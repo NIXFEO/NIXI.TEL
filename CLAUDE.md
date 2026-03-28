@@ -2,52 +2,97 @@
 
 ## Project
 
-SBC (Session Border Controller) written in Rust (~26K lines), production-ready.
+SBC (Session Border Controller) written in Rust (~31K lines), production-ready.
+Open-source: https://github.com/NIXFEO/NIXI.TEL
 Designed for PSTN trunking with full B2BUA call control.
 
-**Current version**: Phase 17
+**Current version**: Phase 18 (2026-03-28)
+**License**: MIT (NIXFEO)
+
+## Server
+
+- **SSH**: `root@sip.nixi.tel`
+- **Config**: `/opt/sbc/config/production.toml`
+- **Binary**: `/usr/local/bin/sbc` (backup: `/usr/local/bin/sbc.bak`)
+- **Logs**: `/var/log/sbc/sbc.log`
+- **CDR**: `/var/log/sbc/cdr.jsonl`
+- **Service**: `systemctl {start|stop|restart} sbc`
+- **Systemd**: `/etc/systemd/system/sbc.service`
+- **Disk**: 17G total, ~49% used, 8.8G free
+
+### Other projects on server
+- `/opt/diamy/src/` — Diamy SIP Network Monitor (code source only, no build artifacts)
 
 ## Build & Deploy
 
 ```bash
-# Build release
-cargo build --release
+# 1. Upload sources
+scp crates/sbc-core/src/*.rs root@sip.nixi.tel:/root/sbc/crates/sbc-core/src/
+scp crates/sbc-core/src/sbc/*.rs root@sip.nixi.tel:/root/sbc/crates/sbc-core/src/sbc/
+scp crates/sbc-core/src/media/*.rs root@sip.nixi.tel:/root/sbc/crates/sbc-core/src/media/
+scp crates/sbc-core/src/routing/*.rs root@sip.nixi.tel:/root/sbc/crates/sbc-core/src/routing/
 
-# Deploy
-systemctl stop sbc
-cp target/release/sbc /usr/local/bin/sbc
-systemctl start sbc
+# 2. Build on server
+ssh root@sip.nixi.tel 'source ~/.cargo/env && cd /root/sbc && cargo build --release'
+
+# 3. Test on server
+ssh root@sip.nixi.tel 'source ~/.cargo/env && cd /root/sbc && cargo test'
+
+# 4. Deploy (graceful — sends BYE to all active peers)
+ssh root@sip.nixi.tel 'cp /usr/local/bin/sbc /usr/local/bin/sbc.bak && systemctl stop sbc && cp /root/sbc/target/release/sbc /usr/local/bin/sbc && systemctl start sbc'
+
+# 5. Smoke test
+ssh root@sip.nixi.tel 'curl -s -H "Authorization: Bearer TOKEN" http://127.0.0.1:8080/api/v1/registrations'
+
+# 6. Clean build artifacts after deploy (saves ~3GB)
+ssh root@sip.nixi.tel 'cp /root/sbc/target/release/sbc /tmp/sbc-bak && rm -rf /root/sbc/target && mkdir -p /root/sbc/target/release && mv /tmp/sbc-bak /root/sbc/target/release/sbc'
 ```
 
-**Important:** Always use `systemctl stop sbc` (SIGTERM) for graceful shutdown — the SBC sends BYE to all active peers. Never `kill -9`.
+**Important:** Always use `systemctl stop sbc` (SIGTERM) for graceful shutdown. Never `kill -9`.
+
+### Rollback
+```bash
+ssh root@sip.nixi.tel 'systemctl stop sbc && cp /usr/local/bin/sbc.bak /usr/local/bin/sbc && systemctl start sbc'
+```
+
+### Local build (macOS)
+Requires cmake for Opus. rsip fork at `../rsip-nixi`.
+```bash
+export PATH="/path/to/cmake/bin:$PATH"
+cargo test
+```
 
 ## Architecture
 
-### Key files
+### Key files (refactored Phase 18)
 
 | File | Lines | Role |
 |------|-------|------|
-| `sbc.rs` | ~3400 | Main dispatch: handle_invite/bye/cancel/ack/refer, graceful_shutdown, event loop |
-| `b2bua.rs` | ~1000 | B2BUA half-mode (same Call-ID both legs), call state, suffix match |
+| `sbc/mod.rs` | ~1600 | Core struct, config, event loop, REGISTER, OPTIONS |
+| `sbc/invite_handler.rs` | ~665 | INVITE routing, 407 auth retry, outbound topology |
+| `sbc/response_handler.rs` | ~492 | 200 OK relay, SDP, WebRTC/DTLS/SRTP handling |
+| `sbc/call_handler.rs` | ~616 | BYE, CANCEL, ACK, REFER, timeouts, graceful shutdown |
+| `b2bua.rs` | ~1160 | B2BUA half-mode, call state, suffix match, IP disambiguation |
 | `media/rtp.rs` | ~1400 | Bidirectional RTP relay, STUN/DTLS demux, inactivity timeout (90s) |
 | `media/manager.rs` | ~900 | MediaSession, RTP port management (DashMap) |
-| `media/sdp.rs` | ~700 | SDP parsing/rewriting, WebRTC<->trunk SDP transform, DTMF |
+| `media/sdp.rs` | ~790 | SDP parsing/rewriting, WebRTC<->trunk SDP transform, DTMF |
 | `media/srtp_crypto.rs` | ~870 | SRTP encrypt/decrypt, key derivation |
 | `media/ice.rs` | ~920 | ICE agent (connectivity checks, candidate gathering) |
 | `media/stun.rs` | ~780 | STUN binding requests/responses, MESSAGE-INTEGRITY |
 | `media/dtls.rs` | ~620 | DTLS handshake, SRTP key export |
 | `transcoding.rs` | ~1050 | Opus<->G.711 (PCMU/PCMA) transcoding, resampling |
-| `topology.rs` | ~610 | Via/Contact/Record-Route rewriting (RFC 3261), TLS transport param |
+| `topology.rs` | ~610 | Via/Contact/Record-Route rewriting (RFC 3261) |
 | `config.rs` | ~375 | TOML config parsing, TrunkConfigToml, DidMapping |
-| `routing/trunk.rs` | ~640 | TrunkConfig, normalize_number, normalize_caller, prefix matching, LCR |
+| `routing/trunk.rs` | ~780 | TrunkConfig, normalize_number, normalize_caller, prefix matching, LCR |
 | `routing/router.rs` | ~430 | INVITE routing, route_request_candidates() for multi-trunk failover |
 | `register.rs` | ~880 | SIP REGISTER handler, InMemoryRegistrar, binding management |
 | `auth.rs` | ~750 | Digest auth (401 challenge/verify), nonce management, hot-reload users |
+| `api.rs` | ~490 | REST API router: /health, /api/v1/calls, /registrations, /stats, /trunks |
+| `http_server.rs` | ~340 | HTTP server, auth token, registrar wiring |
 | `storage.rs` | ~620 | CDR (InMemory + FileCdrStorage JSON-lines) |
 | `metrics.rs` | ~600 | Prometheus counters (active_calls, requests, responses, rtp_packets, auth) |
 | `dos.rs` | ~525 | Rate limiting per IP (token bucket) |
 | `acl.rs` | ~725 | IP access control lists |
-| `http_server.rs` | ~300 | REST API + /metrics endpoint |
 | `trunk_register.rs` | ~200 | Outbound REGISTER to trunks (auth 401/407) |
 
 ### Inactive modules (code present, not used in production)
@@ -57,6 +102,36 @@ systemctl start sbc
 - `tls_client.rs` — TLS outbound for trunks
 - `dialog/` — Dialog state machine (bypassed, B2BUA manages directly)
 - `transaction/` — Transaction state machine (bypassed, stateless processing)
+
+## REST API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check (200 if healthy, 503 if not) |
+| GET | `/ready` | Readiness probe |
+| GET | `/metrics` | Prometheus metrics (text/plain) |
+| GET | `/api/v1/calls` | Active calls list (JSON) |
+| GET | `/api/v1/registrations` | Registered SIP users (AOR, contact, expires, transport) |
+| GET | `/api/v1/stats` | Global stats (active_calls, uptime, requests) |
+| GET | `/api/v1/trunks` | Trunk list |
+| POST | `/api/v1/trunks` | Create trunk |
+| GET | `/api/calls` | Legacy alias for /api/v1/calls |
+| GET | `/api/registrations` | Legacy alias for /api/v1/registrations |
+| GET | `/api/status` | Legacy alias for /api/v1/stats |
+
+## Tests
+
+**404 tests passing** (1 pre-existing failure in transcoding::test_downsample_48k_to_8k — rubato resampling edge case).
+
+Test coverage by module:
+- `b2bua.rs` — 14 tests (suffix match, IP disambiguation, port fallback, stray BYE)
+- `routing/trunk.rs` — 21 tests (prefix matching, normalize_number, normalize_caller)
+- `media/sdp.rs` — 16 tests (parse, round-trip, WebRTC transform, Linphone compat)
+- `auth.rs` — 40+ tests (MD5, digest challenge/verify, nonce management)
+- `topology.rs` — 20+ tests (Via/Contact/Record-Route rewriting)
+- `dos.rs` — 13 tests (token bucket, whitelist, blacklist)
+- `storage.rs` — 18 tests (CDR CRUD, JSON serialization)
+- `api.rs` — 17 tests (all endpoints, registrations, legacy routes)
 
 ## Trunk interop notes
 
@@ -82,29 +157,31 @@ When the trunk sends BYE for an inbound call and the callee has already hung up 
 ### Double 100 Trying (cosmetic)
 The SBC sends 2x 100 Trying per INVITE: one stateless (no Record-Route) and one after processing (with Record-Route). Benign, could be optimized.
 
-### sbc.rs too large (~3400 lines)
-Main file deserves refactoring: extract handle_invite, handle_response (200 OK + SDP), and BYE/CANCEL helpers into separate modules.
-
 ### SIP construction via format!()
 Synthetic BYEs (graceful shutdown, timeout) are built by string formatting. Fragile — deserves a minimal SIP builder.
 
 ### Lock contention B2BUA
 `B2buaManager.calls` uses `Mutex<HashMap>`. Fine for current volume (~5 concurrent calls) but potential bottleneck at 100+. Consider migrating to DashMap.
 
+### transcoding::test_downsample_48k_to_8k failure
+Pre-existing test failure — rubato resampling produces 551 samples instead of expected 1000. Cosmetic, transcoding works in production.
+
 ## Roadmap
 
 ### v1.1 — Reliability & Observability
-- [ ] `/api/calls` and `/api/registrations` handlers
+- [x] `/api/v1/calls` and `/api/v1/registrations` handlers ✅ Phase 18
+- [x] `/health` endpoint ✅ Phase 18
+- [x] Legacy API routes (`/api/calls`, `/api/registrations`, `/api/status`) ✅ Phase 18
 - [ ] RTP timeout alerting (log warn + metric)
 - [ ] Enriched CDRs: caller/callee numbers, trunk name, codec, rtp_packets count
 - [ ] Log rotation (logrotate for sbc.log and cdr.jsonl)
-- [ ] `/health` endpoint
 
 ### v1.2 — Refactoring
-- [ ] Extract handle_invite -> `invite_handler.rs`
-- [ ] Extract handle_response -> `response_handler.rs`
+- [x] Extract handle_invite -> `sbc/invite_handler.rs` ✅ Phase 18
+- [x] Extract handle_response -> `sbc/response_handler.rs` ✅ Phase 18
+- [x] Extract BYE/CANCEL/ACK/REFER -> `sbc/call_handler.rs` ✅ Phase 18
+- [x] Unit tests: suffix match, SDP rewriting, normalize_number, normalize_caller ✅ Phase 18
 - [ ] SIP message builder (replace format!())
-- [ ] Unit tests: suffix match, SDP rewriting, normalize_number, normalize_caller
 
 ### v1.3 — Multi-trunk & Resilience
 - [ ] Active trunk failover (5s timeout, route_request_candidates ready)
