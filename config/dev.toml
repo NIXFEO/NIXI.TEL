@@ -1,0 +1,45 @@
+# NIXI.TEL SBC - Development Configuration
+
+[general]
+name = "SBC-Dev"
+instance_id = "sbc-dev-01"
+
+[network]
+public_ipv4 = "127.0.0.1"
+
+# Only UDP listener for development
+[[network.listeners]]
+transport = "UDP"
+bind_address = "127.0.0.1"
+bind_port = 5060
+
+[media]
+rtp_port_range = [10000, 10100]
+rtcp_enabled = true
+transcoding_threads = 2
+codecs = ["PCMU", "PCMA"]
+
+[media.webrtc]
+enabled = false
+stun_servers = []
+turn_enabled = false
+
+[database]
+postgres_url = "postgresql://sbc:sbc@localhost/sbc_dev"
+postgres_max_connections = 5
+redis_url = "redis://localhost:6379/1"
+
+[security]
+rate_limit_global = 100
+rate_limit_per_ip = 10
+auth_challenge_timeout = 30
+
+[management]
+api_enabled = true
+api_bind_address = "127.0.0.1"
+api_port = 8080
+
+[metrics]
+prometheus_enabled = true
+prometheus_bind_address = "127.0.0.1"
+prometheus_port = 9090

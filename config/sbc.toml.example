@@ -1,0 +1,77 @@
+# NIXI.TEL SBC - Configuration Example
+
+[general]
+name = "SBC-NIXI"
+instance_id = "sbc-prod-01"
+
+[network]
+# Public IP address for topology hiding
+public_ipv4 = "203.0.113.10"
+# public_ipv6 = "2001:db8::1"
+
+# SIP Listeners
+[[network.listeners]]
+transport = "UDP"
+bind_address = "0.0.0.0"
+bind_port = 5060
+
+[[network.listeners]]
+transport = "TCP"
+bind_address = "0.0.0.0"
+bind_port = 5060
+
+[[network.listeners]]
+transport = "TLS"
+bind_address = "0.0.0.0"
+bind_port = 5061
+cert_file = "/etc/sbc/certs/server.crt"
+key_file = "/etc/sbc/certs/server.key"
+
+[[network.listeners]]
+transport = "WSS"
+bind_address = "0.0.0.0"
+bind_port = 8089
+cert_file = "/etc/sbc/certs/server.crt"
+key_file = "/etc/sbc/certs/server.key"
+
+[media]
+# RTP port range for media relay
+rtp_port_range = [10000, 20000]
+rtcp_enabled = true
+
+# Number of threads for transcoding
+transcoding_threads = 4
+
+# Supported codecs (priority order)
+codecs = ["PCMU", "PCMA", "Opus", "G729"]
+
+[media.webrtc]
+enabled = true
+stun_servers = ["stun:stun.l.google.com:19302"]
+turn_enabled = false
+
+[database]
+postgres_url = "postgresql://sbc:password@localhost/sbc"
+postgres_max_connections = 20
+redis_url = "redis://localhost:6379"
+
+[security]
+# Global rate limit (requests per second)
+rate_limit_global = 1000
+
+# Per-IP rate limit (requests per second)
+rate_limit_per_ip = 50
+
+# Authentication challenge timeout (seconds)
+auth_challenge_timeout = 30
+
+[management]
+api_enabled = true
+api_bind_address = "127.0.0.1"
+api_port = 8080
+# api_auth_token = "your-secret-token-here"
+
+[metrics]
+prometheus_enabled = true
+prometheus_bind_address = "0.0.0.0"
+prometheus_port = 9090

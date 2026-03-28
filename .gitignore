@@ -1,0 +1,37 @@
+# Build
+/target/
+**/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Production config & secrets
+config/production.toml
+*.pem
+*.key
+*.p12
+.env
+.env.*
+
+# Logs & data
+*.log
+*.jsonl
+/cdr/
+
+# Claude Code (local project memory)
+.claude/
+
+# Build tools downloaded locally
+cmake-*/
+*.tar.gz
+
+# Cargo lock kept for binary crate reproducibility
+# Cargo.lock

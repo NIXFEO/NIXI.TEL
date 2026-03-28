@@ -1,0 +1,45 @@
+# NIXI.TEL SBC - Test Configuration
+
+[general]
+name = "SBC-Test"
+instance_id = "sbc-test-01"
+
+[network]
+public_ipv4 = "127.0.0.1"
+
+# UDP listener on non-standard port for testing
+[[network.listeners]]
+transport = "UDP"
+bind_address = "127.0.0.1"
+bind_port = 15060
+
+[media]
+rtp_port_range = [20000, 20100]
+rtcp_enabled = true
+transcoding_threads = 2
+codecs = ["PCMU", "PCMA"]
+
+[media.webrtc]
+enabled = false
+stun_servers = []
+turn_enabled = false
+
+[database]
+postgres_url = "postgresql://sbc:sbc@localhost/sbc_test"
+postgres_max_connections = 5
+redis_url = "redis://localhost:6379/2"
+
+[security]
+rate_limit_global = 100
+rate_limit_per_ip = 10
+auth_challenge_timeout = 30
+
+[management]
+api_enabled = true
+api_bind_address = "127.0.0.1"
+api_port = 18080
+
+[metrics]
+prometheus_enabled = true
+prometheus_bind_address = "127.0.0.1"
+prometheus_port = 19090
