@@ -305,6 +305,7 @@ impl SessionDescription {
         Ok(value.to_string())
     }
 
+    #[allow(dead_code)]
     fn parse_connection_opt<'a, I>(lines: &mut std::iter::Peekable<I>) -> Result<Option<Connection>>
     where
         I: Iterator<Item = &'a str>,
@@ -458,6 +459,7 @@ impl MediaDescription {
 }
 
 /// WebRTC-specific attributes to strip when transforming SDP for a PSTN trunk.
+#[allow(dead_code)]
 const WEBRTC_STRIP_ATTRS: &[&str] = &[
     "fingerprint", "setup", "ice-ufrag", "ice-pwd", "ice-options", "ice-lite",
     "candidate", "rtcp-mux", "rtcp-rsize", "mid", "extmap", "ssrc", "ssrc-group",

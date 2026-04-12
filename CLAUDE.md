@@ -6,7 +6,7 @@ SBC (Session Border Controller) written in Rust (~31K lines), production-ready.
 Open-source: https://github.com/NIXFEO/NIXI.TEL
 Designed for PSTN trunking with full B2BUA call control.
 
-**Current version**: Phase 18 (2026-03-28)
+**Current version**: Phase 19 (2026-04-12)
 **License**: MIT (NIXFEO)
 
 ## Server
@@ -87,7 +87,7 @@ cargo test
 | `routing/router.rs` | ~430 | INVITE routing, route_request_candidates() for multi-trunk failover |
 | `register.rs` | ~880 | SIP REGISTER handler, InMemoryRegistrar, binding management |
 | `auth.rs` | ~750 | Digest auth (401 challenge/verify), nonce management, hot-reload users |
-| `api.rs` | ~490 | REST API router: /health, /api/v1/calls, /registrations, /stats, /trunks |
+| `api.rs` | ~580 | REST API router: /health, /api/v1/calls, /registrations, /stats, /trunks, /cdrs, /alerts, /reload |
 | `http_server.rs` | ~340 | HTTP server, auth token, registrar wiring |
 | `storage.rs` | ~620 | CDR (InMemory + FileCdrStorage JSON-lines) |
 | `metrics.rs` | ~600 | Prometheus counters (active_calls, requests, responses, rtp_packets, auth) |
@@ -113,8 +113,11 @@ cargo test
 | GET | `/api/v1/calls` | Active calls list (JSON) |
 | GET | `/api/v1/registrations` | Registered SIP users (AOR, contact, expires, transport) |
 | GET | `/api/v1/stats` | Global stats (active_calls, uptime, requests) |
-| GET | `/api/v1/trunks` | Trunk list |
+| GET | `/api/v1/trunks` | Trunk list (with health status, active/total/failed calls) |
 | POST | `/api/v1/trunks` | Create trunk |
+| POST | `/api/v1/reload` | Hot-reload config (DIDs, users, trunks) without restart |
+| GET | `/api/v1/cdrs` | Recent CDR list (last 100, enriched with caller/callee/trunk/codec) |
+| GET | `/api/v1/alerts` | Active alerts (trunk down, high auth failure rate, high call failure rate) |
 | GET | `/api/calls` | Legacy alias for /api/v1/calls |
 | GET | `/api/registrations` | Legacy alias for /api/v1/registrations |
 | GET | `/api/status` | Legacy alias for /api/v1/stats |
@@ -172,9 +175,16 @@ Pre-existing test failure — rubato resampling produces 551 samples instead of 
 - [x] `/api/v1/calls` and `/api/v1/registrations` handlers ✅ Phase 18
 - [x] `/health` endpoint ✅ Phase 18
 - [x] Legacy API routes (`/api/calls`, `/api/registrations`, `/api/status`) ✅ Phase 18
+- [x] Log rotation (logrotate for sbc.log + cdr.jsonl, 30/90 days) ✅ Phase 19
+- [x] Hot-reload config via SIGHUP + `POST /api/v1/reload` ✅ Phase 19
+- [x] Enriched CDRs: caller/callee numbers, trunk name, codec ✅ Phase 19
+- [x] `/api/v1/cdrs` endpoint (recent CDRs) ✅ Phase 19
+- [x] `/api/v1/alerts` endpoint (trunk down, auth/call failure rates) ✅ Phase 19
+- [x] Trunk health checks (OPTIONS keepalive, passive mode) ✅ Phase 19
+- [x] `/api/v1/trunks` enriched with health/stats ✅ Phase 19
+- [x] TLS cert auto-renewal hook (certbot → SBC reload) ✅ Phase 19
+- [x] Daily config backup (`/opt/sbc/backups/`) ✅ Phase 19
 - [ ] RTP timeout alerting (log warn + metric)
-- [ ] Enriched CDRs: caller/callee numbers, trunk name, codec, rtp_packets count
-- [ ] Log rotation (logrotate for sbc.log and cdr.jsonl)
 
 ### v1.2 — Refactoring
 - [x] Extract handle_invite -> `sbc/invite_handler.rs` ✅ Phase 18
@@ -185,7 +195,7 @@ Pre-existing test failure — rubato resampling produces 551 samples instead of 
 
 ### v1.3 — Multi-trunk & Resilience
 - [ ] Active trunk failover (5s timeout, route_request_candidates ready)
-- [ ] Trunk health monitoring (OPTIONS keepalive every 30s)
+- [x] Trunk health monitoring (OPTIONS keepalive every 30s) ✅ Phase 19
 - [ ] Re-INVITE / Session refresh for long calls (>1h)
 - [ ] End-to-end DTMF relay (RFC 2833)
 

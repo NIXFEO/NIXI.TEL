@@ -16,7 +16,7 @@
 use crate::media::PortPair;
 use crate::media::srtp::SrtpContext;
 use crate::media::stun::{classify_packet, build_binding_response_with_integrity, MultiplexedPacketType};
-use crate::transcoding::{Codec, Transcoder};
+use crate::transcoding::Transcoder;
 use crate::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -415,7 +415,7 @@ impl RtpSession {
         // We clone the context for the send direction
         let recv_shared = self.srtp_recv_ctx_a.clone();
         let send_shared = self.srtp_send_ctx_a.clone();
-        let crypto_suite = ctx.crypto_suite();
+        let _crypto_suite = ctx.crypto_suite();
         // Create a second context with the same key material for the send direction
         let ctx2 = ctx.clone_for_send();
         tokio::spawn(async move {

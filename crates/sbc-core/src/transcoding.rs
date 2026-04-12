@@ -15,7 +15,7 @@
 
 use crate::{Error, Result};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants

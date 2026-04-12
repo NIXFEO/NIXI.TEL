@@ -3,17 +3,15 @@
 //! Manages all client and server transactions
 
 use crate::transaction::state_machine::{
-    ClientTransaction, ClientTransactionState, ServerTransaction, ServerTransactionState,
-    TransactionId, TransactionType,
+    ClientTransaction, ServerTransaction,
+    TransactionId,
 };
-use crate::transaction::timers::{RetransmitScheduler, SipTimers};
+use crate::transaction::timers::SipTimers;
 use crate::{Error, Result};
 use dashmap::DashMap;
 use rsip::{Request, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Transaction Manager
@@ -25,6 +23,7 @@ pub struct TransactionManager {
     server_transactions: Arc<DashMap<TransactionId, ServerTransaction>>,
 
     /// SIP timers configuration
+    #[allow(dead_code)]
     timers: SipTimers,
 }
 

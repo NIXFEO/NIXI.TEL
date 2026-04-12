@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::info;
 
 /// DTLS Role
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -141,6 +141,7 @@ pub struct DtlsContext {
     srtp_keys: Arc<Mutex<Option<DtlsSrtpKeys>>>,
 
     /// Local certificate (DER-encoded) — kept for fingerprint verification
+    #[allow(dead_code)]
     cert_der: Vec<u8>,
 
     /// webrtc-dtls Certificate — the SAME certificate used for SDP fingerprint

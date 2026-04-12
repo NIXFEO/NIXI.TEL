@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TLS configuration

@@ -24,14 +24,14 @@
 //! CREATE UNIQUE INDEX idx_reg_aor_contact ON sip_registrations(aor, contact);
 //! ```
 
-use crate::{Error, Result};
+use crate::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -336,6 +336,7 @@ impl Registrar for InMemoryRegistrar {
 /// and expose it via `last_sql()` for testing, while delegating actual
 /// storage to an in-memory cache for environments without a DB.
 pub struct PostgresRegistrar {
+    #[allow(dead_code)]
     db_url: String,
     /// Fallback in-memory store (used when DB is unavailable)
     fallback: InMemoryRegistrar,

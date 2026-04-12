@@ -16,6 +16,7 @@ use crate::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 /// Configuration du serveur HTTP
@@ -68,6 +69,20 @@ impl HttpServer {
         // Re-create router with registrar — Arc::get_mut only works if we're the sole owner
         if let Some(router) = Arc::get_mut(&mut self.router) {
             router.registrar = Some(registrar);
+        }
+        self
+    }
+
+    pub fn with_reload_notify(mut self, notify: Arc<Notify>) -> Self {
+        if let Some(router) = Arc::get_mut(&mut self.router) {
+            router.reload_notify = Some(notify);
+        }
+        self
+    }
+
+    pub fn with_cdr(mut self, cdr: Arc<crate::storage::CdrManager>) -> Self {
+        if let Some(router) = Arc::get_mut(&mut self.router) {
+            router.cdr = Some(cdr);
         }
         self
     }

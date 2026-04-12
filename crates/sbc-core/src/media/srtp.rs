@@ -130,7 +130,8 @@ impl SrtpContext {
         }
 
         let base64_data = &key_params[inline_prefix.len()..];
-        let decoded = base64::decode(base64_data)
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(base64_data)
             .map_err(|e| Error::Media(format!("Invalid base64 in key params: {}", e)))?;
 
         let key_len = crypto_suite.master_key_len();
@@ -183,7 +184,8 @@ impl SrtpContext {
         let mut key_material = Vec::new();
         key_material.extend_from_slice(&self.master_key);
         key_material.extend_from_slice(&self.master_salt);
-        format!("inline:{}", base64::encode(&key_material))
+        use base64::Engine;
+        format!("inline:{}", base64::engine::general_purpose::STANDARD.encode(&key_material))
     }
 }
 

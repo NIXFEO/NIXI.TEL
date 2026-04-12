@@ -3,7 +3,6 @@
 //! Manages ICE candidates, connectivity checks, and NAT traversal
 
 use crate::{Error, Result};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;

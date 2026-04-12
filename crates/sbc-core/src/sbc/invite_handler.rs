@@ -268,6 +268,13 @@ impl Sbc {
             // ── Store trunk_id on the B2BUA call for 407 retry ──────────────
             // We need trunk_id to look up credentials when we get a 407 response
             self.b2bua.store_outbound_invite(&uuid, String::new(), trunk.id).await;
+            // Store trunk name for CDR enrichment
+            {
+                let mut calls = self.b2bua.calls_locked().await;
+                if let Some(call) = calls.get_mut(&uuid) {
+                    call.trunk_name = Some(trunk.name.clone());
+                }
+            }
             info!("B2BUA: stored trunk_id={} for call {}", trunk.id, uuid);
 
             let dest = match trunk.destination() {
@@ -285,6 +292,22 @@ impl Sbc {
 
             (dest, trunk.transport.to_rsip_transport(), None)
         };
+
+        // ── CDR enrichment: store caller/callee numbers and trunk name ──────
+        {
+            let caller_num = request.from_header().ok()
+                .and_then(|h| h.typed().ok())
+                .map(|from: rsip::typed::From| from.uri.user().unwrap_or("unknown").to_string());
+            let callee_num = callee_aor.as_deref()
+                .and_then(|aor| aor.strip_prefix("sip:"))
+                .and_then(|s| s.split('@').next())
+                .map(|s| s.to_string());
+            let mut calls = self.b2bua.calls_locked().await;
+            if let Some(call) = calls.get_mut(&uuid) {
+                call.caller_number = caller_num;
+                call.callee_number = callee_num;
+            }
+        }
 
         // ── Detect callee WebRTC (PSTN → WebRTC) ──────────────────────────────
         // If the callee is on WSS/WS transport, it's a WebRTC endpoint.

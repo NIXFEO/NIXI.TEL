@@ -7,7 +7,7 @@
 //! - Compteurs de violations
 //! - Cleanup automatique des entrées expirées
 
-use crate::{Error, Result};
+use crate::Result;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

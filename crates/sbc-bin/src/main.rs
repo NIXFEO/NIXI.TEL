@@ -50,6 +50,9 @@ async fn main() -> Result<()> {
     // Start outbound REGISTER loops for trunks that need it
     sbc.start_trunk_registrations();
 
+    // Start trunk health checks (OPTIONS keepalive every 30s)
+    sbc.start_trunk_health_checks();
+
     info!("SBC started successfully");
     info!("Instance ID: {}", config.general.instance_id);
     info!(

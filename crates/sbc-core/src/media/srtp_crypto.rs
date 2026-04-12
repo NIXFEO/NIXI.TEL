@@ -283,7 +283,7 @@ impl SrtpCrypto {
 pub fn derive_srtp_keys(
     master_key: &[u8],
     master_salt: &[u8],
-    key_derivation_rate: u8,
+    _key_derivation_rate: u8,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     if master_key.len() != 16 && master_key.len() != 32 {
         return Err(Error::Media(format!(

@@ -8,10 +8,10 @@
 use crate::b2bua::{B2buaManager, CallSnapshot};
 use crate::metrics::{HealthReport, SbcMetrics};
 use crate::register::Registrar;
-use crate::routing::router::Router;
 use crate::routing::trunk::TrunkManager;
-use crate::{Error, Result};
+use crate::storage::CdrManager;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Supported HTTP response content types
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +71,8 @@ pub struct ApiRouter {
     b2bua:         Arc<B2buaManager>,
     trunks:        Arc<TrunkManager>,
     pub registrar: Option<Arc<dyn Registrar>>,
+    pub reload_notify: Option<Arc<Notify>>,
+    pub cdr: Option<Arc<CdrManager>>,
 }
 
 impl ApiRouter {
@@ -79,7 +81,12 @@ impl ApiRouter {
         b2bua:   Arc<B2buaManager>,
         trunks:  Arc<TrunkManager>,
     ) -> Self {
-        Self { metrics, b2bua, trunks, registrar: None }
+        Self { metrics, b2bua, trunks, registrar: None, reload_notify: None, cdr: None }
+    }
+
+    pub fn with_reload_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.reload_notify = Some(notify);
+        self
     }
 
     pub fn with_registrar(mut self, registrar: Arc<dyn Registrar>) -> Self {
@@ -105,6 +112,9 @@ impl ApiRouter {
             ("GET",  "/api/v1/stats")              => self.stats().await,
             ("GET",  "/api/v1/trunks")             => self.list_trunks().await,
             ("POST", "/api/v1/trunks")             => self.create_trunk(body).await,
+            ("POST", "/api/v1/reload")             => self.reload_config().await,
+            ("GET",  "/api/v1/cdrs")               => self.list_cdrs().await,
+            ("GET",  "/api/v1/alerts")              => self.alerts().await,
 
             // Legacy routes (convenience aliases)
             ("GET",  "/api/calls")                 => self.list_calls().await,
@@ -193,14 +203,85 @@ impl ApiRouter {
         ApiResponse::ok_json(body)
     }
 
+    // ── Reload ─────────────────────────────────────────────────────────────────
+
+    async fn reload_config(&self) -> ApiResponse {
+        match &self.reload_notify {
+            Some(notify) => {
+                notify.notify_one();
+                ApiResponse::ok_json(r#"{"status": "reload_triggered"}"#)
+            }
+            None => ApiResponse::internal_error("reload not available"),
+        }
+    }
+
+    // ── CDRs ───────────────────────────────────────────────────────────────────
+
+    async fn list_cdrs(&self) -> ApiResponse {
+        match &self.cdr {
+            Some(cdr) => {
+                let json = cdr.recent_to_json(100).await;
+                ApiResponse::ok_json(json)
+            }
+            None => ApiResponse::ok_json("[]"),
+        }
+    }
+
+    // ── Alerts ────────────────────────────────────────────────────────────────
+
+    async fn alerts(&self) -> ApiResponse {
+        let mut alerts: Vec<String> = Vec::new();
+
+        // Check trunk health
+        let stats = self.trunks.get_stats();
+        for (t, s) in &stats {
+            if s.consecutive_failures >= 3 {
+                alerts.push(format!(
+                    r#"{{"level":"critical","type":"trunk_down","trunk":"{}","failures":{}}}"#,
+                    t.name, s.consecutive_failures
+                ));
+            }
+        }
+
+        // Check auth failure rate
+        let auth_failures = self.metrics.auth_failures_total.load(std::sync::atomic::Ordering::Relaxed);
+        let auth_challenges = self.metrics.auth_challenges_total.load(std::sync::atomic::Ordering::Relaxed);
+        if auth_challenges > 10 && auth_failures as f64 / auth_challenges as f64 > 0.5 {
+            alerts.push(format!(
+                r#"{{"level":"warning","type":"high_auth_failure_rate","failures":{},"challenges":{}}}"#,
+                auth_failures, auth_challenges
+            ));
+        }
+
+        // Check call failure rate
+        let calls_total = self.metrics.calls_total.load(std::sync::atomic::Ordering::Relaxed);
+        let calls_failed = self.metrics.calls_failed_total.load(std::sync::atomic::Ordering::Relaxed);
+        if calls_total > 5 && calls_failed as f64 / calls_total as f64 > 0.5 {
+            alerts.push(format!(
+                r#"{{"level":"warning","type":"high_call_failure_rate","failed":{},"total":{}}}"#,
+                calls_failed, calls_total
+            ));
+        }
+
+        ApiResponse::ok_json(format!("[{}]", alerts.join(",")))
+    }
+
     // ── Trunks ─────────────────────────────────────────────────────────────────
 
     async fn list_trunks(&self) -> ApiResponse {
-        let trunks = self.trunks.list_trunks();
-        let items: Vec<String> = trunks.iter().map(|t| {
+        let stats = self.trunks.get_stats();
+        let items: Vec<String> = stats.iter().map(|(t, s)| {
+            let health = if s.consecutive_failures == 0 {
+                "up"
+            } else if s.disabled_until.is_some() {
+                "down"
+            } else {
+                "degraded"
+            };
             format!(
-                r#"{{"id": "{}", "name": "{}", "host": "{}", "port": {}, "enabled": {}}}"#,
-                t.id, t.name, t.host, t.port, t.enabled
+                r#"{{"id": "{}", "name": "{}", "host": "{}", "port": {}, "enabled": {}, "health": "{}", "active_calls": {}, "total_calls": {}, "failed_calls": {}, "consecutive_failures": {}}}"#,
+                t.id, t.name, t.host, t.port, t.enabled, health,
+                s.active_calls, s.total_calls, s.failed_calls, s.consecutive_failures
             )
         }).collect();
         ApiResponse::ok_json(format!("[{}]", items.join(", ")))

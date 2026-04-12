@@ -7,8 +7,7 @@
 //! This allows full control over call routing, NAT traversal,
 //! codec normalisation, and media anchoring.
 
-use crate::dialog::{Dialog, DialogManager, DialogState};
-use crate::media::{MediaManager, MediaSession, WebRtcSdpInfo};
+use crate::media::{MediaManager, WebRtcSdpInfo};
 use crate::media::webrtc_handler::WebRtcSession;
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -173,6 +172,19 @@ pub struct B2buaCall {
     pub webrtc_sdp_answer: Option<String>,
 
     // ── PSTN → WebRTC (callee is WebRTC) ─────────────────────────────
+    // ── CDR enrichment fields ─────────────────────────────────────
+    /// Caller's phone number or SIP user (e.g. "alice" or "+33612345678")
+    pub caller_number: Option<String>,
+
+    /// Callee's phone number or SIP user (e.g. "bob" or "0612345678")
+    pub callee_number: Option<String>,
+
+    /// Trunk name used for this call (e.g. "nixi-trunk-out")
+    pub trunk_name: Option<String>,
+
+    /// Codec negotiated for this call (e.g. "PCMU", "Opus")
+    pub codec: Option<String>,
+
     /// Whether the callee is a WebRTC client (transport=WSS/WS)
     pub callee_is_webrtc: bool,
 
@@ -227,6 +239,10 @@ impl B2buaCall {
             webrtc_session: None,
             webrtc_ice_pwd: None,
             webrtc_sdp_answer: None,
+            caller_number: None,
+            callee_number: None,
+            trunk_name: None,
+            codec: None,
             callee_is_webrtc: false,
             webrtc_session_b: None,
             webrtc_ice_pwd_b: None,

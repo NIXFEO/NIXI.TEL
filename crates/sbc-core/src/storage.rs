@@ -10,7 +10,6 @@
 //!   - auth_users  : utilisateurs SIP
 
 use crate::{Error, Result};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -76,11 +75,12 @@ impl CdrRecord {
 
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"id":"{}","call_id":"{}","caller":"{}","callee":"{}","duration_secs":{},"codec":{},"is_webrtc":{},"disconnect_reason":"{}","started_at":{},"ended_at":{}}}"#,
+            r#"{{"id":"{}","call_id":"{}","caller":"{}","callee":"{}","trunk_id":{},"duration_secs":{},"codec":{},"is_webrtc":{},"disconnect_reason":"{}","started_at":{},"ended_at":{}}}"#,
             self.id,
             self.call_id,
             self.caller,
             self.callee,
+            self.trunk_id.as_deref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
             self.duration_secs,
             self.codec.as_deref().map(|c| format!("\"{}\"", c)).unwrap_or_else(|| "null".to_string()),
             self.is_webrtc,
@@ -429,6 +429,11 @@ impl CdrManager {
 
     pub fn with_storage(storage: Arc<dyn CdrStorage>) -> Self {
         Self { storage }
+    }
+
+    /// Get a reference to the underlying storage (for direct CDR inserts)
+    pub fn storage(&self) -> &dyn CdrStorage {
+        self.storage.as_ref()
     }
 
     /// Create a CDR manager with file-based storage (JSON-lines)

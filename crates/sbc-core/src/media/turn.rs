@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// TURN Message Types (extends STUN)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,6 +86,7 @@ pub struct TurnAllocation {
     pub lifetime: u32,
 
     /// Transaction ID
+    #[allow(dead_code)]
     transaction_id: [u8; 12],
 }
 
@@ -96,6 +97,7 @@ pub struct TurnPermission {
     pub peer_address: SocketAddr,
 
     /// Expiration time
+    #[allow(dead_code)]
     expiration: std::time::Instant,
 }
 
@@ -118,9 +120,11 @@ pub struct TurnClient {
     socket: Arc<UdpSocket>,
 
     /// Username for authentication
+    #[allow(dead_code)]
     username: String,
 
     /// Password for authentication
+    #[allow(dead_code)]
     password: String,
 
     /// Current allocation
@@ -143,9 +147,9 @@ impl TurnClient {
     /// Use `create()` for real async construction.
     #[deprecated(note = "Use TurnClient::create() instead")]
     pub fn new(
-        server_addr: SocketAddr,
-        username: String,
-        password: String,
+        _server_addr: SocketAddr,
+        _username: String,
+        _password: String,
     ) -> Result<Self> {
         // Cannot actually create socket here - would need async
         Err(Error::Media("Use TurnClient::create() for async construction".to_string()))
@@ -292,7 +296,7 @@ impl TurnClient {
 
         // Wait for response
         let mut buf = vec![0u8; 2048];
-        let (len, _) = timeout(
+        let (_len, _) = timeout(
             Duration::from_millis(self.timeout_ms),
             self.socket.recv_from(&mut buf),
         )

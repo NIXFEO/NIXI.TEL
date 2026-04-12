@@ -102,6 +102,9 @@ pub struct Sbc {
 
     /// Known trunk IPs (whitelisted for inbound INVITE anti-spam)
     trunk_ips: Vec<String>,
+
+    /// Notify signal for API-triggered config reload
+    reload_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Sbc {
@@ -230,6 +233,25 @@ impl Sbc {
             SbcIdentity::new(&public_ip.to_string(), &domain, 5060, false)
         });
 
+        // --- Reload notify (shared between API and event loop) ---
+        let reload_notify = Arc::new(tokio::sync::Notify::new());
+
+        // --- CDR storage (shared between call handler and API) ---
+        let cdr: Arc<CdrManager> = if let Some(ref cdr_file) = config.general.cdr_file {
+            match CdrManager::new_file(cdr_file).await {
+                Ok(mgr) => {
+                    info!("CDR file storage: {}", cdr_file);
+                    Arc::new(mgr)
+                }
+                Err(e) => {
+                    warn!("CDR file storage failed ({}), using memory: {}", cdr_file, e);
+                    Arc::new(CdrManager::new_memory())
+                }
+            }
+        } else {
+            Arc::new(CdrManager::new_memory())
+        };
+
         // --- HTTP API + /metrics endpoint ---
         if config.management.api_enabled {
             let http_addr: std::net::SocketAddr = format!(
@@ -247,7 +269,9 @@ impl Sbc {
                 metrics.clone(),
                 b2bua.clone(),
                 trunk_manager.clone(),
-            ).with_registrar(registrar.clone());
+            ).with_registrar(registrar.clone())
+             .with_reload_notify(reload_notify.clone())
+             .with_cdr(cdr.clone());
             if let Err(e) = http_server.start().await {
                 warn!("HTTP API server failed to start: {}", e);
             } else {
@@ -283,19 +307,25 @@ impl Sbc {
             identity,
             enable_digest_auth,
             metrics,
-            cdr: Arc::new(CdrManager::new_memory()),
+            cdr,
             _maintenance: None,
             config_path: None,
             trunk_manager: trunk_manager.clone(),
             pending_register_responses: Arc::new(DashMap::new()),
             did_mappings: config.dids.clone(),
             trunk_ips,
+            reload_notify,
         })
     }
 
     /// Set the config file path (for SIGHUP hot-reload)
     pub fn set_config_path(&mut self, path: impl Into<String>) {
         self.config_path = Some(path.into());
+    }
+
+    /// Get the reload notifier (for API-triggered reload)
+    pub fn reload_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.reload_notify.clone()
     }
 
     /// Hot-reload configuration from the TOML file.
@@ -432,6 +462,7 @@ impl Sbc {
             pending_register_responses: Arc::new(DashMap::new()),
             did_mappings: Vec::new(),
             trunk_ips: Vec::new(),
+            reload_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -635,6 +666,139 @@ impl Sbc {
         }
     }
 
+    /// Start trunk health checks (OPTIONS keepalive every 30s)
+    pub fn start_trunk_health_checks(&self) {
+        let trunks = self.trunk_manager.list_trunks();
+        let identity = self.identity.clone();
+        let trunk_manager = self.trunk_manager.clone();
+        let metrics = self.metrics.clone();
+
+        let udp_socket = match self.transport.udp_socket() {
+            Some(s) => s,
+            None => {
+                warn!("No UDP socket available — trunk health checks will not start");
+                return;
+            }
+        };
+
+        let pending = self.pending_register_responses.clone();
+
+        for trunk in trunks {
+            if !trunk.enabled { continue; }
+            info!("Starting OPTIONS health check for trunk '{}' ({}:{})", trunk.name, trunk.host, trunk.port);
+            let identity = identity.clone();
+            let sock = udp_socket.clone();
+            let pending = pending.clone();
+            let tm = trunk_manager.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(Self::trunk_health_check_task(trunk, identity, sock, pending, tm, metrics));
+        }
+    }
+
+    /// Health check task — sends OPTIONS to trunk every 30s, tracks up/down state
+    async fn trunk_health_check_task(
+        trunk: TrunkConfig,
+        identity: Option<SbcIdentity>,
+        sock: Arc<tokio::net::UdpSocket>,
+        pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
+        trunk_manager: Arc<TrunkManager>,
+        _metrics: Arc<SbcMetrics>,
+    ) {
+        let trunk_name = trunk.name.clone();
+        let trunk_id = trunk.id;
+        let mut was_up = true;
+        let mut ever_responded = false; // Track if trunk supports OPTIONS at all
+
+        // Wait 5s before first check (let SBC finish starting)
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        loop {
+            let dest = match trunk.destination() {
+                Some(d) => d,
+                None => {
+                    warn!("Trunk '{}': no destination for health check", trunk_name);
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
+
+            let call_id = format!("hc-{}-{}", trunk_name, &uuid::Uuid::new_v4().to_string()[..8]);
+            let branch = format!("z9hG4bK{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]);
+
+            let (sbc_ip, _) = match &identity {
+                Some(id) => (id.public_ip.clone(), id.sip_domain.clone()),
+                None => ("127.0.0.1".to_string(), trunk.host.clone()),
+            };
+
+            let options_msg = format!(
+                "OPTIONS sip:{}:{} SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP {}:5060;branch={};rport\r\n\
+                 Max-Forwards: 70\r\n\
+                 From: <sip:healthcheck@{}>;tag={}\r\n\
+                 To: <sip:{}:{}>\r\n\
+                 Call-ID: {}\r\n\
+                 CSeq: 1 OPTIONS\r\n\
+                 User-Agent: NIXI-SBC/1.0\r\n\
+                 Content-Length: 0\r\n\r\n",
+                trunk.host, trunk.port,
+                sbc_ip, branch,
+                sbc_ip, &uuid::Uuid::new_v4().to_string()[..8],
+                trunk.host, trunk.port,
+                call_id,
+            );
+
+            // Register oneshot for response
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            pending.insert(call_id.clone(), tx);
+
+            let is_up = match sock.send_to(options_msg.as_bytes(), dest).await {
+                Ok(_) => {
+                    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                        Ok(Ok(raw)) => {
+                            let status = crate::trunk_register::parse_status(&raw);
+                            status >= 200 && status < 500
+                        }
+                        _ => {
+                            pending.remove(&call_id);
+                            false
+                        }
+                    }
+                }
+                Err(_) => {
+                    pending.remove(&call_id);
+                    false
+                }
+            };
+
+            // State transition logging
+            if is_up {
+                ever_responded = true;
+                if !was_up {
+                    info!("Trunk '{}' is UP — responding to OPTIONS", trunk_name);
+                    trunk_manager.update_state(&trunk_id, |s| s.record_success());
+                }
+            } else if ever_responded {
+                // Trunk previously responded to OPTIONS but stopped — real issue
+                if was_up {
+                    warn!("Trunk '{}' is DOWN — no response to OPTIONS (timeout 5s)", trunk_name);
+                    trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
+                } else {
+                    trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
+                    debug!("Trunk '{}' still DOWN", trunk_name);
+                }
+            } else {
+                // Trunk never responded to OPTIONS — probably doesn't support it
+                // Log once at info level, then go quiet
+                if was_up {
+                    info!("Trunk '{}' does not respond to OPTIONS — health check passive only", trunk_name);
+                }
+            }
+
+            was_up = is_up;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
     /// Start the SBC with network configuration
     pub async fn start(
         &mut self,
@@ -708,6 +872,12 @@ impl Sbc {
                     info!("SIGHUP received — reloading configuration");
                     if let Err(e) = self.reload_config().await {
                         error!("SIGHUP reload failed: {}", e);
+                    }
+                }
+                _ = self.reload_notify.notified() => {
+                    info!("API reload requested — reloading configuration");
+                    if let Err(e) = self.reload_config().await {
+                        error!("API reload failed: {}", e);
                     }
                 }
                 _ = sigterm.recv() => {
@@ -1068,6 +1238,7 @@ fn build_trying(request: &Request) -> Result<SipMessage> {
 
 /// Build a BYE request to send to the other leg of a B2BUA call.
 /// Creates a minimal but valid BYE using a new Call-ID/CSeq for the outbound leg.
+#[allow(dead_code)]
 fn build_bye_for_other_leg(original_bye: &Request, _dest: std::net::SocketAddr) -> String {
     // Extract Call-ID from the inbound BYE for logging, but we create a fresh BYE
     // that reuses From/To from the inbound request so the callee recognizes the dialog.
@@ -1121,6 +1292,7 @@ fn build_bye_for_other_leg(original_bye: &Request, _dest: std::net::SocketAddr) 
 /// Call-ID, From-tag, To, CSeq number (but method=CANCEL), and top-most Via.
 /// We reuse From/To/CSeq from the original CANCEL (which mirrors the INVITE)
 /// but substitute the outbound Call-ID (the leg SBC→callee used the same Call-ID).
+#[allow(dead_code)]
 fn build_cancel_for_callee(
     original_cancel: &Request,
     outbound_call_id: &str,
@@ -1174,7 +1346,7 @@ fn build_cancel_for_callee(
 /// We strip the body and update Content-Type/Content-Length.
 fn strip_sdp_body(raw: &str) -> String {
     let mut result = String::new();
-    let mut in_body = false;
+    let in_body = false;
     for line in raw.split("\r\n") {
         if in_body {
             continue; // Skip body
@@ -1464,6 +1636,7 @@ fn build_register_200(
 /// Extract the user part from a SIP URI.
 /// e.g. "sip:+33612345678@sip.nixi.tel" → "+33612345678"
 /// e.g. "sip:0612345678@trunk.example.com" → "0612345678"
+#[allow(dead_code)]
 fn extract_uri_user(uri: &str) -> Option<String> {
     // Strip "sip:" or "sips:" prefix
     let without_scheme = uri.strip_prefix("sip:")

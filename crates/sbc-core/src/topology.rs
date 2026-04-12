@@ -14,7 +14,6 @@
 //!   5. **Max-Forwards decrement**   — RFC 3261 §8.1.1
 
 use crate::{Error, Result};
-use std::net::SocketAddr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SBC identity used for header rewriting

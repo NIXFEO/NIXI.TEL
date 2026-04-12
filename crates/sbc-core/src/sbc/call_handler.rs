@@ -205,7 +205,7 @@ impl Sbc {
         &mut self,
         request: Request,
         source: SocketAddr,
-        transport: rsip::Transport,
+        _transport: rsip::Transport,
         _reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
         let call_id = request.call_id_header()
@@ -238,7 +238,7 @@ impl Sbc {
             {
                 // Build a fresh ACK for the callee leg (B2BUA must rewrite headers)
                 let callee_contact = format!("sip:{}:{}", callee_dest.ip(), callee_dest.port());
-                let caller_user = request.from_header()
+                let _caller_user = request.from_header()
                     .ok()
                     .map(|h| h.value().to_string())
                     .unwrap_or_default();
@@ -426,21 +426,38 @@ impl Sbc {
                 }
             }
 
-            // ── CDR: record the terminated call ──────────────────────────────
+            // ── CDR: record the terminated call (enriched) ──────────────────
             {
                 let calls = self.b2bua.calls_locked().await;
                 if let Some(call) = calls.get(&uuid) {
-                    let caller = call.inbound.call_id.clone();
-                    let callee = call.outbound.as_ref().map(|l| l.call_id.clone()).unwrap_or_default();
+                    let call_id = call.inbound.call_id.clone();
+                    let caller = call.caller_number.clone().unwrap_or_else(|| call.inbound.call_id.clone());
+                    let callee = call.callee_number.clone().unwrap_or_else(|| {
+                        call.outbound.as_ref().map(|l| l.call_id.clone()).unwrap_or_default()
+                    });
                     let duration = call.duration_secs();
                     let is_webrtc = call.caller_is_webrtc;
-                    let call_id = call.inbound.call_id.clone();
+                    let codec = call.codec.clone();
+                    let trunk_name = call.trunk_name.clone();
                     drop(calls); // release lock before async call
-                    if let Err(e) = self.cdr.record_call(
-                        &call_id, &caller, &callee,
-                        duration, is_webrtc, None, "normal-clearing",
-                    ).await {
+
+                    let mut record = crate::storage::CdrRecord::new(
+                        call_id, caller, callee,
+                    ).with_duration(duration)
+                     .with_webrtc(is_webrtc)
+                     .with_disconnect_reason("normal-clearing");
+                    if let Some(c) = codec.as_deref() {
+                        record = record.with_codec(c);
+                    }
+                    record.trunk_id = trunk_name;
+                    if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
                         warn!("CDR recording failed: {}", e);
+                    } else {
+                        info!("CDR: {} → {} ({} secs, codec={}, trunk={}, webrtc={})",
+                            record.caller, record.callee, duration,
+                            record.codec.as_deref().unwrap_or("unknown"),
+                            record.trunk_id.as_deref().unwrap_or("local"),
+                            is_webrtc);
                     }
                 }
             }

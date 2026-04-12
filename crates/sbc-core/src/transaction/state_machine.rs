@@ -5,7 +5,7 @@
 //! - Non-INVITE transactions
 
 use crate::{Error, Result};
-use rsip::{Method, Request, Response, SipMessage, StatusCode};
+use rsip::{Method, Request, Response, StatusCode};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};

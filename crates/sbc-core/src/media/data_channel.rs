@@ -26,9 +26,8 @@
 
 use crate::{Error, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
-use tracing::{debug, info, warn};
+use tokio::sync::mpsc;
+use tracing::info;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SCTP Constants (RFC 4960 / RFC 8831)
@@ -337,6 +336,7 @@ pub struct DataChannelManager {
     next_stream_id: u16,
 
     /// Whether this side is the DTLS client (uses even stream IDs)
+    #[allow(dead_code)]
     is_dtls_client: bool,
 
     /// Total messages relayed

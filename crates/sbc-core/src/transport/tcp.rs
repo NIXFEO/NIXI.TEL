@@ -253,6 +253,7 @@ impl TcpListenerServer {
     }
 
     /// Parse SIP message from raw bytes (no reply channel)
+    #[allow(dead_code)]
     fn parse_sip_message(data: &[u8], source: SocketAddr) -> Result<ReceivedMessage> {
         let message = SipMessage::try_from(data)
             .map_err(|e| Error::Parse(format!("Failed to parse SIP message: {}", e)))?;
