@@ -108,8 +108,26 @@ pub struct Sbc {
 }
 
 impl Sbc {
-    /// Create a new SBC instance from full configuration
+    /// Create a new SBC instance from full configuration (with optional Phase 5 management handler).
+    ///
+    /// If `management` is `Some`, the management API endpoints (users, DIDs, config/reload)
+    /// are wired into the HTTP server.  Pass `None` to omit them (existing behaviour).
+    pub async fn new_from_config_with_management(
+        config: &SbcConfig,
+        management: Option<Arc<dyn crate::api::ManagementHandler>>,
+    ) -> Result<Self> {
+        Self::_new_from_config_inner(config, management).await
+    }
+
+    /// Create a new SBC instance from full configuration (no management handler).
     pub async fn new_from_config(config: &SbcConfig) -> Result<Self> {
+        Self::_new_from_config_inner(config, None).await
+    }
+
+    async fn _new_from_config_inner(
+        config: &SbcConfig,
+        management: Option<Arc<dyn crate::api::ManagementHandler>>,
+    ) -> Result<Self> {
         // --- Metrics (created early so counters can be shared with Media) ---
         let metrics = Arc::new(SbcMetrics::new());
 
@@ -264,7 +282,7 @@ impl Sbc {
             if let Some(ref token) = config.management.api_auth_token {
                 http_config = http_config.with_token(token.clone());
             }
-            let http_server = HttpServer::new(
+            let mut http_server = HttpServer::new(
                 http_config,
                 metrics.clone(),
                 b2bua.clone(),
@@ -272,6 +290,9 @@ impl Sbc {
             ).with_registrar(registrar.clone())
              .with_reload_notify(reload_notify.clone())
              .with_cdr(cdr.clone());
+            if let Some(mgmt) = management {
+                http_server = http_server.with_management(mgmt);
+            }
             if let Err(e) = http_server.start().await {
                 warn!("HTTP API server failed to start: {}", e);
             } else {

@@ -87,6 +87,13 @@ impl HttpServer {
         self
     }
 
+    pub fn with_management(mut self, handler: Arc<dyn crate::api::ManagementHandler>) -> Self {
+        if let Some(router) = Arc::get_mut(&mut self.router) {
+            router.management = Some(handler);
+        }
+        self
+    }
+
     /// Démarrer le serveur HTTP en arrière-plan
     pub async fn start(self) -> Result<()> {
         let addr = self.config.bind_address;

@@ -4,11 +4,14 @@
 //! All message handling is delegated to sbc_core::Sbc.
 
 use anyhow::Result;
+use sbc_core::api::ManagementHandler;
 use sbc_core::config::SbcConfig;
 use sbc_core::Sbc;
+use sbc_management::api::ManagementRouter;
 use std::path::PathBuf;
+use std::sync::Arc;
 use structopt::StructOpt;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "sbc", about = "NIXI.TEL SBC - Session Border Controller")]
@@ -38,8 +41,38 @@ async fn main() -> Result<()> {
     let config = SbcConfig::from_file(&config_path)?;
     info!("Configuration loaded: {}", config.general.name);
 
-    // Build integrated SBC from config (wires all modules)
-    let mut sbc = Sbc::new_from_config(&config).await?;
+    // Build Phase 5 management handler (Postgres-backed users/DIDs/reload)
+    let management: Option<Arc<dyn ManagementHandler>> = if config.management.api_enabled {
+        match ManagementRouter::new(
+            &config.database.postgres_url,
+            config.security.sip_realm.clone(),
+        )
+        .await
+        {
+            Ok(router) => {
+                router.ensure_schema().await;
+                info!(
+                    "Management API: users/DID endpoints active (realm={})",
+                    config.security.sip_realm
+                );
+                Some(Arc::new(router))
+            }
+            Err(e) => {
+                warn!(
+                    "Management API: Postgres unavailable ({}) — \
+                     /api/v1/users and /api/v1/dids will return 500",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build integrated SBC from config (wires all modules), including the
+    // management handler so it is registered with the HTTP server before start.
+    let mut sbc = Sbc::new_from_config_with_management(&config, management).await?;
 
     // Store config path for SIGHUP hot-reload
     sbc.set_config_path(config_path);
@@ -83,4 +116,3 @@ fn init_logging(verbose: bool) {
         .with_ansi(false)
         .init();
 }
-
