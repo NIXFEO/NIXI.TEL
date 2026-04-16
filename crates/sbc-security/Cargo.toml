@@ -1,0 +1,19 @@
+[package]
+name = "sbc-security"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsip = { workspace = true }
+tokio = { workspace = true }
+
+dashmap = { workspace = true }
+uuid = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+tracing = { workspace = true }
+ipnetwork = { workspace = true }
+
+serde = { workspace = true }

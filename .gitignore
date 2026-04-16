@@ -1,6 +1,8 @@
-# Build
+# Rust
 /target/
-**/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
 
 # IDE
 .idea/
@@ -8,30 +10,34 @@
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
-Thumbs.db
 
-# Production config & secrets
-config/production.toml
-*.pem
-*.key
-*.p12
-.env
-.env.*
-
-# Logs & data
+# Logs
 *.log
-*.jsonl
-/cdr/
+sbc.log
 
-# Claude Code (local project memory)
-.claude/
+# Configuration (keep examples)
+config/sbc.toml
+!config/*.example
+!config/dev.toml
 
-# Build tools downloaded locally
-cmake-*/
-*.tar.gz
+# TLS certificates
+*.key
+*.crt
+*.pem
+/certs/
 
-# Cargo lock kept for binary crate reproducibility
-# Cargo.lock
+# Database
+*.db
+*.sqlite
+
+# Build artifacts
+/dist/
+/build/
+
+# Test outputs
+/test-results/
+
+# Temporary files
+/tmp/
+*.tmp

@@ -7,7 +7,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # rsip pour SIP
-rsip = { version = "0.4", path = "../rsip-nixi" }
+rsip = { version = "0.4", path = "rsip-nixi" }
 
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }

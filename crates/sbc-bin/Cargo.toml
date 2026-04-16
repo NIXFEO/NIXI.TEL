@@ -9,6 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 sbc-core = { path = "../sbc-core" }
+sbc-media = { path = "../sbc-media" }
+sbc-security = { path = "../sbc-security" }
+sbc-storage = { path = "../sbc-storage" }
+sbc-management = { path = "../sbc-management" }
 
 tokio = { workspace = true }
 
