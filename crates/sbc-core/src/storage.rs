@@ -73,18 +73,43 @@ impl CdrRecord {
         self
     }
 
+    /// Escape a string value for safe embedding inside a JSON string literal.
+    fn json_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 4);
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"'  => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
     pub fn to_json(&self) -> String {
+        let trunk = self.trunk_id.as_deref()
+            .map(|t| format!("\"{}\"", Self::json_escape(t)))
+            .unwrap_or_else(|| "null".to_string());
+        let codec = self.codec.as_deref()
+            .map(|c| format!("\"{}\"", Self::json_escape(c)))
+            .unwrap_or_else(|| "null".to_string());
         format!(
             r#"{{"id":"{}","call_id":"{}","caller":"{}","callee":"{}","trunk_id":{},"duration_secs":{},"codec":{},"is_webrtc":{},"disconnect_reason":"{}","started_at":{},"ended_at":{}}}"#,
-            self.id,
-            self.call_id,
-            self.caller,
-            self.callee,
-            self.trunk_id.as_deref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
+            Self::json_escape(&self.id),
+            Self::json_escape(&self.call_id),
+            Self::json_escape(&self.caller),
+            Self::json_escape(&self.callee),
+            trunk,
             self.duration_secs,
-            self.codec.as_deref().map(|c| format!("\"{}\"", c)).unwrap_or_else(|| "null".to_string()),
+            codec,
             self.is_webrtc,
-            self.disconnect_reason,
+            Self::json_escape(&self.disconnect_reason),
             self.started_at,
             self.ended_at,
         )
@@ -230,6 +255,11 @@ impl CdrStorage for FileCdrStorage {
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = file.write_all(json_line.as_bytes()).await {
                     error!("CDR file write error: {}", e);
+                    return Err(Error::Transport(format!("CDR file write: {}", e)));
+                }
+                // Flush so data reaches the kernel buffer before the handle drops.
+                if let Err(e) = file.flush().await {
+                    error!("CDR file flush error: {}", e);
                     return Err(Error::Transport(format!("CDR file write: {}", e)));
                 }
             }
