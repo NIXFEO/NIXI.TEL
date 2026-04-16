@@ -13,6 +13,25 @@ use crate::storage::CdrManager;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+// ── Management handler plug-in point ─────────────────────────────────────────
+
+/// Trait for plugging the Phase 5 management handler into the core API router.
+///
+/// `sbc-management` implements this; `sbc-bin` wires the concrete type into
+/// `ApiRouter::with_management()` so that `sbc-core` never depends on `sbc-management`.
+///
+/// Returns `None` when the path is not a management route (lets the core router
+/// continue to its own 404 fall-through).
+#[async_trait::async_trait]
+pub trait ManagementHandler: Send + Sync {
+    async fn handle_management(
+        &self,
+        method: &str,
+        path:   &str,
+        body:   &str,
+    ) -> Option<ApiResponse>;
+}
+
 /// Supported HTTP response content types
 #[derive(Debug, Clone, Copy)]
 pub enum ContentType {
@@ -73,6 +92,8 @@ pub struct ApiRouter {
     pub registrar: Option<Arc<dyn Registrar>>,
     pub reload_notify: Option<Arc<Notify>>,
     pub cdr: Option<Arc<CdrManager>>,
+    /// Phase 5 management handler (users, DIDs, config reload)
+    pub management: Option<Arc<dyn ManagementHandler>>,
 }
 
 impl ApiRouter {
@@ -81,7 +102,7 @@ impl ApiRouter {
         b2bua:   Arc<B2buaManager>,
         trunks:  Arc<TrunkManager>,
     ) -> Self {
-        Self { metrics, b2bua, trunks, registrar: None, reload_notify: None, cdr: None }
+        Self { metrics, b2bua, trunks, registrar: None, reload_notify: None, cdr: None, management: None }
     }
 
     pub fn with_reload_notify(mut self, notify: Arc<Notify>) -> Self {
@@ -91,6 +112,11 @@ impl ApiRouter {
 
     pub fn with_registrar(mut self, registrar: Arc<dyn Registrar>) -> Self {
         self.registrar = Some(registrar);
+        self
+    }
+
+    pub fn with_management(mut self, handler: Arc<dyn ManagementHandler>) -> Self {
+        self.management = Some(handler);
         self
     }
 
@@ -122,7 +148,15 @@ impl ApiRouter {
             ("GET",  "/api/status")                => self.stats().await,
             ("GET",  "/api/trunks")                => self.list_trunks().await,
 
-            _                                      => ApiResponse::not_found(),
+            // Phase 5 management routes — delegate to plugged-in handler
+            _ => {
+                if let Some(ref mgmt) = self.management {
+                    if let Some(resp) = mgmt.handle_management(method, path, body).await {
+                        return resp;
+                    }
+                }
+                ApiResponse::not_found()
+            }
         }
     }
 

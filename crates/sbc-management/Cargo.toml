@@ -4,14 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sbc-core = { path = "../sbc-core" }
+
 tokio = { workspace = true }
-# Management dependencies - Phase 5
-# axum = { workspace = true }
-# tower = { workspace = true }
-# prometheus = { workspace = true }
-# serde = { workspace = true }
-# serde_json = { workspace = true }
+sqlx = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+async-trait = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
