@@ -1,0 +1,25 @@
+[package]
+name = "sbc-media"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+# Media dependencies - Phase 3/4
+# webrtc = { workspace = true }
+# webrtc-ice = { workspace = true }
+# webrtc-dtls = { workspace = true }
+# webrtc-srtp = { workspace = true }
+# rtp = { workspace = true }
+# rtcp = { workspace = true }
+# sdp = { workspace = true }
+# opus = { workspace = true }
+# g711 = { workspace = true }
+# rubato = { workspace = true }
+# rayon = { workspace = true }
+# dashmap = { workspace = true }
+# bytes = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

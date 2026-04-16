@@ -1,7 +1,7 @@
-# NIXI.TEL SBC - Configuration Example
+# SBC W3tel - Configuration Example
 
 [general]
-name = "SBC-NIXI"
+name = "SBC-W3tel"
 instance_id = "sbc-prod-01"
 
 [network]

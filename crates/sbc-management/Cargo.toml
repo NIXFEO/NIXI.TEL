@@ -1,0 +1,22 @@
+[package]
+name = "sbc-management"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sbc-core = { path = "../sbc-core" }
+
+tokio = { workspace = true }
+sqlx = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+async-trait = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

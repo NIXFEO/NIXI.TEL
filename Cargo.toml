@@ -2,12 +2,13 @@
 members = [
     "crates/sbc-core",
     "crates/sbc-bin",
+    "crates/sbc-management",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 # rsip pour SIP
-rsip = { version = "0.4", path = "../rsip-nixi" }
+rsip = { version = "0.4", path = "rsip-nixi" }
 
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
@@ -72,3 +73,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 config = "0.13"
 ipnetwork = "0.20"
 trust-dns-resolver = "0.23"
+
+# Async traits
+async-trait = "0.1"
+
+# OS interface
+libc = "0.2"

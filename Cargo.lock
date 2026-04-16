@@ -1981,6 +1981,10 @@ dependencies = [
  "config",
  "rsip",
  "sbc-core",
+ "sbc-management",
+ "sbc-media",
+ "sbc-security",
+ "sbc-storage",
  "serde",
  "structopt",
  "thiserror",
@@ -2030,6 +2034,51 @@ dependencies = [
  "webrtc-ice",
  "webrtc-srtp",
  "webrtc-util 0.8.1",
+]
+
+[[package]]
+name = "sbc-management"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sbc-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "sbc-security"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "ipnetwork",
+ "rsip",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid 1.21.0",
+]
+
+[[package]]
+name = "sbc-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

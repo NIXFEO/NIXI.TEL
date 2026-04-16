@@ -1,4 +1,4 @@
-# NIXI.TEL SBC - Test Configuration avec tous les transports
+# SBC W3tel - Test Configuration avec tous les transports
 
 [general]
 name = "SBC-Test-All"
