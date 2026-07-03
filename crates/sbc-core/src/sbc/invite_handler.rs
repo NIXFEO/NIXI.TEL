@@ -11,6 +11,26 @@ impl Sbc {
     ) -> Result<()> {
         info!("Received INVITE from {}", source);
 
+        // ── In-dialog re-INVITE (RFC 4028 session refresh)? ─────────────
+        // A To-tag + a known Call-ID means an existing dialog: answer with
+        // unchanged SDP instead of treating it as a new call.
+        let to_has_tag = request.to_header().ok()
+            .and_then(|h| h.typed().ok())
+            .map(|to: rsip::typed::To| to.params.iter().any(|p| matches!(p, rsip::Param::Tag(_))))
+            .unwrap_or(false);
+        if to_has_tag {
+            if let Ok(cid_header) = request.call_id_header() {
+                let cid = cid_header.value().to_string();
+                if let Some((uuid, is_from_caller)) =
+                    self.b2bua.find_by_any_call_id_with_source(&cid, Some(source)).await
+                {
+                    return self
+                        .handle_reinvite(&uuid, is_from_caller, request, source, transport, reply_tx)
+                        .await;
+                }
+            }
+        }
+
         // ── Anti-spam: reject INVITE from unregistered/unknown sources ──
         // Allow if any of:
         //   (1) source IP matches a registered user's received_ip
@@ -518,6 +538,20 @@ impl Sbc {
             info!("INVITE outbound {}", to_line.unwrap_or("(no To)"));
             info!("INVITE outbound {}", callid_line.unwrap_or("(no Call-ID)"));
         }
+        // ── RFC 4028: offer session timers on trunk legs ─────────────────
+        let outbound_raw = {
+            let is_trunk_call = {
+                let calls = self.b2bua.calls_locked().await;
+                calls.get(&uuid).map(|c| c.trunk_name.is_some()).unwrap_or(false)
+            };
+            match (self.session_timer, is_trunk_call) {
+                (Some((expires, min_se)), true) => inject_session_timer_headers(
+                    &outbound_raw, expires, min_se,
+                ),
+                _ => outbound_raw,
+            }
+        };
+
         self.transport.reply(outbound_raw.as_bytes(), dest, outbound_transport, outbound_reply_tx.as_ref()).await?;
         info!("Forwarded INVITE to {} via {:?}", dest, outbound_transport);
 
@@ -934,11 +968,37 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
+    fn inject_session_timer_headers_before_content_length() {
+        let raw = "INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nContent-Length: 0\r\n\r\n";
+        let out = inject_session_timer_headers(raw, 1800, 90);
+        assert!(out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nContent-Length: 0"));
+        rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
+    }
+
+    #[test]
     fn extract_contact_uri_variants() {
         assert_eq!(
             extract_contact_uri("\"Bob\" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60"),
             "sip:b@1.2.3.4:5060;transport=tcp"
         );
         assert_eq!(extract_contact_uri("sip:b@1.2.3.4"), "sip:b@1.2.3.4");
+    }
+}
+
+/// Insert `Supported: timer`, `Session-Expires` and `Min-SE` before the
+/// Content-Length header of a raw INVITE.
+pub(crate) fn inject_session_timer_headers(raw: &str, expires: u32, min_se: u32) -> String {
+    let insert = format!(
+        "Supported: timer\r\nSession-Expires: {}\r\nMin-SE: {}\r\n",
+        expires, min_se
+    );
+    if let Some(pos) = raw.to_lowercase().find("content-length:") {
+        let mut out = String::with_capacity(raw.len() + insert.len());
+        out.push_str(&raw[..pos]);
+        out.push_str(&insert);
+        out.push_str(&raw[pos..]);
+        out
+    } else {
+        raw.to_string()
     }
 }

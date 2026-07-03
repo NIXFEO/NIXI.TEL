@@ -79,6 +79,23 @@ impl Sbc {
                     }
                 }
                 200..=299 => {
+                    // ── RFC 4028: 200 OK for one of OUR refresh re-INVITEs? ──
+                    // Consume it locally (ACK, re-arm timer) — the caller must
+                    // never see it.
+                    if let Some(cseq_num) = response_cseq_invite(&response) {
+                        let (sbc_ip, sbc_port) = self.identity.as_ref()
+                            .map(|id| (id.public_ip.clone(), id.sip_port))
+                            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+                        if let Some((ack, dest, tp, tx)) = self.b2bua
+                            .complete_session_refresh(&uuid, cseq_num, &sbc_ip, sbc_port)
+                            .await
+                        {
+                            info!("Session refresh 200 OK consumed (call {}) — sending ACK", uuid);
+                            let _ = self.transport.reply(ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                            return Ok(());
+                        }
+                    }
+
                     // Final success (200 OK) — rewrite SDP + relay to caller + start RTP proxy
                     let callee_tag = response.to_header()
                         .ok()
@@ -123,6 +140,24 @@ impl Sbc {
                             self.b2bua
                                 .set_established_dialog(&uuid, from_raw, to_raw, callee_contact)
                                 .await;
+                        }
+                    }
+
+                    // ── RFC 4028: arm the session timer on the trunk leg ──────
+                    // Interval = the 200 OK's Session-Expires when present
+                    // (trunk answers e.g. 14400;refresher=uac — WE are the uac
+                    // and must refresh), else our configured value.
+                    if let Some((configured, min_se)) = self.session_timer {
+                        let is_trunk_leg = {
+                            let calls = self.b2bua.calls_locked().await;
+                            calls.get(&uuid).map(|c| c.trunk_name.is_some()).unwrap_or(false)
+                        };
+                        if is_trunk_leg {
+                            let raw_resp = rsip::SipMessage::Response(response.clone()).to_string();
+                            let negotiated = parse_session_expires(&raw_resp)
+                                .unwrap_or(configured)
+                                .max(min_se);
+                            self.b2bua.set_session_timer(&uuid, negotiated).await;
                         }
                     }
 
@@ -448,6 +483,7 @@ impl Sbc {
                                 } else {
                                     info!("SDP 200 OK outbound (unchanged):\n{}", rewritten);
                                 }
+                                self.b2bua.set_last_sdp_to_caller(&uuid, rewritten.clone()).await;
                                 response_to_relay.body = rewritten.into_bytes();
                                 // Update Content-Length to match new body size (critical for TCP framing)
                                 update_content_length_response(&mut response_to_relay);
@@ -532,5 +568,50 @@ impl Sbc {
         }
 
         Ok(())
+    }
+}
+
+
+/// CSeq number of a response when its CSeq method is INVITE.
+fn response_cseq_invite(response: &Response) -> Option<u32> {
+    let raw = response
+        .headers
+        .iter()
+        .map(|h| h.to_string())
+        .find(|h| h.to_lowercase().starts_with("cseq:"))?;
+    let value = raw.split_once(':')?.1.trim();
+    let mut parts = value.split_whitespace();
+    let num = parts.next()?.parse().ok()?;
+    let method = parts.next()?;
+    method.eq_ignore_ascii_case("INVITE").then_some(num)
+}
+
+/// Parse `Session-Expires: 1800;refresher=uac` (long or compact `x:` form).
+pub(crate) fn parse_session_expires(raw: &str) -> Option<u32> {
+    for line in raw.split("\r\n") {
+        let lower = line.to_lowercase();
+        if lower.starts_with("session-expires:") || lower.starts_with("x:") {
+            let value = line.split_once(':')?.1.trim();
+            let secs = value.split(';').next()?.trim();
+            return secs.parse().ok();
+        }
+        if line.is_empty() {
+            break;
+        }
+    }
+    None
+}
+
+
+#[cfg(test)]
+mod session_timer_tests {
+    #[test]
+    fn parse_session_expires_forms() {
+        let raw = "SIP/2.0 200 OK\r\nSession-Expires: 14400;refresher=uac\r\n\r\n";
+        assert_eq!(super::parse_session_expires(raw), Some(14400));
+        let bare = "SIP/2.0 200 OK\r\nSession-Expires: 1800\r\n\r\n";
+        assert_eq!(super::parse_session_expires(bare), Some(1800));
+        let none = "SIP/2.0 200 OK\r\nContact: <sip:x@y>\r\n\r\n";
+        assert_eq!(super::parse_session_expires(none), None);
     }
 }

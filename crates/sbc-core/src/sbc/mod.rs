@@ -7,6 +7,7 @@
 mod invite_handler;
 pub(crate) use invite_handler::extract_contact_uri as invite_handler_contact_uri;
 mod response_handler;
+pub(crate) use response_handler::parse_session_expires as response_handler_session_expires;
 mod call_handler;
 pub mod hydrate;
 pub mod import;
@@ -120,6 +121,9 @@ pub struct Sbc {
 
     /// Outbound INVITE answer timeout before trunk failover.
     invite_timeout: Duration,
+
+    /// RFC 4028 session timers (None = disabled): (session_expires, min_se).
+    session_timer: Option<(u32, u32)>,
 }
 
 impl Sbc {
@@ -409,6 +413,10 @@ impl Sbc {
             config_store,
             events,
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
+            session_timer: config.security.session_timer_enabled.then(|| (
+                config.security.session_expires.max(config.security.min_se) as u32,
+                config.security.min_se as u32,
+            )),
         })
     }
 
@@ -615,6 +623,7 @@ impl Sbc {
             config_store: None,
             events: crate::events::EventBus::new(),
             invite_timeout: Duration::from_secs(5),
+            session_timer: None,
         }
     }
 
@@ -1041,6 +1050,7 @@ impl Sbc {
                 }
                 _ = call_timeout_interval.tick() => {
                     self.check_call_timeouts().await;
+                    self.send_session_refreshes().await;
                 }
                 _ = failover_interval.tick() => {
                     self.check_invite_failover().await;

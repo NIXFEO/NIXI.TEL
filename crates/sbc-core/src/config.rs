@@ -240,12 +240,27 @@ pub struct SecurityConfig {
     /// (no provisional >= 180 within this window → CANCEL + next trunk).
     #[serde(default = "default_invite_timeout")]
     pub invite_timeout: u64,
+
+    /// RFC 4028 session timers: SBC refreshes the trunk leg with re-INVITEs
+    /// so long calls survive intermediaries (trunk negotiates 4h expiry).
+    #[serde(default)]
+    pub session_timer_enabled: bool,
+
+    /// Session-Expires interval offered on outbound INVITEs (seconds).
+    #[serde(default = "default_session_expires")]
+    pub session_expires: u64,
+
+    /// Minimum acceptable Session-Expires (RFC 4028 Min-SE).
+    #[serde(default = "default_min_se")]
+    pub min_se: u64,
 }
 
 fn default_max_call_duration() -> u64 { 14400 }
 fn default_call_setup_timeout() -> u64 { 60 }
 fn default_rtp_timeout() -> u64 { 90 }
 fn default_invite_timeout() -> u64 { 5 }
+fn default_session_expires() -> u64 { 1800 }
+fn default_min_se() -> u64 { 90 }
 
 fn default_sip_realm() -> String {
     "sbc.local".to_string()
@@ -353,6 +368,9 @@ impl Default for SbcConfig {
                 call_setup_timeout: 60,
                 rtp_timeout: 90,
                 invite_timeout: 5,
+                session_timer_enabled: false,
+                session_expires: 1800,
+                min_se: 90,
             },
             management: ManagementConfig {
                 api_enabled: true,

@@ -577,6 +577,110 @@ impl Sbc {
     ///  3. Create new INVITE to the transfer target
     ///  4. Send NOTIFY to the transferor with transfer progress
     ///  5. On success, bridge new call and disconnect transferor
+    /// Handle an in-dialog re-INVITE (session refresh, RFC 4028).
+    /// Answers 200 OK with the SDP previously sent to that peer — media
+    /// stays untouched. Without this, a refresher peer's re-INVITE would be
+    /// treated as a new call and destroy its own session.
+    pub(crate) async fn handle_reinvite(
+        &mut self,
+        uuid: &crate::b2bua::CallUuid,
+        is_from_caller: bool,
+        request: Request,
+        source: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+    ) -> Result<()> {
+        info!(
+            "In-dialog re-INVITE from {} ({}) for call {} — answering with unchanged SDP",
+            source,
+            if is_from_caller { "caller" } else { "callee" },
+            &uuid[..8.min(uuid.len())]
+        );
+
+        // SDP previously sent toward that peer; fall back to mirroring the
+        // request's own SDP (degenerate but keeps the session alive).
+        let sdp = {
+            let calls = self.b2bua.calls_locked().await;
+            calls.get(uuid).and_then(|call| {
+                if is_from_caller {
+                    call.last_sdp_to_caller.clone()
+                } else {
+                    call.original_outbound_invite
+                        .as_deref()
+                        .and_then(|raw| raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()))
+                        .filter(|b| !b.is_empty())
+                }
+            })
+        }
+        .or_else(|| {
+            std::str::from_utf8(&request.body).ok().map(|s| s.to_string()).filter(|s| !s.is_empty())
+        });
+
+        // Session-Expires: echo the peer's value, else our configured one
+        let raw_req = rsip::SipMessage::Request(request.clone()).to_string();
+        let session_expires = super::response_handler_session_expires(&raw_req)
+            .or(self.session_timer.map(|(e, _)| e));
+
+        let (sbc_ip, sbc_port) = self.identity.as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+
+        let msg = build_plain_response_for_request(&request, 200, "OK")?;
+        let mut response = match msg {
+            rsip::SipMessage::Response(r) => r,
+            _ => return Ok(()),
+        };
+        response.headers.push(rsip::Header::Other(
+            "Contact".to_string(),
+            format!("<sip:sbc@{}:{}>", sbc_ip, sbc_port),
+        ));
+        response.headers.push(rsip::Header::Other(
+            "Supported".to_string(),
+            "timer".to_string(),
+        ));
+        if let Some(se) = session_expires {
+            response.headers.push(rsip::Header::Other(
+                "Session-Expires".to_string(),
+                format!("{};refresher=uac", se),
+            ));
+        }
+        if let Some(sdp) = sdp {
+            response.headers.push(rsip::Header::Other(
+                "Content-Type".to_string(),
+                "application/sdp".to_string(),
+            ));
+            response.body = sdp.into_bytes();
+        }
+        update_content_length_response(&mut response);
+
+        self.metrics.inc_sip_response(200);
+        let data = rsip::SipMessage::Response(response).to_string().into_bytes();
+        self.transport.reply(&data, source, transport, reply_tx).await
+    }
+
+    /// Send due RFC 4028 refresh re-INVITEs (30s tick). No-op when session
+    /// timers are disabled.
+    pub(crate) async fn send_session_refreshes(&mut self) {
+        if self.session_timer.is_none() {
+            return;
+        }
+        let (sbc_ip, sbc_port) = self.identity.as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+
+        for (uuid, reinvite, dest, transport, reply_tx) in
+            self.b2bua.due_session_refreshes(&sbc_ip, sbc_port).await
+        {
+            info!("Session refresh: re-INVITE → {} (call {})", dest, &uuid[..8.min(uuid.len())]);
+            if let Err(e) = self.transport
+                .reply(reinvite.as_bytes(), dest, transport, reply_tx.as_ref())
+                .await
+            {
+                warn!("Session refresh send failed for call {}: {}", uuid, e);
+            }
+        }
+    }
+
     /// Handle INFO — relay in-dialog INFO (e.g. DTMF via SIP INFO) to the
     /// other leg instead of answering 501. No 2833↔INFO conversion: the
     /// INFO body passes through untouched.

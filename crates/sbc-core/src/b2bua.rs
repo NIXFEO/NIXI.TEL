@@ -123,6 +123,17 @@ pub struct FailoverState {
     pub provisional_received: bool,
 }
 
+/// RFC 4028 session-timer state for one call.
+#[derive(Debug, Clone)]
+pub struct SessionTimerState {
+    /// Negotiated Session-Expires (seconds).
+    pub interval_secs: u32,
+    /// When the next refresh re-INVITE is due (start + interval/2).
+    pub next_refresh_at: std::time::Instant,
+    /// CSeq of an in-flight refresh re-INVITE (to match its 200 OK).
+    pub pending_refresh_cseq: Option<u32>,
+}
+
 /// A B2BUA call — two legs + shared media session
 #[derive(Debug)]
 pub struct B2buaCall {
@@ -227,6 +238,13 @@ pub struct B2buaCall {
 
     /// Multi-trunk failover state (None for registrar-routed calls)
     pub failover: Option<FailoverState>,
+
+    /// RFC 4028 session-timer state (None = timers off for this call)
+    pub session_timer: Option<SessionTimerState>,
+
+    /// SDP body as last sent to the caller (rewritten 200 OK) — used to
+    /// answer refresh re-INVITEs with an unchanged offer.
+    pub last_sdp_to_caller: Option<String>,
 }
 
 impl B2buaCall {
@@ -279,6 +297,8 @@ impl B2buaCall {
             webrtc_ice_pwd_b: None,
             webrtc_sdp_offer: None,
             failover: None,
+            session_timer: None,
+            last_sdp_to_caller: None,
         }
     }
 
@@ -365,6 +385,13 @@ impl B2buaCall {
             transport: transport_token(self.callee_transport),
         })
     }
+}
+
+/// Extract the body (after the blank line) from a raw SIP message.
+fn extract_body(raw: &str) -> Option<String> {
+    raw.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .filter(|b| !b.is_empty())
 }
 
 /// Extract the CSeq number from a raw SIP message.
@@ -618,6 +645,121 @@ impl B2buaManager {
                 (c.uuid.clone(), f.attempt, !f.candidates.is_empty())
             })
             .collect()
+    }
+
+    /// Arm the RFC 4028 session timer: SBC refreshes the callee (trunk) leg.
+    pub async fn set_session_timer(&self, uuid: &CallUuid, interval_secs: u32) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.session_timer = Some(SessionTimerState {
+                interval_secs,
+                next_refresh_at: std::time::Instant::now()
+                    + Duration::from_secs((interval_secs / 2).max(30) as u64),
+                pending_refresh_cseq: None,
+            });
+            info!(
+                "Session timer armed for call {}: {}s (refresh every {}s)",
+                uuid, interval_secs, (interval_secs / 2).max(30)
+            );
+        }
+    }
+
+    /// Connected calls whose refresh is due. For each, returns the refresh
+    /// re-INVITE (built from the callee-leg dialog identity + the SDP of the
+    /// outbound INVITE) and the destination; bumps CSeq and re-arms the timer.
+    pub async fn due_session_refreshes(
+        &self,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Vec<(CallUuid, String, SocketAddr, rsip::Transport, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+        let mut out = Vec::new();
+        let mut calls = self.calls.lock().await;
+        let now = std::time::Instant::now();
+        for call in calls.values_mut() {
+            if call.state != CallState::Connected {
+                continue;
+            }
+            let Some(dest) = call.callee_dest else { continue };
+            let Some(st) = call.session_timer.as_ref() else { continue };
+            if st.next_refresh_at > now || st.pending_refresh_cseq.is_some() {
+                continue;
+            }
+            let Some(mut d) = call.dialog_info_toward_callee(local_ip, local_port) else {
+                continue;
+            };
+            // SDP previously sent to the callee = body of the outbound INVITE
+            let sdp = call
+                .original_outbound_invite
+                .as_deref()
+                .and_then(extract_body)
+                .unwrap_or_default();
+            if sdp.is_empty() {
+                continue; // no SDP to refresh with — skip rather than break media
+            }
+            let invite_cseq = call
+                .original_outbound_invite
+                .as_deref()
+                .and_then(parse_cseq_number)
+                .unwrap_or(1);
+            let leg_cseq = call.outbound.as_ref().map(|l| l.cseq).unwrap_or(1);
+            d.cseq = invite_cseq.max(leg_cseq) + 1;
+            if let Some(leg) = call.outbound.as_mut() {
+                leg.cseq = d.cseq;
+            }
+
+            let interval = st.interval_secs;
+            let contact = format!("<sip:sbc@{}:{}>", local_ip, local_port);
+            let reinvite = crate::sip_builder::build_reinvite(
+                &d,
+                &sdp,
+                &contact,
+                Some((interval, "uac")),
+            );
+            if let Some(st) = call.session_timer.as_mut() {
+                st.pending_refresh_cseq = Some(d.cseq);
+                st.next_refresh_at =
+                    now + Duration::from_secs((interval / 2).max(30) as u64);
+            }
+            out.push((
+                call.uuid.clone(),
+                reinvite,
+                dest,
+                call.callee_transport,
+                call.callee_reply_tx.clone(),
+            ));
+        }
+        out
+    }
+
+    /// If `cseq` matches an in-flight refresh re-INVITE for this call,
+    /// consume it and return the ACK to send. The 200 OK must NOT be
+    /// relayed to the caller.
+    pub async fn complete_session_refresh(
+        &self,
+        uuid: &CallUuid,
+        cseq: u32,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<(String, SocketAddr, rsip::Transport, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+        let mut calls = self.calls.lock().await;
+        let call = calls.get_mut(uuid)?;
+        let st = call.session_timer.as_mut()?;
+        if st.pending_refresh_cseq != Some(cseq) {
+            return None;
+        }
+        st.pending_refresh_cseq = None;
+        info!("Session refresh confirmed for call {} (CSeq {})", uuid, cseq);
+        let d = call.dialog_info_toward_callee(local_ip, local_port)?;
+        let ack = crate::sip_builder::build_ack_for_2xx(&d, cseq);
+        Some((ack, call.callee_dest?, call.callee_transport, call.callee_reply_tx.clone()))
+    }
+
+    /// Store the SDP as last sent to the caller (rewritten 200 OK body).
+    pub async fn set_last_sdp_to_caller(&self, uuid: &CallUuid, sdp: String) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.last_sdp_to_caller = Some(sdp);
+        }
     }
 
     /// Get the media session ID for a call (for SDP rewriting / RTP proxy)
