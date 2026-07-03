@@ -23,10 +23,12 @@ RFC 4028 session timers, DTMF PT re-mapping, WS lifecycle, anti-fraud
 - **CDR**: `/var/log/sbc/cdr.jsonl`
 - **Service**: `systemctl {start|stop|restart} sbc`
 - **Systemd**: `/etc/systemd/system/sbc.service`
-- **Disk**: 17G total, ~49% used, 8.8G free
+- **Disk**: 17G total — après build, purger `/root/sbc/target` (étape 6) ; journald est
+  limité à 200M (vacuum 2026-07-03) ; `/opt/diamy/src` ne doit PAS avoir de `target/`
 
 ### Other projects on server
-- `/opt/diamy/src/` — Diamy SIP Network Monitor (code source only, no build artifacts)
+- `/opt/diamy/src/` — Diamy SIP Network Monitor (source only; son `target/` de 844M
+  a été purgé le 2026-07-03 — le supprimer s'il réapparaît)
 
 ## Build & Deploy
 
