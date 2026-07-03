@@ -42,8 +42,7 @@ rubato = "0.14"
 sdp = "0.5"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "sqlite", "migrate", "uuid", "chrono", "json"] }
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate", "uuid", "chrono", "json"] }
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }

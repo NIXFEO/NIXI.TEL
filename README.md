@@ -95,7 +95,6 @@ store), `sbc-management` (axum API), `sbc-bin` (binary).
 - [docs/WEBRTC.md](docs/WEBRTC.md) — WebRTC gateway guide
 - [docs/INSTALL.md](docs/INSTALL.md) — production install (systemd, certs)
 - [examples/webrtc-client/](examples/webrtc-client/) — browser softphone demo
-- [docs/history/](docs/history/) — development phase reports
 
 ## License
 
