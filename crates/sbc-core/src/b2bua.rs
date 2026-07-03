@@ -74,6 +74,17 @@ pub struct CallLeg {
 
     /// Whether this leg is fully established (200 ACK done)
     pub established: bool,
+
+    /// Full `From` header value of the dialog (display, URI, `;tag=`),
+    /// as seen on the wire for this leg. Needed to build synthetic
+    /// in-dialog requests (BYE/re-INVITE) that strict UAS accept.
+    pub from_raw: Option<String>,
+
+    /// Full `To` header value with the remote tag once known.
+    pub to_raw: Option<String>,
+
+    /// Remote target: the peer's Contact URI (from INVITE or 200 OK).
+    pub remote_target: Option<String>,
 }
 
 impl CallLeg {
@@ -85,6 +96,9 @@ impl CallLeg {
             remote_addr,
             cseq: 1,
             established: false,
+            from_raw: None,
+            to_raw: None,
+            remote_target: None,
         }
     }
 
@@ -277,6 +291,75 @@ impl B2buaCall {
     pub fn duration_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
+
+    /// Dialog identity for a synthetic request toward the caller.
+    /// From/To are reversed relative to the INVITE: our identity toward the
+    /// caller is the answered `To` (with its tag). None until the dialog
+    /// identity has been captured (INVITE From + 200 OK To).
+    pub fn dialog_info_toward_caller(
+        &self,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<crate::sip_builder::DialogInfo> {
+        let from_raw = self.inbound.to_raw.clone()?;
+        let to_raw = self.inbound.from_raw.clone()?;
+        let request_uri = self
+            .inbound
+            .remote_target
+            .clone()
+            .unwrap_or_else(|| format!("sip:{}", self.caller_source));
+        Some(crate::sip_builder::DialogInfo {
+            call_id: self.inbound.call_id.clone(),
+            from_raw,
+            to_raw,
+            request_uri,
+            cseq: 1,
+            local_ip: local_ip.to_string(),
+            local_port,
+            transport: transport_token(self.caller_transport),
+        })
+    }
+
+    /// Dialog identity for a synthetic request toward the callee
+    /// (SBC acts as UAC on the outbound leg). `cseq` should come from
+    /// `outbound.next_cseq()` when the leg is mutable.
+    pub fn dialog_info_toward_callee(
+        &self,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<crate::sip_builder::DialogInfo> {
+        let out = self.outbound.as_ref()?;
+        let from_raw = out.from_raw.clone()?;
+        let to_raw = out.to_raw.clone()?;
+        let request_uri = out
+            .remote_target
+            .clone()
+            .or_else(|| self.callee_request_uri.clone())
+            .or_else(|| self.callee_dest.map(|d| format!("sip:{}", d)))?;
+        Some(crate::sip_builder::DialogInfo {
+            call_id: out.call_id.clone(),
+            from_raw,
+            to_raw,
+            request_uri,
+            cseq: out.cseq,
+            local_ip: local_ip.to_string(),
+            local_port,
+            transport: transport_token(self.callee_transport),
+        })
+    }
+}
+
+/// Via transport token for an rsip transport.
+pub fn transport_token(t: rsip::Transport) -> String {
+    match t {
+        rsip::Transport::Udp => "UDP",
+        rsip::Transport::Tcp => "TCP",
+        rsip::Transport::Tls => "TLS",
+        rsip::Transport::Ws => "WS",
+        rsip::Transport::Wss => "WSS",
+        _ => "UDP",
+    }
+    .to_string()
 }
 
 /// B2BUA Manager — owns all active calls
@@ -391,6 +474,42 @@ impl B2buaManager {
         call.callee_transport = callee_transport;
         debug!("B2BUA: outbound leg attached for call {}", uuid);
         Ok(())
+    }
+
+    /// Record the caller-side dialog identity from the original INVITE:
+    /// the raw `From` value (with the caller's tag) and the caller's Contact.
+    pub async fn set_inbound_dialog(
+        &self,
+        uuid: &CallUuid,
+        from_raw: String,
+        caller_contact: Option<String>,
+    ) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.inbound.from_raw = Some(from_raw);
+            call.inbound.remote_target = caller_contact;
+        }
+    }
+
+    /// Record dialog identity established by the 200 OK: the raw `To` value
+    /// (now carrying the callee's tag) applies to both legs in half-B2BUA
+    /// mode; the response's `From` matches the outbound INVITE we sent.
+    pub async fn set_established_dialog(
+        &self,
+        uuid: &CallUuid,
+        outbound_from_raw: String,
+        to_raw: String,
+        callee_contact: Option<String>,
+    ) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.inbound.to_raw = Some(to_raw.clone());
+            if let Some(out) = call.outbound.as_mut() {
+                out.from_raw = Some(outbound_from_raw);
+                out.to_raw = Some(to_raw);
+                out.remote_target = callee_contact;
+            }
+        }
     }
 
     /// Get the media session ID for a call (for SDP rewriting / RTP proxy)

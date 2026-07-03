@@ -36,6 +36,7 @@ pub mod dos;
 pub mod transcoding;
 pub mod topology;
 pub mod register;
+pub mod sip_builder;
 pub mod tls_client;
 pub mod acl;
 

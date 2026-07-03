@@ -104,6 +104,23 @@ impl Sbc {
 
                     let _ = self.b2bua.handle_200_ok(&uuid, callee_tag, callee_sdp_str.clone()).await;
 
+                    // ── Capture established dialog identity (raw From/To/Contact) ──
+                    // The 200 OK's To carries the callee tag; From matches our
+                    // outbound INVITE. Needed for synthetic in-dialog requests.
+                    {
+                        let from_raw = response.from_header().ok().map(|h| h.value().to_string());
+                        let to_raw = response.to_header().ok().map(|h| h.value().to_string());
+                        let callee_contact = response
+                            .contact_header()
+                            .ok()
+                            .map(|h| super::invite_handler_contact_uri(h.value()));
+                        if let (Some(from_raw), Some(to_raw)) = (from_raw, to_raw) {
+                            self.b2bua
+                                .set_established_dialog(&uuid, from_raw, to_raw, callee_contact)
+                                .await;
+                        }
+                    }
+
                     // ── Start RTP proxy after 200 OK ───────────────────────────────────
                     // Guard: only start once (200 OK retransmissions must not re-bind ports)
                     if let Some(media_id) = media_id_pre {

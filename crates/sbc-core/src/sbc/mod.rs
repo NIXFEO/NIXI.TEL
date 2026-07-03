@@ -5,6 +5,7 @@
 //! single SBC instance that owns the full message processing pipeline.
 
 mod invite_handler;
+pub(crate) use invite_handler::extract_contact_uri as invite_handler_contact_uri;
 mod response_handler;
 mod call_handler;
 pub mod hydrate;

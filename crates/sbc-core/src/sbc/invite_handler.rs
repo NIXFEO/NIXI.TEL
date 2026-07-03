@@ -114,6 +114,22 @@ impl Sbc {
             }
         };
 
+        // ── Capture caller-side dialog identity (raw From + Contact) ──
+        // Needed to build synthetic in-dialog requests (BYE on timeout/
+        // shutdown) that the caller accepts instead of answering 481.
+        {
+            let from_raw = request.from_header().ok().map(|h| h.value().to_string());
+            let caller_contact = request
+                .contact_header()
+                .ok()
+                .map(|h| extract_contact_uri(h.value()));
+            if let Some(from_raw) = from_raw {
+                self.b2bua
+                    .set_inbound_dialog(&uuid, from_raw, caller_contact)
+                    .await;
+            }
+        }
+
         // ── Metrics: update active WebRTC calls gauge ──
         {
             let stats = self.b2bua.stats().await;
@@ -685,4 +701,18 @@ impl Sbc {
             raw_msg.to_string()
         }
     }
+}
+
+/// Extract the URI from a Contact header value: `"Bob" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60`
+/// → `sip:b@1.2.3.4:5060;transport=tcp`. Falls back to the trimmed value.
+pub(crate) fn extract_contact_uri(value: &str) -> String {
+    if let (Some(start), Some(end)) = (value.find('<'), value.find('>')) {
+        if end > start {
+            return value[start + 1..end].to_string();
+        }
+    }
+    // No angle brackets: strip header params after ';'… but ';' may belong to
+    // URI params. Without brackets, URI params are indistinguishable from
+    // header params — keep everything up to the first comma.
+    value.split(',').next().unwrap_or(value).trim().to_string()
 }

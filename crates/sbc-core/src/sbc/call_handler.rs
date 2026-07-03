@@ -7,6 +7,11 @@ impl Sbc {
     pub(crate) async fn check_call_timeouts(&mut self) {
         const MAX_CALL_DURATION_SECS: u64 = 7200; // 2 hours
 
+        let (sbc_ip, sbc_port) = self.identity.as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+        const TIMEOUT_REASON: &str = "Q.850;cause=16;text=\"Call duration exceeded\"";
+
         let calls = self.b2bua.calls_locked().await;
         let timed_out: Vec<_> = calls.values()
             .filter(|c| c.started_at.elapsed().as_secs() > MAX_CALL_DURATION_SECS)
@@ -23,6 +28,10 @@ impl Sbc {
                     c.media_session_id.clone(),
                     c.outbound.as_ref().map(|l| l.call_id.clone()),
                     c.started_at.elapsed().as_secs(),
+                    c.dialog_info_toward_caller(&sbc_ip, sbc_port)
+                        .map(|d| crate::sip_builder::build_bye(&d, Some(TIMEOUT_REASON))),
+                    c.dialog_info_toward_callee(&sbc_ip, sbc_port)
+                        .map(|d| crate::sip_builder::build_bye(&d, Some(TIMEOUT_REASON))),
                 )
             })
             .collect();
@@ -32,19 +41,16 @@ impl Sbc {
             return;
         }
 
-        let sbc_ip = self.identity.as_ref()
-            .map(|id| id.public_ip.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-
         for (uuid, call_id, caller_addr, caller_transport, caller_tx,
              callee_dest, callee_transport, callee_tx, media_id,
-             outbound_call_id, duration) in timed_out
+             outbound_call_id, duration, bye_toward_caller, bye_toward_callee) in timed_out
         {
             warn!("Call timeout: {} (Call-ID: {}) exceeded {}s (active {}s) — sending BYE to both sides",
                 &uuid[..8], call_id, MAX_CALL_DURATION_SECS, duration);
 
-            // BYE to caller (trunk)
-            let bye_caller = format!(
+            // BYE to caller (trunk) — real dialog identity when captured,
+            // legacy best-effort otherwise
+            let bye_caller = bye_toward_caller.unwrap_or_else(|| format!(
                 "BYE sip:bye@{} SIP/2.0\r\n\
                  Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
                  From: <sip:sbc@{}>;tag=timeout-{}\r\n\
@@ -57,7 +63,7 @@ impl Sbc {
                 &uuid::Uuid::new_v4().to_string()[..8],
                 sbc_ip, &uuid[..8], caller_addr.ip(),
                 call_id
-            );
+            ));
             let _ = self.transport.reply(
                 bye_caller.as_bytes(), caller_addr, caller_transport,
                 caller_tx.as_ref(),
@@ -66,7 +72,7 @@ impl Sbc {
             // BYE to callee
             if let Some(dest) = callee_dest {
                 let callee_call_id = outbound_call_id.as_deref().unwrap_or(&call_id);
-                let bye_callee = format!(
+                let bye_callee = bye_toward_callee.clone().unwrap_or_else(|| format!(
                     "BYE sip:bye@{} SIP/2.0\r\n\
                      Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
                      From: <sip:sbc@{}>;tag=timeout-{}\r\n\
@@ -79,7 +85,7 @@ impl Sbc {
                     &uuid::Uuid::new_v4().to_string()[..8],
                     sbc_ip, &uuid[..8], dest.ip(),
                     callee_call_id
-                );
+                ));
                 let _ = self.transport.reply(
                     bye_callee.as_bytes(), dest, callee_transport,
                     callee_tx.as_ref(),
@@ -102,6 +108,11 @@ impl Sbc {
     /// Send BYE to all active call peers before shutdown.
     /// This prevents phantom sessions on remote trunks (e.g. trunk OverMaxCall).
     pub(crate) async fn graceful_shutdown(&mut self) {
+        let (sbc_ip, sbc_port) = self.identity.as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+        const SHUTDOWN_REASON: &str = "Q.850;cause=16;text=\"Server shutdown\"";
+
         let calls = self.b2bua.calls_locked().await;
         let active: Vec<_> = calls.values().map(|c| {
             (
@@ -114,11 +125,11 @@ impl Sbc {
                 c.callee_transport,
                 c.callee_reply_tx.clone(),
                 c.media_session_id.clone(),
-                c.inbound.local_tag.clone(),
-                c.inbound.remote_tag.clone(),
-                c.outbound.as_ref().map(|l| l.local_tag.clone()),
-                c.outbound.as_ref().map(|l| l.remote_tag.clone()),
                 c.outbound.as_ref().map(|l| l.call_id.clone()),
+                c.dialog_info_toward_caller(&sbc_ip, sbc_port)
+                    .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
+                c.dialog_info_toward_callee(&sbc_ip, sbc_port)
+                    .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
             )
         }).collect();
         drop(calls);
@@ -131,17 +142,12 @@ impl Sbc {
 
         info!("Graceful shutdown: sending BYE for {} active call(s)", count);
 
-        let sbc_ip = self.identity.as_ref()
-            .map(|id| id.public_ip.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-
         for (uuid, call_id, caller_addr, caller_transport, caller_tx,
              callee_dest, callee_transport, callee_tx, media_id,
-             _inbound_local_tag, _inbound_remote_tag,
-             _outbound_local_tag, _outbound_remote_tag, outbound_call_id) in active
+             outbound_call_id, bye_toward_caller, bye_toward_callee) in active
         {
-            // Build BYE for caller leg
-            let bye_caller = format!(
+            // Build BYE for caller leg — real dialog identity when captured
+            let bye_caller = bye_toward_caller.unwrap_or_else(|| format!(
                 "BYE sip:bye@{} SIP/2.0\r\n\
                  Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
                  From: <sip:sbc@{}>;tag=shutdown-{}\r\n\
@@ -154,7 +160,7 @@ impl Sbc {
                 &uuid::Uuid::new_v4().to_string()[..8],
                 sbc_ip, &uuid[..8], caller_addr.ip(),
                 call_id
-            );
+            ));
             info!("Shutdown BYE → caller {} (call {})", caller_addr, &uuid[..8]);
             let _ = self.transport.reply(
                 bye_caller.as_bytes(), caller_addr, caller_transport,
@@ -164,7 +170,7 @@ impl Sbc {
             // Build BYE for callee leg
             if let Some(dest) = callee_dest {
                 let callee_call_id = outbound_call_id.as_deref().unwrap_or(&call_id);
-                let bye_callee = format!(
+                let bye_callee = bye_toward_callee.clone().unwrap_or_else(|| format!(
                     "BYE sip:bye@{} SIP/2.0\r\n\
                      Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
                      From: <sip:sbc@{}>;tag=shutdown-{}\r\n\
@@ -177,7 +183,7 @@ impl Sbc {
                     &uuid::Uuid::new_v4().to_string()[..8],
                     sbc_ip, &uuid[..8], dest.ip(),
                     callee_call_id
-                );
+                ));
                 info!("Shutdown BYE → callee {} (call {})", dest, &uuid[..8]);
                 let _ = self.transport.reply(
                     bye_callee.as_bytes(), dest, callee_transport,
