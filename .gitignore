@@ -46,3 +46,6 @@ config/sbc.toml
 data/
 *.db-shm
 *.db-wal
+
+# Private ops runbook (prod hosts, IPs, paths)
+CLAUDE.local.md
