@@ -1,4 +1,4 @@
-# SBC W3tel - Test Configuration avec tous les transports
+# NIXI SBC — test configuration with all transports
 
 [general]
 name = "SBC-Test-All"
@@ -39,9 +39,7 @@ stun_servers = []
 turn_enabled = false
 
 [database]
-postgres_url = "postgresql://sbc:sbc@localhost/sbc_test"
-postgres_max_connections = 5
-redis_url = "redis://localhost:6379/2"
+sqlite_path = "data/sbc-test.db"
 
 [security]
 rate_limit_global = 100

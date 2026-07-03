@@ -1,4 +1,4 @@
-# SBC W3tel - Development Configuration
+# NIXI SBC — development configuration (default for `cargo run`)
 
 [general]
 name = "SBC-Dev"
@@ -25,9 +25,7 @@ stun_servers = []
 turn_enabled = false
 
 [database]
-postgres_url = "postgresql://sbc:sbc@localhost/sbc_dev"
-postgres_max_connections = 5
-redis_url = "redis://localhost:6379/1"
+sqlite_path = "data/sbc-dev.db"
 
 [security]
 rate_limit_global = 100
