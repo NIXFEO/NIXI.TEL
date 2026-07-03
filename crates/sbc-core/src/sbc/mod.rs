@@ -7,6 +7,7 @@
 mod invite_handler;
 mod response_handler;
 mod call_handler;
+pub mod import;
 
 use crate::acl::{AclManager, Direction};
 use crate::auth::{DigestAuthenticator, DigestChallenge, generate_digest_response};
@@ -105,6 +106,10 @@ pub struct Sbc {
 
     /// Notify signal for API-triggered config reload
     reload_notify: Arc<tokio::sync::Notify>,
+
+    /// SQLite store for dynamic config (users, DIDs, trunks, routes, ACL).
+    /// `None` when the store could not be opened (SBC still boots from TOML).
+    config_store: Option<Arc<sbc_storage::ConfigStore>>,
 }
 
 impl Sbc {
@@ -270,6 +275,22 @@ impl Sbc {
             Arc::new(CdrManager::new_memory())
         };
 
+        // --- SQLite config store (dynamic config source of truth) ---
+        let config_store = match sbc_storage::ConfigStore::open(&config.database.sqlite_path).await {
+            Ok(store) => {
+                let store = Arc::new(store);
+                import::first_boot_import(&store, config).await;
+                Some(store)
+            }
+            Err(e) => {
+                warn!(
+                    "Config store unavailable ({}): {} — running from TOML only",
+                    config.database.sqlite_path, e
+                );
+                None
+            }
+        };
+
         // --- HTTP API + /metrics endpoint ---
         if config.management.api_enabled {
             let http_addr: std::net::SocketAddr = format!(
@@ -336,7 +357,13 @@ impl Sbc {
             did_mappings: config.dids.clone(),
             trunk_ips,
             reload_notify,
+            config_store,
         })
+    }
+
+    /// SQLite store for dynamic config, when available.
+    pub fn config_store(&self) -> Option<Arc<sbc_storage::ConfigStore>> {
+        self.config_store.clone()
     }
 
     /// Set the config file path (for SIGHUP hot-reload)
@@ -484,6 +511,7 @@ impl Sbc {
             did_mappings: Vec::new(),
             trunk_ips: Vec::new(),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
+            config_store: None,
         }
     }
 

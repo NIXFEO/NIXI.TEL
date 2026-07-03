@@ -5,13 +5,11 @@ edition = "2021"
 
 [dependencies]
 tokio = { workspace = true }
-# Database dependencies - Phase 5
-# sqlx = { workspace = true }
-# redis = { workspace = true }
-# uuid = { workspace = true }
-# chrono = { workspace = true }
-# serde = { workspace = true }
-# serde_json = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 thiserror = { workspace = true }
 anyhow = { workspace = true }

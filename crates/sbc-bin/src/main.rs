@@ -41,33 +41,34 @@ async fn main() -> Result<()> {
     let config = SbcConfig::from_file(&config_path)?;
     info!("Configuration loaded: {}", config.general.name);
 
-    // Build Phase 5 management handler (Postgres-backed users/DIDs/reload)
-    let management: Option<Arc<dyn ManagementHandler>> = if config.management.api_enabled {
-        match ManagementRouter::new(
-            &config.database.postgres_url,
-            config.security.sip_realm.clone(),
-        )
-        .await
-        {
-            Ok(router) => {
-                router.ensure_schema().await;
-                info!(
-                    "Management API: users/DID endpoints active (realm={})",
-                    config.security.sip_realm
-                );
-                Some(Arc::new(router))
-            }
-            Err(e) => {
-                warn!(
-                    "Management API: Postgres unavailable ({}) — \
-                     /api/v1/users and /api/v1/dids will return 500",
-                    e
-                );
-                None
+    // Build Phase 5 management handler (Postgres-backed users/DIDs/reload).
+    // Legacy path — only active when postgres_url is configured; the SQLite
+    // store (config.database.sqlite_path) is becoming the source of truth.
+    let management: Option<Arc<dyn ManagementHandler>> = match (
+        config.management.api_enabled,
+        config.database.postgres_url.as_deref(),
+    ) {
+        (true, Some(postgres_url)) => {
+            match ManagementRouter::new(postgres_url, config.security.sip_realm.clone()).await {
+                Ok(router) => {
+                    router.ensure_schema().await;
+                    info!(
+                        "Management API: users/DID endpoints active (realm={})",
+                        config.security.sip_realm
+                    );
+                    Some(Arc::new(router))
+                }
+                Err(e) => {
+                    warn!(
+                        "Management API: Postgres unavailable ({}) — \
+                         /api/v1/users and /api/v1/dids will return 500",
+                        e
+                    );
+                    None
+                }
             }
         }
-    } else {
-        None
+        _ => None,
     };
 
     // Build integrated SBC from config (wires all modules), including the

@@ -3,6 +3,7 @@ members = [
     "crates/sbc-core",
     "crates/sbc-bin",
     "crates/sbc-management",
+    "crates/sbc-storage",
 ]
 exclude = ["rsip-nixi"]
 resolver = "2"
@@ -38,7 +39,7 @@ rubato = "0.14"
 sdp = "0.5"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "sqlite", "migrate", "uuid", "chrono", "json"] }
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
 # Utilities

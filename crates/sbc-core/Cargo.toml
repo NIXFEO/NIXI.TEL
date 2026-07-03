@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sbc-storage = { path = "../sbc-storage" }
 rsip = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

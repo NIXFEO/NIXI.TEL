@@ -181,10 +181,32 @@ pub struct WebRtcConfig {
 /// Database configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DatabaseConfig {
-    pub postgres_url: String,
+    /// Embedded SQLite store for dynamic config (users, DIDs, trunks, routes, ACL).
+    /// Source of truth for everything managed via the REST API.
+    #[serde(default = "default_sqlite_path")]
+    pub sqlite_path: String,
+    /// Legacy/optional external databases — not required to run the SBC.
+    #[serde(default)]
+    pub postgres_url: Option<String>,
+    #[serde(default = "default_pg_max_conns")]
     pub postgres_max_connections: u32,
-    pub redis_url: String,
+    #[serde(default)]
+    pub redis_url: Option<String>,
 }
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            sqlite_path: default_sqlite_path(),
+            postgres_url: None,
+            postgres_max_connections: default_pg_max_conns(),
+            redis_url: None,
+        }
+    }
+}
+
+fn default_sqlite_path() -> String { "data/sbc.db".to_string() }
+fn default_pg_max_conns() -> u32 { 5 }
 
 /// Security configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -230,6 +252,10 @@ pub struct ManagementConfig {
     pub api_bind_address: IpAddr,
     pub api_port: u16,
     pub api_auth_token: Option<String>,
+    /// CORS allowed origins for the management API.
+    /// Empty = no CORS headers; `["*"]` = any origin.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Metrics configuration
@@ -309,11 +335,7 @@ impl Default for SbcConfig {
                     turn_enabled: false,
                 },
             },
-            database: DatabaseConfig {
-                postgres_url: "postgresql://sbc:password@localhost/sbc".to_string(),
-                postgres_max_connections: 20,
-                redis_url: "redis://localhost:6379".to_string(),
-            },
+            database: DatabaseConfig::default(),
             security: SecurityConfig {
                 rate_limit_global: 1000,
                 rate_limit_per_ip: 50,
@@ -330,6 +352,7 @@ impl Default for SbcConfig {
                 api_bind_address: "127.0.0.1".parse().unwrap(),
                 api_port: 8080,
                 api_auth_token: None,
+                cors_allowed_origins: Vec::new(),
             },
             metrics: MetricsConfig {
                 prometheus_enabled: true,
