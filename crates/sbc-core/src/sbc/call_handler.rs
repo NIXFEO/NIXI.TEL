@@ -382,22 +382,32 @@ impl Sbc {
                 if let Some((callee_reply_tx, callee_dest, callee_transport)) = callee_info {
                     info!("B2BUA: relaying BYE (caller→callee) to {}", callee_dest);
 
-                    // Log the incoming BYE From/To for debugging dialog match issues
-                    let from_hdr = request.from_header().ok().map(|h| h.to_string()).unwrap_or_default();
-                    let to_hdr = request.to_header().ok().map(|h| h.to_string()).unwrap_or_default();
-                    info!("BYE incoming From: {}", from_hdr);
-                    info!("BYE incoming To: {}", to_hdr);
+                    // Prefer a fresh in-dialog BYE with the real dialog
+                    // identity and our own CSeq (true B2BUA behavior —
+                    // avoids 481 when the trunk truncated the Call-ID or
+                    // tags drifted). Raw relay stays as fallback.
+                    let (sbc_ip, sbc_port) = self.identity.as_ref()
+                        .map(|id| (id.public_ip.clone(), id.sip_port))
+                        .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+                    let fresh_bye = self.b2bua
+                        .build_relay_bye_toward_callee(&uuid, &sbc_ip, sbc_port)
+                        .await;
 
-                    let mut raw_bye = rsip::SipMessage::Request(request.clone()).to_string();
-                    // Rewrite Call-ID if it was a suffix match — callee knows the full Call-ID
-                    if let Some((ref stored_inbound_cid, _)) = stored_call_ids {
-                        if *stored_inbound_cid != call_id && stored_inbound_cid.ends_with(&call_id) {
-                            info!("BYE Call-ID rewrite: '{}' → '{}'", call_id, stored_inbound_cid);
-                            raw_bye = raw_bye.replace(&format!("Call-ID: {}", call_id),
-                                                      &format!("Call-ID: {}", stored_inbound_cid));
+                    let bye_out = if let Some(fresh) = fresh_bye {
+                        info!("BYE (caller→callee): synthetic in-dialog BYE");
+                        fresh
+                    } else {
+                        let mut raw_bye = rsip::SipMessage::Request(request.clone()).to_string();
+                        // Rewrite Call-ID if it was a suffix match — callee knows the full Call-ID
+                        if let Some((ref stored_inbound_cid, _)) = stored_call_ids {
+                            if *stored_inbound_cid != call_id && stored_inbound_cid.ends_with(&call_id) {
+                                info!("BYE Call-ID rewrite: '{}' → '{}'", call_id, stored_inbound_cid);
+                                raw_bye = raw_bye.replace(&format!("Call-ID: {}", call_id),
+                                                          &format!("Call-ID: {}", stored_inbound_cid));
+                            }
                         }
-                    }
-                    let bye_out = self.apply_outbound_topology(&raw_bye, callee_transport);
+                        self.apply_outbound_topology(&raw_bye, callee_transport)
+                    };
                     info!("BYE relayed to callee:\n{}", bye_out);
                     let _ = self.transport.reply(
                         bye_out.as_bytes(),
@@ -413,16 +423,28 @@ impl Sbc {
 
                 if let Some((caller_reply_tx, caller_addr, caller_transport)) = caller_info {
                     info!("B2BUA: relaying BYE (callee→caller) to {}", caller_addr);
-                    let mut raw_bye = rsip::SipMessage::Request(request.clone()).to_string();
-                    // Rewrite Call-ID if it was a suffix match — caller knows the full Call-ID
-                    if let Some((ref stored_inbound_cid, _)) = stored_call_ids {
-                        if *stored_inbound_cid != call_id && stored_inbound_cid.ends_with(&call_id) {
-                            info!("BYE Call-ID rewrite: '{}' → '{}'", call_id, stored_inbound_cid);
-                            raw_bye = raw_bye.replace(&format!("Call-ID: {}", call_id),
-                                                      &format!("Call-ID: {}", stored_inbound_cid));
+                    let (sbc_ip, sbc_port) = self.identity.as_ref()
+                        .map(|id| (id.public_ip.clone(), id.sip_port))
+                        .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+                    let fresh_bye = self.b2bua
+                        .build_relay_bye_toward_caller(&uuid, &sbc_ip, sbc_port)
+                        .await;
+
+                    let bye_out = if let Some(fresh) = fresh_bye {
+                        info!("BYE (callee→caller): synthetic in-dialog BYE");
+                        fresh
+                    } else {
+                        let mut raw_bye = rsip::SipMessage::Request(request.clone()).to_string();
+                        // Rewrite Call-ID if it was a suffix match — caller knows the full Call-ID
+                        if let Some((ref stored_inbound_cid, _)) = stored_call_ids {
+                            if *stored_inbound_cid != call_id && stored_inbound_cid.ends_with(&call_id) {
+                                info!("BYE Call-ID rewrite: '{}' → '{}'", call_id, stored_inbound_cid);
+                                raw_bye = raw_bye.replace(&format!("Call-ID: {}", call_id),
+                                                          &format!("Call-ID: {}", stored_inbound_cid));
+                            }
                         }
-                    }
-                    let bye_out = self.apply_outbound_topology(&raw_bye, caller_transport);
+                        self.apply_outbound_topology(&raw_bye, caller_transport)
+                    };
                     let _ = self.transport.reply(
                         bye_out.as_bytes(),
                         caller_addr,
@@ -480,6 +502,10 @@ impl Sbc {
 
             // Mark call terminated
             self.b2bua.terminate_call(&uuid).await;
+        } else if self.b2bua.was_recently_terminated(&call_id) {
+            // Late BYE for a dialog we already tore down (Genesys sends these
+            // 1-8 min after teardown) — benign, answered 200 below.
+            info!("BYE: late BYE for recently terminated Call-ID: {} from {} — benign", call_id, source);
         } else {
             warn!("BYE: no B2BUA call found for Call-ID: {} from {} (stray BYE — phantom session?)", call_id, source);
         }

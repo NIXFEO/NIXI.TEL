@@ -13,6 +13,7 @@ use crate::{Error, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
@@ -349,6 +350,14 @@ impl B2buaCall {
     }
 }
 
+/// Extract the CSeq number from a raw SIP message.
+fn parse_cseq_number(raw: &str) -> Option<u32> {
+    raw.split("\r\n")
+        .find(|l| l.to_lowercase().starts_with("cseq:"))
+        .and_then(|l| l["cseq:".len()..].trim().split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+}
+
 /// Via transport token for an rsip transport.
 pub fn transport_token(t: rsip::Transport) -> String {
     match t {
@@ -372,7 +381,22 @@ pub struct B2buaManager {
 
     /// Event bus for call lifecycle events (None until wired at boot)
     events: std::sync::RwLock<Option<crate::events::EventBus>>,
+
+    /// Recently terminated dialogs (Call-IDs + when), so late BYEs
+    /// (Genesys sends them 1-8 min after teardown) are recognized as benign
+    /// instead of logged as phantom sessions. Pruned on insert; cap 256.
+    recent_terminated: std::sync::Mutex<std::collections::VecDeque<RecentDialog>>,
 }
+
+#[derive(Debug, Clone)]
+struct RecentDialog {
+    inbound_call_id: String,
+    outbound_call_id: Option<String>,
+    terminated_at: std::time::Instant,
+}
+
+/// How long a terminated dialog stays recognizable for late BYEs.
+const RECENT_DIALOG_TTL: Duration = Duration::from_secs(600);
 
 impl B2buaManager {
     pub fn new(media: Arc<MediaManager>) -> Self {
@@ -380,6 +404,7 @@ impl B2buaManager {
             calls: Arc::new(Mutex::new(HashMap::new())),
             media,
             events: std::sync::RwLock::new(None),
+            recent_terminated: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -639,6 +664,12 @@ impl B2buaManager {
         } else {
             None
         };
+        if let Some(call) = calls.get(uuid) {
+            self.remember_terminated(
+                call.inbound.call_id.clone(),
+                call.outbound.as_ref().map(|l| l.call_id.clone()),
+            );
+        }
         calls.remove(uuid);
         drop(calls);
 
@@ -650,6 +681,83 @@ impl B2buaManager {
                 ts: crate::events::event_ts(),
             });
         }
+    }
+
+    fn remember_terminated(&self, inbound_call_id: String, outbound_call_id: Option<String>) {
+        if let Ok(mut recent) = self.recent_terminated.lock() {
+            let now = std::time::Instant::now();
+            recent.retain(|d| now.duration_since(d.terminated_at) < RECENT_DIALOG_TTL);
+            recent.push_back(RecentDialog {
+                inbound_call_id,
+                outbound_call_id,
+                terminated_at: now,
+            });
+            while recent.len() > 256 {
+                recent.pop_front();
+            }
+        }
+    }
+
+    /// Whether a Call-ID matches a dialog terminated within the TTL window.
+    /// Matches full Call-IDs and truncated ones (Genesys strips prefixes,
+    /// so the late BYE's Call-ID is a suffix of the stored one).
+    pub fn was_recently_terminated(&self, call_id: &str) -> bool {
+        if call_id.is_empty() {
+            return false;
+        }
+        let Ok(recent) = self.recent_terminated.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        recent.iter().any(|d| {
+            now.duration_since(d.terminated_at) < RECENT_DIALOG_TTL
+                && (d.inbound_call_id == call_id
+                    || d.inbound_call_id.ends_with(call_id)
+                    || d.outbound_call_id
+                        .as_deref()
+                        .map(|o| o == call_id || o.ends_with(call_id))
+                        .unwrap_or(false))
+        })
+    }
+
+    /// Build a fresh in-dialog BYE toward the callee (used when relaying a
+    /// caller BYE): real dialog identity + incremented outbound CSeq.
+    /// None when the dialog identity was never captured — caller falls back
+    /// to raw relay.
+    pub async fn build_relay_bye_toward_callee(
+        &self,
+        uuid: &CallUuid,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<String> {
+        let mut calls = self.calls.lock().await;
+        let call = calls.get_mut(uuid)?;
+        let mut d = call.dialog_info_toward_callee(local_ip, local_port)?;
+        // In-dialog CSeq must exceed the INVITE's: derive from the outbound
+        // INVITE we sent, fall back to the leg counter.
+        let invite_cseq = call
+            .original_outbound_invite
+            .as_deref()
+            .and_then(parse_cseq_number);
+        let leg = call.outbound.as_mut()?;
+        d.cseq = invite_cseq.map(|n| n + 1).unwrap_or_else(|| leg.cseq + 1);
+        leg.cseq = d.cseq;
+        Some(crate::sip_builder::build_bye(&d, None))
+    }
+
+    /// Build a fresh in-dialog BYE toward the caller (used when relaying a
+    /// callee BYE). The SBC has never sent a request in this direction, so
+    /// CSeq starts at 1 (own numbering space per RFC 3261 §12.2.1.1).
+    pub async fn build_relay_bye_toward_caller(
+        &self,
+        uuid: &CallUuid,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<String> {
+        let calls = self.calls.lock().await;
+        let call = calls.get(uuid)?;
+        let d = call.dialog_info_toward_caller(local_ip, local_port)?;
+        Some(crate::sip_builder::build_bye(&d, None))
     }
 
     /// Look up a call by inbound Call-ID
@@ -1032,6 +1140,66 @@ mod tests {
     fn callee_addr() -> SocketAddr { "192.168.1.200:5060".parse().unwrap() }
 
     const SIMPLE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+
+    #[tokio::test]
+    async fn dialog_identity_and_synthetic_byes() {
+        let mgr = make_manager();
+        let uuid = mgr.create_call(
+            "full-call-id@host".to_string(), "caller-tag".to_string(),
+            caller_addr(), Some(SIMPLE_SDP), None, rsip::Transport::Udp,
+        ).await.unwrap();
+
+        // Before identity capture: no synthetic BYE possible
+        assert!(mgr.build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060).await.is_none());
+
+        mgr.set_inbound_dialog(
+            &uuid,
+            "<sip:caller@pstn.example.com>;tag=caller-tag".to_string(),
+            Some("sip:caller@192.168.1.100:5060".to_string()),
+        ).await;
+        mgr.attach_outbound(
+            &uuid, "full-call-id@host".to_string(), "sbc-tag".to_string(),
+            callee_addr(), None, rsip::Transport::Udp,
+        ).await.unwrap();
+        mgr.set_established_dialog(
+            &uuid,
+            "<sip:caller@pstn.example.com>;tag=caller-tag".to_string(),
+            "<sip:callee@sip.example.com>;tag=callee-tag".to_string(),
+            Some("sip:callee@192.168.1.200:5060".to_string()),
+        ).await;
+
+        // Toward caller: From = answered To (callee side), To = caller's From
+        let bye = mgr.build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060).await.unwrap();
+        assert!(bye.contains("From: <sip:callee@sip.example.com>;tag=callee-tag\r\n"), "{}", bye);
+        assert!(bye.contains("To: <sip:caller@pstn.example.com>;tag=caller-tag\r\n"));
+        assert!(bye.starts_with("BYE sip:caller@192.168.1.100:5060 SIP/2.0"));
+        rsip::SipMessage::try_from(bye.as_bytes().to_vec()).unwrap();
+
+        // Toward callee: From/To as sent on the outbound leg
+        let bye2 = mgr.build_relay_bye_toward_callee(&uuid, "1.2.3.4", 5060).await.unwrap();
+        assert!(bye2.contains("From: <sip:caller@pstn.example.com>;tag=caller-tag\r\n"));
+        assert!(bye2.contains("To: <sip:callee@sip.example.com>;tag=callee-tag\r\n"));
+        rsip::SipMessage::try_from(bye2.as_bytes().to_vec()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recently_terminated_matches_full_and_truncated_call_ids() {
+        let mgr = make_manager();
+        let uuid = mgr.create_call(
+            "prefix-prefix-core@host".to_string(), "t1".to_string(),
+            caller_addr(), None, None, rsip::Transport::Udp,
+        ).await.unwrap();
+
+        assert!(!mgr.was_recently_terminated("core@host"));
+        mgr.terminate_call(&uuid).await;
+
+        // Full Call-ID and Genesys-truncated suffix both recognized
+        assert!(mgr.was_recently_terminated("prefix-prefix-core@host"));
+        assert!(mgr.was_recently_terminated("core@host"));
+        assert!(!mgr.was_recently_terminated("other@host"));
+        assert!(!mgr.was_recently_terminated(""));
+    }
+
 
     #[tokio::test]
     async fn test_create_call() {
