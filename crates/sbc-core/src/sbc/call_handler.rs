@@ -342,7 +342,7 @@ impl Sbc {
         if found.is_none() {
             let source_ip = source.ip().to_string();
             // Check if source is a trunk IP or in the same /24 as a known trunk
-            let is_trunk_related = self.trunk_ips.iter().any(|tip| {
+            let is_trunk_related = self.trunk_ips.read().await.iter().any(|tip| {
                 tip == &source_ip || {
                     // Same /24 subnet check for trunk clusters
                     let tip_prefix = tip.rsplitn(2, '.').nth(1);

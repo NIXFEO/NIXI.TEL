@@ -473,6 +473,11 @@ impl RegisterHandler {
         Self { registrar }
     }
 
+    /// Underlying registrar handle (shared with the HTTP API).
+    pub fn registrar(&self) -> Arc<dyn Registrar> {
+        self.registrar.clone()
+    }
+
     pub fn new_inmemory() -> Self {
         Self::new(Arc::new(InMemoryRegistrar::new()))
     }

@@ -460,6 +460,30 @@ impl TrunkManager {
             .map(|entry| entry.clone())
     }
 
+    /// Update an existing trunk by name, preserving its id (and its resolved
+    /// address when the destination is unchanged, so active calls are safe).
+    /// Returns false when no trunk has that name.
+    pub fn update_trunk_by_name(&self, name: &str, mut new_config: TrunkConfig) -> bool {
+        let existing = match self.find_by_name(name) {
+            Some(t) => t,
+            None => return false,
+        };
+        new_config.id = existing.id;
+        if new_config.host == existing.host && new_config.port == existing.port {
+            new_config.resolved_addr = existing.resolved_addr;
+        }
+        self.trunks.insert(existing.id, new_config);
+        true
+    }
+
+    /// Remove a trunk by name. Returns false when no trunk has that name.
+    pub fn remove_by_name(&self, name: &str) -> bool {
+        match self.find_by_name(name) {
+            Some(t) => self.remove_trunk(&t.id),
+            None => false,
+        }
+    }
+
     /// Enable a trunk
     pub fn enable_trunk(&self, id: &TrunkId) -> bool {
         if let Some(mut entry) = self.trunks.get_mut(id) {

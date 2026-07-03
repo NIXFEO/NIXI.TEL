@@ -7,6 +7,7 @@
 mod invite_handler;
 mod response_handler;
 mod call_handler;
+pub mod hydrate;
 pub mod import;
 
 use crate::acl::{AclManager, Direction};
@@ -98,11 +99,13 @@ pub struct Sbc {
     /// Used by TrunkRegistrar to receive 401/407/200 responses to its REGISTER requests
     pub pending_register_responses: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
 
-    /// DID → SIP user mappings for inbound PSTN calls
-    did_mappings: Vec<DidMapping>,
+    /// DID → SIP user mappings for inbound PSTN calls.
+    /// Shared with the API layer (hydrated from the SQLite store).
+    did_mappings: Arc<tokio::sync::RwLock<Vec<DidMapping>>>,
 
-    /// Known trunk IPs (whitelisted for inbound INVITE anti-spam)
-    trunk_ips: Vec<String>,
+    /// Known trunk IPs (whitelisted for inbound INVITE anti-spam).
+    /// Shared with the API layer (refreshed when trunks change).
+    trunk_ips: Arc<tokio::sync::RwLock<Vec<String>>>,
 
     /// Notify signal for API-triggered config reload
     reload_notify: Arc<tokio::sync::Notify>,
@@ -121,18 +124,65 @@ impl Sbc {
         config: &SbcConfig,
         management: Option<Arc<dyn crate::api::ManagementHandler>>,
     ) -> Result<Self> {
-        Self::_new_from_config_inner(config, management).await
+        let sbc = Self::_new_from_config_inner(config).await?;
+        sbc.start_http_server(config, management).await;
+        Ok(sbc)
     }
 
     /// Create a new SBC instance from full configuration (no management handler).
     pub async fn new_from_config(config: &SbcConfig) -> Result<Self> {
-        Self::_new_from_config_inner(config, None).await
+        let sbc = Self::_new_from_config_inner(config).await?;
+        sbc.start_http_server(config, None).await;
+        Ok(sbc)
     }
 
-    async fn _new_from_config_inner(
+    /// Create the SBC without starting the HTTP API — the caller wires the
+    /// management layer (e.g. SQLite-backed) and then calls
+    /// [`Sbc::start_http_server`] itself.
+    pub async fn new_from_config_without_http(config: &SbcConfig) -> Result<Self> {
+        Self::_new_from_config_inner(config).await
+    }
+
+    /// Start the HTTP API + /metrics endpoint (no-op when disabled in config).
+    pub async fn start_http_server(
+        &self,
         config: &SbcConfig,
         management: Option<Arc<dyn crate::api::ManagementHandler>>,
-    ) -> Result<Self> {
+    ) {
+        if !config.management.api_enabled {
+            return;
+        }
+        let http_addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            config.management.api_bind_address, config.management.api_port
+        )
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
+
+        let mut http_config = HttpServerConfig::new(http_addr);
+        if let Some(ref token) = config.management.api_auth_token {
+            http_config = http_config.with_token(token.clone());
+        }
+        let mut http_server = HttpServer::new(
+            http_config,
+            self.metrics.clone(),
+            self.b2bua.clone(),
+            self.trunk_manager.clone(),
+        )
+        .with_registrar(self.register_handler.registrar())
+        .with_reload_notify(self.reload_notify.clone())
+        .with_cdr(self.cdr.clone());
+        if let Some(mgmt) = management {
+            http_server = http_server.with_management(mgmt);
+        }
+        if let Err(e) = http_server.start().await {
+            warn!("HTTP API server failed to start: {}", e);
+        } else {
+            info!("HTTP API + /metrics listening on http://{}", http_addr);
+        }
+    }
+
+    async fn _new_from_config_inner(config: &SbcConfig) -> Result<Self> {
         // --- Metrics (created early so counters can be shared with Media) ---
         let metrics = Arc::new(SbcMetrics::new());
 
@@ -220,9 +270,9 @@ impl Sbc {
         let register_handler = Arc::new(RegisterHandler::new(registrar.clone()));
 
         // --- Digest Auth ---
-        let (auth, enable_digest_auth) = if config.security.enable_digest_auth
-            && !config.security.sip_users.is_empty()
-        {
+        // Created whenever digest auth is enabled, even with no TOML users:
+        // the user database may live entirely in the SQLite store.
+        let (auth, enable_digest_auth) = if config.security.enable_digest_auth {
             let authenticator = Arc::new(DigestAuthenticator::new(
                 config.security.sip_realm.clone(),
                 config.security.sip_users.clone(),
@@ -275,11 +325,26 @@ impl Sbc {
             Arc::new(CdrManager::new_memory())
         };
 
+        // --- Shared dynamic-config holders (hydrated from the store) ---
+        let did_mappings = Arc::new(tokio::sync::RwLock::new(config.dids.clone()));
+
         // --- SQLite config store (dynamic config source of truth) ---
         let config_store = match sbc_storage::ConfigStore::open(&config.database.sqlite_path).await {
             Ok(store) => {
                 let store = Arc::new(store);
                 import::first_boot_import(&store, config).await;
+
+                // The store is the source of truth from here on: hydrate the
+                // runtime managers from it (TOML entries were seeded above).
+                let handles = hydrate::RuntimeHandles {
+                    auth: auth.clone(),
+                    dids: did_mappings.clone(),
+                    trunks: trunk_manager.clone(),
+                    acl: acl.clone(),
+                };
+                if let Err(e) = hydrate::hydrate_all(&handles, &store).await {
+                    warn!("Hydration from config store failed: {} — TOML values remain active", e);
+                }
                 Some(store)
             }
             Err(e) => {
@@ -291,47 +356,20 @@ impl Sbc {
             }
         };
 
-        // --- HTTP API + /metrics endpoint ---
-        if config.management.api_enabled {
-            let http_addr: std::net::SocketAddr = format!(
-                "{}:{}",
-                config.management.api_bind_address,
-                config.management.api_port
-            ).parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
-
-            let mut http_config = HttpServerConfig::new(http_addr);
-            if let Some(ref token) = config.management.api_auth_token {
-                http_config = http_config.with_token(token.clone());
-            }
-            let mut http_server = HttpServer::new(
-                http_config,
-                metrics.clone(),
-                b2bua.clone(),
-                trunk_manager.clone(),
-            ).with_registrar(registrar.clone())
-             .with_reload_notify(reload_notify.clone())
-             .with_cdr(cdr.clone());
-            if let Some(mgmt) = management {
-                http_server = http_server.with_management(mgmt);
-            }
-            if let Err(e) = http_server.start().await {
-                warn!("HTTP API server failed to start: {}", e);
-            } else {
-                info!("HTTP API + /metrics listening on http://{}", http_addr);
-            }
-        }
-
         // ── Collect trunk IPs for inbound INVITE whitelist ──
-        let trunk_ips: Vec<String> = trunk_manager.list_trunks().iter()
+        // (after hydration, so API/store-defined trunks are included)
+        let trunk_ips_vec: Vec<String> = trunk_manager.list_trunks().iter()
             .filter_map(|t| t.resolved_addr.map(|a| a.ip().to_string()))
+            .chain(trunk_manager.list_trunks().iter().map(|t| t.host.clone()))
             .chain(config.trunks.iter().map(|t| t.host.clone()))
             .collect();
-        if !trunk_ips.is_empty() {
-            info!("Trunk IPs whitelisted for inbound INVITE: {:?}", trunk_ips);
+        if !trunk_ips_vec.is_empty() {
+            info!("Trunk IPs whitelisted for inbound INVITE: {:?}", trunk_ips_vec);
         }
+        let trunk_ips = Arc::new(tokio::sync::RwLock::new(trunk_ips_vec));
 
         // ── Load DID mappings ──
-        for did in &config.dids {
+        for did in did_mappings.read().await.iter() {
             info!("DID mapping: {} → {}", did.number, did.user);
         }
 
@@ -354,7 +392,7 @@ impl Sbc {
             config_path: None,
             trunk_manager: trunk_manager.clone(),
             pending_register_responses: Arc::new(DashMap::new()),
-            did_mappings: config.dids.clone(),
+            did_mappings,
             trunk_ips,
             reload_notify,
             config_store,
@@ -364,6 +402,26 @@ impl Sbc {
     /// SQLite store for dynamic config, when available.
     pub fn config_store(&self) -> Option<Arc<sbc_storage::ConfigStore>> {
         self.config_store.clone()
+    }
+
+    /// Digest authenticator handle (None when digest auth is disabled).
+    pub fn auth(&self) -> Option<Arc<DigestAuthenticator>> {
+        self.auth.clone()
+    }
+
+    /// Shared DID mappings (hydrated from the config store).
+    pub fn did_mappings(&self) -> Arc<tokio::sync::RwLock<Vec<DidMapping>>> {
+        self.did_mappings.clone()
+    }
+
+    /// Runtime handles bundle for API-triggered hydration.
+    pub fn runtime_handles(&self) -> hydrate::RuntimeHandles {
+        hydrate::RuntimeHandles {
+            auth: self.auth.clone(),
+            dids: self.did_mappings.clone(),
+            trunks: self.trunk_manager.clone(),
+            acl: self.acl.clone(),
+        }
     }
 
     /// Set the config file path (for SIGHUP hot-reload)
@@ -387,6 +445,23 @@ impl Sbc {
 
         let config = SbcConfig::from_file(path)?;
 
+        // ── SQLite store present: it is the source of truth for dynamic
+        // config — re-hydrate users/DIDs/trunks/ACL from it and skip the
+        // legacy TOML merge below.
+        if let Some(store) = self.config_store.clone() {
+            let handles = hydrate::RuntimeHandles {
+                auth: self.auth.clone(),
+                dids: self.did_mappings.clone(),
+                trunks: self.trunk_manager.clone(),
+                acl: self.acl.clone(),
+            };
+            hydrate::hydrate_all(&handles, &store).await?;
+            self.refresh_trunk_ips().await;
+            info!("Reload: runtime re-hydrated from config store");
+            return Ok(());
+        }
+
+        // ── Legacy TOML-only reload path ──
         // Reload SIP users in DigestAuthenticator
         if let Some(ref auth) = self.auth {
             if !config.security.sip_users.is_empty() {
@@ -466,18 +541,31 @@ impl Sbc {
         info!("SIGHUP: trunks reloaded — {} total ({} added)", total_trunks, trunks_added);
 
         // Reload DID mappings
-        self.did_mappings = config.dids.clone();
-        info!("SIGHUP: DID mappings reloaded — {} entries", self.did_mappings.len());
+        {
+            let mut dids = self.did_mappings.write().await;
+            *dids = config.dids.clone();
+            info!("SIGHUP: DID mappings reloaded — {} entries", dids.len());
+        }
 
         // Reload trunk IPs whitelist
-        self.trunk_ips = self.trunk_manager.list_trunks().iter()
-            .filter_map(|t| t.resolved_addr.map(|a| a.ip().to_string()))
-            .chain(config.trunks.iter().map(|t| t.host.clone()))
-            .collect();
-        info!("SIGHUP: trunk IPs reloaded — {:?}", self.trunk_ips);
+        self.refresh_trunk_ips().await;
 
         info!("SIGHUP: configuration reloaded successfully");
         Ok(())
+    }
+
+    /// Rebuild the inbound-INVITE trunk IP whitelist from the trunk manager.
+    pub async fn refresh_trunk_ips(&self) {
+        let ips: Vec<String> = self.trunk_manager.list_trunks().iter()
+            .flat_map(|t| {
+                t.resolved_addr
+                    .map(|a| a.ip().to_string())
+                    .into_iter()
+                    .chain(std::iter::once(t.host.clone()))
+            })
+            .collect();
+        info!("Trunk IPs whitelist refreshed — {:?}", ips);
+        *self.trunk_ips.write().await = ips;
     }
 
     /// Create a minimal SBC instance (for tests / simple usage)
@@ -508,8 +596,8 @@ impl Sbc {
             config_path: None,
             trunk_manager,
             pending_register_responses: Arc::new(DashMap::new()),
-            did_mappings: Vec::new(),
-            trunk_ips: Vec::new(),
+            did_mappings: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            trunk_ips: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
             config_store: None,
         }

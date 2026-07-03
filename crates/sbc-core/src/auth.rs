@@ -331,6 +331,13 @@ impl DigestAuthenticator {
     /// Returns (added, removed, total) counts.
     pub async fn reload_users(&self, users: &HashMap<String, String>) -> (usize, usize, usize) {
         let new_ha1 = Self::build_ha1_map(&self.realm, users);
+        self.set_users_ha1(new_ha1).await
+    }
+
+    /// Hot-reload users from a pre-hashed username → HA1 map (SQLite path —
+    /// the store never holds plaintext passwords).
+    /// Returns (added, removed, total) counts.
+    pub async fn set_users_ha1(&self, new_ha1: HashMap<String, String>) -> (usize, usize, usize) {
         let total = new_ha1.len();
 
         let mut current = self.users.write().await;

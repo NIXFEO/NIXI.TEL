@@ -264,6 +264,21 @@ impl AclManager {
         }
     }
 
+    /// Replace the whole rule set atomically (SQLite hydration path).
+    pub async fn replace_rules(&self, new_rules: Vec<AclRule>) -> usize {
+        let mut rules = self.rules.write().await;
+        rules.clear();
+        for rule in new_rules {
+            rules.insert(rule.id.clone(), rule);
+        }
+        rules.len()
+    }
+
+    /// Current default action.
+    pub async fn default_action(&self) -> AclAction {
+        self.config.read().await.default_action
+    }
+
     /// Enable or disable a rule without removing it
     pub async fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let mut rules = self.rules.write().await;

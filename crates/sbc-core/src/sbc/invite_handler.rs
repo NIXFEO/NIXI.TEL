@@ -20,7 +20,7 @@ impl Sbc {
         //   (5) source IP is a known trunk IP (whitelisted)
         let source_ip = source.ip().to_string();
         let is_localhost = source_ip == "127.0.0.1" || source_ip == "::1";
-        let is_trunk_ip = self.trunk_ips.iter().any(|ip| ip == &source_ip);
+        let is_trunk_ip = self.trunk_ips.read().await.iter().any(|ip| ip == &source_ip);
         if is_trunk_ip {
             info!("INVITE from trunk IP {} — whitelisted", source_ip);
         }
@@ -159,14 +159,14 @@ impl Sbc {
                 .unwrap_or(aor);
 
             // Check if this number matches a DID mapping
-            let did_match = self.did_mappings.iter().find(|did| {
+            let did_match = self.did_mappings.read().await.iter().find(|did| {
                 // Match against the number as-is, or with/without leading 0, or E.164 format
                 let n = &did.number;
                 callee_user == n
                     || callee_user == n.trim_start_matches('0')
                     || callee_user == format!("+33{}", n.trim_start_matches('0'))
                     || format!("+33{}", callee_user.trim_start_matches('0')) == format!("+33{}", n.trim_start_matches('0'))
-            });
+            }).cloned();
 
             if let Some(did) = did_match {
                 let sip_realm = self.identity.as_ref()
