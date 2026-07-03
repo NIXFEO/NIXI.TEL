@@ -368,6 +368,11 @@ impl ApiRouter {
             caller_number_format: None,
             caller_number_override: None,
             caller_display_name: None,
+            tls_sni: None,
+            tls_ca_cert: None,
+            tls_verify: true,
+            tls_client_cert: None,
+            tls_client_key: None,
         };
 
         self.trunks.add_trunk(config);

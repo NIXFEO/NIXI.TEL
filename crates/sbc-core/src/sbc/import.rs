@@ -103,7 +103,7 @@ pub async fn first_boot_import(store: &ConfigStore, config: &SbcConfig) -> (usiz
     }
 
     if imported != (0, 0, 0) {
-        let now = chrono_free_now_rfc3339();
+        let now = now_rfc3339();
         let _ = store.set_setting("toml_imported_at", &now).await;
         info!(
             "First-boot import from TOML: {} users, {} DIDs, {} trunks",
@@ -115,7 +115,7 @@ pub async fn first_boot_import(store: &ConfigStore, config: &SbcConfig) -> (usiz
 }
 
 /// RFC 3339 UTC timestamp without pulling chrono into sbc-core.
-fn chrono_free_now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn rfc3339_shape() {
-        let s = chrono_free_now_rfc3339();
+        let s = now_rfc3339();
         assert_eq!(s.len(), 20);
         assert!(s.ends_with('Z'));
         assert!(s.starts_with("20"));

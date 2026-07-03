@@ -4,6 +4,7 @@ pub mod acl;
 pub mod calls;
 pub mod config_api;
 pub mod events;
+pub mod security;
 pub mod system;
 pub mod trunks;
 

@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
             reload: sbc.reload_notify(),
             realm: config.security.sip_realm.clone(),
             api_token: config.management.api_auth_token.clone(),
+            security: sbc.security(),
         };
         if state.store.is_none() {
             warn!("Management API: config store unavailable — mutating endpoints return 503");

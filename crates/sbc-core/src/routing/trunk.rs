@@ -124,6 +124,17 @@ pub struct TrunkConfig {
     pub caller_number_override: Option<String>,
     /// Override caller display name
     pub caller_display_name: Option<String>,
+
+    // ── Outbound TLS (transport = TLS) ──────────────────────────────
+    /// SNI / expected certificate hostname (default: trunk host).
+    pub tls_sni: Option<String>,
+    /// Custom CA bundle path (PEM); None = system roots.
+    pub tls_ca_cert: Option<String>,
+    /// Verify the server certificate (default true).
+    pub tls_verify: bool,
+    /// Client cert/key paths (PEM) — both set = mTLS.
+    pub tls_client_cert: Option<String>,
+    pub tls_client_key: Option<String>,
 }
 
 impl TrunkConfig {
@@ -158,6 +169,11 @@ impl TrunkConfig {
             caller_number_format: None,
             caller_number_override: None,
             caller_display_name: None,
+            tls_sni: None,
+            tls_ca_cert: None,
+            tls_verify: true,
+            tls_client_cert: None,
+            tls_client_key: None,
         }
     }
 

@@ -22,6 +22,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "limit"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-rustls = "0.25"
+rustls-native-certs = "0.7"
 rustls-pemfile = "2.0"
 tokio-tungstenite = "0.21"
 

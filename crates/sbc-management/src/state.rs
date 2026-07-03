@@ -9,6 +9,7 @@ use sbc_core::metrics::SbcMetrics;
 use sbc_core::register::Registrar;
 use sbc_core::routing::TrunkManager;
 use sbc_core::sbc::hydrate::RuntimeHandles;
+use sbc_core::security::SecurityManager;
 use sbc_core::storage::CdrManager;
 use sbc_storage::ConfigStore;
 use std::sync::Arc;
@@ -34,6 +35,8 @@ pub struct AppState {
     pub realm: String,
     /// Bearer token; None disables auth (bind to localhost only!).
     pub api_token: Option<String>,
+    /// Anti-fraud manager (bans, destination rules, user limits).
+    pub security: Arc<SecurityManager>,
 }
 
 impl AppState {

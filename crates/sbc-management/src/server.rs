@@ -87,6 +87,30 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
             "/api/v1/acl/default",
             get(routes::acl::get_default).put(routes::acl::set_default),
         )
+        // Security / anti-fraud
+        .route(
+            "/api/v1/security/bans",
+            get(routes::security::list_bans).post(routes::security::create_ban),
+        )
+        .route("/api/v1/security/bans/:ip", delete(routes::security::delete_ban))
+        .route(
+            "/api/v1/security/destination-rules",
+            get(routes::security::list_destination_rules)
+                .post(routes::security::create_destination_rule),
+        )
+        .route(
+            "/api/v1/security/destination-rules/:id",
+            delete(routes::security::delete_destination_rule),
+        )
+        .route(
+            "/api/v1/security/user-limits",
+            get(routes::security::get_user_limits).put(routes::security::set_default_limits),
+        )
+        .route(
+            "/api/v1/security/user-limits/:user",
+            put(routes::security::set_user_limits).delete(routes::security::delete_user_limits),
+        )
+        .route("/api/v1/security/status", get(routes::security::status))
         // Config
         .route("/api/v1/reload", post(routes::system::reload))
         .route("/api/v1/config/reload", post(routes::system::reload))

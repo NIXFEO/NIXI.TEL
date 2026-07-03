@@ -253,6 +253,11 @@ pub struct SecurityConfig {
     /// Minimum acceptable Session-Expires (RFC 4028 Min-SE).
     #[serde(default = "default_min_se")]
     pub min_se: u64,
+
+    /// Anti-fraud features: [security.ban], [security.destinations],
+    /// [security.user_limits]. All have safe defaults.
+    #[serde(flatten, default)]
+    pub features: crate::security::SecurityFeaturesConfig,
 }
 
 fn default_max_call_duration() -> u64 { 14400 }
@@ -371,6 +376,7 @@ impl Default for SbcConfig {
                 session_timer_enabled: false,
                 session_expires: 1800,
                 min_se: 90,
+                features: Default::default(),
             },
             management: ManagementConfig {
                 api_enabled: true,

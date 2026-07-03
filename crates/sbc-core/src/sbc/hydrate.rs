@@ -125,6 +125,11 @@ pub fn trunk_row_to_config(row: &TrunkRow, extra_prefixes: &[String]) -> TrunkCo
         }),
         caller_number_override: row.caller_number_override.clone(),
         caller_display_name: row.caller_display_name.clone(),
+        tls_sni: row.tls_sni.clone(),
+        tls_ca_cert: row.tls_ca_cert.clone(),
+        tls_verify: row.tls_verify,
+        tls_client_cert: row.tls_client_cert.clone(),
+        tls_client_key: row.tls_client_key.clone(),
     }
 }
 

@@ -38,6 +38,11 @@ pub struct TransportManager {
 
     event_rx: mpsc::UnboundedReceiver<TransportEvent>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
+
+    /// Outbound TLS: per-destination parameters (registered from trunk
+    /// config) and established connections.
+    tls_params: Arc<dashmap::DashMap<SocketAddr, crate::transport::tls_connect::TlsClientParams>>,
+    tls_connections: Arc<dashmap::DashMap<SocketAddr, Arc<crate::transport::tls_connect::TlsClientConnection>>>,
 }
 
 impl TransportManager {
@@ -53,6 +58,8 @@ impl TransportManager {
             message_tx,
             event_rx,
             event_tx,
+            tls_params: Arc::new(dashmap::DashMap::new()),
+            tls_connections: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -205,6 +212,48 @@ impl TransportManager {
         }
     }
 
+    /// Register TLS parameters for an outbound destination (trunk load).
+    pub fn register_tls_destination(
+        &self,
+        dest: SocketAddr,
+        params: crate::transport::tls_connect::TlsClientParams,
+    ) {
+        self.tls_params.insert(dest, params);
+    }
+
+    /// Send a message via TLS. NEVER falls back to plaintext: a destination
+    /// without registered TLS parameters is an error.
+    pub async fn send_tls(&self, data: &[u8], dest: SocketAddr) -> Result<()> {
+        // Reuse a live connection
+        if let Some(conn) = self.tls_connections.get(&dest) {
+            if !conn.is_closed() {
+                return conn.send(data);
+            }
+            drop(conn);
+            self.tls_connections.remove(&dest);
+        }
+
+        let params = self
+            .tls_params
+            .get(&dest)
+            .map(|p| p.clone())
+            .ok_or_else(|| {
+                Error::Transport(format!(
+                    "no TLS parameters registered for {} — refusing plaintext fallback",
+                    dest
+                ))
+            })?;
+
+        let conn = crate::transport::tls_connect::TlsClientConnection::connect(
+            dest,
+            &params,
+            self.message_tx.clone(),
+        )
+        .await?;
+        self.tls_connections.insert(dest, conn.clone());
+        conn.send(data)
+    }
+
     /// Send a message via TCP
     pub async fn send_tcp(&self, data: &[u8], dest: SocketAddr) -> Result<()> {
         // Get or create TCP connection
@@ -231,7 +280,7 @@ impl TransportManager {
         match transport {
             rsip::Transport::Udp => self.send_udp(data, dest).await,
             rsip::Transport::Tcp => self.send_tcp(data, dest).await,
-            rsip::Transport::Tls => self.send_tcp(data, dest).await,
+            rsip::Transport::Tls => self.send_tls(data, dest).await,
             _ => Err(Error::Transport(format!(
                 "Unsupported transport: {:?}",
                 transport

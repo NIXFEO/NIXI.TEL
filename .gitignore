@@ -41,3 +41,8 @@ config/sbc.toml
 # Temporary files
 /tmp/
 *.tmp
+
+# SQLite config store (runtime data)
+data/
+*.db-shm
+*.db-wal

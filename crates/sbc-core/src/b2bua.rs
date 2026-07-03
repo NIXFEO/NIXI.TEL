@@ -985,6 +985,17 @@ impl B2buaManager {
         Some(crate::sip_builder::build_bye(&d, None))
     }
 
+    /// Count non-terminated calls originated by `user` (per-user limits).
+    /// Derived from live state — no shadow counter to drift.
+    pub async fn active_calls_for_user(&self, user: &str) -> u32 {
+        let calls = self.calls.lock().await;
+        calls
+            .values()
+            .filter(|c| !matches!(c.state, CallState::Terminated | CallState::Terminating))
+            .filter(|c| c.caller_number.as_deref() == Some(user))
+            .count() as u32
+    }
+
     /// Look up a call by inbound Call-ID
     pub async fn find_by_inbound_call_id(&self, call_id: &str) -> Option<CallUuid> {
         let calls = self.calls.lock().await;

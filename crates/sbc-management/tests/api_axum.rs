@@ -42,6 +42,7 @@ async fn make_state() -> AppState {
         reload: Arc::new(Notify::new()),
         realm: "sip.example.com".to_string(),
         api_token: Some(TOKEN.to_string()),
+        security: Arc::new(sbc_core::security::SecurityManager::new(Default::default())),
     }
 }
 

@@ -69,10 +69,69 @@ impl Sbc {
             if !ip_known && !from_user_known && !to_user_known {
                 warn!("INVITE rejected from unregistered source {} (IP/From/To all unknown)", source);
                 self.metrics.inc_spam_blocked();
+                // Scanner INVITE floods count toward the fail2ban window
+                if let Some(entry) = self.security.record_auth_failure(source.ip(), None, "INVITE") {
+                    self.persist_ban(&entry);
+                }
                 self.metrics.inc_sip_response(403);
                 let response_403 = build_plain_response_for_request(&request, 403, "Forbidden")?;
                 let data = response_403.to_string().into_bytes();
                 return self.transport.reply(&data, source, transport, reply_tx).await;
+            }
+        }
+
+        // ── Per-user call limits (concurrent + setup rate) ──────────────
+        // Identity: registration matched by source IP, else From user.
+        // Trunk/localhost sources are exempt (inbound PSTN calls).
+        if !is_localhost && !is_trunk_ip {
+            let caller_user = {
+                let regs = self.register_handler.all_registrations().await.unwrap_or_default();
+                regs.iter()
+                    .find(|r| r.received_ip == source_ip)
+                    .and_then(|r| r.aor.strip_prefix("sip:").and_then(|a| a.split('@').next()))
+                    .map(str::to_string)
+                    .or_else(|| {
+                        request.from_header().ok()
+                            .and_then(|h| h.typed().ok())
+                            .and_then(|f: rsip::typed::From| f.uri.user().map(str::to_string))
+                    })
+            };
+            if let Some(user) = caller_user {
+                let concurrent = self.b2bua.active_calls_for_user(&user).await;
+                match self.security.user_limits.check_and_record(&user, concurrent) {
+                    crate::security::LimitDecision::Allowed => {}
+                    crate::security::LimitDecision::ConcurrentExceeded { current, limit } => {
+                        warn!(target: "security", "User '{}' concurrent limit: {}/{}", user, current, limit);
+                        self.security.emit(crate::security::SecurityEvent::UserLimitHit {
+                            user: user.clone(), kind: "concurrent".into(), current, limit,
+                            ts: crate::events::event_ts(),
+                        });
+                        self.metrics.inc_sip_response(403);
+                        let r = build_plain_response_for_request(&request, 403, "Too Many Concurrent Calls")?;
+                        let data = r.to_string().into_bytes();
+                        return self.transport.reply(&data, source, transport, reply_tx).await;
+                    }
+                    crate::security::LimitDecision::RateExceeded { current, limit, retry_after_secs } => {
+                        warn!(target: "security", "User '{}' rate limit: {}/{} per min", user, current, limit);
+                        self.security.emit(crate::security::SecurityEvent::UserLimitHit {
+                            user: user.clone(), kind: "rate".into(), current, limit,
+                            ts: crate::events::event_ts(),
+                        });
+                        self.metrics.inc_sip_response(503);
+                        // 503 + Retry-After (RFC 3261-conformant throttle)
+                        let raw = format!(
+                            "SIP/2.0 503 Service Unavailable\r\nRetry-After: {}\r\nContent-Length: 0\r\n\r\n",
+                            retry_after_secs
+                        );
+                        let r = build_plain_response_for_request(&request, 503, "Service Unavailable")?;
+                        let with_retry = r.to_string().replace(
+                            "\r\nContent-Length:",
+                            &format!("\r\nRetry-After: {}\r\nContent-Length:", retry_after_secs),
+                        );
+                        let _ = raw; // keep formatting simple: send the header-injected variant
+                        return self.transport.reply(with_retry.as_bytes(), source, transport, reply_tx).await;
+                    }
+                }
             }
         }
 
@@ -298,6 +357,31 @@ impl Sbc {
             // No DID match and no registered user — fall back to trunk routing
             // (outbound PSTN call). Multi-candidate: first trunk is used now,
             // the rest are armed for active failover (5s no-answer / 5xx).
+            // ── Destination blocking (anti-IRSF) before trunk selection ──
+            if let Some(dialed) = request.uri.user().map(|s| s.to_string()) {
+                let caller_user = request.from_header().ok()
+                    .and_then(|h| h.typed().ok())
+                    .and_then(|f: rsip::typed::From| f.uri.user().map(str::to_string));
+                if let crate::security::DestinationDecision::Blocked { rule_id, description } =
+                    self.security.destinations.check(&dialed, caller_user.as_deref())
+                {
+                    warn!(target: "security", "Destination blocked: {} (rule {}: {})", dialed, rule_id, description);
+                    self.security.emit(crate::security::SecurityEvent::DestinationBlocked {
+                        user: caller_user,
+                        destination: dialed,
+                        rule: rule_id,
+                        ts: crate::events::event_ts(),
+                    });
+                    self.b2bua.terminate_call(&uuid).await;
+                    self.metrics.inc_call_failed();
+                    self.metrics.inc_sip_response(403);
+                    let r403 = build_plain_response_for_request(&request, 403, "Forbidden - Destination Blocked")?;
+                    let data = r403.to_string().into_bytes();
+                    let _ = self.transport.reply(&data, source, transport, reply_tx).await;
+                    return Ok(());
+                }
+            }
+
             let mut candidates = self.router.route_request_candidates(&request);
             if candidates.is_empty() {
                 warn!("Routing failed for INVITE: no candidate trunk");
@@ -961,6 +1045,11 @@ mod failover_tests {
             caller_number_format: None,
             caller_number_override: None,
             caller_display_name: None,
+            tls_sni: None,
+            tls_ca_cert: None,
+            tls_verify: true,
+            tls_client_cert: None,
+            tls_client_key: None,
         }
     }
 

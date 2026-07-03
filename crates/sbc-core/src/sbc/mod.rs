@@ -124,6 +124,9 @@ pub struct Sbc {
 
     /// RFC 4028 session timers (None = disabled): (session_expires, min_se).
     session_timer: Option<(u32, u32)>,
+
+    /// Anti-fraud: bans, destination blocking, per-user limits.
+    security: Arc<crate::security::SecurityManager>,
 }
 
 impl Sbc {
@@ -262,6 +265,11 @@ impl Sbc {
                 caller_number_format: None,
                 caller_number_override: None,
                 caller_display_name: None,
+                tls_sni: None,
+                tls_ca_cert: None,
+                tls_verify: true,
+                tls_client_cert: None,
+                tls_client_key: None,
             };
 
             // Resolve DNS for hostnames (e.g. trunk.example.com → IP)
@@ -295,6 +303,11 @@ impl Sbc {
 
         // --- ACL ---
         let acl = Arc::new(AclManager::new_permissive());
+
+        // --- Security / anti-fraud (Ban → ACL → DoS pipeline) ---
+        let security = Arc::new(crate::security::SecurityManager::new(
+            config.security.features.clone(),
+        ));
 
         // --- DoS ---
         let dos_config = RateLimitConfig {
@@ -339,6 +352,7 @@ impl Sbc {
         // --- Event bus (feeds the SSE API endpoint) ---
         let events = crate::events::EventBus::new();
         b2bua.set_event_bus(events.clone());
+        security.set_event_bus(events.clone());
 
         // --- Shared dynamic-config holders (hydrated from the store) ---
         let did_mappings = Arc::new(tokio::sync::RwLock::new(config.dids.clone()));
@@ -359,6 +373,23 @@ impl Sbc {
                 };
                 if let Err(e) = hydrate::hydrate_all(&handles, &store).await {
                     warn!("Hydration from config store failed: {} — TOML values remain active", e);
+                }
+
+                // Restore persisted bans (restart must not amnesty offenders)
+                let now = crate::sbc::import::now_rfc3339();
+                match store.load_active_bans(&now).await {
+                    Ok(rows) => {
+                        let count = rows.len();
+                        for row in rows {
+                            if let Some(entry) = ban_row_to_entry(&row) {
+                                security.bans.restore(entry);
+                            }
+                        }
+                        if count > 0 {
+                            info!("Restored {} active ban(s) from store", count);
+                        }
+                    }
+                    Err(e) => warn!("Ban restore failed: {}", e),
                 }
                 Some(store)
             }
@@ -413,6 +444,7 @@ impl Sbc {
             config_store,
             events,
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
+            security,
             session_timer: config.security.session_timer_enabled.then(|| (
                 config.security.session_expires.max(config.security.min_se) as u32,
                 config.security.min_se as u32,
@@ -433,6 +465,26 @@ impl Sbc {
     /// Shared DID mappings (hydrated from the config store).
     pub fn did_mappings(&self) -> Arc<tokio::sync::RwLock<Vec<DidMapping>>> {
         self.did_mappings.clone()
+    }
+
+    /// Persist a ban to the config store (fire-and-forget) so restarts
+    /// do not amnesty offenders.
+    pub fn persist_ban(&self, entry: &crate::security::BanEntry) {
+        let Some(store) = self.config_store.clone() else { return };
+        let row = sbc_storage::BanRow {
+            ip: entry.ip.to_string(),
+            reason: entry.reason.clone(),
+            banned_at: systemtime_rfc3339(entry.banned_at),
+            expires_at: systemtime_rfc3339(entry.expires_at),
+            failures: entry.failures as i64,
+            manual: entry.manual,
+            offense_count: entry.offense_count as i64,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = store.save_ban(&row).await {
+                warn!("Ban persistence failed for {}: {}", row.ip, e);
+            }
+        });
     }
 
     /// Runtime handles bundle for API-triggered hydration.
@@ -478,6 +530,7 @@ impl Sbc {
             };
             hydrate::hydrate_all(&handles, &store).await?;
             self.refresh_trunk_ips().await;
+            self.register_trunk_tls_configs();
             info!("Reload: runtime re-hydrated from config store");
             return Ok(());
         }
@@ -552,6 +605,11 @@ impl Sbc {
                     caller_number_format: None,
                     caller_number_override: None,
                     caller_display_name: None,
+                    tls_sni: None,
+                    tls_ca_cert: None,
+                    tls_verify: true,
+                    tls_client_cert: None,
+                    tls_client_key: None,
                 };
                 let _ = trunk.resolve_destination().await;
                 self.trunk_manager.add_trunk(trunk);
@@ -573,6 +631,29 @@ impl Sbc {
 
         info!("SIGHUP: configuration reloaded successfully");
         Ok(())
+    }
+
+    /// Register outbound-TLS parameters for every TLS trunk with the
+    /// transport manager (send_tls refuses unregistered destinations —
+    /// plaintext fallback is gone).
+    pub fn register_trunk_tls_configs(&self) {
+        for t in self.trunk_manager.list_trunks() {
+            if t.transport == crate::routing::TransportType::Tls {
+                if let Some(dest) = t.destination() {
+                    self.transport.register_tls_destination(
+                        dest,
+                        crate::transport::tls_connect::TlsClientParams {
+                            sni: t.tls_sni.clone().unwrap_or_else(|| t.host.clone()),
+                            ca_cert: t.tls_ca_cert.clone(),
+                            verify: t.tls_verify,
+                            client_cert: t.tls_client_cert.clone(),
+                            client_key: t.tls_client_key.clone(),
+                        },
+                    );
+                    info!("TLS trunk '{}': outbound TLS registered for {}", t.name, dest);
+                }
+            }
+        }
     }
 
     /// Rebuild the inbound-INVITE trunk IP whitelist from the trunk manager.
@@ -624,6 +705,7 @@ impl Sbc {
             events: crate::events::EventBus::new(),
             invite_timeout: Duration::from_secs(5),
             session_timer: None,
+            security: Arc::new(crate::security::SecurityManager::new(Default::default())),
         }
     }
 
@@ -988,6 +1070,9 @@ impl Sbc {
         self.transport.start_listeners(network_config).await?;
         info!("Transport listeners started");
 
+        // Outbound TLS for TLS trunks (no plaintext fallback)
+        self.register_trunk_tls_configs();
+
         // Start maintenance tasks
         let config = maintenance_config.unwrap_or_default();
         let maintenance = MaintenanceTask::new(
@@ -1115,6 +1200,17 @@ impl Sbc {
         let source    = received.source;
         let transport = received.transport;
         let reply_tx  = received.reply_tx;
+
+        // 0. Ban check (fail2ban) — one DashMap read on the hot path
+        if self.security.bans.is_banned(source.ip()) {
+            self.metrics.inc_spam_blocked();
+            if !self.security.bans.silent_drop() {
+                self.metrics.inc_sip_response(403);
+                let response_403 = build_plain_response(403, "Forbidden");
+                let _ = self.transport.reply(response_403.as_bytes(), source, transport, reply_tx.as_ref()).await;
+            }
+            return Ok(());
+        }
 
         // 1. ACL check
         let acl_result = self.acl.check_addr(source, Direction::Inbound).await;
@@ -1246,6 +1342,12 @@ impl Sbc {
                                     debug!("REGISTER auth: nonce issue from {}: {}", source.ip(), e);
                                 } else {
                                     warn!("REGISTER auth failed from {}: {}", source.ip(), e);
+                                    // Real failure → fail2ban strike (stale-nonce
+                                    // retries above must NOT count, or legitimate
+                                    // clients get banned on re-REGISTER).
+                                    if let Some(entry) = self.security.record_auth_failure(source.ip(), None, "REGISTER") {
+                                        self.persist_ban(&entry);
+                                    }
                                 }
                                 let response_403 = build_plain_response_for_request(request, 403, "Forbidden")?;
                                 let data = response_403.to_string().into_bytes();
@@ -1361,6 +1463,7 @@ impl Sbc {
     pub fn cdr(&self) -> &Arc<CdrManager>                  { &self.cdr }
     pub fn metrics(&self) -> &Arc<SbcMetrics>              { &self.metrics }
     pub fn events(&self) -> crate::events::EventBus       { self.events.clone() }
+    pub fn security(&self) -> Arc<crate::security::SecurityManager> { self.security.clone() }
     pub fn trunk_ips(&self) -> Arc<tokio::sync::RwLock<Vec<String>>> { self.trunk_ips.clone() }
 }
 
@@ -1902,6 +2005,68 @@ fn inject_proxy_auth_into_invite(raw_invite: &str, auth_value: &str) -> String {
     lines.insert(insert_pos, format!("Proxy-Authorization: {}", auth_value));
 
     lines.join("\r\n")
+}
+
+/// RFC 3339 for a SystemTime (UTC).
+pub(crate) fn systemtime_rfc3339(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = secs / 86400;
+    let rem_secs = secs % 86400;
+    let (mut y, mut rem) = (1970u64, days);
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let len = if leap { 366 } else { 365 };
+        if rem < len { break; }
+        rem -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_len = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    while rem >= month_len[m] { rem -= month_len[m]; m += 1; }
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m + 1, rem + 1, rem_secs / 3600, (rem_secs % 3600) / 60, rem_secs % 60)
+}
+
+/// Convert a persisted ban row back to a live entry.
+fn ban_row_to_entry(row: &sbc_storage::BanRow) -> Option<crate::security::BanEntry> {
+    let ip: std::net::IpAddr = row.ip.parse().ok()?;
+    let parse_ts = |s: &str| -> Option<std::time::SystemTime> {
+        // RFC 3339 "YYYY-MM-DDTHH:MM:SSZ" → SystemTime (UTC, 1970-2099)
+        let (date, time) = s.split_once('T')?;
+        let mut d = date.split('-');
+        let (y, m, day): (u64, u64, u64) = (
+            d.next()?.parse().ok()?,
+            d.next()?.parse().ok()?,
+            d.next()?.parse().ok()?,
+        );
+        let mut t = time.trim_end_matches('Z').split(':');
+        let (hh, mm, ss): (u64, u64, u64) = (
+            t.next()?.parse().ok()?,
+            t.next()?.parse().ok()?,
+            t.next()?.split('.').next()?.parse().ok()?,
+        );
+        let mut days = 0u64;
+        for yy in 1970..y {
+            days += if (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0 { 366 } else { 365 };
+        }
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let month_len = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for mm_i in 0..(m.saturating_sub(1)) as usize {
+            days += month_len[mm_i];
+        }
+        days += day.saturating_sub(1);
+        Some(std::time::UNIX_EPOCH + Duration::from_secs(days * 86400 + hh * 3600 + mm * 60 + ss))
+    };
+    Some(crate::security::BanEntry {
+        ip,
+        reason: row.reason.clone(),
+        banned_at: parse_ts(&row.banned_at)?,
+        expires_at: parse_ts(&row.expires_at)?,
+        failures: row.failures as u32,
+        manual: row.manual,
+        offense_count: row.offense_count as u32,
+    })
 }
 
 #[cfg(test)]

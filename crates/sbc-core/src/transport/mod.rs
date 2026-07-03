@@ -4,6 +4,7 @@ pub mod manager;
 pub mod udp;
 pub mod tcp;
 pub mod tls;
+pub mod tls_connect;
 pub mod ws;
 
 pub use manager::{TransportManager, TransportStats};

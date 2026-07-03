@@ -9,6 +9,7 @@ rsip = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
