@@ -259,6 +259,29 @@ impl Sbc {
             // reply_tx (the inbound connection channel). This is critical for NAT
             // traversal — the callee's private IP is not reachable from the server.
             let callee_reply_tx = reg.reply_tx.clone();
+
+            // WS/WSS callee with a dead connection is unreachable: the SBC
+            // cannot dial out to a browser behind NAT (by design, like
+            // Kamailio). Answer 480 now instead of sending into the void.
+            if matches!(reg_transport, rsip::Transport::Ws | rsip::Transport::Wss) {
+                let connection_alive = callee_reply_tx
+                    .as_ref()
+                    .map(|tx| !tx.is_closed())
+                    .unwrap_or(false);
+                if !connection_alive {
+                    warn!(
+                        "Registered WS contact {} has no live connection — 480",
+                        addr
+                    );
+                    self.b2bua.terminate_call(&uuid).await;
+                    self.metrics.inc_call_failed();
+                    self.metrics.inc_sip_response(480);
+                    let response_480 = build_plain_response(480, "Temporarily Unavailable");
+                    let _ = self.transport.reply(response_480.as_bytes(), source, transport, reply_tx).await;
+                    return Ok(());
+                }
+            }
+
             (addr, reg_transport, callee_reply_tx)
         } else if did_mapped {
             // DID matched a local user but they are NOT registered → 480 Temporarily Unavailable

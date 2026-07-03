@@ -577,6 +577,105 @@ impl Sbc {
     ///  3. Create new INVITE to the transfer target
     ///  4. Send NOTIFY to the transferor with transfer progress
     ///  5. On success, bridge new call and disconnect transferor
+    /// Handle a transport-level event (currently: WS/WSS connection closed).
+    /// Removes registrations bound to that connection and tears down active
+    /// calls (synthetic BYE to the surviving leg, CDR "ws-closed").
+    pub(crate) async fn handle_transport_event(
+        &mut self,
+        event: crate::transport::manager::TransportEvent,
+    ) {
+        let crate::transport::manager::TransportEvent::ConnectionClosed { peer, transport } = event;
+        info!("Transport event: {:?} connection from {} closed", transport, peer);
+
+        // ── 1. Unregister bindings that lived on this connection ─────────
+        // Without a live WS the contact is unreachable (the SBC cannot dial
+        // out to a browser); the client re-REGISTERs on reconnect.
+        let registrar = self.register_handler.registrar();
+        if let Ok(regs) = registrar.all_registrations().await {
+            let peer_ip = peer.ip().to_string();
+            for reg in regs.iter().filter(|r| {
+                r.received_ip == peer_ip
+                    && r.received_port == peer.port()
+                    && matches!(r.transport.as_str(), "WS" | "WSS")
+            }) {
+                info!("WS closed: unregistering {} ({})", reg.aor, reg.contact);
+                let _ = registrar.unregister(&reg.aor, &reg.contact).await;
+            }
+        }
+
+        // ── 2. Tear down active calls bound to this connection ───────────
+        let (sbc_ip, sbc_port) = self.identity.as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+
+        let affected: Vec<_> = {
+            let calls = self.b2bua.calls_locked().await;
+            calls.values()
+                .filter(|c| {
+                    (c.caller_source == peer
+                        && matches!(c.caller_transport, rsip::Transport::Ws | rsip::Transport::Wss))
+                        || (c.callee_dest == Some(peer)
+                            && matches!(c.callee_transport, rsip::Transport::Ws | rsip::Transport::Wss))
+                })
+                .map(|c| {
+                    let caller_died = c.caller_source == peer;
+                    let bye = if caller_died {
+                        c.dialog_info_toward_callee(&sbc_ip, sbc_port)
+                            .map(|d| crate::sip_builder::build_bye(&d, Some("SIP;cause=200;text=\"ws-closed\"")))
+                    } else {
+                        c.dialog_info_toward_caller(&sbc_ip, sbc_port)
+                            .map(|d| crate::sip_builder::build_bye(&d, Some("SIP;cause=200;text=\"ws-closed\"")))
+                    };
+                    let (dest, tp, tx) = if caller_died {
+                        (c.callee_dest, c.callee_transport, c.callee_reply_tx.clone())
+                    } else {
+                        (Some(c.caller_source), c.caller_transport, c.caller_reply_tx.clone())
+                    };
+                    (
+                        c.uuid.clone(),
+                        bye,
+                        dest,
+                        tp,
+                        tx,
+                        c.media_session_id.clone(),
+                        c.inbound.call_id.clone(),
+                        c.caller_number.clone(),
+                        c.callee_number.clone(),
+                        c.duration_secs(),
+                        c.caller_is_webrtc,
+                    )
+                })
+                .collect()
+        };
+
+        for (uuid, bye, dest, tp, tx, media_id, call_id, caller, callee, duration, is_webrtc) in affected {
+            warn!("WS closed mid-call: terminating call {} (peer {})", &uuid[..8.min(uuid.len())], peer);
+
+            if let (Some(bye), Some(dest)) = (bye, dest) {
+                let _ = self.transport.reply(bye.as_bytes(), dest, tp, tx.as_ref()).await;
+            }
+            if let Some(mid) = media_id {
+                let _ = self.media.terminate_session(&mid);
+            }
+
+            // CDR with explicit disconnect reason
+            let record = crate::storage::CdrRecord::new(
+                call_id,
+                caller.unwrap_or_default(),
+                callee.unwrap_or_default(),
+            )
+            .with_duration(duration)
+            .with_webrtc(is_webrtc)
+            .with_disconnect_reason("ws-closed");
+            if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
+                warn!("CDR recording failed (ws-closed): {}", e);
+            }
+
+            self.metrics.inc_call_terminated();
+            self.b2bua.terminate_call(&uuid).await;
+        }
+    }
+
     /// Handle an in-dialog re-INVITE (session refresh, RFC 4028).
     /// Answers 200 OK with the SDP previously sent to that peer — media
     /// stays untouched. Without this, a refresher peer's re-INVITE would be

@@ -113,6 +113,7 @@ impl WsListenerServer {
     pub async fn listen(
         self,
         message_tx: mpsc::UnboundedSender<ReceivedMessage>,
+        event_tx: mpsc::UnboundedSender<crate::transport::manager::TransportEvent>,
     ) -> Result<()> {
         let proto = if self.tls_acceptor.is_some() { "WSS" } else { "WS" };
         info!("Starting {} listener on {}", proto, self.local_addr);
@@ -129,11 +130,20 @@ impl WsListenerServer {
             debug!("{} connection from {}", proto, peer_addr);
 
             let tx = message_tx.clone();
+            let ev_tx = event_tx.clone();
             let acceptor = self.tls_acceptor.clone();
             let is_wss = acceptor.is_some();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_ws_connection(tcp_stream, peer_addr, tx, acceptor, is_wss).await {
+                let transport = if is_wss { rsip::Transport::Wss } else { rsip::Transport::Ws };
+                let result = handle_ws_connection(tcp_stream, peer_addr, tx, acceptor, is_wss).await;
+                // Reader loop exited (clean close or error): notify the SBC
+                // so registrations/calls bound to this connection are cleaned up.
+                let _ = ev_tx.send(crate::transport::manager::TransportEvent::ConnectionClosed {
+                    peer: peer_addr,
+                    transport,
+                });
+                if let Err(e) = result {
                     // WSS connection errors are mostly scanners/bots sending
                     // invalid HTTP to the WebSocket port — log at debug.
                     debug!("{} connection error from {}: {}", proto, peer_addr, e);

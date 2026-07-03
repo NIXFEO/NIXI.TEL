@@ -252,10 +252,21 @@ impl StunAttribute {
                     bytes.push(0);
                 }
             }
-            StunAttribute::ErrorCode(_code, _reason) => {
-                // TODO: implement error code serialization
+            StunAttribute::ErrorCode(code, reason) => {
+                // RFC 5389 §15.6: 4 bytes (2 reserved, class, number) + reason
+                let class = (code / 100) as u8;
+                let number = (code % 100) as u8;
+                let reason_bytes = reason.as_bytes();
+                let value_len = 4 + reason_bytes.len();
+
                 bytes.extend_from_slice(&StunAttributeType::ErrorCode.to_u16().to_be_bytes());
-                bytes.extend_from_slice(&0u16.to_be_bytes()); // Length = 0 for now
+                bytes.extend_from_slice(&(value_len as u16).to_be_bytes());
+                bytes.extend_from_slice(&[0, 0, class, number]);
+                bytes.extend_from_slice(reason_bytes);
+
+                while bytes.len() % 4 != 0 {
+                    bytes.push(0);
+                }
             }
             StunAttribute::Unknown(attr_type, data) => {
                 bytes.extend_from_slice(&attr_type.to_be_bytes());

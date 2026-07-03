@@ -15,6 +15,16 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 /// Transport manager that handles all listeners
+/// Out-of-band transport events (drained from the SBC event loop tick).
+#[derive(Debug, Clone)]
+pub enum TransportEvent {
+    /// A connection-oriented transport (WS/WSS) closed.
+    ConnectionClosed {
+        peer: std::net::SocketAddr,
+        transport: rsip::Transport,
+    },
+}
+
 pub struct TransportManager {
     /// UDP listeners
     udp_listeners: Vec<Arc<UdpListener>>,
@@ -25,18 +35,24 @@ pub struct TransportManager {
     /// Channel for receiving messages from all listeners
     message_rx: mpsc::UnboundedReceiver<ReceivedMessage>,
     message_tx: mpsc::UnboundedSender<ReceivedMessage>,
+
+    event_rx: mpsc::UnboundedReceiver<TransportEvent>,
+    event_tx: mpsc::UnboundedSender<TransportEvent>,
 }
 
 impl TransportManager {
     /// Create a new transport manager
     pub fn new() -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         Self {
             udp_listeners: Vec::new(),
             tcp_connections: Arc::new(DashMap::new()),
             message_rx,
             message_tx,
+            event_rx,
+            event_tx,
         }
     }
 
@@ -128,8 +144,9 @@ impl TransportManager {
         info!("Started {} listener on {}", proto, listener.local_addr());
 
         let tx = self.message_tx.clone();
+        let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = listener.listen(tx).await {
+            if let Err(e) = listener.listen(tx, event_tx).await {
                 error!("{} listener error: {}", proto, e);
             }
         });
@@ -166,6 +183,16 @@ impl TransportManager {
     /// Receive the next message from any transport
     pub async fn recv_message(&mut self) -> Option<ReceivedMessage> {
         self.message_rx.recv().await
+    }
+
+    /// Drain pending transport events (non-blocking). Called from the SBC
+    /// event-loop tick — WS disconnect cleanup tolerates up to 1s latency.
+    pub fn drain_events(&mut self) -> Vec<TransportEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = self.event_rx.try_recv() {
+            events.push(ev);
+        }
+        events
     }
 
     /// Send a message via UDP

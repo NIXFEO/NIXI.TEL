@@ -1054,6 +1054,9 @@ impl Sbc {
                 }
                 _ = failover_interval.tick() => {
                     self.check_invite_failover().await;
+                    for event in self.transport.drain_events() {
+                        self.handle_transport_event(event).await;
+                    }
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration");
