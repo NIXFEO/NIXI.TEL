@@ -27,16 +27,17 @@ impl Sbc {
 
         info!("Response Call-ID: {}", call_id);
 
-        // ── Route outbound REGISTER responses to the trunk register task ──
-        // REGISTER responses have Call-IDs starting with "reg-" and are routed
-        // via a oneshot channel to the trunk_register_task that's waiting for them.
-        if call_id.starts_with("reg-") {
+        // ── Route outbound REGISTER / OPTIONS health-check responses ──
+        // Trunk REGISTER responses use "reg-" Call-IDs, OPTIONS health checks
+        // use "hc-" Call-IDs; both are awaited on a oneshot channel by their
+        // respective background task via pending_register_responses.
+        if call_id.starts_with("reg-") || call_id.starts_with("hc-") {
             if let Some((_, tx)) = self.pending_register_responses.remove(&call_id) {
                 let raw = rsip::SipMessage::Response(response).to_string();
                 let _ = tx.send(raw);
-                debug!("Routed REGISTER response (Call-ID: {}) to trunk register task", call_id);
+                debug!("Routed trunk task response (Call-ID: {}) to waiting task", call_id);
             } else {
-                debug!("No pending register channel for Call-ID: {} (stale or already consumed)", call_id);
+                debug!("No pending channel for Call-ID: {} (stale or already consumed)", call_id);
             }
             return Ok(());
         }

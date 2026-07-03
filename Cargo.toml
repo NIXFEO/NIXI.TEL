@@ -4,6 +4,7 @@ members = [
     "crates/sbc-bin",
     "crates/sbc-management",
 ]
+exclude = ["rsip-nixi"]
 resolver = "2"
 
 [workspace.dependencies]
