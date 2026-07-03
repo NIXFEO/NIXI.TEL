@@ -1142,6 +1142,7 @@ impl Sbc {
             Method::Bye      => self.handle_bye(request, source, transport, reply_tx).await,
             Method::Cancel   => self.handle_cancel(request, source, transport, reply_tx).await,
             Method::Refer    => self.handle_refer(request, source, transport, reply_tx).await,
+            Method::Info     => self.handle_info(request, source, transport, reply_tx).await,
             method => {
                 warn!("Unhandled SIP method: {}", method);
                 self.metrics.inc_sip_response(501);

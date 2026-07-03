@@ -140,6 +140,12 @@ pub struct RtpSession {
     /// Whether leg-A is a WebRTC endpoint (enables STUN/DTLS/RTP demuxing).
     webrtc_mode_a: bool,
 
+    /// Negotiated telephone-event PT on leg A / leg B (RFC 4733).
+    /// When both are known and differ, DTMF packets are PT-rewritten
+    /// between legs instead of relayed verbatim.
+    dtmf_pt_a: Option<u8>,
+    dtmf_pt_b: Option<u8>,
+
     /// Local ICE password (for STUN MESSAGE-INTEGRITY in responses).
     /// Only used when webrtc_mode_a is true.
     ice_pwd_local: Option<String>,
@@ -352,6 +358,8 @@ impl RtpSession {
             shutdown_tx: None,
             dtls_packet_tx: None,
             webrtc_mode_a: false,
+            dtmf_pt_a: None,
+            dtmf_pt_b: None,
             ice_pwd_local: None,
             dtls_packet_tx_b: None,
             webrtc_mode_b: false,
@@ -390,6 +398,18 @@ impl RtpSession {
             self.session_id, transcoder.src.name(), transcoder.dst.name()
         );
         self.transcoder_a_to_b = Some(transcoder);
+    }
+
+    /// Set the negotiated telephone-event PTs for both legs (RFC 4733).
+    pub fn set_dtmf_pts(&mut self, pt_a: Option<u8>, pt_b: Option<u8>) {
+        if pt_a.is_some() || pt_b.is_some() {
+            info!(
+                "Session {} DTMF telephone-event PTs: leg-A={:?} leg-B={:?}",
+                self.session_id, pt_a, pt_b
+            );
+        }
+        self.dtmf_pt_a = pt_a;
+        self.dtmf_pt_b = pt_b;
     }
 
     /// Set transcoder for B→A direction (callee to caller)
@@ -539,6 +559,8 @@ impl RtpSession {
 
         // WebRTC mode: STUN/DTLS/RTP demuxing on leg A
         let webrtc_mode_a = self.webrtc_mode_a;
+        let dtmf_pt_a = self.dtmf_pt_a;
+        let dtmf_pt_b = self.dtmf_pt_b;
         let dtls_packet_tx = self.dtls_packet_tx.clone();
         let ice_pwd_local = self.ice_pwd_local.clone();
 
@@ -772,14 +794,31 @@ impl RtpSession {
                                     // must NOT be transcoded — relay them as-is (RFC 4733).
                                     // Unknown PTs that aren't DTMF/CN are dropped.
                                     let expected_pt = tc.src.pt();
-                                    let is_dtmf_or_cn = actual_pt >= 96 || actual_pt == 13;
+                                    // DTMF iff the packet carries leg-A's negotiated
+                                    // telephone-event PT (fallback: any dynamic PT when
+                                    // the SDP didn't negotiate one — legacy behavior).
+                                    let is_dtmf = dtmf_pt_a.map(|p| p == actual_pt)
+                                        .unwrap_or(actual_pt >= 96);
+                                    let is_dtmf_or_cn = is_dtmf || actual_pt == 13;
                                     if actual_pt != expected_pt && !is_dtmf_or_cn {
                                         debug!("RTP A→B: skip unknown PT {} (expected {}), {} bytes",
                                             actual_pt, expected_pt, data.len());
                                         continue;
                                     }
                                     if is_dtmf_or_cn {
-                                        debug!("RTP A→B: relaying DTMF/CN PT {} as-is ({} bytes)", actual_pt, data.len());
+                                        // Re-map the telephone-event PT to leg-B's
+                                        // negotiated value (RFC 4733) — without this,
+                                        // digits are lost when legs negotiated
+                                        // different PTs (e.g. 101 vs 96).
+                                        if is_dtmf {
+                                            if let Some(dst_pt) = dtmf_pt_b {
+                                                if dst_pt != actual_pt {
+                                                    debug!("RTP A→B: DTMF PT re-map {} → {}", actual_pt, dst_pt);
+                                                    data[1] = (data[1] & 0x80) | dst_pt;
+                                                }
+                                            }
+                                        }
+                                        debug!("RTP A→B: relaying DTMF/CN PT {} ({} bytes)", data[1] & 0x7F, data.len());
                                         // Skip transcoding — packet goes straight to SRTP encrypt + send
                                     } else {
 
@@ -1081,14 +1120,25 @@ impl RtpSession {
                                     // ── PT filtering (Phase 16: DTMF relay) ──
                                     // DTMF telephone-event (PT 96-127) and CN (PT 13) bypass transcoding
                                     let expected_pt_b = tc.src.pt();
-                                    let is_dtmf_or_cn_b = actual_pt_b >= 96 || actual_pt_b == 13;
+                                    let is_dtmf_b = dtmf_pt_b.map(|p| p == actual_pt_b)
+                                        .unwrap_or(actual_pt_b >= 96);
+                                    let is_dtmf_or_cn_b = is_dtmf_b || actual_pt_b == 13;
                                     if actual_pt_b != expected_pt_b && !is_dtmf_or_cn_b {
                                         debug!("RTP B→A: skip unknown PT {} (expected {}), {} bytes",
                                             actual_pt_b, expected_pt_b, data.len());
                                         continue;
                                     }
                                     if is_dtmf_or_cn_b {
-                                        debug!("RTP B→A: relaying DTMF/CN PT {} as-is ({} bytes)", actual_pt_b, data.len());
+                                        // Re-map telephone-event PT to leg-A's negotiated value
+                                        if is_dtmf_b {
+                                            if let Some(dst_pt) = dtmf_pt_a {
+                                                if dst_pt != actual_pt_b {
+                                                    debug!("RTP B→A: DTMF PT re-map {} → {}", actual_pt_b, dst_pt);
+                                                    data[1] = (data[1] & 0x80) | dst_pt;
+                                                }
+                                            }
+                                        }
+                                        debug!("RTP B→A: relaying DTMF/CN PT {} ({} bytes)", data[1] & 0x7F, data.len());
                                     } else {
 
                                     let header_len = rtp_header_length(&data);

@@ -532,6 +532,21 @@ impl MediaManager {
             }
         }
 
+        // ── DTMF telephone-event PT re-mapping (RFC 4733) ────────────────
+        // Each leg may negotiate a different PT (101 vs 96); the relay
+        // rewrites DTMF packets to the destination leg's PT.
+        {
+            let dtmf_a = sdp_caller_opt
+                .as_deref()
+                .and_then(crate::media::sdp::telephone_event_pt)
+                .map(|(pt, _)| pt);
+            let dtmf_b = sdp_callee_opt
+                .as_deref()
+                .and_then(crate::media::sdp::telephone_event_pt)
+                .map(|(pt, _)| pt);
+            rtp_session.set_dtmf_pts(dtmf_a, dtmf_b);
+        }
+
         // ── Enable WebRTC mode on leg-A if caller SDP is WebRTC ──────────
         // Get local ICE password (set by sbc.rs when creating WebRTC session)
         let ice_pwd_local_opt = self.sessions.get(session_id)

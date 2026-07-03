@@ -543,8 +543,42 @@ impl MediaType {
     }
 }
 
+
+/// Extract the negotiated telephone-event payload type (RFC 4733) and its
+/// clock rate from an SDP body. Returns the first `a=rtpmap:<pt> telephone-event/<rate>`.
+pub fn telephone_event_pt(sdp: &str) -> Option<(u8, u32)> {
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("a=rtpmap:") {
+            if let Some(te_pos) = val.find("telephone-event") {
+                let pt = val.split_whitespace().next()?.parse::<u8>().ok()?;
+                let rate = val[te_pos..]
+                    .split('/')
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(|r| r.parse::<u32>().ok())
+                    .unwrap_or(8000);
+                return Some((pt, rate));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_telephone_event_pt() {
+        let sdp = "v=0\r\nm=audio 5004 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\n";
+        assert_eq!(telephone_event_pt(sdp), Some((101, 8000)));
+
+        let sdp96 = "m=audio 5004 RTP/AVP 8 96\r\na=rtpmap:96 telephone-event/48000\r\n";
+        assert_eq!(telephone_event_pt(sdp96), Some((96, 48000)));
+
+        let none = "m=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(telephone_event_pt(none), None);
+    }
+
     use super::*;
 
     const SAMPLE_SDP: &str = "v=0\r\n\

@@ -577,6 +577,52 @@ impl Sbc {
     ///  3. Create new INVITE to the transfer target
     ///  4. Send NOTIFY to the transferor with transfer progress
     ///  5. On success, bridge new call and disconnect transferor
+    /// Handle INFO — relay in-dialog INFO (e.g. DTMF via SIP INFO) to the
+    /// other leg instead of answering 501. No 2833↔INFO conversion: the
+    /// INFO body passes through untouched.
+    pub(crate) async fn handle_info(
+        &mut self,
+        request: Request,
+        source: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+    ) -> Result<()> {
+        info!("Received INFO from {}", source);
+
+        let call_id = request.call_id_header()
+            .ok()
+            .map(|h| h.value().to_string())
+            .unwrap_or_default();
+
+        let found = self.b2bua.find_by_any_call_id_with_source(&call_id, Some(source)).await;
+
+        if let Some((uuid, is_from_caller)) = found {
+            let raw_info = rsip::SipMessage::Request(request.clone()).to_string();
+            if is_from_caller {
+                if let Some((tx, dest, tp)) = self.b2bua.get_callee_reply_info(&uuid).await {
+                    info!("B2BUA: relaying INFO (caller→callee) to {}", dest);
+                    let out = self.apply_outbound_topology(&raw_info, tp);
+                    let _ = self.transport.reply(out.as_bytes(), dest, tp, tx.as_ref()).await;
+                }
+            } else if let Some((tx, dest, tp)) = self.b2bua.get_caller_reply_info(&uuid).await {
+                info!("B2BUA: relaying INFO (callee→caller) to {}", dest);
+                let out = self.apply_outbound_topology(&raw_info, tp);
+                let _ = self.transport.reply(out.as_bytes(), dest, tp, tx.as_ref()).await;
+            }
+        } else {
+            debug!("INFO: no matching call for Call-ID {} — answering 200 anyway", call_id);
+        }
+
+        // Answer the sender (the relayed leg's response is not awaited —
+        // half-B2BUA answers locally like it does for BYE)
+        self.metrics.inc_sip_response(200);
+        let response_200 = match build_plain_response_for_request(&request, 200, "OK") {
+            Ok(r) => r.to_string().into_bytes(),
+            Err(_) => build_plain_response(200, "OK").into_bytes(),
+        };
+        self.transport.reply(&response_200, source, transport, reply_tx).await
+    }
+
     pub(crate) async fn handle_refer(
         &mut self,
         request: Request,
