@@ -117,6 +117,9 @@ pub struct Sbc {
 
     /// Event bus feeding the SSE API endpoint.
     events: crate::events::EventBus,
+
+    /// Outbound INVITE answer timeout before trunk failover.
+    invite_timeout: Duration,
 }
 
 impl Sbc {
@@ -405,6 +408,7 @@ impl Sbc {
             reload_notify,
             config_store,
             events,
+            invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
         })
     }
 
@@ -610,6 +614,7 @@ impl Sbc {
             reload_notify: Arc::new(tokio::sync::Notify::new()),
             config_store: None,
             events: crate::events::EventBus::new(),
+            invite_timeout: Duration::from_secs(5),
         }
     }
 
@@ -1012,6 +1017,12 @@ impl Sbc {
         let mut call_timeout_interval = tokio::time::interval(Duration::from_secs(30));
         call_timeout_interval.tick().await; // consume the immediate first tick
 
+        // ── Fast tick for INVITE failover (1s) ──
+        // Scans calls waiting on their outbound INVITE; after invite_timeout
+        // with no >=180 provisional, CANCEL and try the next candidate trunk.
+        let mut failover_interval = tokio::time::interval(Duration::from_secs(1));
+        failover_interval.tick().await;
+
         loop {
             #[cfg(unix)]
             tokio::select! {
@@ -1030,6 +1041,9 @@ impl Sbc {
                 }
                 _ = call_timeout_interval.tick() => {
                     self.check_call_timeouts().await;
+                }
+                _ = failover_interval.tick() => {
+                    self.check_invite_failover().await;
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration");

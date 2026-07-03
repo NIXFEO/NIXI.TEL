@@ -252,19 +252,26 @@ impl Sbc {
             let _ = self.transport.reply(response_480.as_bytes(), source, transport, reply_tx).await;
             return Ok(());
         } else {
-            // No DID match and no registered user — fall back to trunk routing (outbound PSTN call)
-            let trunk = match self.router.route_request(&request) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("Routing failed for INVITE: {}", e);
-                    self.b2bua.terminate_call(&uuid).await;
-                    self.metrics.inc_call_failed();
-                    self.metrics.inc_sip_response(503);
-                    let response_503 = build_plain_response(503, "Service Unavailable");
-                    let _ = self.transport.reply(response_503.as_bytes(), source, transport, reply_tx).await;
-                    return Ok(());
-                }
-            };
+            // No DID match and no registered user — fall back to trunk routing
+            // (outbound PSTN call). Multi-candidate: first trunk is used now,
+            // the rest are armed for active failover (5s no-answer / 5xx).
+            let mut candidates = self.router.route_request_candidates(&request);
+            if candidates.is_empty() {
+                warn!("Routing failed for INVITE: no candidate trunk");
+                self.b2bua.terminate_call(&uuid).await;
+                self.metrics.inc_call_failed();
+                self.metrics.inc_sip_response(503);
+                let response_503 = build_plain_response(503, "Service Unavailable");
+                let _ = self.transport.reply(response_503.as_bytes(), source, transport, reply_tx).await;
+                return Ok(());
+            }
+            let trunk = candidates.remove(0);
+            let backup_ids: Vec<crate::routing::TrunkId> =
+                candidates.iter().map(|t| t.id).collect();
+            self.b2bua.set_failover_candidates(&uuid, backup_ids.clone()).await;
+            if !backup_ids.is_empty() {
+                info!("Failover armed: {} backup trunk(s) for call {}", backup_ids.len(), uuid);
+            }
 
             info!("Routing INVITE via trunk: {} ({}:{})", trunk.name, trunk.host, trunk.port);
 
@@ -541,6 +548,102 @@ impl Sbc {
         Ok(())
     }
 
+    /// Periodic scan (1s tick): calls whose outbound INVITE got no >=180
+    /// provisional within `invite_timeout` fail over to the next candidate
+    /// trunk. With no remaining candidate the call is left to the normal
+    /// call-setup timeout (a single slow trunk must not be aborted early).
+    pub(crate) async fn check_invite_failover(&mut self) {
+        let timed_out = self.b2bua.invite_attempts_timed_out(self.invite_timeout).await;
+        for (uuid, attempt, has_remaining) in timed_out {
+            if !has_remaining {
+                continue;
+            }
+            warn!(
+                "Failover: call {} attempt {} unanswered after {:?} — trying next trunk",
+                &uuid[..8.min(uuid.len())], attempt, self.invite_timeout
+            );
+            self.failover_to_next_trunk(&uuid).await;
+        }
+    }
+
+    /// CANCEL the current outbound attempt and re-send the stored INVITE,
+    /// retargeted to the next candidate trunk (fresh Via branch, R-URI and
+    /// number normalization for that trunk).
+    pub(crate) async fn failover_to_next_trunk(&mut self, uuid: &crate::b2bua::CallUuid) {
+        let Some(next_id) = self.b2bua.take_next_failover_candidate(uuid).await else {
+            return;
+        };
+        let Some(trunk) = self.trunk_manager.get_trunk(&next_id) else {
+            warn!("Failover: candidate trunk {} no longer exists — trying next", next_id);
+            // Recurse once per missing candidate (bounded by candidate list length)
+            return Box::pin(self.failover_to_next_trunk(uuid)).await;
+        };
+        let Some(new_dest) = trunk.destination() else {
+            warn!("Failover: trunk '{}' has no destination — trying next", trunk.name);
+            return Box::pin(self.failover_to_next_trunk(uuid)).await;
+        };
+
+        // Snapshot the previous attempt (stored INVITE + current callee dest)
+        let (stored_invite, prev_dest, prev_transport, callee_reply_tx) = {
+            let calls = self.b2bua.calls_locked().await;
+            let Some(call) = calls.get(uuid) else { return };
+            (
+                call.original_outbound_invite.clone(),
+                call.callee_dest,
+                call.callee_transport,
+                call.callee_reply_tx.clone(),
+            )
+        };
+        let Some(stored_invite) = stored_invite.filter(|s| !s.is_empty()) else {
+            warn!("Failover: no stored outbound INVITE for call {} — cannot fail over", uuid);
+            return;
+        };
+
+        // 1. CANCEL the previous attempt (harmless if the trunk never got it)
+        if let (Some(cancel), Some(dest)) =
+            (crate::sip_builder::build_cancel(&stored_invite), prev_dest)
+        {
+            info!("Failover: CANCEL previous attempt → {}", dest);
+            let _ = self.transport
+                .reply(cancel.as_bytes(), dest, prev_transport, callee_reply_tx.as_ref())
+                .await;
+        }
+
+        // 2. Retarget the INVITE to the new trunk
+        let Some(new_invite) = retarget_invite_for_trunk(&stored_invite, &trunk) else {
+            warn!("Failover: could not retarget INVITE for trunk '{}'", trunk.name);
+            return;
+        };
+        let new_transport = trunk.transport.to_rsip_transport();
+
+        info!(
+            "Failover: re-sending INVITE via trunk '{}' ({}:{})",
+            trunk.name, trunk.host, trunk.port
+        );
+        if let Err(e) = self.transport
+            .reply(new_invite.as_bytes(), new_dest, new_transport, None)
+            .await
+        {
+            warn!("Failover: send to trunk '{}' failed: {}", trunk.name, e);
+            return Box::pin(self.failover_to_next_trunk(uuid)).await;
+        }
+
+        // 3. Update call state for the new attempt
+        self.b2bua.store_outbound_invite(uuid, new_invite, trunk.id).await;
+        {
+            let mut calls = self.b2bua.calls_locked().await;
+            if let Some(call) = calls.get_mut(uuid) {
+                call.trunk_name = Some(trunk.name.clone());
+                call.callee_dest = Some(new_dest);
+                call.callee_transport = new_transport;
+                call.callee_reply_tx = None;
+                if let Some(out) = call.outbound.as_mut() {
+                    out.remote_addr = new_dest;
+                }
+            }
+        }
+    }
+
     /// Handle 407 Proxy Authentication Required from a trunk.
     /// Extracts the challenge, computes credentials, and resends the INVITE.
     /// Returns Ok(true) if INVITE was resent, Ok(false) if retry exhausted/impossible.
@@ -715,4 +818,127 @@ pub(crate) fn extract_contact_uri(value: &str) -> String {
     // URI params. Without brackets, URI params are indistinguishable from
     // header params — keep everything up to the first comma.
     value.split(',').next().unwrap_or(value).trim().to_string()
+}
+
+/// Retarget a stored outbound INVITE to another trunk: rewrite the
+/// Request-URI (host:port + trunk-specific number normalization) and
+/// refresh the top Via branch. Returns None when the message is not an
+/// INVITE or has no parseable request line.
+pub(crate) fn retarget_invite_for_trunk(
+    raw_invite: &str,
+    trunk: &crate::routing::TrunkConfig,
+) -> Option<String> {
+    let mut lines: Vec<String> = raw_invite.split("\r\n").map(str::to_string).collect();
+    let first = lines.first()?.clone();
+    let mut parts = first.splitn(3, ' ');
+    if parts.next() != Some("INVITE") {
+        return None;
+    }
+    let uri = parts.next()?;
+    let version = parts.next().unwrap_or("SIP/2.0");
+
+    // Extract the user part from "sip:user@host..." and renormalize
+    let user = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))?
+        .split('@')
+        .next()?
+        .split(';')
+        .next()?
+        .to_string();
+    let normalized = trunk.normalize_number(&user);
+    lines[0] = format!("INVITE sip:{}@{}:{} {}", normalized, trunk.host, trunk.port, version);
+
+    // Fresh branch on the top Via
+    let fresh = crate::sip_builder::new_branch();
+    for line in lines.iter_mut().skip(1) {
+        let lower = line.to_lowercase();
+        if lower.starts_with("via:") || lower.starts_with("v:") {
+            if let Some(pos) = line.find("branch=") {
+                let after = &line[pos + "branch=".len()..];
+                let end = after.find(|c: char| c == ';' || c == ',').map(|i| pos + "branch=".len() + i)
+                    .unwrap_or(line.len());
+                line.replace_range(pos + "branch=".len()..end, &fresh);
+            }
+            break;
+        }
+        if line.is_empty() {
+            break;
+        }
+    }
+
+    Some(lines.join("\r\n"))
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+
+    fn trunk(host: &str, port: u16) -> crate::routing::TrunkConfig {
+        crate::routing::TrunkConfig {
+            id: uuid::Uuid::new_v4(),
+            name: "backup".to_string(),
+            enabled: true,
+            transport: crate::routing::TransportType::Udp,
+            host: host.to_string(),
+            port,
+            resolved_addr: None,
+            auth_required: false,
+            username: None,
+            password: None,
+            realm: None,
+            allowed_codecs: vec![],
+            transcoding_enabled: false,
+            max_concurrent_calls: 10,
+            calls_per_second: 10,
+            allowed_ips: vec![],
+            register_with_trunk: false,
+            registration_interval: std::time::Duration::from_secs(300),
+            cost_per_minute: 0,
+            priority: 100,
+            weight: 100,
+            prefix_patterns: vec![],
+            number_format: crate::routing::trunk::NumberFormat::E164,
+            country_code: Some("33".to_string()),
+            national_prefix: Some("0".to_string()),
+            caller_number_format: None,
+            caller_number_override: None,
+            caller_display_name: None,
+        }
+    }
+
+    const INVITE: &str = "INVITE sip:0612345678@10.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bKoldbranch;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:alice@a.example.com>;tag=al-1\r\n\
+To: <sip:0612345678@pstn>\r\n\
+Call-ID: xyz@host\r\n\
+CSeq: 3 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+    #[test]
+    fn retarget_rewrites_uri_and_branch() {
+        let t = trunk("203.0.113.9", 5080);
+        let out = retarget_invite_for_trunk(INVITE, &t).expect("retarget");
+        assert!(out.starts_with("INVITE sip:+33612345678@203.0.113.9:5080 SIP/2.0\r\n"), "{}", out);
+        assert!(!out.contains("z9hG4bKoldbranch"), "branch must be fresh");
+        assert!(out.contains("branch=z9hG4bK"));
+        assert!(out.contains("Call-ID: xyz@host\r\n"), "dialog identity preserved");
+        rsip::SipMessage::try_from(out.as_bytes().to_vec()).expect("retargeted INVITE parses");
+    }
+
+    #[test]
+    fn retarget_rejects_non_invite() {
+        let t = trunk("203.0.113.9", 5060);
+        assert!(retarget_invite_for_trunk("BYE sip:x SIP/2.0\r\n\r\n", &t).is_none());
+    }
+
+    #[test]
+    fn extract_contact_uri_variants() {
+        assert_eq!(
+            extract_contact_uri("\"Bob\" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60"),
+            "sip:b@1.2.3.4:5060;transport=tcp"
+        );
+        assert_eq!(extract_contact_uri("sip:b@1.2.3.4"), "sip:b@1.2.3.4");
+    }
 }

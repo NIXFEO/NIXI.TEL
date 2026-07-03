@@ -110,6 +110,19 @@ impl CallLeg {
     }
 }
 
+/// Active-failover state for the outbound INVITE (multi-trunk).
+#[derive(Debug, Clone)]
+pub struct FailoverState {
+    /// Remaining candidate trunk ids, in LCR order (first = next to try).
+    pub candidates: Vec<crate::routing::TrunkId>,
+    /// Attempt number (1 = first trunk).
+    pub attempt: u32,
+    /// When the current INVITE attempt was sent.
+    pub invite_sent_at: std::time::Instant,
+    /// A dialog-progressing provisional (>=180) arrived — no more failover.
+    pub provisional_received: bool,
+}
+
 /// A B2BUA call — two legs + shared media session
 #[derive(Debug)]
 pub struct B2buaCall {
@@ -211,6 +224,9 @@ pub struct B2buaCall {
 
     /// Pre-generated WebRTC SDP offer (sent to callee in INVITE)
     pub webrtc_sdp_offer: Option<String>,
+
+    /// Multi-trunk failover state (None for registrar-routed calls)
+    pub failover: Option<FailoverState>,
 }
 
 impl B2buaCall {
@@ -262,6 +278,7 @@ impl B2buaCall {
             webrtc_session_b: None,
             webrtc_ice_pwd_b: None,
             webrtc_sdp_offer: None,
+            failover: None,
         }
     }
 
@@ -535,6 +552,72 @@ impl B2buaManager {
                 out.remote_target = callee_contact;
             }
         }
+    }
+
+    /// Arm multi-trunk failover: remaining candidates in LCR order.
+    pub async fn set_failover_candidates(
+        &self,
+        uuid: &CallUuid,
+        candidates: Vec<crate::routing::TrunkId>,
+    ) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.failover = Some(FailoverState {
+                candidates,
+                attempt: 1,
+                invite_sent_at: std::time::Instant::now(),
+                provisional_received: false,
+            });
+        }
+    }
+
+    /// A >=180 provisional arrived: the current trunk is progressing the
+    /// dialog — disable failover for this call.
+    pub async fn mark_provisional_received(&self, uuid: &CallUuid) {
+        let mut calls = self.calls.lock().await;
+        if let Some(fo) = calls.get_mut(uuid).and_then(|c| c.failover.as_mut()) {
+            fo.provisional_received = true;
+        }
+    }
+
+    /// Pop the next failover candidate and reset the attempt clock.
+    /// None when failover is unarmed, already progressing, or exhausted.
+    pub async fn take_next_failover_candidate(
+        &self,
+        uuid: &CallUuid,
+    ) -> Option<crate::routing::TrunkId> {
+        let mut calls = self.calls.lock().await;
+        let call = calls.get_mut(uuid)?;
+        let fo = call.failover.as_mut()?;
+        if fo.provisional_received || fo.candidates.is_empty() {
+            return None;
+        }
+        let next = fo.candidates.remove(0);
+        fo.attempt += 1;
+        fo.invite_sent_at = std::time::Instant::now();
+        Some(next)
+    }
+
+    /// Calls still waiting on their outbound INVITE past `timeout`:
+    /// (uuid, attempt, has_remaining_candidates).
+    pub async fn invite_attempts_timed_out(
+        &self,
+        timeout: Duration,
+    ) -> Vec<(CallUuid, u32, bool)> {
+        let calls = self.calls.lock().await;
+        calls
+            .values()
+            .filter(|c| {
+                matches!(c.state, CallState::Initiated | CallState::Proceeding)
+                    && c.failover.as_ref().map_or(false, |f| {
+                        !f.provisional_received && f.invite_sent_at.elapsed() > timeout
+                    })
+            })
+            .map(|c| {
+                let f = c.failover.as_ref().unwrap();
+                (c.uuid.clone(), f.attempt, !f.candidates.is_empty())
+            })
+            .collect()
     }
 
     /// Get the media session ID for a call (for SDP rewriting / RTP proxy)

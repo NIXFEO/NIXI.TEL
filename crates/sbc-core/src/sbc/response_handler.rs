@@ -49,6 +49,11 @@ impl Sbc {
             match status {
                 100..=199 => {
                     // Provisional (180 Ringing, 183 Session Progress, etc.) — relay to caller
+                    // >=180 means this trunk is progressing the dialog: failover off.
+                    // (100 Trying only proves the hop is alive — timer keeps running.)
+                    if status >= 180 {
+                        self.b2bua.mark_provisional_received(&uuid).await;
+                    }
                     let _ = self.b2bua.handle_ringing(&uuid).await;
                     info!("B2BUA: relaying {} to caller", status);
                     if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
@@ -489,6 +494,27 @@ impl Sbc {
                     }
                 }
                 _ => {
+                    // ── Trunk-level failures → active failover ──────────────
+                    // 408/5xx/6xx from the trunk mean THIS trunk failed, not the
+                    // call: try the next candidate before surfacing an error.
+                    // Call-level rejections (486 Busy, 487, 404, 403…) are relayed.
+                    let is_trunk_failure = status == 408 || (500..=699).contains(&status);
+                    if is_trunk_failure {
+                        if let Some(next) = self.b2bua.take_next_failover_candidate(&uuid).await {
+                            // Push the candidate back and let the shared path handle it
+                            warn!("B2BUA: trunk answered {} — failing over (call {})", status, uuid);
+                            {
+                                let mut calls = self.b2bua.calls_locked().await;
+                                if let Some(fo) = calls.get_mut(&uuid).and_then(|c| c.failover.as_mut()) {
+                                    fo.candidates.insert(0, next);
+                                    fo.attempt = fo.attempt.saturating_sub(1);
+                                }
+                            }
+                            self.failover_to_next_trunk(&uuid).await;
+                            return Ok(());
+                        }
+                    }
+
                     // Error response (4xx/5xx/6xx) — relay to caller, terminate call
                     info!("B2BUA: relaying error {} to caller, terminating call", status);
                     if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {

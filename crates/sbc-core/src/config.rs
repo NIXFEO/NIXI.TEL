@@ -235,11 +235,17 @@ pub struct SecurityConfig {
     /// RTP inactivity timeout in seconds (default 90)
     #[serde(default = "default_rtp_timeout")]
     pub rtp_timeout: u64,
+
+    /// Outbound INVITE answer timeout in seconds before trunk failover
+    /// (no provisional >= 180 within this window → CANCEL + next trunk).
+    #[serde(default = "default_invite_timeout")]
+    pub invite_timeout: u64,
 }
 
 fn default_max_call_duration() -> u64 { 14400 }
 fn default_call_setup_timeout() -> u64 { 60 }
 fn default_rtp_timeout() -> u64 { 90 }
+fn default_invite_timeout() -> u64 { 5 }
 
 fn default_sip_realm() -> String {
     "sbc.local".to_string()
@@ -346,6 +352,7 @@ impl Default for SbcConfig {
                 max_call_duration: 14400,
                 call_setup_timeout: 60,
                 rtp_timeout: 90,
+                invite_timeout: 5,
             },
             management: ManagementConfig {
                 api_enabled: true,
