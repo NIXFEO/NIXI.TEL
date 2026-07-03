@@ -6,11 +6,16 @@ SBC (Session Border Controller) written in Rust (~31K lines), production-ready.
 Open-source: https://github.com/NIXFEO/NIXI.TEL
 Designed for PSTN trunking with full B2BUA call control.
 
-**Current version**: Phase 19 (2026-04-12)
+**Current version**: Phase 20 — "Super SBC" cycle (2026-07-03): SQLite-backed
+full API (axum + SSE), SIP builder + true-B2BUA BYEs, multi-trunk failover,
+RFC 4028 session timers, DTMF PT re-mapping, WS lifecycle, anti-fraud
+(fail2ban/IRSF/user limits), real outbound TLS.
 **License**: MIT (NIXFEO)
 
 ## Server
 
+- **DNS**: `nixi.tel` (onepage), `sip.nixi.tel` (SIP), `rtp.nixi.tel` (RTP),
+  `webrtc.nixi.tel` (WebRTC/WSS), `monitor.nixi.tel` (monitoring/API) — tous → 51.158.117.229
 - **SSH**: `root@sip.nixi.tel`
 - **Config**: `/opt/sbc/config/production.toml`
 - **Binary**: `/usr/local/bin/sbc` (backup: `/usr/local/bin/sbc.bak`)
@@ -56,15 +61,33 @@ ssh root@sip.nixi.tel 'systemctl stop sbc && cp /usr/local/bin/sbc.bak /usr/loca
 ```
 
 ### Local build (macOS)
-Requires cmake for Opus. rsip fork at `../rsip-nixi`.
+Requires cmake for Opus (pip-installed cmake works). rsip fork is vendored
+at `rsip-nixi/` (workspace-excluded).
 ```bash
-export PATH="/path/to/cmake/bin:$PATH"
-cargo test
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"   # pip cmake
+export CMAKE_POLICY_VERSION_MINIMUM=3.5            # libopus needs <3.5 compat
+cargo test --workspace
 ```
 
 ## Architecture
 
-### Key files (refactored Phase 18)
+### Key files (Phase 18 refactor + Phase 20 additions)
+
+Phase 20 additions:
+
+| File | Role |
+|------|------|
+| `crates/sbc-storage/` | SQLite ConfigStore — source of truth for users/DIDs/trunks/routes/ACL/bans |
+| `sbc-core/src/sbc/hydrate.rs` | Store → runtime managers (applied immediately on API writes) |
+| `sbc-core/src/sbc/import.rs` | Idempotent first-boot TOML → store seed |
+| `sbc-core/src/sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
+| `sbc-core/src/events.rs` | EventBus → SSE `/api/v1/events` |
+| `sbc-core/src/security/` | fail2ban bans, anti-IRSF destination rules, per-user limits |
+| `sbc-core/src/transport/tls_connect.rs` | REAL outbound TLS (tokio-rustls, optional mTLS) — no more plaintext fallback |
+| `sbc-core/src/transport/ws.rs` + `webrtc_handler.rs` | SIP over WSS (RFC 7118) + WebRTC session glue (pre-existing, now documented) |
+| `sbc-management/src/{server,state,routes/}` | axum API server (replaces hand-rolled http_server) |
+| `examples/webrtc-client/` | SIP.js demo softphone |
+
 
 | File | Lines | Role |
 |------|-------|------|
@@ -97,34 +120,25 @@ cargo test
 
 ### Inactive modules (code present, not used in production)
 
-- `media/data_channel.rs` — WebRTC DataChannel (placeholder)
-- `media/turn.rs` — TURN relay (placeholder)
-- `tls_client.rs` — TLS outbound for trunks
+- `media/data_channel.rs` — WebRTC DataChannel (feature-gated `data-channel`)
+- `media/turn.rs` — TURN relay (feature-gated `turn`; use external coturn)
+- `tls_client.rs` — legacy simulated TLS (superseded by `transport/tls_connect.rs`)
+- `http_server.rs` + `api.rs` — legacy HTTP server (superseded by axum in sbc-management)
 - `dialog/` — Dialog state machine (bypassed, B2BUA manages directly)
 - `transaction/` — Transaction state machine (bypassed, stateless processing)
 
-## REST API endpoints
+## REST API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check (200 if healthy, 503 if not) |
-| GET | `/ready` | Readiness probe |
-| GET | `/metrics` | Prometheus metrics (text/plain) |
-| GET | `/api/v1/calls` | Active calls list (JSON) |
-| GET | `/api/v1/registrations` | Registered SIP users (AOR, contact, expires, transport) |
-| GET | `/api/v1/stats` | Global stats (active_calls, uptime, requests) |
-| GET | `/api/v1/trunks` | Trunk list (with health status, active/total/failed calls) |
-| POST | `/api/v1/trunks` | Create trunk |
-| POST | `/api/v1/reload` | Hot-reload config (DIDs, users, trunks) without restart |
-| GET | `/api/v1/cdrs` | Recent CDR list (last 100, enriched with caller/callee/trunk/codec) |
-| GET | `/api/v1/alerts` | Active alerts (trunk down, high auth failure rate, high call failure rate) |
-| GET | `/api/calls` | Legacy alias for /api/v1/calls |
-| GET | `/api/registrations` | Legacy alias for /api/v1/registrations |
-| GET | `/api/status` | Legacy alias for /api/v1/stats |
+Full reference: `docs/API.md`. Everything is SQLite-backed and applied to
+the runtime immediately (no reload). Highlights: CRUD users/dids/trunks/
+routes/acl, `/api/v1/security/*` (bans, destination rules, user limits),
+`GET /api/v1/events` (SSE), `GET /api/v1/export` (backup dump),
+`DELETE /api/v1/calls/{uuid}`. `/health` and `/ready` are public; all else
+needs the bearer token (constant-time check).
 
 ## Tests
 
-**404 tests passing** (1 pre-existing failure in transcoding::test_downsample_48k_to_8k — rubato resampling edge case).
+**~470 tests passing** (workspace). The old transcoding downsample failure was fixed in Phase 18.
 
 Test coverage by module:
 - `b2bua.rs` — 14 tests (suffix match, IP disambiguation, port fallback, stray BYE)
@@ -154,14 +168,18 @@ Some endpoints (e.g. Jambonz-based) drop media silently without sending BYE. The
 
 ## Known issues
 
-### 481 on inbound PSTN BYE (benign)
-When the trunk sends BYE for an inbound call and the callee has already hung up (dialog removed), the callee responds 481. Benign — call is already terminated on both sides. Full fix requires building a synthetic BYE on the SBC side (true B2BUA behavior).
+### 481 on inbound PSTN BYE — FIXED (Phase 20)
+BYEs are now re-originated per leg with the captured dialog identity
+(sip_builder + CallLeg from_raw/to_raw); late Genesys BYEs are recognized
+via a 10-min terminated-dialog ring buffer.
 
 ### Double 100 Trying (cosmetic)
 The SBC sends 2x 100 Trying per INVITE: one stateless (no Record-Route) and one after processing (with Record-Route). Benign, could be optimized.
 
-### SIP construction via format!()
-Synthetic BYEs (graceful shutdown, timeout) are built by string formatting. Fragile — deserves a minimal SIP builder.
+### SIP construction via format!() — FIXED (Phase 20)
+`sip_builder.rs` builds synthetic BYE/CANCEL/ACK/re-INVITE from real dialog
+identity; the legacy format!() path remains only as fallback when a dialog
+was never established.
 
 ### Lock contention B2BUA
 `B2buaManager.calls` uses `Mutex<HashMap>`. Fine for current volume (~5 concurrent calls) but potential bottleneck at 100+. Consider migrating to DashMap.

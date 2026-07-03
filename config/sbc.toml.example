@@ -1,15 +1,21 @@
-# SBC W3tel - Configuration Example
+# NIXI SBC — example configuration
+#
+# Static config lives here. DYNAMIC config (SIP users, DIDs, trunks, routes,
+# ACL rules) lives in the SQLite store (database.sqlite_path) and is managed
+# through the REST API. Entries below ([security.sip_users], [[trunks]],
+# [[dids]]) are IMPORT-ONCE SEEDS: they populate the store on first boot and
+# are ignored afterwards — the store is the source of truth.
 
 [general]
-name = "SBC-W3tel"
-instance_id = "sbc-prod-01"
+name = "NIXI-SBC"
+instance_id = "sbc-01"
+# JSON-lines CDR file (optional; rotate with logrotate)
+cdr_file = "/var/log/sbc/cdr.jsonl"
 
 [network]
-# Public IP address for topology hiding
+# Public IP for topology hiding / SDP rewriting
 public_ipv4 = "203.0.113.10"
-# public_ipv6 = "2001:db8::1"
 
-# SIP Listeners
 [[network.listeners]]
 transport = "UDP"
 bind_address = "0.0.0.0"
@@ -20,58 +26,128 @@ transport = "TCP"
 bind_address = "0.0.0.0"
 bind_port = 5060
 
-[[network.listeners]]
-transport = "TLS"
-bind_address = "0.0.0.0"
-bind_port = 5061
-cert_file = "/etc/sbc/certs/server.crt"
-key_file = "/etc/sbc/certs/server.key"
+# TLS + WSS need a certificate the clients trust (e.g. Let's Encrypt)
+#[[network.listeners]]
+#transport = "TLS"
+#bind_address = "0.0.0.0"
+#bind_port = 5061
+#cert_file = "/etc/letsencrypt/live/sip.example.com/fullchain.pem"
+#key_file  = "/etc/letsencrypt/live/sip.example.com/privkey.pem"
 
-[[network.listeners]]
-transport = "WSS"
-bind_address = "0.0.0.0"
-bind_port = 8089
-cert_file = "/etc/sbc/certs/server.crt"
-key_file = "/etc/sbc/certs/server.key"
+# SIP over WebSocket for browsers (WebRTC) — see docs/WEBRTC.md
+#[[network.listeners]]
+#transport = "WSS"
+#bind_address = "0.0.0.0"
+#bind_port = 8443
+#cert_file = "/etc/letsencrypt/live/sip.example.com/fullchain.pem"
+#key_file  = "/etc/letsencrypt/live/sip.example.com/privkey.pem"
 
 [media]
-# RTP port range for media relay
 rtp_port_range = [10000, 20000]
 rtcp_enabled = true
-
-# Number of threads for transcoding
 transcoding_threads = 4
-
-# Supported codecs (priority order)
-codecs = ["PCMU", "PCMA", "Opus", "G729"]
+codecs = ["PCMU", "PCMA", "Opus"]
+public_ip = "203.0.113.10"
 
 [media.webrtc]
 enabled = true
 stun_servers = ["stun:stun.l.google.com:19302"]
+# TURN is intentionally external (coturn) — this key is reserved:
 turn_enabled = false
 
 [database]
-postgres_url = "postgresql://sbc:password@localhost/sbc"
-postgres_max_connections = 20
-redis_url = "redis://localhost:6379"
+# Embedded SQLite: source of truth for API-managed config. No external
+# database is required to run the SBC.
+sqlite_path = "/var/lib/sbc/sbc.db"
 
 [security]
-# Global rate limit (requests per second)
 rate_limit_global = 1000
-
-# Per-IP rate limit (requests per second)
 rate_limit_per_ip = 50
-
-# Authentication challenge timeout (seconds)
 auth_challenge_timeout = 30
+sip_realm = "sip.example.com"
+enable_digest_auth = true
+
+# Call guards
+max_call_duration = 14400      # hard cap, seconds
+call_setup_timeout = 60
+rtp_timeout = 90               # RTP inactivity teardown
+invite_timeout = 5             # no >=180 within 5s → trunk failover
+
+# RFC 4028 session timers (refresh re-INVITEs on the trunk leg so >4h
+# calls survive). Off by default; enable after validating with your trunk.
+session_timer_enabled = false
+session_expires = 1800
+min_se = 90
+
+# First-boot seeds — manage users via POST /api/v1/users afterwards
+[security.sip_users]
+#alice = "change-me"
+
+# ── Anti-fraud ───────────────────────────────────────────────────────────
+[security.ban]                  # fail2ban-style SIP banning
+enabled = true
+max_failures = 5                # strikes within window_secs → ban
+window_secs = 60
+ban_duration_secs = 3600
+repeat_offender_multiplier = 4  # 2nd ban 4h, 3rd 16h… capped below
+max_ban_secs = 86400
+silent_drop = true              # drop packets (false = answer 403)
+whitelist = ["127.0.0.1"]
+
+[security.destinations]        # anti-IRSF destination blocking
+enabled = true
+default_action = "allow"        # "deny" = allowlist mode
+default_country_code = "33"
+seed_irsf_rules = true          # auto-deny +881/+882/+883/+979
+# [[security.destinations.rules]]
+# prefix = "+889"
+# action = "deny"
+# description = "premium range"
+# user = "alice"               # omit for a global rule
+
+[security.user_limits]
+enabled = true
+default_max_concurrent_calls = 4   # 0 = unlimited
+default_max_calls_per_minute = 10
+# [[security.user_limits.overrides]]
+# user = "pbx-gateway"
+# max_concurrent_calls = 30
+# max_calls_per_minute = 120
 
 [management]
 api_enabled = true
-api_bind_address = "127.0.0.1"
+api_bind_address = "127.0.0.1"  # bind publicly only behind TLS + firewall
 api_port = 8080
-# api_auth_token = "your-secret-token-here"
+api_auth_token = "GENERATE-A-LONG-RANDOM-TOKEN"
+# cors_allowed_origins = ["https://admin.example.com"]
 
 [metrics]
 prometheus_enabled = true
-prometheus_bind_address = "0.0.0.0"
+prometheus_bind_address = "127.0.0.1"
 prometheus_port = 9090
+
+[logging]
+level = "info"
+
+# ── First-boot trunk seed (then use POST /api/v1/trunks) ────────────────
+#[[trunks]]
+#name = "pstn-1"
+#host = "sip.provider.example"
+#port = 5060
+#transport = "UDP"              # UDP | TCP | TLS | WS | WSS
+#auth_required = true
+#username = "account"
+#password = "secret"
+#prefix_patterns = ["+33", "0"]
+#priority = 10
+#number_format = "national"
+#country_code = "33"
+#national_prefix = "0"
+# TLS trunks (transport = "TLS") verify the server cert against the system
+# roots; override with tls_ca_cert / tls_sni, or add tls_client_cert +
+# tls_client_key for mutual TLS.
+
+# ── First-boot DID seed (then use POST /api/v1/dids) ────────────────────
+#[[dids]]
+#number = "0123456789"
+#user = "alice"
