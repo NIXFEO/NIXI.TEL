@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NIXI SBC — WebRTC Demo Client</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin-bottom: 1rem; }
+  label { display: block; margin: .5rem 0 .15rem; font-size: .85rem; opacity: .8; }
+  input, textarea { width: 100%; box-sizing: border-box; padding: .45rem; border-radius: 6px; border: 1px solid #8886; font: inherit; }
+  button { padding: .5rem 1rem; border-radius: 6px; border: 1px solid #8886; cursor: pointer; font: inherit; margin: .25rem .25rem 0 0; }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { padding: .5rem; border-radius: 6px; background: #8881; font-family: monospace; font-size: .85rem; min-height: 1.2em; }
+  #keypad { display: grid; grid-template-columns: repeat(3, 1fr); gap: .3rem; max-width: 220px; }
+  #keypad button { margin: 0; font-size: 1.1rem; }
+  #log { font-family: monospace; font-size: .75rem; white-space: pre-wrap; max-height: 220px; overflow-y: auto; background: #8881; padding: .5rem; border-radius: 6px; }
+</style>
+</head>
+<body>
+<h1>NIXI SBC — WebRTC Demo Client (SIP.js)</h1>
+<p id="status">disconnected</p>
+
+<fieldset>
+  <legend>Account</legend>
+  <label for="wss">WSS server</label>
+  <input id="wss" value="wss://sip.example.com:8443" autocomplete="off">
+  <label for="uri">SIP URI</label>
+  <input id="uri" value="sip:alice@sip.example.com" autocomplete="off">
+  <label for="password">Password</label>
+  <input id="password" type="password" autocomplete="off">
+  <label for="ice">ICE servers (JSON — add your coturn here if needed)</label>
+  <textarea id="ice" rows="3">[{"urls":"stun:stun.l.google.com:19302"}]</textarea>
+  <button id="register">Register</button>
+  <button id="unregister" disabled>Unregister</button>
+</fieldset>
+
+<fieldset>
+  <legend>Call</legend>
+  <label for="target">Destination (number or SIP URI)</label>
+  <input id="target" value="0612345678" autocomplete="off">
+  <button id="call" disabled>Call</button>
+  <button id="hangup" disabled>Hang up</button>
+  <div id="keypad" hidden></div>
+</fieldset>
+
+<audio id="remoteAudio" autoplay></audio>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/sip.js@0.21.2/dist/sip.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
