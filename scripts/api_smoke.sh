@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Post-deploy smoke test for the SBC management API.
-# Usage: api_smoke.sh [BASE_URL] — token read from $SBC_API_TOKEN or production.toml.
+# Usage: api_smoke.sh [BASE_URL]
+#   Token: $SBC_API_TOKEN, else grepped from $SBC_CONFIG (a TOML config path).
 set -u
 
 BASE="${1:-http://127.0.0.1:8080}"
-TOKEN="${SBC_API_TOKEN:-$(grep api_auth_token /opt/sbc/config/production.toml 2>/dev/null | cut -d'"' -f2)}"
+TOKEN="${SBC_API_TOKEN:-}"
+if [ -z "$TOKEN" ] && [ -n "${SBC_CONFIG:-}" ] && [ -f "$SBC_CONFIG" ]; then
+    TOKEN=$(grep api_auth_token "$SBC_CONFIG" | cut -d'"' -f2)
+fi
+if [ -z "$TOKEN" ]; then
+    echo "Set SBC_API_TOKEN (or SBC_CONFIG pointing at your config file)." >&2
+    exit 2
+fi
 AUTH=(-H "Authorization: Bearer ${TOKEN}")
 FAIL=0
 
