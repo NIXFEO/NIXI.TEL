@@ -4,12 +4,10 @@
 //! All message handling is delegated to sbc_core::Sbc.
 
 use anyhow::Result;
-use sbc_core::api::ManagementHandler;
 use sbc_core::config::SbcConfig;
 use sbc_core::Sbc;
-use sbc_management::api::ManagementRouter;
+use sbc_management::state::AppState;
 use std::path::PathBuf;
-use std::sync::Arc;
 use structopt::StructOpt;
 use tracing::{info, warn};
 
@@ -41,31 +39,46 @@ async fn main() -> Result<()> {
     let config = SbcConfig::from_file(&config_path)?;
     info!("Configuration loaded: {}", config.general.name);
 
-    // Build integrated SBC from config (wires all modules). The HTTP server
-    // starts after the management handler is wired below.
+    // Build integrated SBC from config (wires all modules). The management
+    // API (axum) is assembled from the SBC's handles and spawned below.
     let mut sbc = Sbc::new_from_config_without_http(&config).await?;
 
-    // Management handler: users/DIDs CRUD backed by the SQLite config store,
-    // applied to the live runtime immediately on each write.
-    let management: Option<Arc<dyn ManagementHandler>> = match sbc.config_store() {
-        Some(store) => {
-            info!(
-                "Management API: SQLite-backed users/DID endpoints active (realm={})",
-                config.security.sip_realm
-            );
-            Some(Arc::new(ManagementRouter::new(
-                store,
-                config.security.sip_realm.clone(),
-                sbc.runtime_handles(),
-            )))
+    if config.management.api_enabled {
+        let state = AppState {
+            metrics: sbc.metrics().clone(),
+            b2bua: sbc.b2bua().clone(),
+            trunks: sbc.trunk_manager.clone(),
+            registrar: sbc.register_handler().registrar(),
+            cdr: sbc.cdr().clone(),
+            acl: sbc.acl().clone(),
+            auth: sbc.auth(),
+            dids: sbc.did_mappings(),
+            trunk_ips: sbc.trunk_ips(),
+            store: sbc.config_store(),
+            events: sbc.events(),
+            reload: sbc.reload_notify(),
+            realm: config.security.sip_realm.clone(),
+            api_token: config.management.api_auth_token.clone(),
+        };
+        if state.store.is_none() {
+            warn!("Management API: config store unavailable — mutating endpoints return 503");
         }
-        None => {
-            warn!("Management API: config store unavailable — users/DIDs endpoints disabled");
-            None
+        if state.api_token.is_none() {
+            warn!("Management API: no api_auth_token configured — API is UNAUTHENTICATED");
         }
-    };
-
-    sbc.start_http_server(&config, management).await;
+        let addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            config.management.api_bind_address, config.management.api_port
+        )
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
+        let cors = config.management.cors_allowed_origins.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sbc_management::server::serve(addr, state, cors).await {
+                warn!("Management API server failed: {}", e);
+            }
+        });
+    }
 
     // Store config path for SIGHUP hot-reload
     sbc.set_config_path(config_path);

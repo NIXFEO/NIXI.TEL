@@ -27,6 +27,7 @@ pub mod b2bua;
 pub mod auth;
 pub mod metrics;
 pub mod api;
+pub mod events;
 pub mod http_server;
 pub mod storage;
 pub mod dos;

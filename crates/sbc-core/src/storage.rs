@@ -510,6 +510,16 @@ impl CdrManager {
         self.storage.list_recent_cdrs(limit).await
     }
 
+    /// Paginated recent CDRs (most recent first): skip `offset`, take `limit`.
+    /// The fetch window is capped at offset+limit, so the returned count only
+    /// signals whether more pages may exist.
+    pub async fn get_page(&self, limit: usize, offset: usize) -> Result<(Vec<CdrRecord>, usize)> {
+        let window = self.storage.list_recent_cdrs(offset.saturating_add(limit)).await?;
+        let total = window.len();
+        let page = window.into_iter().skip(offset).collect();
+        Ok((page, total))
+    }
+
     pub async fn stats(&self) -> StorageStats {
         self.storage.stats().await
     }

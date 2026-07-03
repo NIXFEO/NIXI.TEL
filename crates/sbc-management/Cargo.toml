@@ -9,6 +9,13 @@ sbc-core = { path = "../sbc-core" }
 tokio = { workspace = true }
 sbc-storage = { path = "../sbc-storage" }
 
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio-stream = { workspace = true }
+subtle = { workspace = true }
+uuid = { workspace = true }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -20,3 +27,7 @@ async-trait = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }

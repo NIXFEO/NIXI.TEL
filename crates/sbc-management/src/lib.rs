@@ -6,7 +6,10 @@
 //! - Event logging and monitoring
 
 pub mod api;
-pub mod metrics;
 pub mod error;
+pub mod metrics;
+pub mod routes;
+pub mod server;
+pub mod state;
 
 pub use error::{Error, Result};

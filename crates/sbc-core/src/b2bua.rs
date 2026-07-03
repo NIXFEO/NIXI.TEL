@@ -286,6 +286,9 @@ pub struct B2buaManager {
 
     /// Media manager for RTP proxy
     media: Arc<MediaManager>,
+
+    /// Event bus for call lifecycle events (None until wired at boot)
+    events: std::sync::RwLock<Option<crate::events::EventBus>>,
 }
 
 impl B2buaManager {
@@ -293,6 +296,20 @@ impl B2buaManager {
         Self {
             calls: Arc::new(Mutex::new(HashMap::new())),
             media,
+            events: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Wire the event bus (called once at boot).
+    pub fn set_event_bus(&self, bus: crate::events::EventBus) {
+        *self.events.write().unwrap() = Some(bus);
+    }
+
+    fn emit(&self, event: crate::events::SbcEvent) {
+        if let Ok(guard) = self.events.read() {
+            if let Some(bus) = guard.as_ref() {
+                bus.publish(event);
+            }
         }
     }
 
@@ -342,6 +359,14 @@ impl B2buaManager {
         );
 
         self.calls.lock().await.insert(uuid.clone(), call);
+
+        self.emit(crate::events::SbcEvent::CallStarted {
+            uuid: uuid.clone(),
+            call_id: inbound_call_id,
+            caller: caller_addr.to_string(),
+            callee: None,
+            ts: crate::events::event_ts(),
+        });
         Ok(uuid)
     }
 
@@ -440,6 +465,11 @@ impl B2buaManager {
         }
 
         info!("B2BUA: call {} state → {}", uuid, call.state.as_str());
+        drop(calls);
+        self.emit(crate::events::SbcEvent::CallAnswered {
+            uuid: uuid.clone(),
+            ts: crate::events::event_ts(),
+        });
         Ok(())
     }
 
@@ -483,11 +513,24 @@ impl B2buaManager {
     /// Mark call as fully terminated
     pub async fn terminate_call(&self, uuid: &CallUuid) {
         let mut calls = self.calls.lock().await;
-        if let Some(call) = calls.get_mut(uuid) {
+        let duration = if let Some(call) = calls.get_mut(uuid) {
             call.state = CallState::Terminated;
             info!("B2BUA: call {} terminated (duration {}s)", uuid, call.duration_secs());
-        }
+            Some(call.duration_secs())
+        } else {
+            None
+        };
         calls.remove(uuid);
+        drop(calls);
+
+        if let Some(duration_secs) = duration {
+            self.emit(crate::events::SbcEvent::CallEnded {
+                uuid: uuid.clone(),
+                duration_secs,
+                reason: "terminated".to_string(),
+                ts: crate::events::event_ts(),
+            });
+        }
     }
 
     /// Look up a call by inbound Call-ID

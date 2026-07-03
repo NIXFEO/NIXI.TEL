@@ -113,6 +113,9 @@ pub struct Sbc {
     /// SQLite store for dynamic config (users, DIDs, trunks, routes, ACL).
     /// `None` when the store could not be opened (SBC still boots from TOML).
     config_store: Option<Arc<sbc_storage::ConfigStore>>,
+
+    /// Event bus feeding the SSE API endpoint.
+    events: crate::events::EventBus,
 }
 
 impl Sbc {
@@ -325,6 +328,10 @@ impl Sbc {
             Arc::new(CdrManager::new_memory())
         };
 
+        // --- Event bus (feeds the SSE API endpoint) ---
+        let events = crate::events::EventBus::new();
+        b2bua.set_event_bus(events.clone());
+
         // --- Shared dynamic-config holders (hydrated from the store) ---
         let did_mappings = Arc::new(tokio::sync::RwLock::new(config.dids.clone()));
 
@@ -396,6 +403,7 @@ impl Sbc {
             trunk_ips,
             reload_notify,
             config_store,
+            events,
         })
     }
 
@@ -600,6 +608,7 @@ impl Sbc {
             trunk_ips: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
             config_store: None,
+            events: crate::events::EventBus::new(),
         }
     }
 
@@ -828,7 +837,8 @@ impl Sbc {
             let pending = pending.clone();
             let tm = trunk_manager.clone();
             let metrics = metrics.clone();
-            tokio::spawn(Self::trunk_health_check_task(trunk, identity, sock, pending, tm, metrics));
+            let events = self.events.clone();
+            tokio::spawn(Self::trunk_health_check_task(trunk, identity, sock, pending, tm, metrics, events));
         }
     }
 
@@ -840,6 +850,7 @@ impl Sbc {
         pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
         trunk_manager: Arc<TrunkManager>,
         _metrics: Arc<SbcMetrics>,
+        events: crate::events::EventBus,
     ) {
         let trunk_name = trunk.name.clone();
         let trunk_id = trunk.id;
@@ -913,12 +924,26 @@ impl Sbc {
                 if !was_up {
                     info!("Trunk '{}' is UP — responding to OPTIONS", trunk_name);
                     trunk_manager.update_state(&trunk_id, |s| s.record_success());
+                    events.publish(crate::events::SbcEvent::TrunkHealth {
+                        trunk: trunk_name.clone(),
+                        status: "up".to_string(),
+                        consecutive_failures: 0,
+                        ts: crate::events::event_ts(),
+                    });
                 }
             } else if ever_responded {
                 // Trunk previously responded to OPTIONS but stopped — real issue
                 if was_up {
                     warn!("Trunk '{}' is DOWN — no response to OPTIONS (timeout 5s)", trunk_name);
                     trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
+                    let failures = trunk_manager.get_state(&trunk_id)
+                        .map(|s| s.consecutive_failures).unwrap_or(1);
+                    events.publish(crate::events::SbcEvent::TrunkHealth {
+                        trunk: trunk_name.clone(),
+                        status: "down".to_string(),
+                        consecutive_failures: failures,
+                        ts: crate::events::event_ts(),
+                    });
                 } else {
                     trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
                     debug!("Trunk '{}' still DOWN", trunk_name);
@@ -1305,6 +1330,9 @@ impl Sbc {
     pub fn dos(&self) -> &Arc<DosProtector>                { &self.dos }
     pub fn register_handler(&self) -> &Arc<RegisterHandler> { &self.register_handler }
     pub fn cdr(&self) -> &Arc<CdrManager>                  { &self.cdr }
+    pub fn metrics(&self) -> &Arc<SbcMetrics>              { &self.metrics }
+    pub fn events(&self) -> crate::events::EventBus       { self.events.clone() }
+    pub fn trunk_ips(&self) -> Arc<tokio::sync::RwLock<Vec<String>>> { self.trunk_ips.clone() }
 }
 
 impl Default for Sbc {
