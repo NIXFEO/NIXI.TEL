@@ -152,12 +152,12 @@ RTP inactivity timeout tears those down.
 Delivered: multi-trunk failover, RFC 4028 session timers, DTMF PT
 re-mapping, SIP message builder (true-B2BUA BYEs), SQLite-backed full API +
 SSE, WebRTC WS lifecycle, anti-fraud (fail2ban / IRSF / per-user limits),
-real outbound TLS + mTLS.
+real outbound TLS + mTLS, enriched CDRs (negotiated codec + inbound trunk),
+RTP-timeout / last-CDR metrics, `RUST_LOG`-configurable log level.
 
 Ideas welcome (open an issue / PR):
 
 - True B2BUA with a distinct Call-ID per leg
 - Clustering with session replication
-- RTP timeout alerting metric
 - 2833 ↔ SIP INFO DTMF conversion
 - Trickle ICE over SIP (RFC 8840)

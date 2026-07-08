@@ -565,6 +565,63 @@ pub fn telephone_event_pt(sdp: &str) -> Option<(u8, u32)> {
     None
 }
 
+/// Name of a well-known static RTP payload type (RFC 3551), for PTs that
+/// carry no `a=rtpmap:` line. Returns `None` for dynamic (≥96) or unknown PTs.
+fn static_pt_name(pt: u8) -> Option<&'static str> {
+    match pt {
+        0 => Some("PCMU"),
+        3 => Some("GSM"),
+        8 => Some("PCMA"),
+        9 => Some("G722"),
+        18 => Some("G729"),
+        _ => None,
+    }
+}
+
+/// Extract the negotiated audio codec name from an SDP *answer*.
+///
+/// In an answer the first payload type on the `m=audio` line is the chosen
+/// codec. Its name comes from the matching `a=rtpmap:<pt> NAME/rate` line, or
+/// from the static payload-type table when no rtpmap is present (e.g. PCMU/0,
+/// PCMA/8). `telephone-event` and comfort-noise (`CN`) are skipped — they are
+/// never the primary voice codec. Returns e.g. `"PCMU"`, `"PCMA"`, `"opus"`.
+pub fn negotiated_audio_codec(sdp: &str) -> Option<String> {
+    // First audio m= line: "m=audio <port> <proto> <pt> <pt> ..."
+    let m_audio = sdp
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("m=audio "))?;
+    let pts: Vec<u8> = m_audio
+        .split_whitespace()
+        .skip(3)
+        .filter_map(|f| f.parse::<u8>().ok())
+        .collect();
+
+    for pt in pts {
+        // Resolve name via rtpmap if present, else the static table.
+        let name = sdp
+            .lines()
+            .map(str::trim)
+            .find_map(|l| {
+                let val = l.strip_prefix("a=rtpmap:")?;
+                let mut it = val.split_whitespace();
+                let map_pt = it.next()?.parse::<u8>().ok()?;
+                if map_pt != pt {
+                    return None;
+                }
+                Some(it.next()?.split('/').next()?.to_string())
+            })
+            .or_else(|| static_pt_name(pt).map(str::to_string));
+
+        match name.as_deref() {
+            // Skip non-voice payloads; keep scanning the format list.
+            Some("telephone-event") | Some("CN") | None => continue,
+            Some(_) => return name,
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -822,5 +879,40 @@ a=rtpmap:8 PCMA/8000\r\n";
 
         let result = SessionDescription::parse(sdp_str);
         assert!(result.is_ok(), "Linphone-style SDP with attributes before t= should parse: {:?}", result.err());
+    }
+
+    use super::negotiated_audio_codec;
+
+    #[test]
+    fn test_negotiated_codec_static_pcmu() {
+        // PT 0 with rtpmap, telephone-event should be skipped.
+        let sdp = "v=0\r\nm=audio 5004 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        assert_eq!(negotiated_audio_codec(sdp).as_deref(), Some("PCMU"));
+    }
+
+    #[test]
+    fn test_negotiated_codec_static_no_rtpmap() {
+        // PCMA (PT 8) with no rtpmap line — resolved from the static table.
+        let sdp = "v=0\r\nm=audio 5004 RTP/AVP 8\r\n";
+        assert_eq!(negotiated_audio_codec(sdp).as_deref(), Some("PCMA"));
+    }
+
+    #[test]
+    fn test_negotiated_codec_dynamic_opus() {
+        let sdp = "v=0\r\nm=audio 5004 RTP/SAVPF 111 101\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:101 telephone-event/48000\r\n";
+        assert_eq!(negotiated_audio_codec(sdp).as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn test_negotiated_codec_skips_leading_telephone_event() {
+        // telephone-event listed first must be skipped in favour of PCMA.
+        let sdp = "v=0\r\nm=audio 5004 RTP/AVP 101 8\r\na=rtpmap:101 telephone-event/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(negotiated_audio_codec(sdp).as_deref(), Some("PCMA"));
+    }
+
+    #[test]
+    fn test_negotiated_codec_none_without_audio() {
+        let sdp = "v=0\r\nm=video 5004 RTP/AVP 96\r\na=rtpmap:96 VP8/90000\r\n";
+        assert_eq!(negotiated_audio_codec(sdp), None);
     }
 }

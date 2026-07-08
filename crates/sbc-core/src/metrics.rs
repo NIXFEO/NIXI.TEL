@@ -72,6 +72,11 @@ pub struct SbcMetrics {
     /// Total ACL denied requests
     pub acl_denied_total: Arc<AtomicU64>,
 
+    /// Total calls torn down by the RTP inactivity timeout (media stopped
+    /// without a BYE — e.g. Jambonz-style callees). A rising rate signals
+    /// one-way-audio or media-path problems.
+    pub rtp_timeouts_total: Arc<AtomicU64>,
+
     /// SIP responses by status code (200, 401, 403, 486, 503 etc.)
     pub sip_responses_by_code: Arc<std::sync::Mutex<HashMap<u16, u64>>>,
 
@@ -88,6 +93,11 @@ pub struct SbcMetrics {
 
     /// Currently active SIP registrations
     pub active_registrations: Arc<AtomicU64>,
+
+    /// Unix timestamp (seconds) of the most recent CDR successfully written
+    /// (0 = none since start). Lets monitoring alert when CDRs stop flowing —
+    /// the failure mode where the CDR file silently went empty for weeks.
+    pub last_cdr_written_time: Arc<AtomicU64>,
 
     /// Uptime start timestamp (Unix seconds)
     pub start_time: u64,
@@ -116,11 +126,13 @@ impl SbcMetrics {
             sip_parse_errors_total:  Arc::new(AtomicU64::new(0)),
             dos_blocked_total:       Arc::new(AtomicU64::new(0)),
             acl_denied_total:        Arc::new(AtomicU64::new(0)),
+            rtp_timeouts_total:      Arc::new(AtomicU64::new(0)),
             sip_responses_by_code:   Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_calls:            Arc::new(AtomicU64::new(0)),
             active_webrtc_calls:     Arc::new(AtomicU64::new(0)),
             allocated_ports:         Arc::new(AtomicU64::new(0)),
             active_registrations:    Arc::new(AtomicU64::new(0)),
+            last_cdr_written_time:   Arc::new(AtomicU64::new(0)),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
@@ -213,6 +225,20 @@ impl SbcMetrics {
         self.acl_denied_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a call torn down by the RTP inactivity timeout.
+    pub fn inc_rtp_timeout(&self) {
+        self.rtp_timeouts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stamp the time a CDR was just written (Unix seconds, current time).
+    pub fn record_cdr_written(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        self.last_cdr_written_time.store(now, Ordering::Relaxed);
+    }
+
     pub fn set_allocated_ports(&self, n: u64) {
         self.allocated_ports.store(n, Ordering::Relaxed);
     }
@@ -279,6 +305,10 @@ impl SbcMetrics {
         gauge!("sbc_active_registrations",
                "Number of currently active SIP registrations",
                self.active_registrations.load(Ordering::Relaxed));
+
+        gauge!("sbc_last_cdr_written_timestamp_seconds",
+               "Unix time of the last CDR written (0 = none since start)",
+               self.last_cdr_written_time.load(Ordering::Relaxed));
 
         // ── SIP counters ──────────────────────────────────────────────────────
         counter!("sbc_sip_requests",
@@ -368,6 +398,10 @@ impl SbcMetrics {
         counter!("sbc_acl_denied",
                  "Total requests denied by ACL rules",
                  self.acl_denied_total.load(Ordering::Relaxed));
+
+        counter!("sbc_rtp_timeouts",
+                 "Total calls torn down by the RTP inactivity timeout",
+                 self.rtp_timeouts_total.load(Ordering::Relaxed));
 
         // ── Media counters ────────────────────────────────────────────────────
         counter!("sbc_rtp_packets",
@@ -564,6 +598,24 @@ mod tests {
         assert!(output.contains("sbc_active_calls 1"));
         assert!(output.contains("sbc_auth_challenges_total 1"));
         assert!(output.contains("method=\"INVITE\""));
+    }
+
+    #[test]
+    fn test_cdr_and_rtp_timeout_metrics() {
+        let m = SbcMetrics::new();
+        // Fresh metrics: no CDR yet, no timeouts.
+        assert_eq!(m.last_cdr_written_time.load(Ordering::Relaxed), 0);
+
+        m.inc_rtp_timeout();
+        m.inc_rtp_timeout();
+        m.record_cdr_written();
+
+        assert_eq!(m.rtp_timeouts_total.load(Ordering::Relaxed), 2);
+        assert!(m.last_cdr_written_time.load(Ordering::Relaxed) > 0);
+
+        let output = m.render_prometheus();
+        assert!(output.contains("sbc_rtp_timeouts_total 2"));
+        assert!(output.contains("# TYPE sbc_last_cdr_written_timestamp_seconds gauge"));
     }
 
     #[test]

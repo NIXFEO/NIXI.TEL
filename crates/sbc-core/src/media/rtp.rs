@@ -105,6 +105,9 @@ pub struct RtpSession {
     /// Global SRTP decrypted counter (from SbcMetrics)
     global_srtp_decrypt_counter: Option<Arc<AtomicU64>>,
 
+    /// Global RTP inactivity-timeout counter (from SbcMetrics)
+    global_rtp_timeout_counter: Option<Arc<AtomicU64>>,
+
     /// SRTP context for leg A — decrypt direction (decrypt packets FROM caller).
     /// For SDES-SRTP: same context as send. For DTLS-SRTP: separate keys.
     /// Uses Arc<Mutex<Option>> so the DTLS handshake task can hot-swap the context
@@ -349,6 +352,7 @@ impl RtpSession {
             global_rtp_counter: None,
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
+            global_rtp_timeout_counter: None,
             srtp_recv_ctx_a: Arc::new(AsyncMutex::new(None)),
             srtp_send_ctx_a: Arc::new(AsyncMutex::new(None)),
             srtp_context_b: Arc::new(AsyncMutex::new(None)),
@@ -387,6 +391,11 @@ impl RtpSession {
     /// Attach global SRTP decrypted counter (from SbcMetrics)
     pub fn set_global_srtp_decrypt_counter(&mut self, counter: Arc<AtomicU64>) {
         self.global_srtp_decrypt_counter = Some(counter);
+    }
+
+    /// Attach global RTP inactivity-timeout counter (from SbcMetrics)
+    pub fn set_global_rtp_timeout_counter(&mut self, counter: Arc<AtomicU64>) {
+        self.global_rtp_timeout_counter = Some(counter);
     }
 
     /// Set transcoder for A→B direction (caller to callee)
@@ -546,6 +555,7 @@ impl RtpSession {
         let global_rtp_counter = self.global_rtp_counter.clone();
         let global_srtp_encrypt_counter = self.global_srtp_encrypt_counter.clone();
         let global_srtp_decrypt_counter = self.global_srtp_decrypt_counter.clone();
+        let global_rtp_timeout_counter = self.global_rtp_timeout_counter.clone();
 
         // SRTP contexts — Arc<Mutex<Option<SrtpContext>>> allows hot-swap after DTLS handshake
         let srtp_recv_a = self.srtp_recv_ctx_a.clone();
@@ -663,6 +673,9 @@ impl RtpSession {
                         if idle_secs > rtp_timeout_secs && pkt_count > 0 {
                             warn!("RTP session {} no media for {}s (timeout={}s) — terminating (relayed {} packets)",
                                 session_id, idle_secs, rtp_timeout_secs, pkt_count);
+                            if let Some(ref c) = global_rtp_timeout_counter {
+                                c.fetch_add(1, Ordering::Relaxed);
+                            }
                             break;
                         }
                     }

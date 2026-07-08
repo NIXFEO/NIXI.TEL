@@ -63,6 +63,8 @@ pub struct MediaManager {
     /// Global SRTP decrypted counter (from SbcMetrics)
     global_srtp_decrypt_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 
+    global_rtp_timeout_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+
     /// Global transcoded packet counter (from SbcMetrics)
     global_transcode_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
@@ -135,6 +137,7 @@ impl MediaManager {
             global_rtp_counter: None,
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
+            global_rtp_timeout_counter: None,
             global_transcode_counter: None,
         }
     }
@@ -151,6 +154,7 @@ impl MediaManager {
             global_rtp_counter: None,
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
+            global_rtp_timeout_counter: None,
             global_transcode_counter: None,
         }
     }
@@ -168,6 +172,10 @@ impl MediaManager {
     /// Attach global SRTP decrypted counter from SbcMetrics
     pub fn set_global_srtp_decrypt_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
         self.global_srtp_decrypt_counter = Some(counter);
+    }
+
+    pub fn set_global_rtp_timeout_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.global_rtp_timeout_counter = Some(counter);
     }
 
     /// Attach global transcoded packet counter from SbcMetrics
@@ -417,6 +425,9 @@ impl MediaManager {
         }
         if let Some(ref counter) = self.global_srtp_decrypt_counter {
             rtp_session.set_global_srtp_decrypt_counter(counter.clone());
+        }
+        if let Some(ref counter) = self.global_rtp_timeout_counter {
+            rtp_session.set_global_rtp_timeout_counter(counter.clone());
         }
 
         // Attach global transcoded packet counter for Prometheus metrics

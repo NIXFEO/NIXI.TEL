@@ -107,16 +107,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Initialize logging based on verbosity
+/// Initialize logging.
+///
+/// Level precedence: `--verbose` forces DEBUG; otherwise the `RUST_LOG`
+/// environment variable is honored (e.g. `RUST_LOG=debug`, or targeted
+/// `RUST_LOG=sbc_core=debug,info`); if unset, defaults to INFO. This makes
+/// the log level adjustable via the systemd unit's `Environment=RUST_LOG=…`
+/// without editing the binary invocation.
 fn init_logging(verbose: bool) {
-    let level = if verbose {
-        tracing::Level::DEBUG
+    use tracing_subscriber::EnvFilter;
+
+    let filter = if verbose {
+        EnvFilter::new("debug")
     } else {
-        tracing::Level::INFO
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
     tracing_subscriber::fmt()
-        .with_max_level(level)
+        .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)

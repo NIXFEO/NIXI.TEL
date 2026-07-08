@@ -452,10 +452,17 @@ impl Sbc {
                 .and_then(|aor| aor.strip_prefix("sip:"))
                 .and_then(|s| s.split('@').next())
                 .map(|s| s.to_string());
+            // Inbound (PSTN → registered user) calls carry no outbound trunk,
+            // so trunk_name is unset above. Attribute them to the originating
+            // trunk by matching the source IP, so the CDR trunk_id is populated.
+            let inbound_trunk = self.trunk_manager.name_for_ip(&source.ip().to_string());
             let mut calls = self.b2bua.calls_locked().await;
             if let Some(call) = calls.get_mut(&uuid) {
                 call.caller_number = caller_num;
                 call.callee_number = callee_num;
+                if call.trunk_name.is_none() {
+                    call.trunk_name = inbound_trunk;
+                }
             }
         }
 

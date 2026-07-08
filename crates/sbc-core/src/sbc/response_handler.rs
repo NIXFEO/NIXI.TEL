@@ -126,6 +126,13 @@ impl Sbc {
 
                     let _ = self.b2bua.handle_200_ok(&uuid, callee_tag, callee_sdp_str.clone()).await;
 
+                    // ── Record the negotiated codec (from the SDP answer) for the CDR ──
+                    if let Some(ref sdp) = callee_sdp_str {
+                        if let Some(codec) = crate::media::sdp::negotiated_audio_codec(sdp) {
+                            self.b2bua.set_codec(&uuid, &codec).await;
+                        }
+                    }
+
                     // ── Capture established dialog identity (raw From/To/Contact) ──
                     // The 200 OK's To carries the callee tag; From matches our
                     // outbound INVITE. Needed for synthetic in-dialog requests.

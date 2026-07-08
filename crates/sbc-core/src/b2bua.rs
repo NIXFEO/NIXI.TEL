@@ -664,6 +664,17 @@ impl B2buaManager {
         }
     }
 
+    /// Record the negotiated media codec for a call (from the SDP answer),
+    /// so it appears in the CDR. Idempotent; only sets when not already known.
+    pub async fn set_codec(&self, uuid: &CallUuid, codec: &str) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            if call.codec.is_none() {
+                call.codec = Some(codec.to_string());
+            }
+        }
+    }
+
     /// Connected calls whose refresh is due. For each, returns the refresh
     /// re-INVITE (built from the callee-leg dialog identity + the SDP of the
     /// outbound INVITE) and the destination; bumps CSeq and re-arms the timer.

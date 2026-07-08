@@ -209,6 +209,7 @@ impl Sbc {
         media_mgr.set_global_rtp_counter(metrics.rtp_packets_total.clone());
         media_mgr.set_global_srtp_encrypt_counter(metrics.srtp_encrypted_total.clone());
         media_mgr.set_global_srtp_decrypt_counter(metrics.srtp_decrypted_total.clone());
+        media_mgr.set_global_rtp_timeout_counter(metrics.rtp_timeouts_total.clone());
         media_mgr.set_global_transcode_counter(metrics.transcoded_total.clone());
         let media = Arc::new(media_mgr);
 

@@ -476,6 +476,22 @@ impl TrunkManager {
             .map(|entry| entry.clone())
     }
 
+    /// Find the name of the trunk a source IP belongs to, matching against the
+    /// trunk's configured host and its DNS-resolved address. Used to attribute
+    /// inbound (PSTN → registered user) calls to the originating trunk in CDRs.
+    pub fn name_for_ip(&self, ip: &str) -> Option<String> {
+        self.trunks
+            .iter()
+            .find(|entry| {
+                entry.host == ip
+                    || entry
+                        .resolved_addr
+                        .map(|a| a.ip().to_string() == ip)
+                        .unwrap_or(false)
+            })
+            .map(|entry| entry.name.clone())
+    }
+
     /// Update an existing trunk by name, preserving its id (and its resolved
     /// address when the destination is unchanged, so active calls are safe).
     /// Returns false when no trunk has that name.
@@ -810,5 +826,16 @@ mod tests {
 
         assert_eq!(trunk.normalize_number("612345678"), "612345678",
             "Number without + or 0 prefix → passthrough (ambiguous)");
+    }
+
+    #[test]
+    fn test_name_for_ip_matches_host() {
+        let mgr = TrunkManager::new();
+        let mut trunk = TrunkConfig::new("nixi-trunk-out".into());
+        trunk.host = "46.28.168.58".into();
+        mgr.add_trunk(trunk);
+
+        assert_eq!(mgr.name_for_ip("46.28.168.58").as_deref(), Some("nixi-trunk-out"));
+        assert_eq!(mgr.name_for_ip("1.2.3.4"), None);
     }
 }

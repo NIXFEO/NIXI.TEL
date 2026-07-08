@@ -481,6 +481,7 @@ impl Sbc {
                     if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
                         warn!("CDR recording failed: {}", e);
                     } else {
+                        self.metrics.record_cdr_written();
                         info!("CDR: {} → {} ({} secs, codec={}, trunk={}, webrtc={})",
                             record.caller, record.callee, duration,
                             record.codec.as_deref().unwrap_or("unknown"),
@@ -669,6 +670,8 @@ impl Sbc {
             .with_disconnect_reason("ws-closed");
             if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
                 warn!("CDR recording failed (ws-closed): {}", e);
+            } else {
+                self.metrics.record_cdr_written();
             }
 
             self.metrics.inc_call_terminated();
