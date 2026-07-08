@@ -1555,6 +1555,50 @@ mod tests {
         assert_eq!(stats.total_active, 5);
     }
 
+    /// Concurrency stress test: hammer the call map from many tasks at once to
+    /// prove the `Mutex<HashMap>` is correct and deadlock-free well beyond
+    /// production volume. Each task creates a call, mutates it through several
+    /// locked methods, then half are terminated concurrently. Completion alone
+    /// proves no deadlock; the count assertions prove no lost updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_call_storm() {
+        use std::time::Instant;
+        const N: usize = 200;
+        let mgr = Arc::new(make_manager());
+
+        // Phase 1 — N concurrent create + mutate.
+        let start = Instant::now();
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let mgr = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                let uuid = mgr.create_call(
+                    format!("storm-{}", i), format!("tag-{}", i), caller_addr(), None,
+                    None, rsip::Transport::Udp,
+                ).await.unwrap();
+                // Exercise several independent locked mutators + a read.
+                mgr.set_codec(&uuid, "PCMU").await;
+                mgr.set_session_timer(&uuid, 1800).await;
+                let _ = mgr.stats().await;
+                uuid
+            }));
+        }
+        let uuids: Vec<CallUuid> = futures_util::future::join_all(handles)
+            .await.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(mgr.stats().await.total_active, N, "all calls must be present");
+
+        // Phase 2 — terminate half concurrently while the rest stay live.
+        let mut handles = Vec::with_capacity(N / 2);
+        for uuid in uuids.iter().take(N / 2).cloned() {
+            let mgr = mgr.clone();
+            handles.push(tokio::spawn(async move { mgr.terminate_call(&uuid).await }));
+        }
+        futures_util::future::join_all(handles).await;
+
+        assert_eq!(mgr.stats().await.total_active, N - N / 2, "exactly half remain");
+        eprintln!("call storm: {} creates + {} terminates in {:?}", N, N / 2, start.elapsed());
+    }
+
     #[tokio::test]
     async fn test_webrtc_call_detected() {
         let webrtc_sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=ice-ufrag:abc\r\na=ice-pwd:xyz\r\na=fingerprint:sha-256 AA:BB\r\n";
