@@ -1204,7 +1204,7 @@ impl Sbc {
 
         // 0. Ban check (fail2ban) — one DashMap read on the hot path
         if self.security.bans.is_banned(source.ip()) {
-            self.metrics.inc_spam_blocked();
+            self.metrics.inc_security_ban_drop();
             if !self.security.bans.silent_drop() {
                 self.metrics.inc_sip_response(403);
                 let response_403 = build_plain_response(403, "Forbidden");
@@ -1347,6 +1347,7 @@ impl Sbc {
                                     // retries above must NOT count, or legitimate
                                     // clients get banned on re-REGISTER).
                                     if let Some(entry) = self.security.record_auth_failure(source.ip(), None, "REGISTER") {
+                                        self.metrics.inc_security_ban();
                                         self.persist_ban(&entry);
                                     }
                                 }

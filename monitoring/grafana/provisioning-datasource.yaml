@@ -1,0 +1,12 @@
+# Grafana Prometheus datasource — drop into /etc/grafana/provisioning/datasources/.
+# The bundled dashboard references the datasource by UID; either set this UID
+# here, or edit the "uid" fields in dashboards/sbc-overview.json to match your
+# existing Prometheus datasource.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: efdqq22ymisqod
+    url: http://127.0.0.1:9090
+    isDefault: true

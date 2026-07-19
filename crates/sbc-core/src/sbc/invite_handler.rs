@@ -71,6 +71,7 @@ impl Sbc {
                 self.metrics.inc_spam_blocked();
                 // Scanner INVITE floods count toward the fail2ban window
                 if let Some(entry) = self.security.record_auth_failure(source.ip(), None, "INVITE") {
+                    self.metrics.inc_security_ban();
                     self.persist_ban(&entry);
                 }
                 self.metrics.inc_sip_response(403);
@@ -106,6 +107,7 @@ impl Sbc {
                             user: user.clone(), kind: "concurrent".into(), current, limit,
                             ts: crate::events::event_ts(),
                         });
+                        self.metrics.inc_security_user_limit_rejection();
                         self.metrics.inc_sip_response(403);
                         let r = build_plain_response_for_request(&request, 403, "Too Many Concurrent Calls")?;
                         let data = r.to_string().into_bytes();
@@ -117,6 +119,7 @@ impl Sbc {
                             user: user.clone(), kind: "rate".into(), current, limit,
                             ts: crate::events::event_ts(),
                         });
+                        self.metrics.inc_security_user_limit_rejection();
                         self.metrics.inc_sip_response(503);
                         // 503 + Retry-After (RFC 3261-conformant throttle)
                         let raw = format!(
@@ -373,6 +376,7 @@ impl Sbc {
                         ts: crate::events::event_ts(),
                     });
                     self.b2bua.terminate_call(&uuid).await;
+                    self.metrics.inc_security_destination_blocked();
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(403);
                     let r403 = build_plain_response_for_request(&request, 403, "Forbidden - Destination Blocked")?;

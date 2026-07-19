@@ -1,0 +1,13 @@
+# Example Prometheus scrape config for the NIXI SBC.
+# The SBC exposes Prometheus metrics on its management API (default :8080)
+# behind the bearer token, OR on a dedicated metrics port if configured.
+# Adjust target, port and token to your deployment.
+scrape_configs:
+  - job_name: 'nixi-sbc'
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials: 'YOUR_API_TOKEN'   # management.api_auth_token
+    static_configs:
+      - targets: ['127.0.0.1:8080']

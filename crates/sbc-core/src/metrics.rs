@@ -72,6 +72,18 @@ pub struct SbcMetrics {
     /// Total ACL denied requests
     pub acl_denied_total: Arc<AtomicU64>,
 
+    /// Total fail2ban bans issued (auth-failure threshold reached)
+    pub security_bans_total: Arc<AtomicU64>,
+
+    /// Total packets/requests dropped because their source IP was banned
+    pub security_ban_drops_total: Arc<AtomicU64>,
+
+    /// Total calls blocked by destination rules (anti-IRSF)
+    pub security_destination_blocked_total: Arc<AtomicU64>,
+
+    /// Total calls rejected by per-user limits (concurrent + rate)
+    pub security_user_limit_rejections_total: Arc<AtomicU64>,
+
     /// Total calls torn down by the RTP inactivity timeout (media stopped
     /// without a BYE — e.g. Jambonz-style callees). A rising rate signals
     /// one-way-audio or media-path problems.
@@ -126,6 +138,10 @@ impl SbcMetrics {
             sip_parse_errors_total:  Arc::new(AtomicU64::new(0)),
             dos_blocked_total:       Arc::new(AtomicU64::new(0)),
             acl_denied_total:        Arc::new(AtomicU64::new(0)),
+            security_bans_total:                 Arc::new(AtomicU64::new(0)),
+            security_ban_drops_total:            Arc::new(AtomicU64::new(0)),
+            security_destination_blocked_total:  Arc::new(AtomicU64::new(0)),
+            security_user_limit_rejections_total: Arc::new(AtomicU64::new(0)),
             rtp_timeouts_total:      Arc::new(AtomicU64::new(0)),
             sip_responses_by_code:   Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_calls:            Arc::new(AtomicU64::new(0)),
@@ -223,6 +239,26 @@ impl SbcMetrics {
 
     pub fn inc_acl_denied(&self) {
         self.acl_denied_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a fail2ban ban being issued.
+    pub fn inc_security_ban(&self) {
+        self.security_bans_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a packet/request dropped because its source is banned.
+    pub fn inc_security_ban_drop(&self) {
+        self.security_ban_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a call blocked by destination rules (anti-IRSF).
+    pub fn inc_security_destination_blocked(&self) {
+        self.security_destination_blocked_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a call rejected by per-user limits.
+    pub fn inc_security_user_limit_rejection(&self) {
+        self.security_user_limit_rejections_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a call torn down by the RTP inactivity timeout.
@@ -398,6 +434,23 @@ impl SbcMetrics {
         counter!("sbc_acl_denied",
                  "Total requests denied by ACL rules",
                  self.acl_denied_total.load(Ordering::Relaxed));
+
+        // ── Anti-fraud counters (fail2ban / IRSF / per-user limits) ────────────
+        counter!("sbc_security_bans",
+                 "Total fail2ban bans issued (auth-failure threshold reached)",
+                 self.security_bans_total.load(Ordering::Relaxed));
+
+        counter!("sbc_security_ban_drops",
+                 "Total requests dropped because their source IP was banned",
+                 self.security_ban_drops_total.load(Ordering::Relaxed));
+
+        counter!("sbc_security_destination_blocked",
+                 "Total calls blocked by destination rules (anti-IRSF)",
+                 self.security_destination_blocked_total.load(Ordering::Relaxed));
+
+        counter!("sbc_security_user_limit_rejections",
+                 "Total calls rejected by per-user limits (concurrent + rate)",
+                 self.security_user_limit_rejections_total.load(Ordering::Relaxed));
 
         counter!("sbc_rtp_timeouts",
                  "Total calls torn down by the RTP inactivity timeout",

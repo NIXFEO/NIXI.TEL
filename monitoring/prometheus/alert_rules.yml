@@ -1,0 +1,34 @@
+# Example alerting rules for the NIXI SBC.
+groups:
+  - name: nixi-sbc
+    rules:
+      - alert: SBCDown
+        expr: up{job="nixi-sbc"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "SBC is down (Prometheus cannot scrape /metrics)"
+
+      - alert: SBCCdrsStale
+        # No CDR written in the last hour while calls are being attempted.
+        expr: (time() - sbc_last_cdr_written_timestamp_seconds > 3600)
+              and (rate(sbc_calls_total[15m]) > 0)
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "No CDR written in over an hour despite call attempts"
+
+      - alert: SBCRtpTimeouts
+        # Sustained RTP inactivity teardowns → one-way-audio / media path issues.
+        expr: rate(sbc_rtp_timeouts_total[10m]) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Elevated RTP inactivity timeouts (possible media path issue)"
+
+      - alert: SBCAuthFailureSpike
+        expr: rate(sbc_auth_failures_total[5m]) > 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Sustained SIP auth-failure rate (scanner activity / brute force)"

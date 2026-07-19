@@ -1,0 +1,14 @@
+# Grafana dashboard provider — drop into /etc/grafana/provisioning/dashboards/
+# and place the dashboards under the `path` below.
+apiVersion: 1
+providers:
+  - name: 'nixi-sbc'
+    orgId: 1
+    folder: 'SBC'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
