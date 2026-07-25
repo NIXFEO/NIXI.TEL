@@ -16,12 +16,14 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
+use crate::rate_limit::{client_ip, RateLimiter};
 use crate::routes;
 use crate::state::AppState;
 
 const BODY_LIMIT_BYTES: usize = 256 * 1024;
 
 pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router {
+    let rate_limiter = RateLimiter::per_minute(state.api_rate_limit_per_min);
     let mut app = Router::new()
         // Health & readiness (public)
         .route("/health", get(routes::system::health))
@@ -122,12 +124,49 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
         .route("/api/trunks", get(routes::trunks::list_trunks))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
+        // Rate-limit is outermost so it runs first, before auth and handlers.
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            rate_limit_middleware,
+        ))
         .with_state(state);
 
     if let Some(cors) = build_cors(cors_allowed_origins) {
         app = app.layer(cors);
     }
     app
+}
+
+/// Per-source-IP rate limit. Requests over budget get `429`, with the
+/// offending IP logged at `warn`. `/health` and `/ready` are exempt so
+/// liveness probes never trip it.
+async fn rate_limit_middleware(
+    State(limiter): State<RateLimiter>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path == "/health" || path == "/ready" {
+        return next.run(request).await;
+    }
+
+    let ip = client_ip(&request);
+    if limiter.check(ip) {
+        next.run(request).await
+    } else {
+        warn!(
+            source_ip = %ip,
+            method = %request.method(),
+            path = %request.uri().path(),
+            "management API rate limit exceeded"
+        );
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("content-type", "application/json")],
+            r#"{"error":"rate limit exceeded","code":"too_many_requests"}"#,
+        )
+            .into_response()
+    }
 }
 
 fn build_cors(origins: &[String]) -> Option<CorsLayer> {
@@ -162,8 +201,23 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
+    let source_ip = client_ip(&request);
+    let method = request.method().clone();
+    // Mutations get audited even on success; reads only when auth fails.
+    let is_mutation = matches!(method, Method::POST | Method::PUT | Method::DELETE);
+
+    // Defense in depth: the binary refuses to start without a resolved token
+    // (see sbc-bin/main.rs), so this arm should be unreachable in production.
+    // If it is ever reached, fail CLOSED rather than fail open.
     let Some(expected) = state.api_token.as_deref() else {
-        return next.run(request).await;
+        warn!(
+            source_ip = %source_ip,
+            method = %method,
+            path = %path,
+            auth = "denied",
+            "management API request rejected: no api_token configured (fail-closed)"
+        );
+        return unauthorized();
     };
 
     let presented = request
@@ -190,16 +244,37 @@ async fn auth_middleware(
         .map(|p| p.as_bytes().ct_eq(expected.as_bytes()).into())
         .unwrap_or(false);
 
+    let path = path.to_string();
     if authorized {
+        if is_mutation {
+            info!(
+                source_ip = %source_ip,
+                method = %method,
+                path = %path,
+                auth = "ok",
+                "management API mutation"
+            );
+        }
         next.run(request).await
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [("content-type", "application/json")],
-            r#"{"error":"unauthorized","code":"unauthorized"}"#,
-        )
-            .into_response()
+        warn!(
+            source_ip = %source_ip,
+            method = %method,
+            path = %path,
+            auth = "denied",
+            "management API authentication failed"
+        );
+        unauthorized()
     }
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [("content-type", "application/json")],
+        r#"{"error":"unauthorized","code":"unauthorized"}"#,
+    )
+        .into_response()
 }
 
 /// Bind and serve until the process exits.
@@ -211,7 +286,10 @@ pub async fn serve(
     let app = build_router(state, &cors_allowed_origins);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Management API (axum) listening on http://{}", addr);
-    if let Err(e) = axum::serve(listener, app).await {
+    // `ConnectInfo` makes the TCP peer address available to the rate-limit and
+    // audit middleware (used when no X-Real-IP / X-Forwarded-For is present).
+    let make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    if let Err(e) = axum::serve(listener, make_service).await {
         warn!("Management API server exited: {}", e);
     }
     Ok(())

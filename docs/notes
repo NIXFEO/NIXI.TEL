@@ -1,0 +1,104 @@
+# Note de sécurité — API d'administration du SBC exposée publiquement
+
+**Serveur :** sip.nixi.tel (51.158.117.229) — SBC NIXI.TEL
+**Date du constat :** 25/07/2026
+**Gravité :** Critique
+**Statut :** À corriger
+
+---
+
+## Résumé
+
+Le vhost nginx `sip.nixi.tel` (port 443) expose **publiquement** l'API de
+management du SBC, et **nginx injecte lui-même le token d'authentification**.
+Résultat : n'importe qui sur Internet peut administrer le SBC (lister, créer,
+supprimer des comptes SIP) **sans aucune authentification**, et donc passer des
+appels facturés sur le trunk PSTN sortant.
+
+## Détail technique
+
+L'API du SBC écoute en local uniquement (`127.0.0.1:8080`, c'est correct).
+Le problème vient du reverse-proxy : dans `/etc/nginx/sites-enabled/sip.nixi.tel`,
+le bloc `server` en écoute sur 443 contient :
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    ...
+    proxy_set_header Authorization "Bearer nixi-sbc-admin-****";  # ← token injecté par nginx
+}
+```
+
+Comme nginx ajoute le header `Authorization` à chaque requête, le client n'a
+**rien à fournir**. Une simple requête publique suffit :
+
+```
+GET  https://sip.nixi.tel/api/v1/users        → liste tous les comptes SIP
+POST https://sip.nixi.tel/api/v1/users        → crée un compte SIP
+```
+
+### Impact
+
+- **Prise de contrôle de la téléphonie** : création de comptes SIP arbitraires
+  → passage d'appels sur le trunk PSTN sortant (`nixi-trunk-out`) →
+  **fraude télécom / facturation** (toll fraud).
+- **Fuite de données** : énumération de tous les comptes clients CPaaS et de
+  leur configuration.
+- **Déni de service** : suppression/altération des comptes existants.
+
+### Autres secrets exposés dans le fichier de config
+
+`/opt/sbc/config/production.toml` contient en clair (à considérer comme
+compromis une fois l'API ouverte au public) :
+
+- `api_auth_token` (token d'admin du SBC)
+- Mots de passe SIP des comptes (`[security.sip_users]`)
+- Identifiants PostgreSQL (`postgres_url`)
+
+## Correctifs recommandés (par ordre de priorité)
+
+1. **Fermer l'exposition publique de l'API (immédiat).**
+   Choisir l'une de ces options dans le vhost `sip.nixi.tel` :
+   - **Supprimer purement** le `location /` qui proxifie vers `:8080` si
+     l'API n'a pas besoin d'être jointe à distance (l'administration se fait
+     alors en SSH + localhost).
+   - **OU** restreindre par IP :
+     ```nginx
+     location / {
+         allow <IP-admin-ou-VPN>;
+         deny all;
+         proxy_pass http://127.0.0.1:8080;
+         # ne PAS injecter le token ici
+     }
+     ```
+   - **OU** déplacer l'API sur un vhost/hostname dédié protégé (mTLS, auth
+     basic, VPN), et **ne jamais** faire injecter le Bearer par nginx : le
+     client légitime doit présenter le token lui-même.
+
+2. **Faire tourner tous les secrets** (car exposés) :
+   - régénérer `api_auth_token`
+   - changer les mots de passe SIP des comptes concernés
+   - changer le mot de passe PostgreSQL (`sbc_db`)
+
+3. **Vérifier l'absence d'abus déjà survenu** :
+   - `GET /api/v1/users` en local → repérer des comptes inconnus/non créés par
+     l'équipe (⚠️ deux comptes de test `webtest1` / `webtest2` ont été créés
+     lors de ce diagnostic — à supprimer s'ils ne sont plus utiles).
+   - CDR : `/var/log/sbc/cdr.jsonl` → chercher des appels sortants anormaux
+     (destinations premium/internationales, pics de volume).
+   - Logs : `/var/log/sbc/sbc.log`.
+
+4. **Durcissement complémentaire** :
+   - retirer les secrets du fichier de config au profit de variables
+     d'environnement / d'un secret manager, avec droits `600 root:root`.
+   - activer un pare-feu (aucune règle `ufw`/`iptables` active constatée) pour
+     n'exposer que 80/443/5060/5061/8443 et les plages RTP nécessaires.
+
+## Comptes de test créés pendant le diagnostic
+
+- `webtest1`, `webtest2` (realm `sip.nixi.tel`) — créés pour valider le client
+  WebRTC. **À supprimer** s'ils ne servent plus :
+  ```bash
+  curl -X DELETE -H "Authorization: Bearer <token>" \
+    http://127.0.0.1:8080/api/v1/users/webtest1
+  ```

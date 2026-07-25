@@ -44,6 +44,17 @@ async fn main() -> Result<()> {
     let mut sbc = Sbc::new_from_config_without_http(&config).await?;
 
     if config.management.api_enabled {
+        // Resolve the management API token (env SBC_API_TOKEN overrides TOML)
+        // and FAIL CLOSED if none is configured — never start an
+        // unauthenticated management API.
+        let api_token = sbc_core::config::resolve_api_token(&config.management.api_auth_token);
+        if api_token.is_none() {
+            anyhow::bail!(
+                "management API is enabled but no API token is configured. Set the \
+                 SBC_API_TOKEN environment variable or [management].api_auth_token in \
+                 the config file. Refusing to start an unauthenticated management API."
+            );
+        }
         let state = AppState {
             metrics: sbc.metrics().clone(),
             b2bua: sbc.b2bua().clone(),
@@ -58,14 +69,12 @@ async fn main() -> Result<()> {
             events: sbc.events(),
             reload: sbc.reload_notify(),
             realm: config.security.sip_realm.clone(),
-            api_token: config.management.api_auth_token.clone(),
+            api_token,
+            api_rate_limit_per_min: config.management.api_rate_limit_per_min,
             security: sbc.security(),
         };
         if state.store.is_none() {
             warn!("Management API: config store unavailable — mutating endpoints return 503");
-        }
-        if state.api_token.is_none() {
-            warn!("Management API: no api_auth_token configured — API is UNAUTHENTICATED");
         }
         let addr: std::net::SocketAddr = format!(
             "{}:{}",

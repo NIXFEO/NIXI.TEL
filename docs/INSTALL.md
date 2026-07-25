@@ -12,9 +12,10 @@ single static binary plus a TOML config file and an embedded SQLite store —
 4. [Configuration](#4-configuration)
 5. [systemd service](#5-systemd-service)
 6. [TLS / WSS certificates](#6-tls--wss-certificates)
-7. [Firewall](#7-firewall)
-8. [Verification](#8-verification)
-9. [Upgrades & rollback](#9-upgrades--rollback)
+7. [Securing the management API](#7-securing-the-management-api)
+8. [Firewall](#8-firewall)
+9. [Verification](#9-verification)
+10. [Upgrades & rollback](#10-upgrades--rollback)
 
 ---
 
@@ -77,13 +78,19 @@ sudo cp config/sbc.toml.example /etc/sbc/sbc.toml
 sudo chmod 600 /etc/sbc/sbc.toml
 ```
 
-Edit `/etc/sbc/sbc.toml` — at minimum set `public_ipv4`, `sip_realm`,
-`database.sqlite_path` (e.g. `/var/lib/sbc/sbc.db`) and a strong
-`management.api_auth_token`:
+Edit `/etc/sbc/sbc.toml` — at minimum set `public_ipv4`, `sip_realm` and
+`database.sqlite_path` (e.g. `/var/lib/sbc/sbc.db`). The management API needs
+a strong token; **prefer supplying it via the `SBC_API_TOKEN` environment
+variable** (see [§7](#7-securing-the-management-api)) rather than writing
+`management.api_auth_token` in clear text in the TOML:
 
 ```bash
 openssl rand -hex 32   # generate an API token
 ```
+
+The API refuses to start when it is enabled without a token (fail-closed),
+so a missing/empty token is caught at boot rather than silently running
+unauthenticated.
 
 The example config is fully commented, including the anti-fraud sections
 (`[security.ban]`, `[security.destinations]`, `[security.user_limits]`) and
@@ -102,6 +109,8 @@ After=network.target
 
 [Service]
 Type=simple
+# Secrets (API token) live here, not in the TOML — see §7
+EnvironmentFile=/etc/sbc/sbc.env
 ExecStart=/usr/local/bin/sbc --config /etc/sbc/sbc.toml
 Restart=on-failure
 # Graceful stop: the SBC sends BYE to active peers on SIGTERM
@@ -111,6 +120,13 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
+```
+
+Create the secrets file that systemd reads (see §7 for details):
+
+```bash
+sudo install -m 600 -o root -g root /dev/null /etc/sbc/sbc.env
+echo "SBC_API_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/sbc/sbc.env >/dev/null
 ```
 
 ```bash
@@ -152,36 +168,150 @@ curl -s -X POST -H "Authorization: Bearer $SBC_API_TOKEN" \
   http://127.0.0.1:8080/api/v1/reload
 ```
 
-For the management API, put it behind an nginx TLS reverse proxy rather than
-exposing port 8080 directly.
+For remote access to the management API, read [§7](#7-securing-the-management-api)
+carefully before exposing it — a naive reverse proxy is how the API ends up
+open to the Internet.
 
-## 7. Firewall
+## 7. Securing the management API
+
+The management API (axum) is a full administration surface: it can create,
+enumerate and delete SIP users, trunks and DIDs. An unauthenticated actor who
+reaches it can provision accounts and place billed calls on your PSTN trunk
+(toll fraud), leak your customer list, or wipe your configuration. Treat it
+with the same care as an SSH login.
+
+### Golden rule — keep it on localhost
+
+Bind the API to `127.0.0.1:8080` (the default) and administer it over an SSH
+session on the box:
 
 ```bash
+ssh admin@sip.example.com
+curl -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/stats
+```
+
+For a workstation, forward the port over SSH instead of exposing it:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 admin@sip.example.com
+# now http://127.0.0.1:8080 on your laptop reaches the SBC API
+```
+
+With this pattern, port 8080 stays closed at the firewall and the API is
+never reachable from the public Internet. The SBC also validates its own
+bind: enabling the API on a non-loopback address without a firewall in front
+is flagged at startup.
+
+### The token: keep it out of the config and out of nginx
+
+Supply the token through the environment, not in the TOML. systemd loads it
+from an `EnvironmentFile` owned by root:
+
+```bash
+# /etc/sbc/sbc.env  — mode 600, root:root
+SBC_API_TOKEN=<paste output of: openssl rand -hex 32>
+```
+
+```bash
+sudo install -m 600 -o root -g root /dev/null /etc/sbc/sbc.env
+echo "SBC_API_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/sbc/sbc.env >/dev/null
+```
+
+`SBC_API_TOKEN` overrides `management.api_auth_token`, so you can leave the
+TOML free of secrets. The API **refuses to start when it is enabled without a
+token** — a fail-closed boot is preferable to a silently open API. If you do
+keep a token in the TOML, that file must be `chmod 600`.
+
+### If you truly need remote access: a correct nginx block
+
+Only expose the API remotely when SSH/localhost is genuinely not workable,
+and even then lock it down. A correct reverse proxy:
+
+- restricts by source IP (`allow`/`deny all`) or requires mutual TLS,
+- terminates TLS,
+- **passes the client's own `Authorization` header through unchanged** — the
+  client presents its token; nginx must never mint one,
+- leaves port 8080 closed at the firewall (nginx reaches it over localhost).
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name admin.sip.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/admin.sip.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/admin.sip.example.com/privkey.pem;
+
+    location / {
+        # Restrict to your admin network / VPN — everything else is denied.
+        allow 203.0.113.0/24;      # office / VPN egress
+        deny  all;
+
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # The caller supplies its own bearer token; nginx does NOT inject one.
+        # (Do not set proxy_set_header Authorization here.)
+    }
+}
+```
+
+For stronger control, require a client certificate instead of an IP allowlist
+(`ssl_verify_client on;` with `ssl_client_certificate <ca.pem>;`).
+
+> **Never do this.** The following turns the reverse proxy into an open door:
+> nginx adds the token to every request, so any anonymous visitor is
+> authenticated as admin. This exact misconfiguration exposed the SBC API to
+> the public Internet — see
+> [docs/incidents/2026-07-25-management-api-exposure.md](incidents/2026-07-25-management-api-exposure.md).
+>
+> ```nginx
+> location / {
+>     proxy_pass http://127.0.0.1:8080;
+>     proxy_set_header Authorization "Bearer <token>";   # ← DO NOT DO THIS
+> }
+> ```
+
+### Runtime protections
+
+The API additionally rate-limits requests and writes an audit log of
+authenticated administrative actions, so credential-stuffing and unexpected
+changes leave a trace. Ship those logs to your central logging and alert on
+`4xx` auth failures and on user/trunk mutations you did not initiate.
+
+## 8. Firewall
+
+Expose only the media/signalling ports. Keep the management API (8080) and
+Prometheus metrics (9090) closed — reach them via localhost or an SSH tunnel:
+
+```bash
+sudo ufw allow 80/tcp                 # ACME/HTTP (certbot), if used
+sudo ufw allow 443/tcp                # TLS reverse proxy, if used
 sudo ufw allow 5060/udp
 sudo ufw allow 5060/tcp
 sudo ufw allow 5061/tcp
 sudo ufw allow 8443/tcp
-sudo ufw allow 10000:20000/udp
-# Keep 8080 (API) and 9090 (metrics) closed — reach them via localhost / a proxy
+sudo ufw allow 10000:20000/udp        # RTP media
+# Do NOT open 8080 (management API) or 9090 (metrics).
 sudo ufw enable
 ```
 
-## 8. Verification
+## 9. Verification
 
 ```bash
 # Health (public)
 curl http://127.0.0.1:8080/health
 
-# Authenticated endpoints
-TOKEN=your-api-token
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/stats
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/trunks
+# Authenticated endpoints — take the token from the systemd env file
+source /etc/sbc/sbc.env            # sets SBC_API_TOKEN (run as root)
+curl -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/stats
+curl -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/trunks
 
 # Create a user and watch events
-curl -X POST http://127.0.0.1:8080/api/v1/users -H "Authorization: Bearer $TOKEN" \
+curl -X POST http://127.0.0.1:8080/api/v1/users -H "Authorization: Bearer $SBC_API_TOKEN" \
   -d '{"username":"alice","password":"s3cret"}'
-curl -N "http://127.0.0.1:8080/api/v1/events?token=$TOKEN"
+curl -N "http://127.0.0.1:8080/api/v1/events?token=$SBC_API_TOKEN"
 ```
 
 The repo ships `scripts/api_smoke.sh` which exercises every endpoint —
@@ -190,7 +320,7 @@ set `SBC_API_TOKEN` and run it after each deploy.
 For WebRTC, serve `examples/webrtc-client/` over HTTPS and register a user
 against your WSS listener (see [WEBRTC.md](WEBRTC.md)).
 
-## 9. Upgrades & rollback
+## 10. Upgrades & rollback
 
 ```bash
 git pull && cargo build --release

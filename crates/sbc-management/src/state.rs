@@ -33,8 +33,11 @@ pub struct AppState {
     pub events: EventBus,
     pub reload: Arc<Notify>,
     pub realm: String,
-    /// Bearer token; None disables auth (bind to localhost only!).
+    /// Bearer token. Must be `Some` in production — the binary refuses to
+    /// start the management API without a resolved token (fail-closed).
     pub api_token: Option<String>,
+    /// Per-source-IP request budget for the management API (requests/minute).
+    pub api_rate_limit_per_min: u32,
     /// Anti-fraud manager (bans, destination rules, user limits).
     pub security: Arc<SecurityManager>,
 }

@@ -282,6 +282,42 @@ pub struct ManagementConfig {
     /// Empty = no CORS headers; `["*"]` = any origin.
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// Explicit opt-in required to bind the management API to a non-loopback
+    /// address. When false (default) and `api_bind_address` is not loopback,
+    /// the SBC refuses to start — the management API must never be publicly
+    /// exposed without deliberate operator intent (firewall + TLS assumed).
+    #[serde(default)]
+    pub allow_public_bind: bool,
+    /// Per-source-IP request budget for the management API, in requests per
+    /// minute. Requests over the budget are answered `429 Too Many Requests`.
+    #[serde(default = "default_api_rate_limit_per_min")]
+    pub api_rate_limit_per_min: u32,
+}
+
+fn default_api_rate_limit_per_min() -> u32 {
+    60
+}
+
+/// Resolve the effective management API bearer token.
+///
+/// Precedence: the `SBC_API_TOKEN` environment variable (when present and
+/// non-empty) overrides the TOML `[management].api_auth_token`. Whitespace is
+/// trimmed; an all-whitespace value counts as unset. Returns `None` when no
+/// token is configured anywhere — callers MUST fail closed in that case.
+pub fn resolve_api_token(toml_val: &Option<String>) -> Option<String> {
+    resolve_api_token_from(std::env::var("SBC_API_TOKEN").ok(), toml_val)
+}
+
+/// Pure resolution logic (env value injected) for testability.
+fn resolve_api_token_from(env_val: Option<String>, toml_val: &Option<String>) -> Option<String> {
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    env_val
+        .as_deref()
+        .and_then(non_empty)
+        .or_else(|| toml_val.as_deref().and_then(non_empty))
 }
 
 /// Metrics configuration
@@ -325,6 +361,28 @@ impl SbcConfig {
                     )));
                 }
             }
+        }
+
+        // Fail closed: never expose the management API on a non-loopback
+        // address without a deliberate opt-in. A publicly reachable, world-
+        // writable config surface is exactly the incident this guards against.
+        if self.management.api_enabled && !self.management.api_bind_address.is_loopback() {
+            if !self.management.allow_public_bind {
+                return Err(crate::Error::Config(format!(
+                    "management API bound to non-loopback address {} without \
+                     allow_public_bind=true — refusing to start. The management \
+                     API must never be publicly exposed; bind to 127.0.0.1 and \
+                     reverse-proxy it, or set [management].allow_public_bind=true \
+                     only if it is firewalled and TLS-fronted.",
+                    self.management.api_bind_address
+                )));
+            }
+            tracing::warn!(
+                addr = %self.management.api_bind_address,
+                "management API bound to non-loopback address {} — ensure it is \
+                 firewalled and never publicly exposed",
+                self.management.api_bind_address
+            );
         }
 
         Ok(())
@@ -384,6 +442,8 @@ impl Default for SbcConfig {
                 api_port: 8080,
                 api_auth_token: None,
                 cors_allowed_origins: Vec::new(),
+                allow_public_bind: false,
+                api_rate_limit_per_min: default_api_rate_limit_per_min(),
             },
             metrics: MetricsConfig {
                 prometheus_enabled: true,
@@ -425,5 +485,61 @@ mod tests {
             key_file: None,  // Missing key
         }];
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_public_management_bind_refused_without_optin() {
+        let mut config = SbcConfig::default();
+        config.management.api_bind_address = "0.0.0.0".parse().unwrap();
+        config.management.allow_public_bind = false;
+        assert!(
+            config.validate().is_err(),
+            "non-loopback management bind must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_public_management_bind_allowed_with_optin() {
+        let mut config = SbcConfig::default();
+        config.management.api_bind_address = "0.0.0.0".parse().unwrap();
+        config.management.allow_public_bind = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_public_bind_ignored_when_api_disabled() {
+        let mut config = SbcConfig::default();
+        config.management.api_enabled = false;
+        config.management.api_bind_address = "0.0.0.0".parse().unwrap();
+        config.management.allow_public_bind = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_resolve_api_token_precedence() {
+        // env wins over TOML
+        assert_eq!(
+            resolve_api_token_from(Some("env-tok".into()), &Some("toml-tok".into())),
+            Some("env-tok".to_string())
+        );
+        // empty/whitespace env falls back to TOML
+        assert_eq!(
+            resolve_api_token_from(Some("   ".into()), &Some("toml-tok".into())),
+            Some("toml-tok".to_string())
+        );
+        // no env → TOML
+        assert_eq!(
+            resolve_api_token_from(None, &Some("toml-tok".into())),
+            Some("toml-tok".to_string())
+        );
+        // nothing configured → None (caller must fail closed)
+        assert_eq!(resolve_api_token_from(None, &None), None);
+        // whitespace-only TOML counts as unset
+        assert_eq!(resolve_api_token_from(None, &Some("  ".into())), None);
+        // env value is trimmed
+        assert_eq!(
+            resolve_api_token_from(Some("  spaced  ".into()), &None),
+            Some("spaced".to_string())
+        );
     }
 }

@@ -42,6 +42,7 @@ async fn make_state() -> AppState {
         reload: Arc::new(Notify::new()),
         realm: "sip.example.com".to_string(),
         api_token: Some(TOKEN.to_string()),
+        api_rate_limit_per_min: 0, // disabled for deterministic tests
         security: Arc::new(sbc_core::security::SecurityManager::new(Default::default())),
     }
 }
@@ -99,6 +100,59 @@ async fn token_via_query_param_works_for_sse_use_case() {
             None,
             false,
         ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn no_token_configured_fails_closed() {
+    // Defense in depth: even if the server were somehow started without a
+    // token, every non-public route must be denied (never fail open).
+    let mut state = make_state().await;
+    state.api_token = None;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/stats", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // /health stays public regardless.
+    let resp = app
+        .oneshot(req("GET", "/health", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_over_budget() {
+    let mut state = make_state().await;
+    state.api_rate_limit_per_min = 3; // small budget; oneshot has no ConnectInfo → shared key
+    let app = build_router(state, &[]);
+
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/api/v1/stats", None, true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // 4th request exceeds the per-minute budget.
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/stats", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Liveness probes are exempt from the limit.
+    let resp = app
+        .oneshot(req("GET", "/health", None, false))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

@@ -118,6 +118,12 @@ default_max_calls_per_minute = 10
 api_enabled = true
 api_bind_address = "127.0.0.1"  # bind publicly only behind TLS + firewall
 api_port = 8080
+# PREFER supplying the token via the SBC_API_TOKEN environment variable
+# (systemd EnvironmentFile, 600 root:root) instead of writing it here in
+# clear text. The env var overrides this key. Generate with:
+#   openssl rand -hex 32
+# If a token IS written below, this file MUST be chmod 600. The API refuses
+# to start when enabled without a token (fail-closed).
 api_auth_token = "GENERATE-A-LONG-RANDOM-TOKEN"
 # cors_allowed_origins = ["https://admin.example.com"]
 
