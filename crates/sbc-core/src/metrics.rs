@@ -89,6 +89,11 @@ pub struct SbcMetrics {
     /// one-way-audio or media-path problems.
     pub rtp_timeouts_total: Arc<AtomicU64>,
 
+    /// Outbound INVITEs re-sent after a trunk's `422 Session Interval Too
+    /// Small` (RFC 4028 §7.4). A steady rate means a trunk's Min-SE floor
+    /// is above `[security] session_expires` — raise it to skip the round trip.
+    pub session_timer_422_retries_total: Arc<AtomicU64>,
+
     /// SIP responses by status code (200, 401, 403, 486, 503 etc.)
     pub sip_responses_by_code: Arc<std::sync::Mutex<HashMap<u16, u64>>>,
 
@@ -143,6 +148,7 @@ impl SbcMetrics {
             security_destination_blocked_total:  Arc::new(AtomicU64::new(0)),
             security_user_limit_rejections_total: Arc::new(AtomicU64::new(0)),
             rtp_timeouts_total:      Arc::new(AtomicU64::new(0)),
+            session_timer_422_retries_total: Arc::new(AtomicU64::new(0)),
             sip_responses_by_code:   Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_calls:            Arc::new(AtomicU64::new(0)),
             active_webrtc_calls:     Arc::new(AtomicU64::new(0)),
@@ -264,6 +270,11 @@ impl SbcMetrics {
     /// Count a call torn down by the RTP inactivity timeout.
     pub fn inc_rtp_timeout(&self) {
         self.rtp_timeouts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an INVITE re-sent after a 422 Session Interval Too Small.
+    pub fn inc_session_timer_422_retry(&self) {
+        self.session_timer_422_retries_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
@@ -455,6 +466,10 @@ impl SbcMetrics {
         counter!("sbc_rtp_timeouts",
                  "Total calls torn down by the RTP inactivity timeout",
                  self.rtp_timeouts_total.load(Ordering::Relaxed));
+
+        counter!("sbc_session_timer_422_retries",
+                 "Total outbound INVITEs re-sent after a trunk 422 Session Interval Too Small (RFC 4028)",
+                 self.session_timer_422_retries_total.load(Ordering::Relaxed));
 
         // ── Media counters ────────────────────────────────────────────────────
         counter!("sbc_rtp_packets",
@@ -666,8 +681,13 @@ mod tests {
         assert_eq!(m.rtp_timeouts_total.load(Ordering::Relaxed), 2);
         assert!(m.last_cdr_written_time.load(Ordering::Relaxed) > 0);
 
+        m.inc_session_timer_422_retry();
+        assert_eq!(m.session_timer_422_retries_total.load(Ordering::Relaxed), 1);
+
         let output = m.render_prometheus();
         assert!(output.contains("sbc_rtp_timeouts_total 2"));
+        assert!(output.contains("# TYPE sbc_session_timer_422_retries counter"));
+        assert!(output.contains("sbc_session_timer_422_retries_total 1"));
         assert!(output.contains("# TYPE sbc_last_cdr_written_timestamp_seconds gauge"));
     }
 

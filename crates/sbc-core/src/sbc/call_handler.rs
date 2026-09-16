@@ -130,6 +130,9 @@ impl Sbc {
                     .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
                 c.dialog_info_toward_callee(&sbc_ip, sbc_port)
                     .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
+                // INVITE still pending toward the callee (no 200 OK yet): a
+                // BYE cannot match — CANCEL the live attempt instead.
+                c.invite_attempts.last().and_then(|a| crate::sip_builder::build_cancel(&a.raw)),
             )
         }).collect();
         drop(calls);
@@ -144,7 +147,7 @@ impl Sbc {
 
         for (uuid, call_id, caller_addr, caller_transport, caller_tx,
              callee_dest, callee_transport, callee_tx, media_id,
-             outbound_call_id, bye_toward_caller, bye_toward_callee) in active
+             outbound_call_id, bye_toward_caller, bye_toward_callee, cancel_toward_callee) in active
         {
             // Build BYE for caller leg — real dialog identity when captured
             let bye_caller = bye_toward_caller.unwrap_or_else(|| format!(
@@ -167,28 +170,38 @@ impl Sbc {
                 caller_tx.as_ref(),
             ).await;
 
-            // Build BYE for callee leg
+            // Callee leg: BYE when the dialog is established, CANCEL when
+            // the INVITE is still pending (a BYE would leave a ghost session
+            // on the trunk — the OverMaxCall case).
             if let Some(dest) = callee_dest {
-                let callee_call_id = outbound_call_id.as_deref().unwrap_or(&call_id);
-                let bye_callee = bye_toward_callee.clone().unwrap_or_else(|| format!(
-                    "BYE sip:bye@{} SIP/2.0\r\n\
-                     Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
-                     From: <sip:sbc@{}>;tag=shutdown-{}\r\n\
-                     To: <sip:callee@{}>\r\n\
-                     Call-ID: {}\r\n\
-                     CSeq: 1 BYE\r\n\
-                     Reason: Q.850;cause=16;text=\"Server shutdown\"\r\n\
-                     Content-Length: 0\r\n\r\n",
-                    dest.ip(), sbc_ip,
-                    &uuid::Uuid::new_v4().to_string()[..8],
-                    sbc_ip, &uuid[..8], dest.ip(),
-                    callee_call_id
-                ));
-                info!("Shutdown BYE → callee {} (call {})", dest, &uuid[..8]);
-                let _ = self.transport.reply(
-                    bye_callee.as_bytes(), dest, callee_transport,
-                    callee_tx.as_ref(),
-                ).await;
+                if let (None, Some(cancel)) = (&bye_toward_callee, &cancel_toward_callee) {
+                    info!("Shutdown CANCEL → callee {} (call {}, INVITE pending)", dest, &uuid[..8]);
+                    let _ = self.transport.reply(
+                        cancel.as_bytes(), dest, callee_transport,
+                        callee_tx.as_ref(),
+                    ).await;
+                } else {
+                    let callee_call_id = outbound_call_id.as_deref().unwrap_or(&call_id);
+                    let bye_callee = bye_toward_callee.clone().unwrap_or_else(|| format!(
+                        "BYE sip:bye@{} SIP/2.0\r\n\
+                         Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
+                         From: <sip:sbc@{}>;tag=shutdown-{}\r\n\
+                         To: <sip:callee@{}>\r\n\
+                         Call-ID: {}\r\n\
+                         CSeq: 1 BYE\r\n\
+                         Reason: Q.850;cause=16;text=\"Server shutdown\"\r\n\
+                         Content-Length: 0\r\n\r\n",
+                        dest.ip(), sbc_ip,
+                        &uuid::Uuid::new_v4().to_string()[..8],
+                        sbc_ip, &uuid[..8], dest.ip(),
+                        callee_call_id
+                    ));
+                    info!("Shutdown BYE → callee {} (call {})", dest, &uuid[..8]);
+                    let _ = self.transport.reply(
+                        bye_callee.as_bytes(), dest, callee_transport,
+                        callee_tx.as_ref(),
+                    ).await;
+                }
             }
 
             // Terminate media session
@@ -256,10 +269,16 @@ impl Sbc {
                     .ok()
                     .map(|h| h.value().to_string())
                     .unwrap_or_default();
-                let cseq_header = request.cseq_header()
+                // CSeq: the callee-leg INVITE's number (RFC 3261 §13.2.2.4),
+                // which differs from the caller's after a 407/422 retry.
+                let caller_cseq_header = request.cseq_header()
                     .ok()
                     .map(|h| h.value().to_string())
                     .unwrap_or("1 ACK".to_string());
+                let cseq_header = ack_cseq_for_callee(
+                    &caller_cseq_header,
+                    self.b2bua.outbound_invite_cseq(&uuid).await,
+                );
 
                 // Get the callee's Request-URI (the contact from the callee's 200 OK)
                 let callee_req_uri = self.b2bua.get_callee_contact_uri(&uuid).await
@@ -538,17 +557,27 @@ impl Sbc {
         if let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await {
             // Get callee info BEFORE terminating the call
             let callee_cancel_info = self.b2bua.get_callee_cancel_info(&uuid).await;
+            let current_attempt = self.b2bua.current_attempt(&uuid).await;
 
-            // Terminate call + release media
-            let media_id = self.b2bua.get_media_session_id(&uuid).await;
-            if let Some(mid) = media_id {
-                let _ = self.media.terminate_session(&mid);
-            }
+            // Terminate call (releases media)
             self.b2bua.terminate_call(&uuid).await;
             self.metrics.inc_call_failed();
 
-            // Relay CANCEL to callee (if the INVITE was already forwarded)
-            if let Some((_out_call_id, _cseq, callee_dest, callee_reply_tx, callee_transport)) = callee_cancel_info {
+            // CANCEL toward the callee (if the INVITE was already forwarded).
+            // RFC 3261 §9.1: it must carry the INVITE's own Request-URI, Via
+            // branch and CSeq, so build it from the live attempt — the raw
+            // relay through topology hiding minted a fresh branch and kept
+            // the caller's R-URI/CSeq, which never matched after a retry.
+            if let Some((attempt, tx)) = current_attempt {
+                if let Some(cancel) = crate::sip_builder::build_cancel(&attempt.raw) {
+                    info!("B2BUA: CANCEL → callee {} (from INVITE attempt CSeq {})", attempt.dest, attempt.cseq);
+                    let _ = self.transport.reply(cancel.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
+                } else {
+                    warn!("B2BUA: stored INVITE for call {} is not parseable — CANCEL not sent", uuid);
+                }
+            } else if let Some((_out_call_id, _cseq, callee_dest, callee_reply_tx, callee_transport)) = callee_cancel_info {
+                // Legacy path: no attempt recorded (should not happen for a
+                // forwarded INVITE) — best-effort relay.
                 info!("B2BUA: relaying CANCEL to callee at {}", callee_dest);
                 let raw_cancel = rsip::SipMessage::Request(request.clone()).to_string();
                 let cancel_out = self.apply_outbound_topology(&raw_cancel, callee_transport);
@@ -621,8 +650,11 @@ impl Sbc {
                 .map(|c| {
                     let caller_died = c.caller_source == peer;
                     let bye = if caller_died {
+                        // Dialog established → BYE; INVITE still pending →
+                        // CANCEL the live attempt (a BYE cannot match yet).
                         c.dialog_info_toward_callee(&sbc_ip, sbc_port)
                             .map(|d| crate::sip_builder::build_bye(&d, Some("SIP;cause=200;text=\"ws-closed\"")))
+                            .or_else(|| c.invite_attempts.last().and_then(|a| crate::sip_builder::build_cancel(&a.raw)))
                     } else {
                         c.dialog_info_toward_caller(&sbc_ip, sbc_port)
                             .map(|d| crate::sip_builder::build_bye(&d, Some("SIP;cause=200;text=\"ws-closed\"")))
@@ -913,5 +945,28 @@ impl Sbc {
         }
 
         Ok(())
+    }
+}
+
+/// CSeq header value for the ACK relayed toward the callee: the callee-leg
+/// INVITE's number when known (it diverges from the caller's after a
+/// 407/422 retry), else the caller's own header (registrar-routed callees
+/// keep the caller's CSeq end to end).
+fn ack_cseq_for_callee(caller_cseq_header: &str, outbound_invite_cseq: Option<u32>) -> String {
+    match outbound_invite_cseq {
+        Some(n) => format!("{} ACK", n),
+        None => caller_cseq_header.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod ack_tests {
+    use super::ack_cseq_for_callee;
+
+    #[test]
+    fn ack_cseq_prefers_callee_leg_invite_cseq() {
+        assert_eq!(ack_cseq_for_callee("1 ACK", Some(4)), "4 ACK");
+        assert_eq!(ack_cseq_for_callee("17 ACK", Some(17)), "17 ACK");
+        assert_eq!(ack_cseq_for_callee("1 ACK", None), "1 ACK");
     }
 }

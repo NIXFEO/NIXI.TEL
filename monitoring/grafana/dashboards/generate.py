@@ -106,6 +106,10 @@ P += [stat("Last CDR age","time() - sbc_last_cdr_written_timestamp_seconds",0,y,
       stat("SIP parse errors (total)","sbc_sip_parse_errors_total",12,y,w=6),
       stat("Failed calls (total)","sbc_calls_failed_total",18,y,w=6)]
 y+=4
+# A steady rate here means a trunk's Min-SE floor is above [security]
+# session_expires: the SBC pays a 422 round trip on every call until it is raised.
+P += [stat("Session-timer 422 retries (total)","sbc_session_timer_422_retries_total",0,y,w=6)]
+y+=4
 
 dash={"uid":"nixi-sbc-overview","title":"NIXI SBC — Overview","tags":["sbc","nixi"],
     "timezone":"browser","schemaVersion":39,"version":3,"refresh":"30s",

@@ -128,10 +128,70 @@ pub struct FailoverState {
 pub struct SessionTimerState {
     /// Negotiated Session-Expires (seconds).
     pub interval_secs: u32,
+    /// Min-SE to carry in refresh re-INVITEs (raised by a peer's 422).
+    pub min_se: u32,
     /// When the next refresh re-INVITE is due (start + interval/2).
     pub next_refresh_at: std::time::Instant,
     /// CSeq of an in-flight refresh re-INVITE (to match its 200 OK).
     pub pending_refresh_cseq: Option<u32>,
+    /// Raw in-flight refresh re-INVITE, so a non-2xx answer can be ACKed.
+    pub pending_refresh_raw: Option<String>,
+    /// Most recent refresh re-INVITE (CSeq, raw), kept after its answer so
+    /// a retransmitted answer can be re-ACKed instead of being mistaken
+    /// for a final of the callee-leg INVITE.
+    pub last_refresh: Option<(u32, String)>,
+    /// Consecutive failed refreshes (reset by a 2xx or a 422 that raised
+    /// the interval): drives the retry backoff and the give-up budget.
+    pub refresh_failures: u32,
+}
+
+/// Outcome of a non-2xx answer to the SBC's own refresh re-INVITE.
+#[derive(Debug)]
+pub struct RefreshFailure {
+    /// ACK for the rejected re-INVITE (None when its raw text is unknown).
+    pub ack: Option<String>,
+    pub dest: SocketAddr,
+    pub transport: rsip::Transport,
+    pub reply_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// The peer no longer has the dialog (481/408, or refreshes keep
+    /// failing): the caller must tear the call down.
+    pub dialog_gone: bool,
+}
+
+/// Refresh failures tolerated before the session is considered dead.
+const MAX_REFRESH_FAILURES: u32 = 3;
+
+/// One INVITE transaction the SBC sent toward the callee: the initial
+/// forward, a 407/422 retry or a failover re-send. Responses are attributed
+/// to attempts by Via branch, so a late answer from a superseded attempt
+/// (retransmitted 422, 487 after a failover CANCEL) is ACKed and dropped
+/// instead of being mistaken for the live transaction.
+#[derive(Debug, Clone)]
+pub struct InviteAttempt {
+    /// Raw INVITE exactly as sent (source for CANCEL / non-2xx ACK).
+    pub raw: String,
+    /// Top Via branch of `raw` (None when unparsable).
+    pub branch: Option<String>,
+    /// CSeq number of `raw`.
+    pub cseq: u32,
+    /// Where the INVITE was sent (ACK/CANCEL go to the same place).
+    pub dest: SocketAddr,
+    pub transport: rsip::Transport,
+    /// Trunk the attempt targeted (None for registrar-routed callees).
+    pub trunk_id: Option<crate::routing::TrunkId>,
+}
+
+/// Maximum attempts remembered per call (initial + retries + failovers).
+const MAX_INVITE_ATTEMPTS: usize = 8;
+
+/// Which INVITE transaction a callee-leg response belongs to.
+#[derive(Debug, Clone)]
+pub enum InviteResponseClass {
+    /// The transaction currently in flight.
+    Current,
+    /// A superseded attempt (retried or failed over). Carries the attempt
+    /// so the response can still be ACKed; None when it cannot be found.
+    Stale(Option<InviteAttempt>),
 }
 
 /// A B2BUA call — two legs + shared media session
@@ -190,8 +250,20 @@ pub struct B2buaCall {
     /// back to the caller so the UAC can match the response to its INVITE transaction.
     pub caller_original_vias: Vec<String>,
 
+    /// CSeq number of the caller's INVITE. The trunk leg starts with the
+    /// same number but every retry bumps it, so responses relayed back to
+    /// the caller get this value restored.
+    pub caller_invite_cseq: Option<u32>,
+
+    /// INVITE transactions sent toward the callee, oldest first; the last
+    /// one is live. Mirrored into `original_outbound_invite` / `trunk_id`
+    /// / `callee_dest` for the existing readers.
+    pub invite_attempts: Vec<InviteAttempt>,
+
     // ── Outbound trunk auth (407 retry) ─────────────────────────────
-    /// Raw outbound INVITE (topology-hidden) stored for 407 challenge retry
+    /// Raw outbound INVITE (topology-hidden) as last sent — 407/422 retries
+    /// and failover rebuild from it; CANCEL/BYE/refresh derive their CSeq
+    /// and branch from it.
     pub original_outbound_invite: Option<String>,
 
     /// Trunk ID used for this call (for credential lookup on 407)
@@ -199,6 +271,10 @@ pub struct B2buaCall {
 
     /// Number of auth retries attempted (capped at 1 to prevent loops)
     pub auth_retry_count: u32,
+
+    /// RFC 4028 §7.4 retries after a 422 for the current trunk attempt
+    /// (capped at 1; reset by failover).
+    pub session_timer_retry_count: u32,
 
     /// WebRTC session (ICE agent, DTLS context, SRTP) — only set when caller_is_webrtc
     pub webrtc_session: Option<Arc<Mutex<WebRtcSession>>>,
@@ -282,9 +358,12 @@ impl B2buaCall {
             callee_transport: rsip::Transport::Udp,
             callee_request_uri: None,
             caller_original_vias: Vec::new(),
+            caller_invite_cseq: None,
+            invite_attempts: Vec::new(),
             original_outbound_invite: None,
             trunk_id: None,
             auth_retry_count: 0,
+            session_timer_retry_count: 0,
             webrtc_session: None,
             webrtc_ice_pwd: None,
             webrtc_sdp_answer: None,
@@ -395,7 +474,7 @@ fn extract_body(raw: &str) -> Option<String> {
 }
 
 /// Extract the CSeq number from a raw SIP message.
-fn parse_cseq_number(raw: &str) -> Option<u32> {
+pub(crate) fn parse_cseq_number(raw: &str) -> Option<u32> {
     raw.split("\r\n")
         .find(|l| l.to_lowercase().starts_with("cseq:"))
         .and_then(|l| l["cseq:".len()..].trim().split_whitespace().next())
@@ -437,6 +516,9 @@ struct RecentDialog {
     inbound_call_id: String,
     outbound_call_id: Option<String>,
     terminated_at: std::time::Instant,
+    /// Last INVITE sent toward the callee, so a final response that lands
+    /// after teardown (487 after a caller CANCEL) can still be ACKed.
+    last_attempt: Option<InviteAttempt>,
 }
 
 /// How long a terminated dialog stays recognizable for late BYEs.
@@ -648,20 +730,123 @@ impl B2buaManager {
     }
 
     /// Arm the RFC 4028 session timer: SBC refreshes the callee (trunk) leg.
-    pub async fn set_session_timer(&self, uuid: &CallUuid, interval_secs: u32) {
+    /// `min_se` is carried in every refresh re-INVITE.
+    pub async fn set_session_timer(&self, uuid: &CallUuid, interval_secs: u32, min_se: u32) {
         let mut calls = self.calls.lock().await;
         if let Some(call) = calls.get_mut(uuid) {
             call.session_timer = Some(SessionTimerState {
                 interval_secs,
+                min_se,
                 next_refresh_at: std::time::Instant::now()
                     + Duration::from_secs((interval_secs / 2).max(30) as u64),
                 pending_refresh_cseq: None,
+                pending_refresh_raw: None,
+                last_refresh: None,
+                refresh_failures: 0,
             });
             info!(
-                "Session timer armed for call {}: {}s (refresh every {}s)",
-                uuid, interval_secs, (interval_secs / 2).max(30)
+                "Session timer armed for call {}: {}s (refresh every {}s, Min-SE {})",
+                uuid, interval_secs, (interval_secs / 2).max(30), min_se
             );
         }
+    }
+
+    /// Whether `cseq` is the SBC's own in-flight refresh re-INVITE on this call.
+    pub async fn is_pending_refresh(&self, uuid: &CallUuid, cseq: u32) -> bool {
+        let calls = self.calls.lock().await;
+        calls
+            .get(uuid)
+            .and_then(|c| c.session_timer.as_ref())
+            .is_some_and(|st| st.pending_refresh_cseq == Some(cseq))
+    }
+
+    /// A non-2xx answer to our refresh re-INVITE. Clears the pending CSeq
+    /// and returns the ACK to send. A 422 raises the interval / Min-SE to
+    /// what the peer demands and the next tick retries; any other rejection
+    /// is retried with backoff. `dialog_gone` is set when the peer proved it
+    /// lost the dialog (481 / 408) or refreshes keep failing — the caller
+    /// must then tear the call down instead of keeping a zombie session.
+    pub async fn fail_session_refresh(
+        &self,
+        uuid: &CallUuid,
+        cseq: u32,
+        status: u16,
+        min_se_422: Option<u32>,
+        response_to: &str,
+    ) -> Option<RefreshFailure> {
+        let mut calls = self.calls.lock().await;
+        let call = calls.get_mut(uuid)?;
+        let st = call.session_timer.as_mut()?;
+        if st.pending_refresh_cseq != Some(cseq) {
+            return None;
+        }
+        st.pending_refresh_cseq = None;
+        let raw = st.pending_refresh_raw.take();
+        // A 422 that actually raises the interval is progress, not a failure.
+        let progressed = status == 422 && min_se_422.is_some_and(|m| m > st.interval_secs);
+        if status == 422 {
+            if let Some(min) = min_se_422 {
+                st.interval_secs = st.interval_secs.max(min);
+                st.min_se = st.min_se.max(min);
+            }
+        }
+        if progressed {
+            st.refresh_failures = 0;
+        } else {
+            st.refresh_failures += 1;
+        }
+        let dialog_gone = matches!(status, 408 | 481) || st.refresh_failures >= MAX_REFRESH_FAILURES;
+        let backoff_secs = (30u64 << st.refresh_failures.min(4)).min((st.interval_secs / 2).max(30) as u64);
+        st.next_refresh_at = std::time::Instant::now() + Duration::from_secs(backoff_secs);
+        if dialog_gone {
+            warn!(
+                "Session refresh rejected {} for call {} (CSeq {}, {} consecutive failures) — dialog gone, tearing down",
+                status, uuid, cseq, st.refresh_failures
+            );
+        } else {
+            warn!(
+                "Session refresh rejected {} for call {} (CSeq {}) — session kept, next refresh in {}s (interval {}s, Min-SE {})",
+                status, uuid, cseq, backoff_secs, st.interval_secs, st.min_se
+            );
+        }
+        let ack = raw.and_then(|r| crate::sip_builder::build_ack_for_non_2xx(&r, response_to));
+        Some(RefreshFailure {
+            ack,
+            dest: call.callee_dest?,
+            transport: call.callee_transport,
+            reply_tx: call.callee_reply_tx.clone(),
+            dialog_gone,
+        })
+    }
+
+    /// A retransmitted answer to a refresh re-INVITE whose outcome was
+    /// already consumed (its CSeq matches the last refresh sent). Returns
+    /// the ACK to re-send (None for a 1xx) with its destination; outer
+    /// None when `cseq` is not a known refresh.
+    pub async fn refresh_duplicate_ack(
+        &self,
+        uuid: &CallUuid,
+        cseq: u32,
+        status: u16,
+        response_to: &str,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<(Option<String>, SocketAddr, rsip::Transport, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+        let calls = self.calls.lock().await;
+        let call = calls.get(uuid)?;
+        let st = call.session_timer.as_ref()?;
+        let (last_cseq, raw) = st.last_refresh.as_ref()?;
+        if *last_cseq != cseq {
+            return None;
+        }
+        let ack = match status {
+            100..=199 => None,
+            200..=299 => call
+                .dialog_info_toward_callee(local_ip, local_port)
+                .map(|d| crate::sip_builder::build_ack_for_2xx(&d, cseq)),
+            _ => crate::sip_builder::build_ack_for_non_2xx(raw, response_to),
+        };
+        Some((ack, call.callee_dest?, call.callee_transport, call.callee_reply_tx.clone()))
     }
 
     /// Record the negotiated media codec for a call (from the SDP answer),
@@ -719,15 +904,19 @@ impl B2buaManager {
             }
 
             let interval = st.interval_secs;
+            let min_se = st.min_se;
             let contact = format!("<sip:sbc@{}:{}>", local_ip, local_port);
             let reinvite = crate::sip_builder::build_reinvite(
                 &d,
                 &sdp,
                 &contact,
                 Some((interval, "uac")),
+                Some(min_se),
             );
             if let Some(st) = call.session_timer.as_mut() {
                 st.pending_refresh_cseq = Some(d.cseq);
+                st.pending_refresh_raw = Some(reinvite.clone());
+                st.last_refresh = Some((d.cseq, reinvite.clone()));
                 st.next_refresh_at =
                     now + Duration::from_secs((interval / 2).max(30) as u64);
             }
@@ -759,6 +948,8 @@ impl B2buaManager {
             return None;
         }
         st.pending_refresh_cseq = None;
+        st.pending_refresh_raw = None;
+        st.refresh_failures = 0;
         info!("Session refresh confirmed for call {} (CSeq {})", uuid, cseq);
         let d = call.dialog_info_toward_callee(local_ip, local_port)?;
         let ack = crate::sip_builder::build_ack_for_2xx(&d, cseq);
@@ -901,9 +1092,17 @@ impl B2buaManager {
             None
         };
         if let Some(call) = calls.get(uuid) {
+            // Release the RTP port pair here so every teardown path (error
+            // relay, API kick, invalid destination…) frees it, not only BYE.
+            if let Some(media_id) = &call.media_session_id {
+                if let Err(e) = self.media.terminate_session(media_id) {
+                    debug!("B2BUA: media session already gone: {}", e);
+                }
+            }
             self.remember_terminated(
                 call.inbound.call_id.clone(),
                 call.outbound.as_ref().map(|l| l.call_id.clone()),
+                call.invite_attempts.last().cloned(),
             );
         }
         calls.remove(uuid);
@@ -919,7 +1118,12 @@ impl B2buaManager {
         }
     }
 
-    fn remember_terminated(&self, inbound_call_id: String, outbound_call_id: Option<String>) {
+    fn remember_terminated(
+        &self,
+        inbound_call_id: String,
+        outbound_call_id: Option<String>,
+        last_attempt: Option<InviteAttempt>,
+    ) {
         if let Ok(mut recent) = self.recent_terminated.lock() {
             let now = std::time::Instant::now();
             recent.retain(|d| now.duration_since(d.terminated_at) < RECENT_DIALOG_TTL);
@@ -927,11 +1131,29 @@ impl B2buaManager {
                 inbound_call_id,
                 outbound_call_id,
                 terminated_at: now,
+                last_attempt,
             });
             while recent.len() > 256 {
                 recent.pop_front();
             }
         }
+    }
+
+    /// Last INVITE attempt of a recently terminated dialog whose Call-ID
+    /// matches (exact or Genesys-truncated suffix), for ACKing a stray
+    /// final response after teardown.
+    pub fn recent_attempt_for_call_id(&self, call_id: &str) -> Option<InviteAttempt> {
+        if call_id.is_empty() {
+            return None;
+        }
+        let recent = self.recent_terminated.lock().ok()?;
+        let now = std::time::Instant::now();
+        recent
+            .iter()
+            .rev()
+            .filter(|d| now.duration_since(d.terminated_at) < RECENT_DIALOG_TTL)
+            .find(|d| d.inbound_call_id == call_id || d.inbound_call_id.ends_with(call_id))
+            .and_then(|d| d.last_attempt.clone())
     }
 
     /// Whether a Call-ID matches a dialog terminated within the TTL window.
@@ -1139,12 +1361,149 @@ impl B2buaManager {
         ))
     }
 
-    /// Store the caller's original Via headers (before topology hiding strips them)
-    pub async fn set_caller_vias(&self, uuid: &CallUuid, vias: Vec<String>) {
+    /// Store the caller's original Via headers (before topology hiding strips
+    /// them) and the caller's INVITE CSeq (restored in relayed responses).
+    pub async fn set_caller_vias(&self, uuid: &CallUuid, vias: Vec<String>, invite_cseq: Option<u32>) {
         let mut calls = self.calls.lock().await;
         if let Some(call) = calls.get_mut(uuid) {
             debug!("B2BUA: stored {} original Via header(s) for call {}", vias.len(), uuid);
             call.caller_original_vias = vias;
+            call.caller_invite_cseq = invite_cseq;
+        }
+    }
+
+    /// CSeq number of the caller's INVITE (None if never captured).
+    pub async fn get_caller_invite_cseq(&self, uuid: &CallUuid) -> Option<u32> {
+        let calls = self.calls.lock().await;
+        calls.get(uuid).and_then(|c| c.caller_invite_cseq)
+    }
+
+    // ── Callee-leg INVITE attempts ───────────────────────────────────
+
+    /// Record an INVITE just sent toward the callee (initial forward, 407 or
+    /// 422 retry, failover). Becomes the live transaction: CANCEL, ACK, BYE
+    /// and refreshes derive branch/CSeq from it, and the failover no-answer
+    /// clock restarts. `outbound.cseq` is deliberately left alone — the
+    /// synthetic BYE builders use it verbatim and must stay above it.
+    pub async fn push_invite_attempt(
+        &self,
+        uuid: &CallUuid,
+        raw: String,
+        dest: SocketAddr,
+        transport: rsip::Transport,
+        trunk_id: Option<crate::routing::TrunkId>,
+    ) {
+        let branch = crate::sip_builder::top_via_branch(&raw);
+        let cseq = parse_cseq_number(&raw).unwrap_or(1);
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.original_outbound_invite = Some(raw.clone());
+            if trunk_id.is_some() {
+                call.trunk_id = trunk_id;
+            }
+            call.callee_dest = Some(dest);
+            call.callee_transport = transport;
+            if let Some(fo) = call.failover.as_mut() {
+                fo.invite_sent_at = std::time::Instant::now();
+            }
+            call.invite_attempts.push(InviteAttempt { raw, branch, cseq, dest, transport, trunk_id });
+            if call.invite_attempts.len() > MAX_INVITE_ATTEMPTS {
+                call.invite_attempts.remove(0);
+            }
+            debug!(
+                "B2BUA: INVITE attempt #{} for call {} (CSeq {}, branch {:?}) → {}",
+                call.invite_attempts.len(), uuid, cseq, call.invite_attempts.last().and_then(|a| a.branch.as_deref()), dest
+            );
+        }
+    }
+
+    /// The live INVITE attempt toward the callee, with the callee reply channel.
+    pub async fn current_attempt(
+        &self,
+        uuid: &CallUuid,
+    ) -> Option<(InviteAttempt, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+        let calls = self.calls.lock().await;
+        let call = calls.get(uuid)?;
+        Some((call.invite_attempts.last()?.clone(), call.callee_reply_tx.clone()))
+    }
+
+    /// CSeq number of the live INVITE toward the callee (None before it is sent).
+    pub async fn outbound_invite_cseq(&self, uuid: &CallUuid) -> Option<u32> {
+        let calls = self.calls.lock().await;
+        calls.get(uuid).and_then(|c| c.invite_attempts.last()).map(|a| a.cseq)
+    }
+
+    /// Attribute a callee-leg INVITE response to an attempt. Via branch is
+    /// authoritative (a failover re-send keeps the CSeq and changes only the
+    /// branch); the CSeq number is the fallback when a branch is missing.
+    /// None when the call is unknown; `Current` when nothing was ever sent.
+    pub async fn classify_invite_response(
+        &self,
+        uuid: &CallUuid,
+        response_branch: Option<&str>,
+        response_cseq: u32,
+    ) -> Option<InviteResponseClass> {
+        let calls = self.calls.lock().await;
+        let call = calls.get(uuid)?;
+        let Some(current) = call.invite_attempts.last() else {
+            return Some(InviteResponseClass::Current);
+        };
+        let older = || call.invite_attempts.iter().rev().skip(1);
+        if let Some(branch) = response_branch {
+            if current.branch.as_deref() == Some(branch) {
+                return Some(InviteResponseClass::Current);
+            }
+            if let Some(a) = older().find(|a| a.branch.as_deref() == Some(branch)) {
+                return Some(InviteResponseClass::Stale(Some(a.clone())));
+            }
+        }
+        // Responses echo the request's CSeq, so a CSeq above the live INVITE
+        // cannot answer it: it belongs to an in-dialog request of ours (a
+        // refresh re-INVITE whose outcome was already consumed). Never relay
+        // it, never ACK it from the attempt, never tear the call down on it.
+        if response_cseq > current.cseq {
+            warn!(
+                "B2BUA: response CSeq {} (branch {:?}) is above the live INVITE attempt of call {} (CSeq {}) — not this transaction, dropped",
+                response_cseq, response_branch, uuid, current.cseq
+            );
+            return Some(InviteResponseClass::Stale(None));
+        }
+        if let Some(branch) = response_branch {
+            if current.branch.is_some() && response_cseq == current.cseq {
+                warn!(
+                    "B2BUA: response branch {} matches no INVITE attempt of call {} (current {:?}) — treating as current",
+                    branch, uuid, current.branch
+                );
+                return Some(InviteResponseClass::Current);
+            }
+        }
+        if response_cseq < current.cseq {
+            let by_cseq = older().find(|a| a.cseq == response_cseq).cloned();
+            return Some(InviteResponseClass::Stale(by_cseq));
+        }
+        Some(InviteResponseClass::Current)
+    }
+
+    /// Reset the 407 retry budget (a new INVITE transaction may be
+    /// challenged once more: 422 retry, failover to another trunk).
+    pub async fn reset_auth_retry(&self, uuid: &CallUuid) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.auth_retry_count = 0;
+        }
+    }
+
+    /// RFC 4028 422 retries already done for the current trunk attempt.
+    pub async fn get_session_timer_retry_count(&self, uuid: &CallUuid) -> u32 {
+        let calls = self.calls.lock().await;
+        calls.get(uuid).map(|c| c.session_timer_retry_count).unwrap_or(0)
+    }
+
+    /// Count a 422 retry (call after re-sending the INVITE).
+    pub async fn increment_session_timer_retry(&self, uuid: &CallUuid) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.session_timer_retry_count += 1;
         }
     }
 
@@ -1578,7 +1937,7 @@ mod tests {
                 ).await.unwrap();
                 // Exercise several independent locked mutators + a read.
                 mgr.set_codec(&uuid, "PCMU").await;
-                mgr.set_session_timer(&uuid, 1800).await;
+                mgr.set_session_timer(&uuid, 1800, 90).await;
                 let _ = mgr.stats().await;
                 uuid
             }));
@@ -1793,5 +2152,278 @@ mod tests {
         // Orphan BYE arrives — call should not be found
         let result = mgr.find_by_any_call_id(call_id).await;
         assert!(result.is_none(), "Terminated call should not be found by orphan BYE");
+    }
+}
+
+#[cfg(test)]
+mod invite_attempt_tests {
+    use super::*;
+
+    fn make_manager() -> B2buaManager {
+        let media = Arc::new(MediaManager::with_port_range(30000..30100, None));
+        B2buaManager::new(media)
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    const SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+
+    fn invite(branch: &str, cseq: u32) -> String {
+        format!(
+            "INVITE sip:bob@203.0.113.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 198.51.100.1:5060;branch={};rport\r\n\
+             From: <sip:caller@pstn.example.com>;tag=caller-tag\r\n\
+             To: <sip:bob@b.example.com>\r\n\
+             Call-ID: cid-1\r\n\
+             CSeq: {} INVITE\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            branch, cseq, SDP.len(), SDP
+        )
+    }
+
+    async fn call_with_attempts(mgr: &B2buaManager) -> (CallUuid, SocketAddr, SocketAddr) {
+        let uuid = mgr
+            .create_call("cid-1".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .await
+            .unwrap();
+        mgr.set_failover_candidates(&uuid, vec![]).await;
+        let trunk_a = addr("203.0.113.9:5060");
+        let trunk_b = addr("203.0.113.10:5060");
+        // initial INVITE, 407 retry (CSeq+1), failover (same CSeq, new branch, other trunk)
+        mgr.push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), trunk_a, rsip::Transport::Udp, None).await;
+        assert_eq!(mgr.outbound_invite_cseq(&uuid).await, Some(3));
+        mgr.push_invite_attempt(&uuid, invite("z9hG4bKbbb", 4), trunk_a, rsip::Transport::Udp, None).await;
+        // Everything stamped so far (set_failover_candidates, two pushes) is
+        // strictly before this marker: only the third push can move the clock past it.
+        let marker = std::time::Instant::now();
+        mgr.push_invite_attempt(&uuid, invite("z9hG4bKccc", 4), trunk_b, rsip::Transport::Udp, None).await;
+        {
+            let calls = mgr.calls.lock().await;
+            assert!(calls[&uuid].failover.as_ref().unwrap().invite_sent_at >= marker, "push restarts the no-answer clock");
+        }
+        (uuid, trunk_a, trunk_b)
+    }
+
+    #[tokio::test]
+    async fn responses_are_attributed_by_branch_then_cseq() {
+        let mgr = make_manager();
+        let (uuid, trunk_a, trunk_b) = call_with_attempts(&mgr).await;
+
+        assert_eq!(mgr.outbound_invite_cseq(&uuid).await, Some(4));
+        let (current, _) = mgr.current_attempt(&uuid).await.unwrap();
+        assert_eq!(current.dest, trunk_b);
+        assert_eq!(current.branch.as_deref(), Some("z9hG4bKccc"));
+
+        let classify = |branch: Option<&'static str>, cseq: u32| mgr.classify_invite_response(&uuid, branch, cseq);
+
+        assert!(matches!(classify(Some("z9hG4bKccc"), 4).await, Some(InviteResponseClass::Current)));
+        // Late 422 from trunk A's retry: same CSeq as the live attempt, old branch
+        match classify(Some("z9hG4bKbbb"), 4).await {
+            Some(InviteResponseClass::Stale(Some(a))) => {
+                assert_eq!(a.dest, trunk_a);
+                assert_eq!(a.cseq, 4);
+            }
+            other => panic!("expected stale with trunk A attempt, got {:?}", other),
+        }
+        // Retransmitted 407 of the very first attempt
+        match classify(Some("z9hG4bKaaa"), 3).await {
+            Some(InviteResponseClass::Stale(Some(a))) => assert_eq!(a.branch.as_deref(), Some("z9hG4bKaaa")),
+            other => panic!("{:?}", other),
+        }
+        // No branch echoed: CSeq fallback
+        match classify(None, 3).await {
+            Some(InviteResponseClass::Stale(Some(a))) => assert_eq!(a.cseq, 3),
+            other => panic!("{:?}", other),
+        }
+        assert!(matches!(classify(None, 4).await, Some(InviteResponseClass::Current)));
+        // Unknown branch: current when CSeq is the live one, stale by CSeq when older
+        assert!(matches!(classify(Some("z9hG4bKzzz"), 4).await, Some(InviteResponseClass::Current)));
+        match classify(Some("z9hG4bKzzz"), 3).await {
+            Some(InviteResponseClass::Stale(Some(a))) => assert_eq!(a.cseq, 3),
+            other => panic!("{:?}", other),
+        }
+        // CSeq above the live INVITE (a consumed refresh re-INVITE's answer,
+        // retransmitted): never the INVITE's final — dropped, not "current"
+        assert!(matches!(classify(Some("z9hG4bKrefresh"), 5).await, Some(InviteResponseClass::Stale(None))));
+        assert!(matches!(classify(None, 5).await, Some(InviteResponseClass::Stale(None))));
+        // Unknown call
+        assert!(mgr.classify_invite_response(&"nope".to_string(), Some("z9hG4bKccc"), 4).await.is_none());
+
+        let calls = mgr.calls.lock().await;
+        let c = &calls[&uuid];
+        assert_eq!(c.invite_attempts.len(), 3);
+        assert!(c.original_outbound_invite.as_deref().unwrap().contains("z9hG4bKccc"), "mirror follows the live attempt");
+        assert_eq!(c.callee_dest, Some(trunk_b));
+    }
+
+    #[tokio::test]
+    async fn no_attempt_means_current_and_attempts_are_bounded() {
+        let mgr = make_manager();
+        let uuid = mgr
+            .create_call("cid-2".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            mgr.classify_invite_response(&uuid, Some("z9hG4bKx"), 1).await,
+            Some(InviteResponseClass::Current)
+        ));
+        assert!(mgr.current_attempt(&uuid).await.is_none());
+        assert_eq!(mgr.outbound_invite_cseq(&uuid).await, None);
+
+        for i in 0..12u32 {
+            mgr.push_invite_attempt(&uuid, invite(&format!("z9hG4bK{}", i), 3 + i), addr("203.0.113.9:5060"), rsip::Transport::Udp, None).await;
+        }
+        let calls = mgr.calls.lock().await;
+        assert_eq!(calls[&uuid].invite_attempts.len(), MAX_INVITE_ATTEMPTS);
+        assert_eq!(calls[&uuid].invite_attempts.last().unwrap().cseq, 14, "newest attempt kept");
+    }
+
+    #[tokio::test]
+    async fn terminate_call_releases_media_and_remembers_last_attempt() {
+        let mgr = make_manager();
+        let uuid = mgr
+            .create_call("cid-3".into(), "t".into(), addr("192.168.1.100:5060"), Some(SDP), None, rsip::Transport::Udp)
+            .await
+            .unwrap();
+        let before = mgr.media.stats().allocated_ports;
+        assert!(before > 0, "create_call with SDP allocates an RTP port pair");
+        mgr.push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), addr("203.0.113.9:5060"), rsip::Transport::Udp, None).await;
+
+        mgr.terminate_call(&uuid).await;
+
+        assert_eq!(mgr.media.stats().allocated_ports, 0, "terminate_call must free the media session");
+        let a = mgr.recent_attempt_for_call_id("cid-3").expect("last attempt remembered");
+        assert_eq!(a.cseq, 3);
+        assert!(mgr.recent_attempt_for_call_id("id-3").is_some(), "truncated Call-ID suffix");
+        assert!(mgr.recent_attempt_for_call_id("other").is_none());
+        assert!(mgr.recent_attempt_for_call_id("").is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_retry_reset_and_caller_cseq() {
+        let mgr = make_manager();
+        let uuid = mgr
+            .create_call("cid-4".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .await
+            .unwrap();
+        let trunk_id = uuid::Uuid::new_v4();
+        mgr.store_outbound_invite(&uuid, String::new(), trunk_id).await;
+        mgr.increment_auth_retry(&uuid).await;
+        assert_eq!(mgr.get_auth_retry_info(&uuid).await.unwrap().2, 1);
+        mgr.reset_auth_retry(&uuid).await;
+        assert_eq!(mgr.get_auth_retry_info(&uuid).await.unwrap().2, 0);
+
+        assert_eq!(mgr.get_caller_invite_cseq(&uuid).await, None);
+        mgr.set_caller_vias(&uuid, vec!["Via: SIP/2.0/UDP 10.0.0.9;branch=z9hG4bKc".into()], Some(7)).await;
+        assert_eq!(mgr.get_caller_invite_cseq(&uuid).await, Some(7));
+        assert_eq!(mgr.get_caller_vias(&uuid).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_clears_pending_and_rearms_on_422() {
+        let mgr = make_manager();
+        let uuid = mgr
+            .create_call("cid-5".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .await
+            .unwrap();
+        mgr.set_inbound_dialog(&uuid, "<sip:caller@pstn.example.com>;tag=caller-tag".into(), None).await;
+        mgr.attach_outbound(&uuid, "cid-5".into(), "sbc-tag".into(), addr("203.0.113.9:5060"), None, rsip::Transport::Udp).await.unwrap();
+        mgr.set_established_dialog(
+            &uuid,
+            "<sip:caller@pstn.example.com>;tag=caller-tag".into(),
+            "<sip:bob@b.example.com>;tag=callee-tag".into(),
+            Some("sip:bob@203.0.113.9:5060".into()),
+        ).await;
+        mgr.push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), addr("203.0.113.9:5060"), rsip::Transport::Udp, None).await;
+        mgr.set_session_timer(&uuid, 1800, 90).await;
+        {
+            let mut calls = mgr.calls.lock().await;
+            let c = calls.get_mut(&uuid).unwrap();
+            c.state = CallState::Connected;
+            c.session_timer.as_mut().unwrap().next_refresh_at = std::time::Instant::now() - Duration::from_secs(1);
+        }
+
+        let due = mgr.due_session_refreshes("1.2.3.4", 5060).await;
+        assert_eq!(due.len(), 1);
+        let reinvite = due[0].1.clone();
+        assert!(reinvite.contains("Session-Expires: 1800;refresher=uac\r\n"), "{}", reinvite);
+        assert!(reinvite.contains("Min-SE: 90\r\n"), "refresh carries Min-SE: {}", reinvite);
+        let cseq = parse_cseq_number(&reinvite).unwrap();
+        assert_eq!(cseq, 4, "refresh CSeq follows the stored INVITE");
+        assert!(mgr.is_pending_refresh(&uuid, cseq).await);
+        assert!(!mgr.is_pending_refresh(&uuid, cseq + 1).await);
+        assert!(mgr.due_session_refreshes("1.2.3.4", 5060).await.is_empty(), "no second refresh while one is pending");
+
+        // Trunk answers 422 Min-SE 14400 to the refresh
+        let outcome = mgr
+            .fail_session_refresh(&uuid, cseq, 422, Some(14400), "<sip:bob@b.example.com>;tag=callee-tag")
+            .await
+            .expect("pending refresh recognised");
+        let ack = outcome.ack.expect("ACK built from the stored re-INVITE");
+        assert_eq!(outcome.dest, addr("203.0.113.9:5060"));
+        assert!(!outcome.dialog_gone, "a 422 that raised the interval is progress");
+        assert!(ack.starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", ack);
+        assert!(ack.contains(&format!("CSeq: {} ACK\r\n", cseq)));
+        let reinvite_branch = crate::sip_builder::top_via_branch(&reinvite).unwrap();
+        assert!(ack.contains(&reinvite_branch), "ACK reuses the re-INVITE's branch");
+        assert!(!mgr.is_pending_refresh(&uuid, cseq).await);
+        {
+            let calls = mgr.calls.lock().await;
+            let st = calls[&uuid].session_timer.as_ref().unwrap();
+            assert_eq!(st.pending_refresh_cseq, None);
+            assert!(st.pending_refresh_raw.is_none());
+            assert_eq!(st.refresh_failures, 0);
+            assert_eq!(st.interval_secs, 14400);
+            assert_eq!(st.min_se, 14400);
+            assert!(st.next_refresh_at > std::time::Instant::now());
+            assert_eq!(st.last_refresh.as_ref().map(|(c, _)| *c), Some(cseq), "last refresh kept for duplicates");
+        }
+        // Not pending any more → a second failure report is ignored…
+        assert!(mgr.fail_session_refresh(&uuid, cseq, 481, None, "x").await.is_none());
+        // …but a retransmitted answer to that refresh is still recognised and re-ACKed
+        let (dup_ack, _, _, _) = mgr
+            .refresh_duplicate_ack(&uuid, cseq, 422, "<sip:bob@b.example.com>;tag=callee-tag", "1.2.3.4", 5060)
+            .await
+            .expect("known refresh CSeq");
+        assert!(dup_ack.unwrap().contains(&format!("CSeq: {} ACK\r\n", cseq)));
+        assert!(mgr.refresh_duplicate_ack(&uuid, cseq + 7, 422, "x", "1.2.3.4", 5060).await.is_none());
+        // The call itself survived
+        assert_eq!(mgr.stats().await.total_active, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_failures_back_off_then_give_up_and_481_is_fatal() {
+        let mgr = make_manager();
+        let uuid = mgr
+            .create_call("cid-6".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .await
+            .unwrap();
+        mgr.attach_outbound(&uuid, "cid-6".into(), "sbc-tag".into(), addr("203.0.113.9:5060"), None, rsip::Transport::Udp).await.unwrap();
+        mgr.set_session_timer(&uuid, 1800, 90).await;
+        async fn fail(mgr: &B2buaManager, uuid: &CallUuid, cseq: u32, status: u16) -> RefreshFailure {
+            {
+                let mut calls = mgr.calls.lock().await;
+                let st = calls.get_mut(uuid).unwrap().session_timer.as_mut().unwrap();
+                st.pending_refresh_cseq = Some(cseq);
+                st.pending_refresh_raw = None;
+            }
+            mgr.fail_session_refresh(uuid, cseq, status, None, "x").await.unwrap()
+        }
+        // 500, 500 → kept with growing backoff; third consecutive failure → give up
+        assert!(!fail(&mgr, &uuid, 10, 500).await.dialog_gone);
+        let after_one = mgr.calls.lock().await[&uuid].session_timer.as_ref().unwrap().next_refresh_at;
+        assert!(!fail(&mgr, &uuid, 11, 500).await.dialog_gone);
+        let after_two = mgr.calls.lock().await[&uuid].session_timer.as_ref().unwrap().next_refresh_at;
+        assert!(after_two > after_one, "backoff grows: {:?} vs {:?}", after_two, after_one);
+        assert!(fail(&mgr, &uuid, 12, 500).await.dialog_gone, "third consecutive failure exhausts the budget");
+
+        // A 481 / 408 is fatal immediately, whatever the counter says
+        mgr.set_session_timer(&uuid, 1800, 90).await;
+        assert!(fail(&mgr, &uuid, 20, 481).await.dialog_gone);
+        mgr.set_session_timer(&uuid, 1800, 90).await;
+        assert!(fail(&mgr, &uuid, 21, 408).await.dialog_gone);
     }
 }

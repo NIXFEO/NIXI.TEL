@@ -18,7 +18,7 @@ database required.
 - B2BUA with topology hiding (Via/Contact/Record-Route rewriting)
 - Digest authentication with hot-reloadable user store
 - Active **multi-trunk failover** (no answer in 5s or 5xx → CANCEL + next trunk, LCR-ordered)
-- **RFC 4028 session timers** — long calls survive trunk-side 4h expiry
+- **RFC 4028 session timers** — long calls survive trunk-side 4h expiry; a trunk's `422 Session Interval Too Small` is renegotiated automatically
 - Synthetic in-dialog requests built from real dialog identity (no 481 phantom sessions)
 - Trunk health checks (OPTIONS keepalive), outbound trunk registration (401/407)
 - Battle-tested trunk interop: variable cluster IPs, truncated Call-IDs, late BYEs

@@ -519,6 +519,18 @@ impl Sbc {
 
         let config = SbcConfig::from_file(path)?;
 
+        // ── RFC 4028 session-timer offer: applied without a restart, so an
+        // operator can raise session_expires to a trunk's floor (e.g. 14400
+        // for Genesys) on the fly. Affects new calls only.
+        let session_timer = config.security.session_timer_enabled.then(|| (
+            config.security.session_expires.max(config.security.min_se) as u32,
+            config.security.min_se as u32,
+        ));
+        if session_timer != self.session_timer {
+            info!("Reload: session timers {:?} → {:?}", self.session_timer, session_timer);
+            self.session_timer = session_timer;
+        }
+
         // ── SQLite store present: it is the source of truth for dynamic
         // config — re-hydrate users/DIDs/trunks/ACL from it and skip the
         // legacy TOML merge below.
@@ -1240,7 +1252,7 @@ impl Sbc {
                 self.handle_request(request, source, transport, reply_tx.as_ref()).await
             }
             SipMessage::Response(response) => {
-                self.handle_response(response, source, transport).await
+                self.handle_response(response, source, transport, reply_tx.as_ref()).await
             }
         }
     }
@@ -1758,6 +1770,7 @@ fn rewrite_response_for_caller(
     raw_response: &str,
     caller_vias: &[String],
     identity: Option<&crate::topology::SbcIdentity>,
+    caller_invite_cseq: Option<u32>,
 ) -> String {
     use crate::topology::RawSipMessage;
 
@@ -1774,6 +1787,21 @@ fn rewrite_response_for_caller(
     // Insert in reverse so the first Via ends up at the top
     for via in caller_vias.iter().rev() {
         msg.prepend_header(via.clone());
+    }
+
+    // 2b. Restore the caller's INVITE CSeq number: a 407/422 retry bumps
+    // the CSeq on the callee leg only, and the caller's dialog state
+    // (RFC 3261 §12.2.1.1) expects its own number echoed. No-op when the
+    // numbers already agree; other methods (BYE…) are left alone.
+    if let Some(n) = caller_invite_cseq {
+        let is_invite = msg
+            .header_values("cseq")
+            .first()
+            .map(|v| v.split_whitespace().nth(1).is_some_and(|m| m.eq_ignore_ascii_case("INVITE")))
+            .unwrap_or(false);
+        if is_invite {
+            msg.set_header("CSeq", &format!("{} INVITE", n));
+        }
     }
 
     // 3. Rewrite Contact to SBC URI (topology hiding for responses)
@@ -1960,53 +1988,32 @@ fn extract_request_uri_from_raw(raw: &str) -> Option<String> {
 /// Inject Proxy-Authorization into a raw INVITE and update Via branch + CSeq.
 /// This creates a new INVITE suitable for 407 auth retry.
 fn inject_proxy_auth_into_invite(raw_invite: &str, auth_value: &str) -> String {
-    let mut lines: Vec<String> = raw_invite.lines().map(|l| l.to_string()).collect();
+    // 1+2. New transaction: fresh top-Via branch (RFC 3261 §8.1.1.7) and
+    //      CSeq+1 (§22.2). Header block only — the SDP body is untouched.
+    let renewed = crate::sip_builder::renew_invite_transaction(raw_invite);
+    let (head, body) = match renewed.find("\r\n\r\n") {
+        Some(pos) => (&renewed[..pos], &renewed[pos + 4..]),
+        None => (renewed.as_str(), ""),
+    };
+    let mut lines: Vec<String> = head.split("\r\n").map(|l| l.to_string()).collect();
 
-    // 1. Generate a new Via branch (RFC 3261 §8.1.1.7 requires unique branch per request)
-    let new_branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string());
+    // 3. Drop any earlier Proxy-Authorization (a 422 retry may precede a
+    //    fresh challenge) so the new credentials are the only ones.
+    lines.retain(|l| !l.to_lowercase().starts_with("proxy-authorization:"));
 
-    // 2. Update the Via header with a new branch parameter
-    for line in lines.iter_mut() {
-        if line.to_lowercase().starts_with("via:") || line.to_lowercase().starts_with("v:") {
-            // Replace the branch parameter
-            if let Some(branch_start) = line.find("branch=") {
-                // Find end of branch value (next ';' or end of line)
-                let rest = &line[branch_start + 7..];
-                let branch_end = rest.find(|c: char| c == ';' || c == ',' || c == '\r' || c == '\n')
-                    .unwrap_or(rest.len());
-                let old_branch = format!("branch={}", &rest[..branch_end]);
-                *line = line.replace(&old_branch, &format!("branch={}", new_branch));
-            }
-            break; // Only update the top Via
-        }
-    }
-
-    // 3. Increment CSeq number
-    for line in lines.iter_mut() {
-        if line.to_lowercase().starts_with("cseq:") {
-            // CSeq format: "CSeq: 1 INVITE"
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                if let Ok(seq_num) = parts[1].parse::<u32>() {
-                    *line = format!("CSeq: {} {}", seq_num + 1, parts[2]);
-                }
-            }
-            break;
-        }
-    }
-
-    // 4. Inject Proxy-Authorization header after the first line (Request-Line)
-    // Insert it after the Via header for proper ordering
+    // 4. Inject Proxy-Authorization after the request line and the top Via
     let insert_pos = lines.iter()
         .position(|l| {
             let lower = l.to_lowercase();
             !lower.starts_with("invite ") && !lower.starts_with("via:") && !lower.starts_with("v:")
         })
         .unwrap_or(1);
-
     lines.insert(insert_pos, format!("Proxy-Authorization: {}", auth_value));
 
-    lines.join("\r\n")
+    let mut out = lines.join("\r\n");
+    out.push_str("\r\n\r\n");
+    out.push_str(body);
+    out
 }
 
 /// RFC 3339 for a SystemTime (UTC).
@@ -2122,5 +2129,66 @@ mod tests {
         let sbc = Sbc::new_from_config(&config).await.unwrap();
         assert!(sbc.auth.is_some());
         assert!(sbc.enable_digest_auth);
+    }
+}
+
+#[cfg(test)]
+mod cseq_mapping_tests {
+    use super::*;
+
+    const RESP_200: &str = "SIP/2.0 200 OK\r\n\
+        Via: SIP/2.0/UDP 1.2.3.4;branch=z9hG4bKsbc\r\n\
+        From: <sip:a@b>;tag=1\r\n\
+        To: <sip:c@d>;tag=2\r\n\
+        Call-ID: x\r\n\
+        CSeq: 4 INVITE\r\n\
+        Content-Length: 0\r\n\r\n";
+
+    #[test]
+    fn rewrite_response_restores_caller_invite_cseq() {
+        let vias = vec!["Via: SIP/2.0/UDP 10.0.0.9;branch=z9hG4bKcaller".to_string()];
+        let out = rewrite_response_for_caller(RESP_200, &vias, None, Some(3));
+        assert!(out.contains("CSeq: 3 INVITE\r\n"), "{}", out);
+        assert!(out.contains("branch=z9hG4bKcaller"));
+        assert!(!out.contains("z9hG4bKsbc"));
+        rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
+
+        // Same number: no-op
+        let same = rewrite_response_for_caller(RESP_200, &vias, None, Some(4));
+        assert!(same.contains("CSeq: 4 INVITE\r\n"));
+        // Unknown caller CSeq: untouched
+        let none = rewrite_response_for_caller(RESP_200, &vias, None, None);
+        assert!(none.contains("CSeq: 4 INVITE\r\n"));
+        // Other methods are never rewritten
+        let bye = RESP_200.replace("4 INVITE", "4 BYE");
+        assert!(rewrite_response_for_caller(&bye, &vias, None, Some(3)).contains("CSeq: 4 BYE\r\n"));
+        // A header-less 503 must not gain a CSeq
+        let plain = build_plain_response(503, "Service Unavailable");
+        assert!(!rewrite_response_for_caller(&plain, &vias, None, Some(3)).contains("CSeq:"));
+    }
+
+    #[test]
+    fn inject_proxy_auth_renews_transaction_dedupes_and_keeps_body() {
+        let invite = "INVITE sip:x@y SIP/2.0\r\n\
+            Via: SIP/2.0/UDP h;branch=z9hG4bKold;rport\r\n\
+            Proxy-Authorization: Digest stale\r\n\
+            From: <sip:a@b>;tag=1\r\n\
+            To: <sip:x@y>\r\n\
+            Call-ID: c\r\n\
+            CSeq: 3 INVITE\r\n\
+            Content-Type: application/sdp\r\n\
+            Content-Length: 5\r\n\r\n\
+            v=0\r\n";
+        let out = inject_proxy_auth_into_invite(invite, "Digest fresh");
+        assert_eq!(out.matches("Proxy-Authorization:").count(), 1, "{}", out);
+        assert!(out.contains("Proxy-Authorization: Digest fresh\r\n"));
+        assert!(out.contains("CSeq: 4 INVITE\r\n"));
+        assert!(!out.contains("z9hG4bKold"));
+        assert!(out.contains("branch=z9hG4bK"));
+        assert!(out.ends_with("Content-Length: 5\r\n\r\nv=0\r\n"), "body and its CRLF preserved: {:?}", out);
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        assert!(lines[1].starts_with("Via:"));
+        assert!(lines[2].starts_with("Proxy-Authorization:"), "inserted right after the top Via");
+        rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
     }
 }

@@ -74,12 +74,12 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | File | Role |
 |------|------|
 | `sbc/mod.rs` | Core struct, config, event loop, REGISTER, OPTIONS, pipeline |
-| `sbc/invite_handler.rs` | INVITE routing, trunk failover, 407 retry, session-timer offer |
-| `sbc/response_handler.rs` | Response relay, SDP, WebRTC/DTLS/SRTP, session-timer completion |
+| `sbc/invite_handler.rs` | INVITE routing, trunk failover, 407/422 retries, session-timer offer |
+| `sbc/response_handler.rs` | Response relay, non-2xx ACK + per-attempt attribution, SDP, WebRTC/DTLS/SRTP, session-timer completion |
 | `sbc/call_handler.rs` | BYE/CANCEL/ACK/INFO, re-INVITE, timeouts, graceful shutdown |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
-| `b2bua.rs` | B2BUA half-mode, dialog state, failover state, session timers |
+| `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
 | `events.rs` | `EventBus` → SSE `/api/v1/events` |
 | `security/` | fail2ban banning, anti-IRSF destination rules, per-user limits |
 | `routing/{trunk,router}.rs` | TrunkConfig, LCR, `route_request_candidates()` for failover |
@@ -134,8 +134,23 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   via a 10-min terminated-dialog ring buffer and answered 200.
 - **OverMaxCall** — if the SBC doesn't BYE on shutdown, ghost sessions
   accumulate and the trunk returns `486 Busy Here`; graceful shutdown prevents it.
-- **Session-Expires** — trunks negotiate 14400s (4h) with `refresher=uac`; the
-  SBC refreshes via re-INVITE (RFC 4028) so long calls survive.
+- **Session-Expires** — trunks negotiate 14400s (4h) with `refresher=uac`; with
+  `[security] session_timer_enabled = true` (off by default) the SBC refreshes
+  via re-INVITE (RFC 4028) so long calls survive.
+- **422 Session Interval Too Small / Min-SE 14400** — Genesys rejects any
+  Session-Expires below 14400. The SBC ACKs the 422 and re-sends the INVITE
+  once with the trunk's Min-SE (RFC 4028 §7.4); raise `session_expires` to
+  14400 to skip that round trip (applied on SIGHUP). Timer headers are
+  *replaced* on the trunk leg, never appended to the caller's own.
+- **Non-2xx finals are ACKed and attributed by Via branch** — every INVITE
+  attempt toward a trunk (initial, 407/422 retry, failover) is remembered;
+  a late 487/422 from a superseded attempt is ACKed and dropped instead of
+  tearing the live call down. The CANCEL and the non-2xx ACK reuse the
+  attempt's Via branch and CSeq; the 2xx ACK reuses only the CSeq (it is its
+  own transaction, RFC 3261 §17.1.1.3). Responses relayed to the caller get
+  the caller's own CSeq back. A 481/408 to the SBC's refresh re-INVITE (or
+  three failed refreshes in a row) tears the call down with a BYE to the
+  caller instead of refreshing a dead dialog forever.
 
 Some callees (e.g. Jambonz-based) drop media without sending BYE — the 90s
 RTP inactivity timeout tears those down.

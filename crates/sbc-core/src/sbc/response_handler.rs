@@ -1,12 +1,19 @@
 use super::*;
 
+/// Caller reply channel + address + transport, as returned by
+/// `B2buaManager::get_caller_reply_info`.
+type CallerReplyInfo = Option<(Option<UnboundedSender<Vec<u8>>>, SocketAddr, rsip::Transport)>;
+
 impl Sbc {
     /// Handle incoming SIP response (from trunk/callee) — relay back to caller
+    /// `reply_tx` is the connection the response arrived on (None for UDP):
+    /// a stray final after teardown is ACKed back over it.
     pub(crate) async fn handle_response(
         &mut self,
         response: Response,
         source: SocketAddr,
         _transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
         let status = response.status_code.code();
         info!("Handling {} response from {}", status, source);
@@ -45,6 +52,68 @@ impl Sbc {
         if let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await {
             // Get caller's reply info before processing the response
             let caller_info = self.b2bua.get_caller_reply_info(&uuid).await;
+            // The caller's INVITE CSeq: restored in every relayed response,
+            // since 407/422 retries bump the CSeq on the callee leg only.
+            let caller_cseq = self.b2bua.get_caller_invite_cseq(&uuid).await;
+
+            // ── Callee-leg transaction prelude ─────────────────────────────
+            // 1. Responses to SBC-originated CANCEL/BYE: nothing awaits them
+            //    (a 481/200 to our CANCEL after a failover must not touch the
+            //    call now ringing on the next trunk).
+            // 2. Answers to our own refresh re-INVITE: consumed locally.
+            // 3. Attribute INVITE responses to the attempt they belong to:
+            //    a late 422/487 from a superseded attempt is ACKed and dropped.
+            // 4. ACK every non-2xx INVITE final (RFC 3261 §17.1.1.3) so UDP
+            //    peers stop retransmitting it for 32 s.
+            if let Some((resp_cseq, method)) = response_cseq(&response) {
+                if method.eq_ignore_ascii_case("CANCEL") || method.eq_ignore_ascii_case("BYE") {
+                    debug!("{} to our {} on call {} — SBC-originated transaction, dropped", status, method, uuid);
+                    return Ok(());
+                }
+                if method.eq_ignore_ascii_case("INVITE") {
+                    let raw_resp = rsip::SipMessage::Response(response.clone()).to_string();
+                    let response_to = response
+                        .to_header()
+                        .ok()
+                        .map(|h| h.value().to_string())
+                        .unwrap_or_default();
+
+                    if self.b2bua.is_pending_refresh(&uuid, resp_cseq).await {
+                        self.handle_refresh_response(&uuid, status, resp_cseq, &raw_resp, &response_to).await;
+                        return Ok(());
+                    }
+                    // Retransmitted answer to a refresh whose outcome was already
+                    // consumed (our ACK got lost): re-ACK, never treat it as a
+                    // final of the callee-leg INVITE.
+                    let (sbc_ip, sbc_port) = self.sbc_addr();
+                    if let Some((ack, dest, tp, tx)) = self
+                        .b2bua
+                        .refresh_duplicate_ack(&uuid, resp_cseq, status, &response_to, &sbc_ip, sbc_port)
+                        .await
+                    {
+                        debug!("{} for session refresh CSeq {} (call {}) — duplicate, re-ACKed", status, resp_cseq, uuid);
+                        if let Some(ack) = ack {
+                            let _ = self.transport.reply(ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                        }
+                        return Ok(());
+                    }
+
+                    let branch = crate::sip_builder::top_via_branch(&raw_resp);
+                    if let Some(crate::b2bua::InviteResponseClass::Stale(attempt)) = self
+                        .b2bua
+                        .classify_invite_response(&uuid, branch.as_deref(), resp_cseq)
+                        .await
+                    {
+                        self.handle_stale_invite_response(&uuid, status, resp_cseq, &response, &response_to, attempt)
+                            .await;
+                        return Ok(());
+                    }
+
+                    if status >= 300 {
+                        self.ack_callee_final(&uuid, &response_to).await;
+                    }
+                }
+            }
 
             match status {
                 100..=199 => {
@@ -63,7 +132,7 @@ impl Sbc {
                         // We MUST replace the Via with the caller's original Via.
                         let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
                         let raw = rsip::SipMessage::Response(response).to_string();
-                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref());
+                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref(), caller_cseq);
 
                         // ── WebRTC: strip SDP body from 183 Session Progress ────
                         // The trunk sends PCMA/AVP SDP in 183 which is incompatible
@@ -79,22 +148,8 @@ impl Sbc {
                     }
                 }
                 200..=299 => {
-                    // ── RFC 4028: 200 OK for one of OUR refresh re-INVITEs? ──
-                    // Consume it locally (ACK, re-arm timer) — the caller must
-                    // never see it.
-                    if let Some(cseq_num) = response_cseq_invite(&response) {
-                        let (sbc_ip, sbc_port) = self.identity.as_ref()
-                            .map(|id| (id.public_ip.clone(), id.sip_port))
-                            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
-                        if let Some((ack, dest, tp, tx)) = self.b2bua
-                            .complete_session_refresh(&uuid, cseq_num, &sbc_ip, sbc_port)
-                            .await
-                        {
-                            info!("Session refresh 200 OK consumed (call {}) — sending ACK", uuid);
-                            let _ = self.transport.reply(ack.as_bytes(), dest, tp, tx.as_ref()).await;
-                            return Ok(());
-                        }
-                    }
+                    // (Answers to our own refresh re-INVITEs were consumed by
+                    // the prelude above — they never reach this arm.)
 
                     // Final success (200 OK) — rewrite SDP + relay to caller + start RTP proxy
                     let callee_tag = response.to_header()
@@ -153,18 +208,33 @@ impl Sbc {
                     // ── RFC 4028: arm the session timer on the trunk leg ──────
                     // Interval = the 200 OK's Session-Expires when present
                     // (trunk answers e.g. 14400;refresher=uac — WE are the uac
-                    // and must refresh), else our configured value.
-                    if let Some((configured, min_se)) = self.session_timer {
-                        let is_trunk_leg = {
+                    // and must refresh), else what WE offered in the INVITE
+                    // (raised by a 422 retry), else our configured value.
+                    // Min-SE likewise follows the offer, so refresh
+                    // re-INVITEs never fall below what the trunk demanded.
+                    if let Some((configured, cfg_min_se)) = self.session_timer {
+                        // Same gate as the offer (set_session_timer_headers in
+                        // handle_invite): trunk_id. trunk_name is also set from
+                        // the SOURCE IP on inbound trunk→user calls, where the
+                        // SBC deliberately offered no timers and must not refresh.
+                        let toward_trunk = {
                             let calls = self.b2bua.calls_locked().await;
-                            calls.get(&uuid).map(|c| c.trunk_name.is_some()).unwrap_or(false)
+                            calls.get(&uuid).map(|c| c.trunk_id.is_some()).unwrap_or(false)
                         };
-                        if is_trunk_leg {
+                        if toward_trunk {
                             let raw_resp = rsip::SipMessage::Response(response.clone()).to_string();
+                            let offered = self.b2bua.current_attempt(&uuid).await.map(|(a, _)| a.raw);
+                            let offered_se = offered.as_deref().and_then(parse_session_expires);
+                            let min_se = offered
+                                .as_deref()
+                                .and_then(parse_min_se)
+                                .unwrap_or(cfg_min_se)
+                                .max(cfg_min_se);
                             let negotiated = parse_session_expires(&raw_resp)
+                                .or(offered_se)
                                 .unwrap_or(configured)
                                 .max(min_se);
-                            self.b2bua.set_session_timer(&uuid, negotiated).await;
+                            self.b2bua.set_session_timer(&uuid, negotiated, min_se).await;
                         }
                     }
 
@@ -502,7 +572,7 @@ impl Sbc {
                         // We MUST replace the Via with the caller's original Via.
                         let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
                         let raw = rsip::SipMessage::Response(response_to_relay).to_string();
-                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref());
+                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref(), caller_cseq);
                         let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
                     }
                 }
@@ -522,17 +592,28 @@ impl Sbc {
                             info!("B2BUA: retrying INVITE with Proxy-Authorization for call {}", uuid);
                         }
                         Ok(false) | Err(_) => {
-                            // Auth retry failed or exhausted — relay error to caller
+                            // Auth retry failed or exhausted — 503 to caller (don't leak trunk's 407)
                             warn!("B2BUA: 407 auth retry failed for call {}, relaying to caller", uuid);
-                            if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
-                                let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
-                                // Send 503 to caller (don't leak trunk's 407)
-                                let response_503 = build_plain_response(503, "Service Unavailable");
-                                let raw = rewrite_response_for_caller(&response_503, &caller_vias, self.identity.as_ref());
-                                let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
-                            }
-                            self.b2bua.terminate_call(&uuid).await;
-                            self.metrics.inc_call_failed();
+                            let response_503 = build_plain_response(503, "Service Unavailable");
+                            self.relay_error_and_terminate(&uuid, response_503, caller_info, caller_cseq).await;
+                        }
+                    }
+                }
+                422 => {
+                    // ── Session Interval Too Small (RFC 4028 §7.4) ────────────
+                    // The trunk's Min-SE is above the Session-Expires WE offered
+                    // on its leg: re-send the INVITE with its floor. The caller
+                    // never offered the rejected value, so it only sees the 422
+                    // when a retry is impossible (already retried, no Min-SE…).
+                    info!("B2BUA: received 422 Session Interval Too Small for call {}", uuid);
+                    match self.handle_422_session_interval_retry(&uuid, &response, source).await {
+                        Ok(true) => {
+                            info!("B2BUA: retrying INVITE with the trunk's Min-SE for call {}", uuid);
+                        }
+                        Ok(false) | Err(_) => {
+                            info!("B2BUA: relaying 422 to caller, terminating call {}", uuid);
+                            let raw = rsip::SipMessage::Response(response).to_string();
+                            self.relay_error_and_terminate(&uuid, raw, caller_info, caller_cseq).await;
                         }
                     }
                 }
@@ -560,27 +641,260 @@ impl Sbc {
 
                     // Error response (4xx/5xx/6xx) — relay to caller, terminate call
                     info!("B2BUA: relaying error {} to caller, terminating call", status);
-                    if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
-                        let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
-                        let raw = rsip::SipMessage::Response(response).to_string();
-                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref());
-                        let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
-                    }
-                    self.b2bua.terminate_call(&uuid).await;
-                    self.metrics.inc_call_failed();
+                    let raw = rsip::SipMessage::Response(response).to_string();
+                    self.relay_error_and_terminate(&uuid, raw, caller_info, caller_cseq).await;
                 }
             }
         } else {
+            // A final answer for a dialog we already tore down: typically the
+            // 487 that follows the caller's CANCEL, or a 200 OK that crossed
+            // that CANCEL on the wire. ACK it from the last attempt so the
+            // peer stops retransmitting; a 2xx is also BYEd, otherwise the
+            // trunk keeps a billed, answered ghost session. Sent back over the
+            // connection the response arrived on (WS/TLS), else to the attempt's
+            // destination (UDP).
+            if let Some((cseq, method)) = response_cseq(&response) {
+                if status >= 200 && method.eq_ignore_ascii_case("INVITE") {
+                    if let Some(attempt) = self.b2bua.recent_attempt_for_call_id(&call_id) {
+                        if attempt.cseq == cseq {
+                            let to = response.to_header().ok().map(|h| h.value().to_string()).unwrap_or_default();
+                            if status < 300 {
+                                warn!("{} for terminated call (Call-ID {}) — ACK + BYE → {}", status, call_id, attempt.dest);
+                                self.ack_and_bye_answered_dialog(
+                                    &attempt, &response, cseq, &to, reply_tx,
+                                    "Q.850;cause=31;text=\"Call already cancelled\"",
+                                ).await;
+                                return Ok(());
+                            }
+                            if let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, &to) {
+                                debug!("{} for terminated call (Call-ID {}) — ACK → {}", status, call_id, attempt.dest);
+                                let _ = self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, reply_tx).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
             info!("No B2BUA call found for response Call-ID: {} from {} (stray response)", call_id, source);
         }
 
         Ok(())
     }
+
+    /// SBC IP/port for synthetic requests (identity when configured).
+    fn sbc_addr(&self) -> (String, u16) {
+        self.identity.as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060))
+    }
+
+    /// ACK a 2xx that answered an INVITE nobody is waiting for any more
+    /// (superseded attempt, or a dialog already torn down), then BYE the
+    /// dialog it created (RFC 3261 §13.2.2.4 + §15): otherwise the peer
+    /// retransmits the 2xx for 32 s and keeps an answered ghost session.
+    async fn ack_and_bye_answered_dialog(
+        &self,
+        attempt: &crate::b2bua::InviteAttempt,
+        response: &Response,
+        cseq: u32,
+        response_to: &str,
+        tx: Option<&UnboundedSender<Vec<u8>>>,
+        reason: &str,
+    ) {
+        let (sbc_ip, sbc_port) = self.sbc_addr();
+        let from_raw = response.from_header().ok().map(|h| h.value().to_string()).unwrap_or_default();
+        let call_id = response.call_id_header().ok().map(|h| h.value().to_string()).unwrap_or_default();
+        let request_uri = response
+            .contact_header()
+            .ok()
+            .map(|h| super::invite_handler_contact_uri(h.value()))
+            .unwrap_or_else(|| format!("sip:{}", attempt.dest));
+        let d = crate::sip_builder::DialogInfo {
+            call_id,
+            from_raw,
+            to_raw: response_to.to_string(),
+            request_uri,
+            cseq,
+            local_ip: sbc_ip,
+            local_port: sbc_port,
+            transport: crate::b2bua::transport_token(attempt.transport),
+        };
+        let ack = crate::sip_builder::build_ack_for_2xx(&d, cseq);
+        let bye = crate::sip_builder::build_bye(
+            &crate::sip_builder::DialogInfo { cseq: cseq + 1, ..d },
+            Some(reason),
+        );
+        let _ = self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, tx).await;
+        let _ = self.transport.reply(bye.as_bytes(), attempt.dest, attempt.transport, tx).await;
+    }
+
+    /// The peer no longer has the dialog (481/408 to our refresh, or the
+    /// refresh budget is exhausted): BYE the caller, write the CDR and
+    /// release the call — a dead dialog must not be refreshed for hours.
+    async fn teardown_lost_dialog(&mut self, uuid: &crate::b2bua::CallUuid, status: u16) {
+        let (sbc_ip, sbc_port) = self.sbc_addr();
+        if let Some(bye) = self.b2bua.build_relay_bye_toward_caller(uuid, &sbc_ip, sbc_port).await {
+            if let Some((tx, addr, tp)) = self.b2bua.get_caller_reply_info(uuid).await {
+                info!("Session refresh {}: dialog lost on the trunk — BYE → caller {} (call {})", status, addr, uuid);
+                let _ = self.transport.reply(bye.as_bytes(), addr, tp, tx.as_ref()).await;
+            }
+        } else {
+            warn!("Session refresh {}: dialog lost on the trunk, no caller dialog identity — releasing call {}", status, uuid);
+        }
+
+        let cdr = {
+            let calls = self.b2bua.calls_locked().await;
+            calls.get(uuid).map(|c| (
+                c.inbound.call_id.clone(),
+                c.caller_number.clone().unwrap_or_default(),
+                c.callee_number.clone().unwrap_or_default(),
+                c.duration_secs(),
+                c.caller_is_webrtc,
+                c.codec.clone(),
+                c.trunk_name.clone(),
+            ))
+        };
+        if let Some((call_id, caller, callee, duration, is_webrtc, codec, trunk_name)) = cdr {
+            let mut record = crate::storage::CdrRecord::new(call_id, caller, callee)
+                .with_duration(duration)
+                .with_webrtc(is_webrtc)
+                .with_disconnect_reason("dialog-lost");
+            if let Some(c) = codec.as_deref() {
+                record = record.with_codec(c);
+            }
+            record.trunk_id = trunk_name;
+            if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
+                warn!("CDR recording failed (dialog-lost): {}", e);
+            } else {
+                self.metrics.record_cdr_written();
+            }
+        }
+
+        self.metrics.inc_call_terminated();
+        self.b2bua.terminate_call(uuid).await;
+        self.metrics.set_allocated_ports(self.media.stats().allocated_ports as u64);
+    }
+
+    /// Relay a final error to the caller (Vias + CSeq restored) and tear the
+    /// call down. `terminate_call` releases the media session.
+    pub(super) async fn relay_error_and_terminate(
+        &mut self,
+        uuid: &crate::b2bua::CallUuid,
+        raw_response: String,
+        caller_info: CallerReplyInfo,
+        caller_cseq: Option<u32>,
+    ) {
+        if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
+            let caller_vias = self.b2bua.get_caller_vias(uuid).await;
+            let raw = rewrite_response_for_caller(&raw_response, &caller_vias, self.identity.as_ref(), caller_cseq);
+            let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+        }
+        self.b2bua.terminate_call(uuid).await;
+        self.metrics.inc_call_failed();
+        self.metrics.set_allocated_ports(self.media.stats().allocated_ports as u64);
+    }
+
+    /// ACK a non-2xx final of the live callee-leg INVITE (RFC 3261
+    /// §17.1.1.3), sent where the INVITE went — clustered trunks answer
+    /// from other IPs than the one we dialled.
+    async fn ack_callee_final(&self, uuid: &crate::b2bua::CallUuid, response_to: &str) {
+        let Some((attempt, tx)) = self.b2bua.current_attempt(uuid).await else { return };
+        let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to) else {
+            warn!("ACK (non-2xx): stored INVITE for call {} is not parseable — no ACK sent", uuid);
+            return;
+        };
+        match self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await {
+            Ok(()) => debug!("ACK (non-2xx) → {} for call {} (CSeq {})", attempt.dest, uuid, attempt.cseq),
+            Err(e) => warn!("ACK (non-2xx) → {} failed for call {}: {}", attempt.dest, uuid, e),
+        }
+    }
+
+    /// Answer to one of OUR refresh re-INVITEs: never relayed to the caller.
+    async fn handle_refresh_response(
+        &mut self,
+        uuid: &crate::b2bua::CallUuid,
+        status: u16,
+        cseq: u32,
+        raw_resp: &str,
+        response_to: &str,
+    ) {
+        match status {
+            100..=199 => debug!("{} to session refresh (call {}) — ignored", status, uuid),
+            200..=299 => {
+                let (sbc_ip, sbc_port) = self.sbc_addr();
+                if let Some((ack, dest, tp, tx)) =
+                    self.b2bua.complete_session_refresh(uuid, cseq, &sbc_ip, sbc_port).await
+                {
+                    info!("Session refresh 200 OK consumed (call {}) — sending ACK", uuid);
+                    let _ = self.transport.reply(ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                }
+            }
+            _ => {
+                let min_se = (status == 422).then(|| parse_min_se(raw_resp)).flatten();
+                let Some(outcome) = self.b2bua.fail_session_refresh(uuid, cseq, status, min_se, response_to).await
+                else {
+                    return;
+                };
+                match outcome.ack {
+                    Some(ack) => {
+                        let _ = self.transport.reply(ack.as_bytes(), outcome.dest, outcome.transport, outcome.reply_tx.as_ref()).await;
+                    }
+                    None => warn!("Session refresh {} for call {}: no stored re-INVITE — cannot ACK", status, uuid),
+                }
+                if outcome.dialog_gone {
+                    self.teardown_lost_dialog(uuid, status).await;
+                }
+            }
+        }
+    }
+
+    /// Response for a superseded INVITE attempt (retransmitted 422/407, a
+    /// 487 after the failover CANCEL, an answer from an abandoned trunk).
+    /// Never relayed to the caller; ACKed (and BYEd for a 2xx) toward the
+    /// attempt it belongs to.
+    async fn handle_stale_invite_response(
+        &self,
+        uuid: &crate::b2bua::CallUuid,
+        status: u16,
+        cseq: u32,
+        response: &Response,
+        response_to: &str,
+        attempt: Option<crate::b2bua::InviteAttempt>,
+    ) {
+        let Some(attempt) = attempt else {
+            debug!("{} for a superseded INVITE of call {} (CSeq {}) — no attempt record, dropped", status, uuid, cseq);
+            return;
+        };
+        // Reuse the live connection only when the stale attempt went to the
+        // same peer (retry); a failed-over trunk gets a fresh send.
+        let tx = match self.b2bua.current_attempt(uuid).await {
+            Some((cur, tx)) if cur.dest == attempt.dest => tx,
+            _ => None,
+        };
+        match status {
+            100..=199 => debug!("{} for superseded INVITE (call {}, CSeq {}) — dropped", status, uuid, cseq),
+            200..=299 => {
+                // Glare: an attempt we abandoned was answered. Honour the
+                // dialog (ACK) and end it (BYE) — the caller is on another leg.
+                warn!("{} for superseded INVITE (call {}, CSeq {}) — ACK + BYE → {}", status, uuid, cseq, attempt.dest);
+                self.ack_and_bye_answered_dialog(
+                    &attempt, response, cseq, response_to, tx.as_ref(),
+                    "Q.850;cause=31;text=\"Superseded INVITE answered\"",
+                ).await;
+            }
+            _ => {
+                if let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to) {
+                    debug!("{} for superseded INVITE (call {}, CSeq {}) — ACK → {}, dropped", status, uuid, cseq, attempt.dest);
+                    let _ = self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
+                }
+            }
+        }
+    }
 }
 
 
-/// CSeq number of a response when its CSeq method is INVITE.
-fn response_cseq_invite(response: &Response) -> Option<u32> {
+/// CSeq number and method of a response.
+fn response_cseq(response: &Response) -> Option<(u32, String)> {
     let raw = response
         .headers
         .iter()
@@ -589,24 +903,37 @@ fn response_cseq_invite(response: &Response) -> Option<u32> {
     let value = raw.split_once(':')?.1.trim();
     let mut parts = value.split_whitespace();
     let num = parts.next()?.parse().ok()?;
-    let method = parts.next()?;
-    method.eq_ignore_ascii_case("INVITE").then_some(num)
+    let method = parts.next()?.to_string();
+    Some((num, method))
 }
 
-/// Parse `Session-Expires: 1800;refresher=uac` (long or compact `x:` form).
-pub(crate) fn parse_session_expires(raw: &str) -> Option<u32> {
+/// Integer value of the first header among `names` (lowercase, with
+/// trailing colon): `Session-Expires: 1800;refresher=uac` → 1800. None when
+/// that header's value up to the first `;` is not a u32 (later duplicates
+/// are not consulted — a malformed 422 is relayed, not guessed at).
+fn header_u32(raw: &str, names: &[&str]) -> Option<u32> {
     for line in raw.split("\r\n") {
+        if line.is_empty() {
+            break;
+        }
         let lower = line.to_lowercase();
-        if lower.starts_with("session-expires:") || lower.starts_with("x:") {
+        if names.iter().any(|n| lower.starts_with(n)) {
             let value = line.split_once(':')?.1.trim();
             let secs = value.split(';').next()?.trim();
             return secs.parse().ok();
         }
-        if line.is_empty() {
-            break;
-        }
     }
     None
+}
+
+/// Parse `Session-Expires: 1800;refresher=uac` (long or compact `x:` form).
+pub(crate) fn parse_session_expires(raw: &str) -> Option<u32> {
+    header_u32(raw, &["session-expires:", "x:"])
+}
+
+/// Parse `Min-SE: 14400` (RFC 4028; no compact form).
+pub(crate) fn parse_min_se(raw: &str) -> Option<u32> {
+    header_u32(raw, &["min-se:"])
 }
 
 
@@ -620,5 +947,379 @@ mod session_timer_tests {
         assert_eq!(super::parse_session_expires(bare), Some(1800));
         let none = "SIP/2.0 200 OK\r\nContact: <sip:x@y>\r\n\r\n";
         assert_eq!(super::parse_session_expires(none), None);
+        let compact = "INVITE sip:x SIP/2.0\r\nx: 600\r\n\r\n";
+        assert_eq!(super::parse_session_expires(compact), Some(600));
+        let in_body_only = "SIP/2.0 200 OK\r\n\r\nSession-Expires: 5\r\n";
+        assert_eq!(super::parse_session_expires(in_body_only), None, "headers end at the blank line");
+    }
+
+    #[test]
+    fn parse_min_se_forms() {
+        assert_eq!(super::parse_min_se("SIP/2.0 422 Session Interval Too Small\r\nMin-SE: 14400\r\n\r\n"), Some(14400));
+        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\nmin-se:  90;foo=bar\r\n\r\n"), Some(90));
+        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\nMin-SE: abc\r\n\r\n"), None);
+        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\nMin-Expires: 3600\r\n\r\n"), None, "Min-Expires is not Min-SE");
+        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn response_cseq_number_and_method() {
+        let raw = "SIP/2.0 481 Call/Transaction Does Not Exist\r\nCSeq: 3 CANCEL\r\nContent-Length: 0\r\n\r\n";
+        let resp = match rsip::SipMessage::try_from(raw.as_bytes().to_vec()).unwrap() {
+            rsip::SipMessage::Response(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(super::response_cseq(&resp), Some((3, "CANCEL".to_string())));
+    }
+}
+
+/// Transaction-level tests: drive `handle_response` on an `Sbc` whose caller
+/// and callee legs are mpsc channels, so every ACK/CANCEL/BYE/INVITE the SBC
+/// emits is observable without sockets.
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    const SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+
+    fn caller_addr() -> SocketAddr { "10.0.0.9:5060".parse().unwrap() }
+    fn trunk_addr() -> SocketAddr { "203.0.113.9:5060".parse().unwrap() }
+
+    fn invite(branch: &str, cseq: u32) -> String {
+        format!(
+            "INVITE sip:bob@203.0.113.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 198.51.100.1:5060;branch={};rport\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sip:alice@a.example.com>;tag=al-1\r\n\
+             To: <sip:bob@b.example.com>\r\n\
+             Call-ID: cid-1\r\n\
+             CSeq: {} INVITE\r\n\
+             Supported: timer\r\n\
+             Session-Expires: 1800\r\n\
+             Min-SE: 90\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            branch, cseq, SDP.len(), SDP
+        )
+    }
+
+    fn response(status_line: &str, branch: &str, cseq: u32, method: &str, extra: &str) -> Response {
+        let raw = format!(
+            "SIP/2.0 {}\r\n\
+             Via: SIP/2.0/UDP 198.51.100.1:5060;branch={};rport=5060;received=203.0.113.9\r\n\
+             From: <sip:alice@a.example.com>;tag=al-1\r\n\
+             To: <sip:bob@b.example.com>;tag=trunk-1\r\n\
+             Call-ID: cid-1\r\n\
+             CSeq: {} {}\r\n\
+             {}Content-Length: 0\r\n\r\n",
+            status_line, branch, cseq, method, extra
+        );
+        match rsip::SipMessage::try_from(raw.into_bytes()).expect("response parses") {
+            rsip::SipMessage::Response(r) => r,
+            _ => panic!("not a response"),
+        }
+    }
+
+    fn drain(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(String::from_utf8(m).unwrap());
+        }
+        out
+    }
+
+    /// One outbound trunk call with its INVITE (branch aaa, CSeq 3) in flight.
+    /// Returns the SBC plus the caller-leg and callee-leg receivers.
+    async fn sbc_with_call() -> (Sbc, crate::b2bua::CallUuid, UnboundedReceiver<Vec<u8>>, UnboundedReceiver<Vec<u8>>) {
+        let mut sbc = Sbc::new();
+        sbc.session_timer = Some((1800, 90));
+        let mut trunk = TrunkConfig::new("genesys".to_string());
+        trunk.host = "203.0.113.9".to_string();
+        trunk.port = 5060;
+        let trunk_id = sbc.add_trunk(trunk);
+
+        let (caller_tx, caller_rx) = unbounded_channel();
+        let (callee_tx, callee_rx) = unbounded_channel();
+        let uuid = sbc.b2bua
+            .create_call("cid-1".into(), "al-1".into(), caller_addr(), Some(SDP), Some(caller_tx), rsip::Transport::Udp)
+            .await
+            .unwrap();
+        sbc.b2bua.set_caller_vias(&uuid, vec!["Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcaller".into()], Some(3)).await;
+        sbc.b2bua.set_inbound_dialog(&uuid, "<sip:alice@a.example.com>;tag=al-1".into(), Some("sip:alice@10.0.0.9:5060".into())).await;
+        sbc.b2bua.store_outbound_invite(&uuid, String::new(), trunk_id).await;
+        sbc.b2bua
+            .attach_outbound(&uuid, "cid-1".into(), "sbc-tag".into(), trunk_addr(), Some(callee_tx), rsip::Transport::Udp)
+            .await
+            .unwrap();
+        {
+            let mut calls = sbc.b2bua.calls_locked().await;
+            calls.get_mut(&uuid).unwrap().trunk_name = Some("genesys".into());
+        }
+        sbc.b2bua
+            .push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), trunk_addr(), rsip::Transport::Udp, Some(trunk_id))
+            .await;
+        (sbc, uuid, caller_rx, callee_rx)
+    }
+
+    async fn alive(sbc: &Sbc) -> bool {
+        sbc.b2bua.find_by_inbound_call_id("cid-1").await.is_some()
+    }
+
+    #[tokio::test]
+    async fn current_final_is_acked_relayed_with_caller_cseq_and_terminates() {
+        let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        assert!(sbc.media.stats().allocated_ports > 0, "the call holds an RTP port pair");
+
+        sbc.handle_response(response("487 Request Terminated", "z9hG4bKaaa", 3, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+
+        let to_trunk = drain(&mut callee_rx);
+        assert_eq!(to_trunk.len(), 1, "exactly one ACK toward the trunk: {:?}", to_trunk);
+        assert!(to_trunk[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"));
+        assert!(to_trunk[0].contains("branch=z9hG4bKaaa"), "ACK reuses the INVITE branch");
+        assert!(to_trunk[0].contains("CSeq: 3 ACK\r\n"));
+        assert!(to_trunk[0].contains("To: <sip:bob@b.example.com>;tag=trunk-1\r\n"), "To copied from the response");
+
+        let to_caller = drain(&mut caller_rx);
+        assert_eq!(to_caller.len(), 1);
+        assert!(to_caller[0].starts_with("SIP/2.0 487"), "{}", to_caller[0]);
+        assert!(to_caller[0].contains("branch=z9hG4bKcaller"), "caller's own Via restored");
+        assert!(to_caller[0].contains("CSeq: 3 INVITE\r\n"));
+
+        assert!(!alive(&sbc).await);
+        assert_eq!(sbc.media.stats().allocated_ports, 0, "media released on error relay");
+    }
+
+    #[tokio::test]
+    async fn retransmitted_422_is_acked_and_dropped_then_budget_exhausted_relays() {
+        let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+
+        // 1. Genesys: 422 Min-SE 14400 → ACK + INVITE re-sent with the floor
+        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", "Min-SE: 14400\r\n"), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let to_trunk = drain(&mut callee_rx);
+        assert_eq!(to_trunk.len(), 2, "ACK then the retried INVITE: {:?}", to_trunk);
+        assert!(to_trunk[0].starts_with("ACK "));
+        assert!(to_trunk[0].contains("CSeq: 3 ACK\r\n"));
+        assert!(to_trunk[0].contains("branch=z9hG4bKaaa"));
+        let retry = &to_trunk[1];
+        assert!(retry.starts_with("INVITE sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", retry);
+        assert!(retry.contains("CSeq: 4 INVITE\r\n"));
+        assert!(!retry.contains("z9hG4bKaaa"), "new transaction, new branch");
+        assert_eq!(retry.matches("Session-Expires:").count(), 1);
+        assert_eq!(retry.matches("Min-SE:").count(), 1);
+        assert!(retry.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\n"), "{}", retry);
+        assert_eq!(retry.matches("Supported: timer").count(), 1);
+        assert!(retry.ends_with(SDP), "body intact");
+        assert!(drain(&mut caller_rx).is_empty(), "the caller never sees the 422");
+        assert!(alive(&sbc).await);
+        assert_eq!(sbc.b2bua.get_session_timer_retry_count(&uuid).await, 1);
+        assert_eq!(sbc.metrics.session_timer_422_retries_total.load(Ordering::Relaxed), 1);
+        let (attempt, _) = sbc.b2bua.current_attempt(&uuid).await.unwrap();
+        assert_eq!(attempt.cseq, 4);
+        let retry_branch = attempt.branch.clone().expect("retry branch recorded");
+        assert!(retry.contains(&retry_branch));
+
+        // 2. UDP retransmission of the first 422 (our ACK got lost): ACK only
+        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", "Min-SE: 14400\r\n"), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let dup = drain(&mut callee_rx);
+        assert_eq!(dup.len(), 1, "{:?}", dup);
+        assert!(dup[0].starts_with("ACK ") && dup[0].contains("branch=z9hG4bKaaa") && dup[0].contains("CSeq: 3 ACK"));
+        assert!(drain(&mut caller_rx).is_empty());
+        assert!(alive(&sbc).await);
+        assert_eq!(sbc.b2bua.get_session_timer_retry_count(&uuid).await, 1, "no second retry");
+
+        // 3. The trunk raises its floor again on the retried INVITE: budget is
+        //    one per attempt → ACK, relay the 422 with the caller's CSeq, tear down
+        sbc.handle_response(response("422 Session Interval Too Small", &retry_branch, 4, "INVITE", "Min-SE: 20000\r\n"), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let last = drain(&mut callee_rx);
+        assert_eq!(last.len(), 1, "ACK only, no third INVITE: {:?}", last);
+        assert!(last[0].starts_with("ACK ") && last[0].contains("CSeq: 4 ACK") && last[0].contains(&retry_branch));
+        let to_caller = drain(&mut caller_rx);
+        assert_eq!(to_caller.len(), 1);
+        assert!(to_caller[0].starts_with("SIP/2.0 422"), "{}", to_caller[0]);
+        assert!(to_caller[0].contains("CSeq: 3 INVITE\r\n"), "caller's CSeq restored: {}", to_caller[0]);
+        assert!(to_caller[0].contains("Min-SE: 20000"), "diagnostics kept");
+        assert!(!alive(&sbc).await);
+        assert_eq!(sbc.metrics.session_timer_422_retries_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn no_retry_when_timers_are_off_or_min_se_missing() {
+        // Timers off: the caller's own offer was rejected → relay
+        let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        sbc.session_timer = None;
+        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", "Min-SE: 14400\r\n"), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let to_trunk = drain(&mut callee_rx);
+        assert_eq!(to_trunk.len(), 1, "ACK only: {:?}", to_trunk);
+        assert!(to_trunk[0].starts_with("ACK "));
+        assert!(drain(&mut caller_rx)[0].starts_with("SIP/2.0 422"));
+        assert!(!alive(&sbc).await);
+
+        // 422 without Min-SE (RFC 4028 §6 violation): nothing to retry with → relay
+        let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        assert_eq!(drain(&mut callee_rx).len(), 1, "ACK only");
+        assert!(drain(&mut caller_rx)[0].starts_with("SIP/2.0 422"));
+        assert!(!alive(&sbc).await);
+    }
+
+    #[tokio::test]
+    async fn stale_2xx_is_acked_and_byed_caller_untouched() {
+        let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        // A 407 retry superseded the first attempt (same trunk, CSeq 4)
+        sbc.b2bua.push_invite_attempt(&uuid, invite("z9hG4bKbbb", 4), trunk_addr(), rsip::Transport::Udp, None).await;
+
+        // Late 200 OK for the FIRST attempt (glare)
+        sbc.handle_response(
+            response("200 OK", "z9hG4bKaaa", 3, "INVITE", "Contact: <sip:bob@203.0.113.9:5060>\r\n"),
+            trunk_addr(), rsip::Transport::Udp, None,
+        ).await.unwrap();
+
+        let to_trunk = drain(&mut callee_rx);
+        assert_eq!(to_trunk.len(), 2, "ACK then BYE: {:?}", to_trunk);
+        assert!(to_trunk[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", to_trunk[0]);
+        assert!(to_trunk[0].contains("CSeq: 3 ACK\r\n"));
+        assert!(to_trunk[1].starts_with("BYE sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", to_trunk[1]);
+        assert!(to_trunk[1].contains("CSeq: 4 BYE\r\n"), "BYE CSeq above the ACK's");
+        assert!(to_trunk[1].contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
+        assert!(to_trunk[1].contains("To: <sip:bob@b.example.com>;tag=trunk-1\r\n"));
+        assert!(to_trunk[1].contains("Reason: Q.850;cause=31"));
+        assert!(drain(&mut caller_rx).is_empty(), "never relayed to the caller");
+        assert!(alive(&sbc).await, "the live attempt is untouched");
+        let calls = sbc.b2bua.calls_locked().await;
+        assert_ne!(calls[&uuid].state, crate::b2bua::CallState::Connected);
+    }
+
+    #[tokio::test]
+    async fn responses_to_our_cancel_or_bye_are_dropped() {
+        let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        sbc.handle_response(response("481 Call/Transaction Does Not Exist", "z9hG4bKaaa", 3, "CANCEL", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        sbc.handle_response(response("200 OK", "z9hG4bKbye", 4, "BYE", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        assert!(drain(&mut callee_rx).is_empty());
+        assert!(drain(&mut caller_rx).is_empty());
+        assert!(alive(&sbc).await);
+    }
+
+    /// Bring the call to Connected with an armed session timer and force a
+    /// refresh re-INVITE out; returns (its CSeq, its Via branch).
+    async fn arm_and_refresh(sbc: &Sbc, uuid: &crate::b2bua::CallUuid, callee_rx: &mut UnboundedReceiver<Vec<u8>>) -> (u32, String) {
+        sbc.b2bua.set_established_dialog(
+            uuid,
+            "<sip:alice@a.example.com>;tag=al-1".into(),
+            "<sip:bob@b.example.com>;tag=trunk-1".into(),
+            Some("sip:bob@203.0.113.9:5060".into()),
+        ).await;
+        {
+            let mut calls = sbc.b2bua.calls_locked().await;
+            calls.get_mut(uuid).unwrap().state = crate::b2bua::CallState::Connected;
+        }
+        if sbc.b2bua.calls_locked().await[uuid].session_timer.is_none() {
+            sbc.b2bua.set_session_timer(uuid, 1800, 90).await;
+        }
+        {
+            let mut calls = sbc.b2bua.calls_locked().await;
+            let st = calls.get_mut(uuid).unwrap().session_timer.as_mut().unwrap();
+            st.next_refresh_at = std::time::Instant::now() - Duration::from_secs(1);
+            st.pending_refresh_cseq = None;
+        }
+        let due = sbc.b2bua.due_session_refreshes("127.0.0.1", 5060).await;
+        assert_eq!(due.len(), 1);
+        let reinvite = due[0].1.clone();
+        // (due_session_refreshes only builds; the tick would send it — not needed here)
+        let _ = drain(callee_rx);
+        (crate::b2bua::parse_cseq_number(&reinvite).unwrap(), crate::sip_builder::top_via_branch(&reinvite).unwrap())
+    }
+
+    #[tokio::test]
+    async fn refresh_rejections_keep_the_session_until_the_dialog_is_gone() {
+        let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        let (cseq, branch) = arm_and_refresh(&sbc, &uuid, &mut callee_rx).await;
+        assert_eq!(cseq, 4, "refresh CSeq follows the stored INVITE");
+
+        // 500 to the refresh: ACK, session kept, caller untouched
+        sbc.handle_response(response("500 Server Internal Error", &branch, cseq, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let out = drain(&mut callee_rx);
+        assert_eq!(out.len(), 1, "{:?}", out);
+        assert!(out[0].starts_with("ACK ") && out[0].contains(&format!("CSeq: {} ACK", cseq)) && out[0].contains(&branch));
+        assert!(drain(&mut caller_rx).is_empty());
+        assert!(alive(&sbc).await);
+
+        // The same 500 retransmitted (branch unknown to the attempts, CSeq above
+        // the live INVITE): re-ACKed, NOT treated as the INVITE's final
+        sbc.handle_response(response("500 Server Internal Error", &branch, cseq, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let out = drain(&mut callee_rx);
+        assert_eq!(out.len(), 1, "{:?}", out);
+        assert!(out[0].starts_with("ACK "));
+        assert!(drain(&mut caller_rx).is_empty(), "no error relayed mid-call");
+        assert!(alive(&sbc).await, "the established call survives a duplicate answer");
+
+        // Next refresh gets 481: the trunk lost the dialog → ACK, BYE the caller, release
+        let (cseq2, branch2) = arm_and_refresh(&sbc, &uuid, &mut callee_rx).await;
+        assert!(cseq2 > cseq);
+        sbc.handle_response(response("481 Call/Transaction Does Not Exist", &branch2, cseq2, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
+            .await
+            .unwrap();
+        let out = drain(&mut callee_rx);
+        assert_eq!(out.len(), 1, "ACK toward the trunk: {:?}", out);
+        assert!(out[0].starts_with("ACK ") && out[0].contains(&format!("CSeq: {} ACK", cseq2)));
+        let to_caller = drain(&mut caller_rx);
+        assert_eq!(to_caller.len(), 1, "BYE toward the caller: {:?}", to_caller);
+        assert!(to_caller[0].starts_with("BYE sip:alice@10.0.0.9:5060 SIP/2.0\r\n"), "{}", to_caller[0]);
+        assert!(to_caller[0].contains("From: <sip:bob@b.example.com>;tag=trunk-1\r\n"));
+        assert!(to_caller[0].contains("To: <sip:alice@a.example.com>;tag=al-1\r\n"));
+        assert!(!alive(&sbc).await);
+        assert_eq!(sbc.media.stats().allocated_ports, 0);
+    }
+
+    #[tokio::test]
+    async fn stray_final_after_teardown_is_acked_and_a_2xx_is_byed() {
+        let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        // Caller cancelled: the call is gone, its last attempt remembered
+        sbc.b2bua.terminate_call(&uuid).await;
+        assert!(!alive(&sbc).await);
+        let (stray_tx, mut stray_rx) = unbounded_channel();
+
+        // 487 that follows the CANCEL: ACK back over the connection it arrived on
+        sbc.handle_response(response("487 Request Terminated", "z9hG4bKaaa", 3, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, Some(&stray_tx))
+            .await
+            .unwrap();
+        let out = drain(&mut stray_rx);
+        assert_eq!(out.len(), 1, "{:?}", out);
+        assert!(out[0].starts_with("ACK ") && out[0].contains("CSeq: 3 ACK") && out[0].contains("branch=z9hG4bKaaa"));
+
+        // 200 OK that crossed the CANCEL on the wire: ACK + BYE, no ghost session
+        sbc.handle_response(
+            response("200 OK", "z9hG4bKaaa", 3, "INVITE", "Contact: <sip:bob@203.0.113.9:5060>\r\n"),
+            trunk_addr(), rsip::Transport::Udp, Some(&stray_tx),
+        ).await.unwrap();
+        let out = drain(&mut stray_rx);
+        assert_eq!(out.len(), 2, "ACK then BYE: {:?}", out);
+        assert!(out[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n") && out[0].contains("CSeq: 3 ACK"));
+        assert!(out[1].starts_with("BYE sip:bob@203.0.113.9:5060 SIP/2.0\r\n") && out[1].contains("CSeq: 4 BYE"));
+        assert!(out[1].contains("Reason: Q.850;cause=31"));
+
+        assert!(drain(&mut caller_rx).is_empty());
+        assert!(drain(&mut callee_rx).is_empty(), "nothing on the old callee channel");
     }
 }

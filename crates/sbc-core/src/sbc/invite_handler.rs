@@ -605,8 +605,13 @@ impl Sbc {
                     }
                 })
                 .collect();
-            info!("Stored {} original Via header(s) for caller", caller_vias.len());
-            self.b2bua.set_caller_vias(&uuid, caller_vias).await;
+            let caller_cseq = request_with_sdp
+                .cseq_header()
+                .ok()
+                .and_then(|h| h.typed().ok())
+                .map(|c: rsip::typed::CSeq| c.seq);
+            info!("Stored {} original Via header(s) for caller (CSeq {:?})", caller_vias.len(), caller_cseq);
+            self.b2bua.set_caller_vias(&uuid, caller_vias, caller_cseq).await;
         }
 
         // ── Step 3b: Apply topology hiding on outbound message ────────────────
@@ -656,14 +661,20 @@ impl Sbc {
             info!("INVITE outbound {}", to_line.unwrap_or("(no To)"));
             info!("INVITE outbound {}", callid_line.unwrap_or("(no Call-ID)"));
         }
-        // ── RFC 4028: offer session timers on trunk legs ─────────────────
+        // ── RFC 4028: offer session timers on the trunk leg we originate ──
+        // The SBC is the UAC toward the trunk, so it owns the offer: any
+        // Session-Expires/Min-SE the caller sent is replaced, never
+        // duplicated (a second Min-SE below the trunk's floor got the
+        // customer's own retry rejected). Gated on trunk_id — inbound
+        // trunk→user calls (trunk_name set from the source IP) are not
+        // stamped toward the softphone.
         let outbound_raw = {
-            let is_trunk_call = {
+            let toward_trunk = {
                 let calls = self.b2bua.calls_locked().await;
-                calls.get(&uuid).map(|c| c.trunk_name.is_some()).unwrap_or(false)
+                calls.get(&uuid).map(|c| c.trunk_id.is_some()).unwrap_or(false)
             };
-            match (self.session_timer, is_trunk_call) {
-                (Some((expires, min_se)), true) => inject_session_timer_headers(
+            match (self.session_timer, toward_trunk) {
+                (Some((expires, min_se)), true) => set_session_timer_headers(
                     &outbound_raw, expires, min_se,
                 ),
                 _ => outbound_raw,
@@ -673,15 +684,16 @@ impl Sbc {
         self.transport.reply(outbound_raw.as_bytes(), dest, outbound_transport, outbound_reply_tx.as_ref()).await?;
         info!("Forwarded INVITE to {} via {:?}", dest, outbound_transport);
 
-        // ── Store raw outbound INVITE for 407 auth retry ──────────────────
-        // If the trunk responds with 407 Proxy Authentication Required,
-        // we need to resend this INVITE with Proxy-Authorization header.
-        // store_outbound_invite was already called with empty string + trunk_id;
-        // now update it with the actual raw INVITE.
-        if let Some((_, trunk_id, _)) = self.b2bua.get_auth_retry_info(&uuid).await {
-            self.b2bua.store_outbound_invite(&uuid, outbound_raw.clone(), trunk_id).await;
-            debug!("B2BUA: stored raw outbound INVITE ({} bytes) for potential 407 retry", outbound_raw.len());
-        }
+        // ── Record the INVITE attempt ──────────────────────────────────
+        // The raw INVITE as sent is the source for CANCEL, non-2xx ACK,
+        // 407/422 retries, failover re-sends and refresh re-INVITEs; its
+        // Via branch attributes the trunk's responses to this attempt.
+        // (trunk_id was stored earlier for trunk-routed calls; None for
+        // registrar-routed callees.)
+        let trunk_id = self.b2bua.get_auth_retry_info(&uuid).await.map(|(_, id, _)| id);
+        self.b2bua
+            .push_invite_attempt(&uuid, outbound_raw.clone(), dest, outbound_transport, trunk_id)
+            .await;
 
         // Attach outbound leg to B2BUA call (store callee reply_tx for BYE relay)
         // IMPORTANT: the outbound Call-ID is the SAME as the inbound INVITE Call-ID
@@ -780,20 +792,115 @@ impl Sbc {
             return Box::pin(self.failover_to_next_trunk(uuid)).await;
         }
 
-        // 3. Update call state for the new attempt
-        self.b2bua.store_outbound_invite(uuid, new_invite, trunk.id).await;
+        // 3. Update call state for the new attempt: the retargeted INVITE is
+        //    the live transaction (fresh branch → responses from the previous
+        //    trunk are recognised as stale), and this trunk gets its own
+        //    407 challenge budget.
+        self.b2bua
+            .push_invite_attempt(uuid, new_invite, new_dest, new_transport, Some(trunk.id))
+            .await;
+        self.b2bua.reset_auth_retry(uuid).await;
         {
             let mut calls = self.b2bua.calls_locked().await;
             if let Some(call) = calls.get_mut(uuid) {
                 call.trunk_name = Some(trunk.name.clone());
-                call.callee_dest = Some(new_dest);
-                call.callee_transport = new_transport;
                 call.callee_reply_tx = None;
+                call.session_timer_retry_count = 0;
                 if let Some(out) = call.outbound.as_mut() {
                     out.remote_addr = new_dest;
                 }
             }
         }
+    }
+
+    /// Handle 422 Session Interval Too Small from a trunk (RFC 4028 §7.4):
+    /// the trunk's Min-SE is above the Session-Expires we offered. Re-send
+    /// the INVITE once with Session-Expires ≥ Min-SE and that Min-SE, as a
+    /// new transaction (fresh branch, CSeq+1). The caller never sees the 422.
+    /// Returns Ok(true) when the INVITE was re-sent, Ok(false) when the 422
+    /// must be relayed instead (timers off, not a trunk, no/bogus Min-SE,
+    /// already retried, send failure).
+    pub(super) async fn handle_422_session_interval_retry(
+        &self,
+        uuid: &crate::b2bua::CallUuid,
+        response: &Response,
+        trunk_source: SocketAddr,
+    ) -> Result<bool> {
+        // 1. Only when WE negotiate timers on the trunk leg. With timers off
+        //    the caller's own headers were passed through, so the 422 rejects
+        //    the caller's offer and the caller is the one to retry.
+        let Some((cfg_se, cfg_min_se)) = self.session_timer else {
+            info!("422 retry: session timers disabled — the caller's own offer was rejected, relaying (call {})", uuid);
+            return Ok(false);
+        };
+
+        // 2. The live INVITE attempt toward a trunk, within the retry budget
+        let Some((attempt, callee_reply_tx)) = self.b2bua.current_attempt(uuid).await else {
+            warn!("422 retry: no outbound INVITE recorded for call {}", uuid);
+            return Ok(false);
+        };
+        let Some(trunk_id) = attempt.trunk_id else {
+            info!("422 retry: callee of call {} is not a trunk — relaying", uuid);
+            return Ok(false);
+        };
+        if self.b2bua.get_session_timer_retry_count(uuid).await >= 1 {
+            warn!("422 retry: already retried once for call {} — giving up", uuid);
+            return Ok(false);
+        }
+        let trunk_name = self
+            .trunk_manager
+            .get_trunk(&trunk_id)
+            .map(|t| t.name)
+            .unwrap_or_else(|| trunk_id.to_string());
+
+        // 3. The trunk's floor
+        let raw_422 = rsip::SipMessage::Response(response.clone()).to_string();
+        let Some(min_se_422) = super::response_handler::parse_min_se(&raw_422) else {
+            warn!("422 retry: trunk '{}' sent 422 without Min-SE (RFC 4028 §6) — cannot retry (call {})", trunk_name, uuid);
+            return Ok(false);
+        };
+
+        // 4. New offer: never below the 422's Min-SE, our config, or what we already offered
+        let offered_se = super::response_handler::parse_session_expires(&attempt.raw);
+        let Some((new_se, new_min_se)) =
+            session_interval_retry_values(offered_se, min_se_422, (cfg_se, cfg_min_se))
+        else {
+            warn!(
+                "422 retry: trunk '{}' demands Min-SE {} but we offered Session-Expires {:?} — unsatisfiable 422, relaying (call {})",
+                trunk_name, min_se_422, offered_se, uuid
+            );
+            return Ok(false);
+        };
+        if new_se > 86_400 {
+            warn!("422 retry: trunk '{}' demands a {}s session interval (> 24h) — honouring it (call {})", trunk_name, new_se, uuid);
+        }
+
+        // 5. Rebuild + send (same destination and connection as the INVITE)
+        let new_invite = build_session_interval_retry(&attempt.raw, new_se, new_min_se);
+        let new_cseq = crate::b2bua::parse_cseq_number(&new_invite).unwrap_or(attempt.cseq + 1);
+        let dest = if attempt.dest.ip().is_unspecified() { trunk_source } else { attempt.dest };
+        if let Err(e) = self
+            .transport
+            .reply(new_invite.as_bytes(), dest, attempt.transport, callee_reply_tx.as_ref())
+            .await
+        {
+            warn!("422 retry: send to {} failed for call {}: {}", dest, uuid, e);
+            return Ok(false);
+        }
+
+        // 6. Commit: bounded retry, fresh 407 budget for the new transaction,
+        //    the re-sent INVITE becomes the live attempt.
+        self.b2bua.increment_session_timer_retry(uuid).await;
+        self.b2bua.reset_auth_retry(uuid).await;
+        self.b2bua
+            .push_invite_attempt(uuid, new_invite, dest, attempt.transport, Some(trunk_id))
+            .await;
+        self.metrics.inc_session_timer_422_retry();
+        warn!(
+            "422 retry: trunk '{}' requires Min-SE {} (offered Session-Expires {:?}) — resent INVITE CSeq {} with Session-Expires {} / Min-SE {} to {} (call {})",
+            trunk_name, min_se_422, offered_se, new_cseq, new_se, new_min_se, dest, uuid
+        );
+        Ok(true)
     }
 
     /// Handle 407 Proxy Authentication Required from a trunk.
@@ -907,18 +1014,25 @@ impl Sbc {
             calls.get(uuid).and_then(|c| c.callee_reply_tx.clone())
         };
 
-        self.transport.reply(
+        if let Err(e) = self.transport.reply(
             new_invite.as_bytes(),
             dest,
             outbound_transport,
             callee_reply_tx.as_ref(),
-        ).await?;
+        ).await {
+            // A send failure must not escape handle_response and leave the
+            // call half-alive: report "retry impossible" so the caller is answered.
+            warn!("407 retry: send to {} failed for call {}: {}", dest, uuid, e);
+            return Ok(false);
+        }
 
         // 9. Increment retry count so we don't loop forever
         self.b2bua.increment_auth_retry(uuid).await;
 
-        // Update stored invite with the authenticated version
-        self.b2bua.store_outbound_invite(uuid, new_invite, trunk_id).await;
+        // The authenticated INVITE is now the live attempt (new branch, CSeq+1)
+        self.b2bua
+            .push_invite_attempt(uuid, new_invite, dest, outbound_transport, Some(trunk_id))
+            .await;
 
         info!("407 retry: resent authenticated INVITE to {} for call {}", dest, uuid);
         Ok(true)
@@ -1091,11 +1205,90 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
-    fn inject_session_timer_headers_before_content_length() {
+    fn set_session_timer_headers_before_content_length() {
         let raw = "INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nContent-Length: 0\r\n\r\n";
-        let out = inject_session_timer_headers(raw, 1800, 90);
-        assert!(out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nContent-Length: 0"));
+        let out = set_session_timer_headers(raw, 1800, 90);
+        assert!(out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nContent-Length: 0"), "{}", out);
         rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
+    }
+
+    /// The customer's second attempt: their own Min-SE plus ours used to
+    /// go out together (duplicate Min-SE, Session-Expires below it).
+    #[test]
+    fn set_session_timer_headers_replaces_existing_and_keeps_single_supported() {
+        let raw = "INVITE sip:x@y SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP h;branch=z9hG4bKx\r\n\
+                   Supported: replaces, timer\r\n\
+                   Min-SE: 14400\r\n\
+                   Session-Expires: 1800;refresher=uac\r\n\
+                   x: 600\r\n\
+                   Min-SE: 90\r\n\
+                   Content-Type: application/sdp\r\n\
+                   Content-Length: 5\r\n\r\n\
+                   v=0\r\n";
+        let out = set_session_timer_headers(raw, 14400, 14400);
+        assert_eq!(out.matches("Session-Expires:").count(), 1, "{}", out);
+        assert_eq!(out.matches("Min-SE:").count(), 1, "{}", out);
+        assert!(!out.contains("\r\nx: "), "compact Session-Expires removed");
+        assert_eq!(out.matches("Supported:").count(), 1, "existing Supported with timer is kept as is");
+        assert!(out.contains("Supported: replaces, timer\r\n"));
+        assert!(out.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\nContent-Length: 5\r\n\r\nv=0\r\n"), "{}", out);
+        rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
+    }
+
+    #[test]
+    fn set_session_timer_headers_adds_timer_next_to_foreign_supported() {
+        let raw = "INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nk: 100rel\r\nl: 0\r\n\r\n";
+        let out = set_session_timer_headers(raw, 1800, 90);
+        assert!(out.contains("k: 100rel\r\n"), "{}", out);
+        assert!(out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nl: 0\r\n"), "{}", out);
+    }
+
+    #[test]
+    fn session_interval_retry_values_table() {
+        // The incident: offered 1800/90, Genesys demands 14400
+        assert_eq!(session_interval_retry_values(Some(1800), 14400, (1800, 90)), Some((14400, 14400)));
+        // Bogus 422: Min-SE not above what we offered → no point retrying
+        assert_eq!(session_interval_retry_values(Some(1800), 600, (1800, 90)), None);
+        assert_eq!(session_interval_retry_values(Some(14400), 14400, (1800, 90)), None);
+        // Configured Session-Expires above the demanded floor is kept
+        assert_eq!(session_interval_retry_values(Some(1800), 14400, (20000, 90)), Some((20000, 14400)));
+        // Below the RFC 4028 §4 minimum → malformed
+        assert_eq!(session_interval_retry_values(Some(1800), 60, (1800, 90)), None);
+        // Nothing parseable in the stored INVITE: retry from the 422 alone
+        assert_eq!(session_interval_retry_values(None, 14400, (1800, 90)), Some((14400, 14400)));
+        // Configured Min-SE above the trunk's: keep ours
+        assert_eq!(session_interval_retry_values(Some(1800), 2000, (1800, 3000)), Some((3000, 3000)));
+    }
+
+    #[test]
+    fn build_session_interval_retry_strips_auth_and_renews_transaction() {
+        let stored = "INVITE sip:+33612345678@203.0.113.9:5060 SIP/2.0\r\n\
+                      Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bKold;rport\r\n\
+                      Max-Forwards: 70\r\n\
+                      Proxy-Authorization: Digest username=\"u\", nonce=\"n\"\r\n\
+                      From: <sip:alice@a.example.com>;tag=al-1\r\n\
+                      To: <sip:+33612345678@pstn>\r\n\
+                      Call-ID: xyz@host\r\n\
+                      CSeq: 3 INVITE\r\n\
+                      Supported: timer\r\n\
+                      Session-Expires: 1800\r\n\
+                      Min-SE: 90\r\n\
+                      Content-Type: application/sdp\r\n\
+                      Content-Length: 22\r\n\r\n\
+                      v=0\r\nm=audio 1 RTP/AVP 0\r\n";
+        let out = build_session_interval_retry(stored, 14400, 14400);
+        rsip::SipMessage::try_from(out.as_bytes().to_vec()).expect("retry INVITE parses");
+        assert!(out.starts_with("INVITE sip:+33612345678@203.0.113.9:5060 SIP/2.0\r\n"));
+        assert!(out.contains("CSeq: 4 INVITE\r\n"), "{}", out);
+        assert!(!out.contains("z9hG4bKold"));
+        assert!(!out.contains("Proxy-Authorization"), "a new transaction gets a fresh challenge");
+        assert_eq!(out.matches("Session-Expires:").count(), 1);
+        assert!(out.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\n"), "{}", out);
+        assert_eq!(out.matches("Supported: timer").count(), 1);
+        assert!(out.contains("Call-ID: xyz@host\r\n"));
+        assert!(out.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
+        assert!(out.ends_with("Content-Length: 22\r\n\r\nv=0\r\nm=audio 1 RTP/AVP 0\r\n"), "body intact: {}", out);
     }
 
     #[test]
@@ -1108,20 +1301,79 @@ Content-Length: 0\r\n\r\n";
     }
 }
 
-/// Insert `Supported: timer`, `Session-Expires` and `Min-SE` before the
-/// Content-Length header of a raw INVITE.
-pub(crate) fn inject_session_timer_headers(raw: &str, expires: u32, min_se: u32) -> String {
-    let insert = format!(
-        "Supported: timer\r\nSession-Expires: {}\r\nMin-SE: {}\r\n",
-        expires, min_se
-    );
-    if let Some(pos) = raw.to_lowercase().find("content-length:") {
-        let mut out = String::with_capacity(raw.len() + insert.len());
-        out.push_str(&raw[..pos]);
-        out.push_str(&insert);
-        out.push_str(&raw[pos..]);
-        out
-    } else {
-        raw.to_string()
+/// Make the SBC the sole RFC 4028 negotiator of a raw INVITE: drop every
+/// existing `Session-Expires` (long or compact `x:`) and `Min-SE`, add
+/// `Supported: timer` unless a Supported header already lists it, and
+/// insert `Session-Expires` + `Min-SE` right before Content-Length.
+/// Idempotent — safe on an INVITE that was already stamped (422 retry).
+pub(crate) fn set_session_timer_headers(raw: &str, expires: u32, min_se: u32) -> String {
+    let Ok(mut msg) = crate::topology::RawSipMessage::parse(raw) else {
+        return raw.to_string();
+    };
+    apply_session_timer_headers(&mut msg, expires, min_se);
+    msg.to_string()
+}
+
+fn apply_session_timer_headers(msg: &mut crate::topology::RawSipMessage, expires: u32, min_se: u32) {
+    msg.remove_header("session-expires");
+    msg.remove_header("x"); // compact form — no short-form mapping in RawSipMessage
+    msg.remove_header("min-se");
+    let has_timer = msg
+        .header_values("supported")
+        .iter()
+        .any(|v| v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("timer")));
+    let mut insert = Vec::with_capacity(3);
+    if !has_timer {
+        insert.push("Supported: timer".to_string());
     }
+    insert.push(format!("Session-Expires: {}", expires));
+    insert.push(format!("Min-SE: {}", min_se));
+    let at = msg
+        .headers
+        .iter()
+        .position(|h| {
+            let name = h.split(':').next().unwrap_or("").trim().to_lowercase();
+            name == "content-length" || name == "l"
+        })
+        .unwrap_or(msg.headers.len());
+    for (i, h) in insert.into_iter().enumerate() {
+        msg.headers.insert(at + i, h);
+    }
+}
+
+/// RFC 4028 §7.4 values for a retry after `422 Min-SE: min_se_422`, given
+/// what the stored INVITE offered and the configured (expires, min_se).
+/// None when a retry cannot help: Min-SE below the RFC 4028 §4 minimum
+/// (malformed), or not above what we already offered (a bogus 422 — an
+/// identical INVITE would be rejected again).
+pub(crate) fn session_interval_retry_values(
+    offered_se: Option<u32>,
+    min_se_422: u32,
+    configured: (u32, u32),
+) -> Option<(u32, u32)> {
+    if min_se_422 < 90 {
+        return None;
+    }
+    if offered_se.is_some_and(|offered| offered >= min_se_422) {
+        return None;
+    }
+    let new_min_se = min_se_422.max(configured.1);
+    let new_se = offered_se.unwrap_or(0).max(configured.0).max(new_min_se);
+    Some((new_se, new_min_se))
+}
+
+/// The INVITE to re-send after a 422: same identity and body, the trunk's
+/// timer values, a fresh transaction (new branch, CSeq+1) and no stale
+/// Proxy-Authorization (the new transaction gets a fresh challenge; a
+/// replayed digest is rejected by nonce-count enforcing servers).
+pub(crate) fn build_session_interval_retry(stored_invite: &str, expires: u32, min_se: u32) -> String {
+    let stamped = match crate::topology::RawSipMessage::parse(stored_invite) {
+        Ok(mut msg) => {
+            msg.remove_header("proxy-authorization");
+            apply_session_timer_headers(&mut msg, expires, min_se);
+            msg.to_string()
+        }
+        Err(_) => stored_invite.to_string(),
+    };
+    crate::sip_builder::renew_invite_transaction(&stamped)
 }

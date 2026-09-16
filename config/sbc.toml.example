@@ -75,6 +75,12 @@ invite_timeout = 5             # no >=180 within 5s → trunk failover
 
 # RFC 4028 session timers (refresh re-INVITEs on the trunk leg so >4h
 # calls survive). Off by default; enable after validating with your trunk.
+# The SBC owns the offer on the trunk leg (the caller's Session-Expires /
+# Min-SE are replaced) and answers a "422 Session Interval Too Small" by
+# re-sending the INVITE once with the trunk's Min-SE (RFC 4028 §7.4).
+# Trunks with a high floor (Genesys: 14400) accept the first INVITE when
+# session_expires is raised to it; keep min_se low — a UAS may lower
+# Session-Expires in its 2xx. Changes are applied on SIGHUP / POST reload.
 session_timer_enabled = false
 session_expires = 1800
 min_se = 90

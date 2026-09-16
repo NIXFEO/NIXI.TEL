@@ -26,6 +26,17 @@ groups:
         annotations:
           summary: "Elevated RTP inactivity timeouts (possible media path issue)"
 
+      - alert: SBCSessionTimer422Retries
+        # A trunk keeps answering 422 Session Interval Too Small: its Min-SE
+        # floor is above [security] session_expires. The SBC retries (RFC
+        # 4028 §7.4) so calls succeed, but every call pays a round trip —
+        # raise session_expires to the trunk's floor (e.g. 14400 for Genesys).
+        expr: rate(sbc_session_timer_422_retries_total[10m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Trunk demands a Session-Expires above the configured value (422 retries ongoing)"
+
       - alert: SBCAuthFailureSpike
         expr: rate(sbc_auth_failures_total[5m]) > 5
         for: 10m
