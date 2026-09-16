@@ -337,3 +337,19 @@ sudo systemctl stop sbc && sudo cp /usr/local/bin/sbc.bak /usr/local/bin/sbc && 
 The SQLite store and TOML file are untouched by binary upgrades. Back up
 `sqlite_path` and grab a config snapshot via `GET /api/v1/export` before
 major upgrades.
+
+**Small VPS (2 GB RAM, no swap):** a full release build can be OOM-killed
+and the kernel may pick the running SBC as the victim. Add a temporary
+swapfile and cap the build's memory so an OOM hits the build, not the
+service:
+
+```bash
+sudo fallocate -l 2G /swapfile.build && sudo chmod 600 /swapfile.build \
+  && sudo mkswap /swapfile.build && sudo swapon /swapfile.build
+systemd-run --scope -p MemoryMax=1400M -p MemorySwapMax=2G nice -n 10 cargo build --release
+sudo swapoff /swapfile.build && sudo rm /swapfile.build
+```
+
+Changing the `[security]` session-timer values (`session_expires`,
+`min_se`) does not need a restart: `kill -HUP` or `POST /api/v1/reload`
+applies them to new calls.
