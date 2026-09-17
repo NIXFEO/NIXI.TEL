@@ -1202,3 +1202,192 @@ async fn forwarded_invite_carries_only_supported_extensions() {
     );
     assert!(call_alive(&sbc, "cid-out-1").await);
 }
+
+/// Digest REGISTER: challenge, success, retransmission, replay, stale
+/// nonce (re-challenge with stale=true, no strike), wrong password (403 +
+/// strike).
+#[tokio::test]
+async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
+    const REALM: &str = "sip.example.com";
+    let mut sbc = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .build();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let auth_events = |sbc: &Sbc| {
+        sbc.security
+            .recent_events()
+            .iter()
+            .filter(|e| matches!(e, crate::security::SecurityEvent::AuthFailure { .. }))
+            .count()
+    };
+
+    // 1. No credentials → 401 with a fresh challenge (not stale)
+    sbc.handle_request(
+        register_request("alice", REALM, 1, ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 401 Unauthorized\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("WWW-Authenticate: Digest realm=\"sip.example.com\", nonce=\""));
+    assert!(!out[0].contains("stale=true"));
+    let nonce = nonce_of(&out[0]);
+
+    // 2. Valid credentials → 200, binding stored
+    let authorized = register_request(
+        "alice",
+        REALM,
+        2,
+        &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+    );
+    sbc.handle_request(
+        authorized.clone(),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(out[0].starts_with("SIP/2.0 200 OK\r\n"), "{}", out[0]);
+    assert_eq!(
+        sbc.register_handler
+            .lookup("sip:alice@sip.example.com")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 3. The same message again (UDP retransmission): still 200, no strike
+    sbc.handle_request(authorized, local_addr(), rsip::Transport::Udp, Some(&tx))
+        .await
+        .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 200 OK\r\n"),
+        "retransmission accepted: {}",
+        out[0]
+    );
+    assert_eq!(auth_events(&sbc), 0);
+
+    // 4. Same nonce and nc from a different request (another Contact): replay → 403 + strike
+    let replay = request(
+        rsip::SipMessage::Request(register_request(
+            "alice",
+            REALM,
+            3,
+            &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+        ))
+        .to_string()
+        .replace(
+            "Contact: <sip:alice@127.0.0.1:5080>",
+            "Contact: <sip:alice@198.51.100.7:5060>",
+        ),
+    );
+    sbc.handle_request(replay, local_addr(), rsip::Transport::Udp, Some(&tx))
+        .await
+        .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        "{}",
+        out[0]
+    );
+    assert_eq!(auth_events(&sbc), 1, "a replay is a strike");
+
+    // 5. Cached nonce that expired: 401 stale=true, no strike
+    sbc.auth.as_ref().unwrap().backdate_nonce(&nonce, 301).await;
+    sbc.handle_request(
+        register_request(
+            "alice",
+            REALM,
+            4,
+            &authorization_line("alice", REALM, "s3cret", &nonce, "00000002"),
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 401 Unauthorized\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("stale=true"), "{}", out[0]);
+    assert_eq!(auth_events(&sbc), 1, "a stale nonce is not a strike");
+    assert_eq!(
+        sbc.metrics
+            .auth_stale_challenges_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // 6. Retry on the fresh challenge → 200
+    let fresh = nonce_of(&out[0]);
+    sbc.handle_request(
+        register_request(
+            "alice",
+            REALM,
+            5,
+            &authorization_line("alice", REALM, "s3cret", &fresh, "00000001"),
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut rx)[0].starts_with("SIP/2.0 200 OK\r\n"));
+
+    // 7. Wrong password on a valid nonce → 403 + strike
+    sbc.handle_request(
+        register_request(
+            "alice",
+            REALM,
+            6,
+            &authorization_line("alice", REALM, "wrong", &fresh, "00000002"),
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        "{}",
+        out[0]
+    );
+    assert_eq!(auth_events(&sbc), 2);
+
+    // 8. Not a Digest header at all → 400, no strike
+    sbc.handle_request(
+        register_request("alice", REALM, 7, "Authorization: Bearer nope\r\n"),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 400 Bad Request\r\n"),
+        "{}",
+        out[0]
+    );
+    assert_eq!(auth_events(&sbc), 2);
+}

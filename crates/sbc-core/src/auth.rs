@@ -287,6 +287,75 @@ impl DigestCredentials {
 struct NonceRecord {
     created_at: u64, // Unix timestamp (secs)
     use_count: u32,
+    /// Highest nonce-count accepted with this nonce (qop=auth).
+    last_nc: u32,
+    /// Fingerprint of the request that used `last_nc`: a byte-identical
+    /// retransmission (same fingerprint, same nc) is accepted again; a
+    /// different request with the same nc is a replay.
+    last_fingerprint: Option<u64>,
+}
+
+/// Why a Digest verification failed (RFC 3261 §22, RFC 7616 §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthFailure {
+    /// The nonce is unknown, expired or already consumed. The client's
+    /// credentials may well be right (it cached an old challenge): answer
+    /// a fresh challenge with `stale=true`. Never a fail2ban strike, never
+    /// an oracle (an unknown nonce yields this whatever the digest).
+    StaleNonce {
+        user: String,
+    },
+    /// A known nonce presented again with a nonce-count that does not
+    /// advance, by a different request: a captured Authorization replayed.
+    Replay {
+        user: String,
+    },
+    /// Known nonce, known user, wrong digest: wrong password.
+    BadCredentials {
+        user: String,
+    },
+    UnknownUser {
+        user: String,
+    },
+    /// Not a parsable Digest header.
+    Malformed,
+}
+
+impl AuthFailure {
+    pub fn user(&self) -> Option<&str> {
+        match self {
+            Self::StaleNonce { user }
+            | Self::Replay { user }
+            | Self::BadCredentials { user }
+            | Self::UnknownUser { user } => Some(user),
+            Self::Malformed => None,
+        }
+    }
+
+    /// Re-challenge with `stale=true` instead of rejecting.
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Self::StaleNonce { .. })
+    }
+
+    /// Counts toward the fail2ban window.
+    pub fn is_attack(&self) -> bool {
+        matches!(
+            self,
+            Self::Replay { .. } | Self::BadCredentials { .. } | Self::UnknownUser { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for AuthFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleNonce { user } => write!(f, "stale or unknown nonce (user {})", user),
+            Self::Replay { user } => write!(f, "replayed authorization (user {})", user),
+            Self::BadCredentials { user } => write!(f, "wrong password (user {})", user),
+            Self::UnknownUser { user } => write!(f, "unknown user {}", user),
+            Self::Malformed => write!(f, "malformed Digest header"),
+        }
+    }
 }
 
 /// Digest Authenticator — generates challenges and verifies responses
@@ -372,10 +441,18 @@ impl DigestAuthenticator {
 
     /// Generate a 401 WWW-Authenticate challenge header value
     pub async fn generate_challenge(&self) -> String {
+        self.generate_challenge_with(false).await
+    }
+
+    /// Challenge with `stale=true` when the client's nonce was merely old
+    /// (RFC 7616 §3.3): it retries with the same credentials at once.
+    pub async fn generate_challenge_with(&self, stale: bool) -> String {
         let nonce = Self::generate_nonce();
         let record = NonceRecord {
             created_at: Self::now_secs(),
             use_count: 0,
+            last_nc: 0,
+            last_fingerprint: None,
         };
         let mut nonces = self.nonces.lock().await;
         if nonces.len() >= MAX_NONCES {
@@ -399,58 +476,108 @@ impl DigestAuthenticator {
         drop(nonces);
 
         format!(
-            r#"Digest realm="{}", nonce="{}", algorithm=MD5, qop="auth""#,
-            self.realm, nonce
+            r#"Digest realm="{}", nonce="{}", algorithm=MD5, qop="auth"{}"#,
+            self.realm,
+            nonce,
+            if stale { ", stale=true" } else { "" }
         )
     }
 
-    /// Verify Authorization header value against our user database
-    ///
-    /// Returns Ok(username) on success, Err on failure.
-    pub async fn verify(&self, auth_header: &str, method: &str) -> Result<String> {
-        let creds = DigestCredentials::from_header(auth_header)?;
+    /// Verify an Authorization header value against our user database.
+    /// Returns the authenticated username, or why it failed.
+    pub async fn verify(
+        &self,
+        auth_header: &str,
+        method: &str,
+    ) -> std::result::Result<String, AuthFailure> {
+        self.verify_with(auth_header, method, None).await
+    }
 
-        // Verify nonce is known and not expired
-        {
-            let mut nonces = self.nonces.lock().await;
-            let record = nonces
-                .get_mut(&creds.nonce)
-                .ok_or_else(|| Error::Other("Invalid or unknown nonce".to_string()))?;
+    /// `verify` with a fingerprint of the request carrying the header
+    /// (Authorization value + source + Contact): a byte-identical UDP
+    /// retransmission of an already-accepted request is accepted again
+    /// instead of being called a replay.
+    pub async fn verify_with(
+        &self,
+        auth_header: &str,
+        method: &str,
+        fingerprint: Option<u64>,
+    ) -> std::result::Result<String, AuthFailure> {
+        let creds =
+            DigestCredentials::from_header(auth_header).map_err(|_| AuthFailure::Malformed)?;
+        let user = creds.username.clone();
 
-            let age = Self::now_secs().saturating_sub(record.created_at);
-            if age > self.nonce_ttl {
-                nonces.remove(&creds.nonce);
-                return Err(Error::Other("Nonce expired".to_string()));
-            }
-            record.use_count += 1;
-        }
-
-        // Look up HA1 for user
-        let users = self.users.read().await;
-        let ha1 = users
-            .get(&creds.username)
-            .ok_or_else(|| Error::Other(format!("Unknown user: {}", creds.username)))?;
-
-        // Compute HA2
-        let ha2 = compute_ha2(method, &creds.uri);
-
-        // Compute expected response
-        let expected = match &creds.qop {
-            Some(qop) if qop == "auth" => {
-                let nc = creds.nc.as_deref().unwrap_or("00000001");
-                let cnonce = creds.cnonce.as_deref().unwrap_or("");
-                compute_response_auth(ha1, &creds.nonce, nc, cnonce, &ha2)
-            }
-            _ => compute_response(ha1, &creds.nonce, &ha2),
+        // Digest first: the nonce state decides between "stale" and "wrong
+        // password" only once we know whether the credentials were right.
+        let ha1 = {
+            let users = self.users.read().await;
+            users
+                .get(&user)
+                .cloned()
+                .ok_or_else(|| AuthFailure::UnknownUser { user: user.clone() })?
         };
+        let ha2 = compute_ha2(method, &creds.uri);
+        let qop_auth = creds.qop.as_deref() == Some("auth");
+        let expected = if qop_auth {
+            let nc = creds.nc.as_deref().unwrap_or("00000001");
+            let cnonce = creds.cnonce.as_deref().unwrap_or("");
+            compute_response_auth(&ha1, &creds.nonce, nc, cnonce, &ha2)
+        } else {
+            compute_response(&ha1, &creds.nonce, &ha2)
+        };
+        let digest_ok = expected == creds.response;
 
-        if expected != creds.response {
-            return Err(Error::Other(
-                "Authentication failed: wrong password".to_string(),
-            ));
+        let mut nonces = self.nonces.lock().await;
+        let now = Self::now_secs();
+        let Some(record) = nonces.get_mut(&creds.nonce) else {
+            // Not ours (restart, a cached challenge from long ago, or a
+            // made-up nonce): re-challenge. Same answer whatever the digest,
+            // so a forged nonce cannot be used to test passwords.
+            return Err(AuthFailure::StaleNonce { user });
+        };
+        if now.saturating_sub(record.created_at) > self.nonce_ttl {
+            nonces.remove(&creds.nonce);
+            return Err(if digest_ok {
+                AuthFailure::StaleNonce { user }
+            } else {
+                AuthFailure::BadCredentials { user }
+            });
+        }
+        if !digest_ok {
+            return Err(AuthFailure::BadCredentials { user });
         }
 
-        Ok(creds.username.clone())
+        // Replay protection (RFC 7616 §5.7): with qop=auth the nonce-count
+        // must advance; a retransmission (same nc, same request) is fine.
+        // Without qop the nonce is single-use.
+        if qop_auth {
+            let nc = creds
+                .nc
+                .as_deref()
+                .and_then(|n| u32::from_str_radix(n.trim(), 16).ok())
+                .ok_or_else(|| AuthFailure::StaleNonce { user: user.clone() })?;
+            if nc > record.last_nc {
+                record.last_nc = nc;
+                record.last_fingerprint = fingerprint;
+            } else if !(nc == record.last_nc
+                && fingerprint.is_some()
+                && fingerprint == record.last_fingerprint)
+            {
+                return Err(AuthFailure::Replay { user });
+            }
+        } else if record.use_count > 0 {
+            return Err(AuthFailure::StaleNonce { user });
+        }
+        record.use_count += 1;
+        Ok(user)
+    }
+
+    /// Test hook: age a nonce so the next use is stale.
+    #[cfg(test)]
+    pub async fn backdate_nonce(&self, nonce: &str, secs: u64) {
+        if let Some(r) = self.nonces.lock().await.get_mut(nonce) {
+            r.created_at = r.created_at.saturating_sub(secs);
+        }
     }
 
     /// Remove expired nonces (run by the maintenance sweeper). Returns the
@@ -640,8 +767,108 @@ mod tests {
         );
 
         let result = auth.verify(&auth_header, "INVITE").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown nonce"));
+        assert_eq!(
+            result,
+            Err(AuthFailure::StaleNonce {
+                user: "alice".into()
+            }),
+            "an unknown nonce is re-challenged, never punished"
+        );
+    }
+
+    fn nonce_of(challenge: &str) -> String {
+        challenge
+            .split("nonce=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn qop_header(nonce: &str, user: &str, password: &str, nc: &str, cnonce: &str) -> String {
+        let ha1 = compute_ha1(user, "example.com", password);
+        let ha2 = compute_ha2("REGISTER", "sip:example.com");
+        let response = compute_response_auth(&ha1, nonce, nc, cnonce, &ha2);
+        format!(
+            r#"Digest username="{}", realm="example.com", nonce="{}", uri="sip:example.com", response="{}", algorithm=MD5, cnonce="{}", nc={}, qop=auth"#,
+            user, nonce, response, cnonce, nc
+        )
+    }
+
+    #[tokio::test]
+    async fn stale_nonce_is_rechallenged_not_punished() {
+        let auth = make_auth();
+        let nonce = nonce_of(&auth.generate_challenge().await);
+        auth.backdate_nonce(&nonce, 301).await;
+        let header = qop_header(&nonce, "alice", "secret123", "00000001", "c1");
+        assert_eq!(
+            auth.verify(&header, "REGISTER").await,
+            Err(AuthFailure::StaleNonce {
+                user: "alice".into()
+            })
+        );
+        // Expired nonce with a wrong digest is still a wrong password.
+        let nonce = nonce_of(&auth.generate_challenge().await);
+        auth.backdate_nonce(&nonce, 301).await;
+        let header = qop_header(&nonce, "alice", "nope", "00000001", "c1");
+        assert_eq!(
+            auth.verify(&header, "REGISTER").await,
+            Err(AuthFailure::BadCredentials {
+                user: "alice".into()
+            })
+        );
+        let challenge = auth.generate_challenge_with(true).await;
+        assert!(challenge.ends_with(", stale=true"), "{}", challenge);
+        assert!(!auth.generate_challenge().await.contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn nonce_count_must_advance_except_for_retransmissions() {
+        let auth = make_auth();
+        let nonce = nonce_of(&auth.generate_challenge().await);
+        let first = qop_header(&nonce, "alice", "secret123", "00000001", "c1");
+        assert_eq!(
+            auth.verify_with(&first, "REGISTER", Some(11)).await,
+            Ok("alice".into())
+        );
+        // Byte-identical retransmission (same fingerprint): accepted again.
+        assert_eq!(
+            auth.verify_with(&first, "REGISTER", Some(11)).await,
+            Ok("alice".into())
+        );
+        // Same nc from another request: replay.
+        assert_eq!(
+            auth.verify_with(&first, "REGISTER", Some(12)).await,
+            Err(AuthFailure::Replay {
+                user: "alice".into()
+            })
+        );
+        // A lower nc: replay too.
+        let lower = qop_header(&nonce, "alice", "secret123", "00000000", "c1");
+        assert!(matches!(
+            auth.verify_with(&lower, "REGISTER", Some(13)).await,
+            Err(AuthFailure::Replay { .. })
+        ));
+        // The next count is fine.
+        let second = qop_header(&nonce, "alice", "secret123", "00000002", "c2");
+        assert_eq!(
+            auth.verify_with(&second, "REGISTER", Some(14)).await,
+            Ok("alice".into())
+        );
+        // Unparsable nc: re-challenge, no strike.
+        let odd = qop_header(&nonce, "alice", "secret123", "zz", "c3");
+        assert!(matches!(
+            auth.verify_with(&odd, "REGISTER", Some(15)).await,
+            Err(AuthFailure::StaleNonce { .. })
+        ));
+        assert!(!AuthFailure::StaleNonce { user: "a".into() }.is_attack());
+        assert!(AuthFailure::Replay { user: "a".into() }.is_attack());
+        assert!(matches!(
+            auth.verify("garbage", "REGISTER").await,
+            Err(AuthFailure::Malformed)
+        ));
     }
 
     #[tokio::test]

@@ -1550,47 +1550,35 @@ impl Sbc {
                             .await;
                     }
                     Some(ref auth_value) => {
-                        // Verify the credentials
+                        // Verify the credentials. The fingerprint lets a
+                        // byte-identical UDP retransmission of an accepted
+                        // REGISTER pass again instead of counting as a replay.
                         let method = request.method.to_string();
-                        match auth.verify(auth_value, &method).await {
+                        let fingerprint = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            auth_value.hash(&mut h);
+                            source.hash(&mut h);
+                            request
+                                .contact_header()
+                                .map(|c| c.value().to_string())
+                                .unwrap_or_default()
+                                .hash(&mut h);
+                            h.finish()
+                        };
+                        match auth
+                            .verify_with(auth_value, &method, Some(fingerprint))
+                            .await
+                        {
                             Ok(username) => {
                                 info!("REGISTER authenticated for user: {}", username);
                                 // Fall through to registration
                             }
-                            Err(e) => {
-                                self.metrics.inc_auth_failure();
-                                self.metrics.inc_sip_response(403);
-                                // Nonce-related failures are expected (client retries
-                                // with stale nonce after re-REGISTER) — log at debug.
-                                // Real auth failures (wrong password, unknown user)
-                                // are logged at warn for security monitoring.
-                                let err_str = e.to_string();
-                                if err_str.contains("nonce") || err_str.contains("Nonce") {
-                                    debug!(
-                                        "REGISTER auth: nonce issue from {}: {}",
-                                        source.ip(),
-                                        e
-                                    );
-                                } else {
-                                    warn!("REGISTER auth failed from {}: {}", source.ip(), e);
-                                    // Real failure → fail2ban strike (stale-nonce
-                                    // retries above must NOT count, or legitimate
-                                    // clients get banned on re-REGISTER).
-                                    if let Some(entry) = self.security.record_auth_failure(
-                                        source.ip(),
-                                        None,
-                                        "REGISTER",
-                                    ) {
-                                        self.metrics.inc_security_ban();
-                                        self.persist_ban(&entry);
-                                    }
-                                }
-                                let response_403 =
-                                    build_plain_response_for_request(request, 403, "Forbidden")?;
-                                let data = response_403.to_string().into_bytes();
+                            Err(failure) => {
                                 return self
-                                    .transport
-                                    .reply(&data, source, transport, reply_tx)
+                                    .reject_register_auth(
+                                        request, source, transport, reply_tx, auth, failure,
+                                    )
                                     .await;
                             }
                         }
@@ -1727,6 +1715,68 @@ impl Sbc {
                 Ok(())
             }
         }
+    }
+
+    /// A REGISTER whose credentials did not verify. A stale nonce gets a
+    /// fresh challenge with `stale=true` (RFC 7616 §3.3) and is never a
+    /// fail2ban strike — clients cache challenges across re-REGISTERs and
+    /// every restart empties the nonce table. A wrong password, an unknown
+    /// user or a replayed Authorization is a strike and a 403; a header
+    /// that is not Digest at all is a 400.
+    async fn reject_register_auth(
+        &self,
+        request: &Request,
+        source: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+        auth: &DigestAuthenticator,
+        failure: crate::auth::AuthFailure,
+    ) -> Result<()> {
+        use crate::auth::AuthFailure;
+        match failure {
+            AuthFailure::StaleNonce { user } => {
+                debug!(
+                    "REGISTER from {} (user {}): stale nonce — re-challenging with stale=true",
+                    source.ip(),
+                    user
+                );
+                self.metrics.inc_auth_challenge();
+                self.metrics.inc_auth_stale_challenge();
+                self.metrics.inc_sip_response(401);
+                let challenge = auth.generate_challenge_with(true).await;
+                let response_401 = build_register_401(request, &challenge)?;
+                let data = response_401.to_string().into_bytes();
+                self.send_sip("401 (stale) → REGISTER", &data, source, transport, reply_tx)
+                    .await;
+            }
+            AuthFailure::Malformed => {
+                warn!(
+                    "REGISTER from {}: Authorization header is not a Digest — 400",
+                    source.ip()
+                );
+                self.metrics.inc_auth_failure();
+                self.metrics.inc_sip_response(400);
+                let r = response_for_request(request, 400, "Bad Request");
+                self.send_sip("400 → REGISTER", r.as_bytes(), source, transport, reply_tx)
+                    .await;
+            }
+            other => {
+                warn!("REGISTER auth failed from {}: {}", source.ip(), other);
+                self.metrics.inc_auth_failure();
+                self.metrics.inc_sip_response(403);
+                if let Some(entry) =
+                    self.security
+                        .record_auth_failure(source.ip(), other.user(), "REGISTER")
+                {
+                    self.metrics.inc_security_ban();
+                    self.persist_ban(&entry);
+                }
+                let r = response_for_request(request, 403, "Forbidden");
+                self.send_sip("403 → REGISTER", r.as_bytes(), source, transport, reply_tx)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     /// Send a SIP message on a leg and account for the outcome. A send that

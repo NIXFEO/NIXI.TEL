@@ -322,6 +322,52 @@ pub(crate) fn local_addr() -> SocketAddr {
     "127.0.0.1:5080".parse().unwrap()
 }
 
+/// REGISTER from the local client for `sip:{user}@{realm}` (Call-ID
+/// `cid-reg-1`, branch derived from `cseq`), with `extra` header lines.
+pub(crate) fn register_request(user: &str, realm: &str, cseq: u32, extra: &str) -> rsip::Request {
+    request(format!(
+        "REGISTER sip:{realm} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKreg{cseq}\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:{user}@{realm}>;tag=r1\r\n\
+         To: <sip:{user}@{realm}>\r\n\
+         Call-ID: cid-reg-1\r\n\
+         CSeq: {cseq} REGISTER\r\n\
+         Contact: <sip:{user}@127.0.0.1:5080>\r\n\
+         Expires: 3600\r\n\
+         {extra}Content-Length: 0\r\n\r\n"
+    ))
+}
+
+/// The nonce of a 401's WWW-Authenticate challenge.
+pub(crate) fn nonce_of(response: &str) -> String {
+    response
+        .split("nonce=\"")
+        .nth(1)
+        .expect("nonce in challenge")
+        .split('"')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// An `Authorization:` header line answering `nonce` with qop=auth.
+pub(crate) fn authorization_line(
+    user: &str,
+    realm: &str,
+    password: &str,
+    nonce: &str,
+    nc: &str,
+) -> String {
+    let ha1 = crate::auth::compute_ha1(user, realm, password);
+    let ha2 = crate::auth::compute_ha2("REGISTER", &format!("sip:{}", realm));
+    let response = crate::auth::compute_response_auth(&ha1, nonce, nc, "cn0nce", &ha2);
+    format!(
+        "Authorization: Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"sip:{}\", response=\"{}\", algorithm=MD5, cnonce=\"cn0nce\", nc={}, qop=auth\r\n",
+        user, realm, nonce, realm, response, nc
+    )
+}
+
 /// Everything queued on a leg, as text, oldest first.
 pub(crate) fn drain(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<String> {
     let mut out = Vec::new();
@@ -370,6 +416,7 @@ pub(crate) struct SbcBuilder {
     invite_timeout: Duration,
     setup_timeout: Duration,
     max_call_duration: Duration,
+    digest: Option<(String, std::collections::HashMap<String, String>)>,
 }
 
 impl SbcBuilder {
@@ -380,11 +427,24 @@ impl SbcBuilder {
             invite_timeout: Duration::from_secs(5),
             setup_timeout: Duration::from_secs(180),
             max_call_duration: Duration::from_secs(14400),
+            digest: None,
         }
     }
 
     pub(crate) fn setup_timeout(mut self, timeout: Duration) -> Self {
         self.setup_timeout = timeout;
+        self
+    }
+
+    /// Digest authentication on, with these `(user, password)` accounts.
+    pub(crate) fn digest_users(mut self, realm: &str, users: &[(&str, &str)]) -> Self {
+        self.digest = Some((
+            realm.to_string(),
+            users
+                .iter()
+                .map(|(u, p)| (u.to_string(), p.to_string()))
+                .collect(),
+        ));
         self
     }
 
@@ -426,6 +486,10 @@ impl SbcBuilder {
         sbc.invite_timeout = self.invite_timeout;
         sbc.call_setup_timeout = self.setup_timeout;
         sbc.max_call_duration = self.max_call_duration;
+        if let Some((realm, users)) = self.digest {
+            sbc.auth = Some(Arc::new(DigestAuthenticator::new(realm, users)));
+            sbc.enable_digest_auth = true;
+        }
         let mut trunk = TrunkConfig::new(TRUNK_NAME.to_string());
         trunk.host = trunk_addr().ip().to_string();
         trunk.port = trunk_addr().port();

@@ -43,6 +43,8 @@ pub struct SbcMetrics {
 
     /// Total auth failures
     pub auth_failures_total: Arc<AtomicU64>,
+    /// 401/407 re-challenges with stale=true (cached nonce, not an attack)
+    pub auth_stale_challenges_total: Arc<AtomicU64>,
 
     /// Total RTP packets forwarded
     pub rtp_packets_total: Arc<AtomicU64>,
@@ -142,6 +144,7 @@ impl SbcMetrics {
             calls_terminated_total: Arc::new(AtomicU64::new(0)),
             auth_challenges_total: Arc::new(AtomicU64::new(0)),
             auth_failures_total: Arc::new(AtomicU64::new(0)),
+            auth_stale_challenges_total: Arc::new(AtomicU64::new(0)),
             rtp_packets_total: Arc::new(AtomicU64::new(0)),
             srtp_encrypted_total: Arc::new(AtomicU64::new(0)),
             srtp_decrypted_total: Arc::new(AtomicU64::new(0)),
@@ -239,6 +242,11 @@ impl SbcMetrics {
 
     pub fn inc_auth_challenge(&self) {
         self.auth_challenges_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_auth_stale_challenge(&self) {
+        self.auth_stale_challenges_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_auth_failure(&self) {
@@ -521,6 +529,12 @@ impl SbcMetrics {
             "sbc_auth_failures",
             "Total authentication failures",
             self.auth_failures_total.load(Ordering::Relaxed)
+        );
+
+        counter!(
+            "sbc_auth_stale_challenges",
+            "Re-challenges with stale=true (client used an old nonce)",
+            self.auth_stale_challenges_total.load(Ordering::Relaxed)
         );
 
         // ── Registration counters ───────────────────────────────────────────────

@@ -102,6 +102,14 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   backoff as before.
 - Relayed BYEs carry the peer's `Reason` header; a CANCEL from a trunk
   with a truncated Call-ID is matched by suffix like ACK/BYE.
+- Digest failures are typed. A REGISTER with an expired, unknown or
+  already-used nonce is re-challenged with `stale=true` (RFC 7616 §3.3)
+  and never counts toward fail2ban — clients that cache the challenge across
+  re-REGISTERs, or reconnect after an SBC restart, were answered 403 and
+  banned after a few tries. Nonce counts must advance (a replayed
+  Authorization is refused), byte-identical UDP retransmissions are
+  accepted, a non-Digest header gets 400. New counter
+  `sbc_auth_stale_challenges_total`.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP
