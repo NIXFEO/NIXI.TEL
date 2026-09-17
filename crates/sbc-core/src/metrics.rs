@@ -8,6 +8,95 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Upper bounds (seconds) of `sbc_call_setup_seconds`: INVITE forwarded →
+/// final answer. Post-dial delay lives in the first buckets, ringing in the
+/// last ones (Timer C caps it at 180 s).
+pub const SETUP_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 180.0,
+];
+/// Upper bounds (seconds) of `sbc_call_duration_seconds`: answer → end.
+pub const DURATION_BUCKETS: &[f64] = &[
+    1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0,
+];
+
+/// A fixed-bucket histogram rendered in the Prometheus text format
+/// (cumulative `_bucket{le}` series, `+Inf`, `_sum`, `_count`). Lock-free:
+/// one atomic per bucket.
+pub struct Histogram {
+    bounds: &'static [f64],
+    buckets: Vec<AtomicU64>,
+    sum_millis: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    pub fn new(bounds: &'static [f64]) -> Self {
+        Self {
+            bounds,
+            buckets: bounds.iter().map(|_| AtomicU64::new(0)).collect(),
+            sum_millis: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one observation in seconds (negative values count as 0).
+    pub fn observe_secs(&self, secs: f64) {
+        let secs = if secs.is_finite() && secs > 0.0 {
+            secs
+        } else {
+            0.0
+        };
+        for (i, bound) in self.bounds.iter().enumerate() {
+            if secs <= *bound {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.sum_millis
+            .fetch_add((secs * 1000.0).round() as u64, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        out.push_str(&format!(
+            "# HELP {} {}\n# TYPE {} histogram\n",
+            name, help, name
+        ));
+        for (i, bound) in self.bounds.iter().enumerate() {
+            out.push_str(&format!(
+                "{}_bucket{{le=\"{}\"}} {}\n",
+                name,
+                bound,
+                self.buckets[i].load(Ordering::Relaxed)
+            ));
+        }
+        let count = self.count();
+        out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", name, count));
+        out.push_str(&format!(
+            "{}_sum {}\n",
+            name,
+            self.sum_millis.load(Ordering::Relaxed) as f64 / 1000.0
+        ));
+        out.push_str(&format!("{}_count {}\n", name, count));
+    }
+}
+
+/// Per-trunk series, keyed by trunk name. `None` gauges are not exported
+/// (a trunk that never answered OPTIONS has no `sbc_trunk_up`; a trunk
+/// without `register_with_trunk` has no `sbc_trunk_registered`).
+#[derive(Debug, Default, Clone)]
+pub struct TrunkSeries {
+    pub up: Option<bool>,
+    pub registered: Option<bool>,
+    pub active_calls: u64,
+    /// Finished calls by outcome (`answered`, `failed`, `cancelled`,
+    /// `timeout`…) — ASR = answered / sum.
+    pub calls: HashMap<&'static str, u64>,
+}
+
 /// All SBC counters and gauges
 pub struct SbcMetrics {
     // ── Counters (monotonically increasing) ──────────────────────────────────
@@ -128,6 +217,12 @@ pub struct SbcMetrics {
     /// the failure mode where the CDR file silently went empty for weeks.
     pub last_cdr_written_time: Arc<AtomicU64>,
 
+    /// Per-trunk gauges and counters (see [`TrunkSeries`]).
+    pub trunks: Arc<std::sync::Mutex<HashMap<String, TrunkSeries>>>,
+    /// INVITE forwarded → final answer, answered calls only.
+    pub call_setup_seconds: Histogram,
+    /// Answer → end (the billable window).
+    pub call_duration_seconds: Histogram,
     /// Uptime start timestamp (Unix seconds)
     pub start_time: u64,
 }
@@ -172,6 +267,9 @@ impl SbcMetrics {
             dos_tracked_ips: Arc::new(AtomicU64::new(0)),
             auth_nonces: Arc::new(AtomicU64::new(0)),
             last_cdr_written_time: Arc::new(AtomicU64::new(0)),
+            trunks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            call_setup_seconds: Histogram::new(SETUP_BUCKETS),
+            call_duration_seconds: Histogram::new(DURATION_BUCKETS),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
@@ -357,6 +455,52 @@ impl SbcMetrics {
     }
 
     /// Uptime in seconds
+    // ── Per-trunk series ─────────────────────────────────────────────────
+    fn with_trunk<F: FnOnce(&mut TrunkSeries)>(&self, trunk: &str, f: F) {
+        if let Ok(mut map) = self.trunks.lock() {
+            f(map.entry(trunk.to_string()).or_default());
+        }
+    }
+
+    /// OPTIONS health verdict: `Some(true)` up, `Some(false)` down, `None`
+    /// unknown (the trunk never answered OPTIONS: passive monitoring only).
+    pub fn set_trunk_up(&self, trunk: &str, up: Option<bool>) {
+        self.with_trunk(trunk, |t| t.up = up);
+    }
+
+    /// Outbound REGISTER state, for trunks that register.
+    pub fn set_trunk_registered(&self, trunk: &str, registered: Option<bool>) {
+        self.with_trunk(trunk, |t| t.registered = registered);
+    }
+
+    pub fn set_trunk_active_calls(&self, trunk: &str, n: u64) {
+        self.with_trunk(trunk, |t| t.active_calls = n);
+    }
+
+    /// One finished call on this trunk, by outcome.
+    pub fn inc_trunk_call(&self, trunk: &str, outcome: &'static str) {
+        self.with_trunk(trunk, |t| *t.calls.entry(outcome).or_insert(0) += 1);
+    }
+
+    /// Forget a trunk's series (deleted through the API).
+    pub fn remove_trunk(&self, trunk: &str) {
+        if let Ok(mut map) = self.trunks.lock() {
+            map.remove(trunk);
+        }
+    }
+
+    pub fn trunk_series(&self, trunk: &str) -> Option<TrunkSeries> {
+        self.trunks.lock().ok().and_then(|m| m.get(trunk).cloned())
+    }
+
+    pub fn observe_call_setup(&self, secs: f64) {
+        self.call_setup_seconds.observe_secs(secs);
+    }
+
+    pub fn observe_call_duration(&self, secs: f64) {
+        self.call_duration_seconds.observe_secs(secs);
+    }
+
     pub fn uptime_secs(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -621,6 +765,66 @@ impl SbcMetrics {
                  "Total outbound INVITEs re-sent after a trunk 422 Session Interval Too Small (RFC 4028)",
                  self.session_timer_422_retries_total.load(Ordering::Relaxed));
 
+        // ── Per-trunk series ──────────────────────────────────────────────────
+        if let Ok(map) = self.trunks.lock() {
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort();
+            let mut ups = String::new();
+            let mut regs = String::new();
+            let mut actives = String::new();
+            let mut calls = String::new();
+            for name in names {
+                let t = &map[name];
+                let label = name.replace('\\', "\\\\").replace('"', "\\\"");
+                if let Some(up) = t.up {
+                    ups.push_str(&format!(
+                        "sbc_trunk_up{{trunk=\"{}\"}} {}\n",
+                        label,
+                        u8::from(up)
+                    ));
+                }
+                if let Some(r) = t.registered {
+                    regs.push_str(&format!(
+                        "sbc_trunk_registered{{trunk=\"{}\"}} {}\n",
+                        label,
+                        u8::from(r)
+                    ));
+                }
+                actives.push_str(&format!(
+                    "sbc_trunk_active_calls{{trunk=\"{}\"}} {}\n",
+                    label, t.active_calls
+                ));
+                let mut outcomes: Vec<_> = t.calls.iter().collect();
+                outcomes.sort();
+                for (outcome, n) in outcomes {
+                    calls.push_str(&format!(
+                        "sbc_trunk_calls_total{{trunk=\"{}\",outcome=\"{}\"}} {}\n",
+                        label, outcome, n
+                    ));
+                }
+            }
+            out.push_str("# HELP sbc_trunk_up Trunk answers OPTIONS (1) or stopped answering (0); absent when it never answered\n# TYPE sbc_trunk_up gauge\n");
+            out.push_str(&ups);
+            out.push_str("# HELP sbc_trunk_registered Outbound REGISTER to the trunk is current (1) or failing (0)\n# TYPE sbc_trunk_registered gauge\n");
+            out.push_str(&regs);
+            out.push_str("# HELP sbc_trunk_active_calls Calls currently on the trunk (both directions)\n# TYPE sbc_trunk_active_calls gauge\n");
+            out.push_str(&actives);
+            out.push_str("# HELP sbc_trunk_calls_total Finished calls per trunk by outcome (answered, failed, cancelled, timeout)\n# TYPE sbc_trunk_calls_total counter\n");
+            out.push_str(&calls);
+        }
+
+        // ── Call timing histograms ────────────────────────────────────────────
+        self.call_setup_seconds.render(
+            &mut out,
+            "sbc_call_setup_seconds",
+            "INVITE forwarded to final answer, answered calls only",
+        );
+        self.call_duration_seconds.render(
+            &mut out,
+            "sbc_call_duration_seconds",
+            "Answer to end of call (billable window)",
+        );
+
         // ── Media counters ────────────────────────────────────────────────────
         counter!(
             "sbc_rtp_packets",
@@ -770,6 +974,55 @@ impl HealthReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn histogram_buckets_are_cumulative_with_sum_and_count() {
+        let h = Histogram::new(&[1.0, 5.0]);
+        h.observe_secs(0.5);
+        h.observe_secs(3.0);
+        h.observe_secs(30.0);
+        h.observe_secs(-1.0); // clamped to 0
+        let mut out = String::new();
+        h.render(&mut out, "t", "help");
+        assert!(out.contains("# TYPE t histogram\n"), "{}", out);
+        assert!(out.contains("t_bucket{le=\"1\"} 2\n"), "{}", out);
+        assert!(out.contains("t_bucket{le=\"5\"} 3\n"), "{}", out);
+        assert!(out.contains("t_bucket{le=\"+Inf\"} 4\n"), "{}", out);
+        assert!(out.contains("t_sum 33.5\n"), "{}", out);
+        assert!(out.contains("t_count 4\n"), "{}", out);
+    }
+
+    #[test]
+    fn trunk_series_render_only_known_gauges() {
+        let m = SbcMetrics::new();
+        m.set_trunk_up("genesys", Some(true));
+        m.set_trunk_active_calls("genesys", 3);
+        m.inc_trunk_call("genesys", "answered");
+        m.inc_trunk_call("genesys", "answered");
+        m.inc_trunk_call("genesys", "failed");
+        m.set_trunk_registered("cpaas", Some(false));
+        let out = m.render_prometheus();
+        assert!(
+            out.contains("sbc_trunk_up{trunk=\"genesys\"} 1\n"),
+            "{}",
+            out
+        );
+        assert!(
+            !out.contains("sbc_trunk_up{trunk=\"cpaas\""),
+            "unknown health is not exported"
+        );
+        assert!(out.contains("sbc_trunk_registered{trunk=\"cpaas\"} 0\n"));
+        assert!(!out.contains("sbc_trunk_registered{trunk=\"genesys\""));
+        assert!(out.contains("sbc_trunk_active_calls{trunk=\"genesys\"} 3\n"));
+        assert!(out.contains("sbc_trunk_active_calls{trunk=\"cpaas\"} 0\n"));
+        assert!(out.contains("sbc_trunk_calls_total{trunk=\"genesys\",outcome=\"answered\"} 2\n"));
+        assert!(out.contains("sbc_trunk_calls_total{trunk=\"genesys\",outcome=\"failed\"} 1\n"));
+        m.remove_trunk("cpaas");
+        assert!(m.trunk_series("cpaas").is_none());
+        assert!(m
+            .render_prometheus()
+            .contains("sbc_call_setup_seconds_bucket{le=\"+Inf\"} 0\n"));
+    }
 
     #[test]
     fn test_metrics_creation() {
