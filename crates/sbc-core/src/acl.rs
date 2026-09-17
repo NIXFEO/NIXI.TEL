@@ -302,7 +302,7 @@ impl AclManager {
         // Sort rules by priority (descending — higher priority first)
         let mut sorted: Vec<&AclRule> =
             rules.values().filter(|r| r.applies_to(direction)).collect();
-        sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
         // Evaluate first match
         for rule in sorted {
@@ -377,7 +377,7 @@ impl AclManager {
     pub async fn rules(&self) -> Vec<AclRule> {
         let rules = self.rules.read().await;
         let mut sorted: Vec<AclRule> = rules.values().cloned().collect();
-        sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
         sorted
     }
 
@@ -437,7 +437,7 @@ impl AclManager {
     pub async fn export_to_text(&self) -> String {
         let rules = self.rules.read().await;
         let mut sorted: Vec<&AclRule> = rules.values().collect();
-        sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.priority));
         sorted
             .iter()
             .map(|r| format!("{}|{}|{}|{}|{}", r.id, r.name, r.cidr, r.action, r.priority))

@@ -645,8 +645,10 @@ fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
 // Helper: raw bytes → i16 slice (little-endian)
 fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
         .collect()
 }
 

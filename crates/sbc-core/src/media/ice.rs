@@ -403,7 +403,7 @@ impl IceAgent {
         }
 
         // Sort by priority (highest first)
-        pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.priority));
     }
 
     /// Get local candidates for SDP

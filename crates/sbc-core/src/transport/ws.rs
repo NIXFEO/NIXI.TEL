@@ -169,7 +169,9 @@ async fn handle_ws_connection(
     is_wss: bool,
 ) -> Result<()> {
     // Upgrade to WebSocket, optionally wrapping with TLS first
-    // We use a callback to validate the SIP sub-protocol (RFC 7118)
+    // We use a callback to validate the SIP sub-protocol (RFC 7118).
+    // The Err type (an HTTP response) is tungstenite's, hence the allow.
+    #[allow(clippy::result_large_err)]
     let callback = |req: &Request, mut resp: Response| {
         // RFC 7118 §5: sub-protocol MUST be "sip"
         let proto = req
@@ -252,6 +254,8 @@ enum WsReader {
 }
 
 impl WsSink {
+    // tungstenite's Error is large; boxing it buys nothing on this path.
+    #[allow(clippy::result_large_err)]
     async fn send_text(
         &mut self,
         text: String,
@@ -262,6 +266,7 @@ impl WsSink {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn send_pong(
         &mut self,
         data: Vec<u8>,
