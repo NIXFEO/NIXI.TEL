@@ -38,13 +38,18 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 - `[security]` session-timer values apply on SIGHUP / `POST /api/v1/reload`.
 - `scripts/deploy.sh` (build-on-host deployment with backups and rollback);
   `sbc --version` and the startup log carry the git commit.
-- CI: rustfmt and clippy are blocking, `cargo deny` checks advisories,
+- CI: rustfmt and clippy are blocking, `cargo deny` checks advisories and
+  bans against a `deny.toml` whose every exception is dated and justified,
   Dependabot watches cargo and actions.
 
 ### Changed
 - Workspace version 0.20.0; release binaries are stripped.
 - `sqlx` 0.8 (no TLS features), `clap` 4 replaces `structopt`;
-  `trust-dns-resolver` (unused) dropped.
+  `trust-dns-resolver` and `config` (unused) dropped; `anyhow`,
+  `crossbeam-epoch`, `rand`, `spin` updated for RUSTSEC-2026-0190/0204/0097
+  and a yanked release. Workspace crates are marked `publish = false`.
+- The whole workspace is rustfmt-formatted and clippy-clean
+  (`--all-targets -D warnings`).
 
 ### Removed
 - Legacy hand-rolled HTTP admin server (`http_server.rs`, `api.rs`) and its

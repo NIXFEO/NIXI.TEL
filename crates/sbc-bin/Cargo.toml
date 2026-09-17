@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "sbc"
@@ -16,7 +17,6 @@ sbc-management = { path = "../sbc-management" }
 
 tokio = { workspace = true }
 
-config = { workspace = true }
 toml = { workspace = true }
 
 serde = { workspace = true }

@@ -1,0 +1,58 @@
+# cargo-deny policy — enforced in CI (`cargo deny check advisories bans`).
+#
+# Every ignored advisory below carries the date it was accepted, the reason,
+# and the condition for removing it. Re-evaluate the list whenever the
+# rustls / webrtc-rs stacks are upgraded (planned: media lot, before any
+# WebRTC production offer).
+
+[graph]
+all-features = false
+exclude-dev = false
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+  # --- Opus codec binding ---------------------------------------------------
+  { id = "RUSTSEC-2026-0150", reason = "2026-09-17: audiopus_sys (via `opus`) is unmaintained; it only bundles libopus and builds it with cmake. No maintained drop-in binding with a bundled build exists. Remove when the transcoder moves to a maintained Opus crate." },
+
+  # --- webrtc-rs stack (not used in production today) ------------------------
+  { id = "RUSTSEC-2025-0141", reason = "2026-09-17: bincode 1.x unmaintained, pulled by webrtc-dtls 0.8. Goes away with the webrtc-rs upgrade." },
+  { id = "RUSTSEC-2025-0009", reason = "2026-09-17: ring 0.16 AES overflow panic, pulled by rcgen 0.11 (webrtc-dtls) and stun 0.4 (webrtc-ice). The SBC's own TLS uses ring 0.17.14 (fixed). Goes away with the webrtc-rs upgrade." },
+  { id = "RUSTSEC-2025-0010", reason = "2026-09-17: ring < 0.17 unmaintained, same dependency path as RUSTSEC-2025-0009." },
+
+  # --- rustls 0.22 / rustls-webpki 0.102 (SBC TLS, WSS, mTLS) ------------------
+  # Fixes exist only in rustls-webpki 0.103 (rustls 0.23). The SBC does not
+  # configure CRLs and pins trunk peers by hostname, so the name-constraint
+  # and CRL advisories do not apply to its verification paths. Remove all
+  # four when tokio-rustls / rustls move to 0.23 (planned with the media lot).
+  { id = "RUSTSEC-2026-0049", reason = "2026-09-17: rustls-webpki 0.101/0.102 CRL distribution-point matching; the SBC configures no CRL." },
+  { id = "RUSTSEC-2026-0098", reason = "2026-09-17: rustls-webpki 0.101/0.102 URI name constraints; not used by the SBC's trunk/WSS verification." },
+  { id = "RUSTSEC-2026-0099", reason = "2026-09-17: rustls-webpki 0.101/0.102 wildcard name constraints; not used by the SBC's trunk/WSS verification." },
+  { id = "RUSTSEC-2026-0104", reason = "2026-09-17: rustls-webpki 0.101/0.102 CRL parsing panic; the SBC parses no CRL." },
+  { id = "RUSTSEC-2025-0134", reason = "2026-09-17: rustls-pemfile unmaintained (used by transport/tls*.rs and rustls-native-certs 0.7). Replace with rustls-pki-types PEM parsing during the rustls 0.23 upgrade." },
+]
+
+[bans]
+# The rustls 0.21/0.22 and ring 0.16/0.17 pairs are known duplicates until
+# the webrtc-rs upgrade; keep them visible without failing the build.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true # workspace path deps carry no version on purpose
+highlight = "all"
+deny = [
+  # Legacy admin HTTP server and unused stacks were removed in 0.20; keep them out.
+  { crate = "openssl", reason = "TLS is rustls-only" },
+  { crate = "native-tls", reason = "TLS is rustls-only" },
+]
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CC0-1.0", "OpenSSL", "Unicode-DFS-2016"]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

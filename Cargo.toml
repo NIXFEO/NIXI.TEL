@@ -13,6 +13,7 @@ version = "0.20.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/NIXFEO/NIXI.TEL"
+publish = false # deployed as a binary, never published to crates.io
 
 [workspace.dependencies]
 # rsip pour SIP
@@ -73,7 +74,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Configuration
-config = "0.13"
 ipnetwork = "0.20"
 
 # Async traits
