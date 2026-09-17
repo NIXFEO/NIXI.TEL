@@ -136,7 +136,7 @@ impl PortPair {
     ///
     /// RTP port must be even, RTCP will be RTP + 1
     pub fn new(rtp: u16) -> Result<Self> {
-        if rtp % 2 != 0 {
+        if !rtp.is_multiple_of(2) {
             return Err(Error::Transport(
                 "RTP port must be even".to_string(),
             ));
@@ -150,7 +150,7 @@ impl PortPair {
 
     /// Check if this is a valid port pair
     pub fn is_valid(&self) -> bool {
-        self.rtp % 2 == 0 && self.rtcp == self.rtp + 1
+        self.rtp.is_multiple_of(2) && self.rtcp == self.rtp + 1
     }
 }
 
@@ -216,11 +216,11 @@ mod tests {
         let allocator = PortAllocator::with_range(10000..10010);
 
         // Allocate all available pairs (5 pairs in range 10000-10010)
-        let pair1 = allocator.allocate().unwrap();
-        let pair2 = allocator.allocate().unwrap();
+        let _pair1 = allocator.allocate().unwrap();
+        let _pair2 = allocator.allocate().unwrap();
         let pair3 = allocator.allocate().unwrap();
-        let pair4 = allocator.allocate().unwrap();
-        let pair5 = allocator.allocate().unwrap();
+        let _pair4 = allocator.allocate().unwrap();
+        let _pair5 = allocator.allocate().unwrap();
 
         assert_eq!(allocator.allocated_count(), 5);
         assert_eq!(allocator.available_count(), 0);

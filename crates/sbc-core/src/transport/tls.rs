@@ -213,7 +213,7 @@ impl TlsListenerServer {
                 }
 
                 // Parse and send the message with the reply channel
-                match Self::parse_sip_message_with_reply(&message, peer_addr, reply_tx.clone()) {
+                match Self::parse_sip_message_with_reply(message, peer_addr, reply_tx.clone()) {
                     Ok(received_msg) => {
                         if let Err(e) = message_tx.send(received_msg) {
                             error!("Failed to send message to handler: {}", e);

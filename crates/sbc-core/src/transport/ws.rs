@@ -213,6 +213,7 @@ async fn handle_ws_connection(
 }
 
 /// Unified WebSocket stream (plain or TLS-wrapped)
+#[allow(clippy::large_enum_variant)] // one stream per connection; the TLS variant is the common case
 enum WsStream {
     Plain(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>),
     Secure(tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
@@ -371,7 +372,6 @@ fn parse_and_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn test_ws_listener_creation() {

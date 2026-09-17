@@ -370,8 +370,8 @@ impl Sbc {
             let is_trunk_related = self.trunk_ips.read().await.iter().any(|tip| {
                 tip == &source_ip || {
                     // Same /24 subnet check for trunk clusters
-                    let tip_prefix = tip.rsplitn(2, '.').nth(1);
-                    let src_prefix = source_ip.rsplitn(2, '.').nth(1);
+                    let tip_prefix = tip.rsplit_once('.').map(|x| x.0);
+                    let src_prefix = source_ip.rsplit_once('.').map(|x| x.0);
                     tip_prefix.is_some() && tip_prefix == src_prefix
                 }
             });
@@ -599,14 +599,11 @@ impl Sbc {
         self.transport.reply(&response_200, source, transport, reply_tx).await
     }
 
-    /// Handle REFER — Attended/Blind Transfer (RFC 3515)
-    ///
-    /// REFER triggers call transfer:
-    ///  1. Extract Refer-To header (the transfer target)
-    ///  2. Accept with 202 Accepted
-    ///  3. Create new INVITE to the transfer target
-    ///  4. Send NOTIFY to the transferor with transfer progress
-    ///  5. On success, bridge new call and disconnect transferor
+    // REFER (RFC 3515, attended/blind transfer) is not implemented: it is
+    // answered 501 by the request dispatcher. A future implementation would
+    // extract Refer-To, answer 202, INVITE the target, NOTIFY the transferor
+    // with progress, then bridge the new call and release the transferor.
+
     /// Handle a transport-level event (currently: WS/WSS connection closed).
     /// Removes registrations bound to that connection and tears down active
     /// calls (synthetic BYE to the surviving leg, CDR "ws-closed").
@@ -931,17 +928,15 @@ impl Sbc {
                     callee_reply_tx.as_ref(),
                 ).await;
             }
-        } else {
-            if let Some((caller_reply_tx, caller_addr, caller_transport)) =
-                self.b2bua.get_caller_reply_info(&uuid).await
-            {
-                info!("REFER: relaying to caller at {}", caller_addr);
-                let raw = rsip::SipMessage::Request(request).to_string();
-                self.send_sip("REFER → caller", 
-                    raw.as_bytes(), caller_addr, caller_transport,
-                    caller_reply_tx.as_ref(),
-                ).await;
-            }
+        } else if let Some((caller_reply_tx, caller_addr, caller_transport)) =
+            self.b2bua.get_caller_reply_info(&uuid).await
+        {
+            info!("REFER: relaying to caller at {}", caller_addr);
+            let raw = rsip::SipMessage::Request(request).to_string();
+            self.send_sip("REFER → caller", 
+                raw.as_bytes(), caller_addr, caller_transport,
+                caller_reply_tx.as_ref(),
+            ).await;
         }
 
         Ok(())

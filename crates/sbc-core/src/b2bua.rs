@@ -477,7 +477,7 @@ fn extract_body(raw: &str) -> Option<String> {
 pub(crate) fn parse_cseq_number(raw: &str) -> Option<u32> {
     raw.split("\r\n")
         .find(|l| l.to_lowercase().starts_with("cseq:"))
-        .and_then(|l| l["cseq:".len()..].trim().split_whitespace().next())
+        .and_then(|l| l["cseq:".len()..].split_whitespace().next())
         .and_then(|n| n.parse().ok())
 }
 
@@ -718,7 +718,7 @@ impl B2buaManager {
             .values()
             .filter(|c| {
                 matches!(c.state, CallState::Initiated | CallState::Proceeding)
-                    && c.failover.as_ref().map_or(false, |f| {
+                    && c.failover.as_ref().is_some_and(|f| {
                         !f.provisional_received && f.invite_sent_at.elapsed() > timeout
                     })
             })
@@ -1053,7 +1053,7 @@ impl B2buaManager {
 
         call.establish_inbound(call.inbound.remote_tag.clone().unwrap_or_default());
 
-        if call.outbound.as_ref().map_or(false, |l| l.established) {
+        if call.outbound.as_ref().is_some_and(|l| l.established) {
             call.state = CallState::Connected;
         }
 
@@ -1254,7 +1254,7 @@ impl B2buaManager {
     pub async fn find_by_outbound_call_id(&self, call_id: &str) -> Option<CallUuid> {
         let calls = self.calls.lock().await;
         calls.values()
-            .find(|c| c.outbound.as_ref().map_or(false, |leg| leg.call_id == call_id))
+            .find(|c| c.outbound.as_ref().is_some_and(|leg| leg.call_id == call_id))
             .map(|c| c.uuid.clone())
     }
 
@@ -1278,7 +1278,7 @@ impl B2buaManager {
         let calls = self.calls.lock().await;
         for call in calls.values() {
             let inbound_matches = call.inbound.call_id == call_id;
-            let outbound_matches = call.outbound.as_ref().map_or(false, |leg| leg.call_id == call_id);
+            let outbound_matches = call.outbound.as_ref().is_some_and(|leg| leg.call_id == call_id);
 
             // Also try suffix match: Genesys-based trunks adds prefixes to Call-IDs
             // e.g. INVITE Call-ID = "14823298-118e8248-104858689_65703785@host"
@@ -1287,7 +1287,7 @@ impl B2buaManager {
                 && call.inbound.call_id.ends_with(call_id)
                 && call.inbound.call_id != *call_id;
             let outbound_suffix = !outbound_matches
-                && call.outbound.as_ref().map_or(false, |leg| {
+                && call.outbound.as_ref().is_some_and(|leg| {
                     leg.call_id.ends_with(call_id) && leg.call_id != *call_id
                 });
 
@@ -1948,7 +1948,7 @@ mod tests {
 
         // Phase 2 — terminate half concurrently while the rest stay live.
         let mut handles = Vec::with_capacity(N / 2);
-        for uuid in uuids.iter().take(N / 2).cloned() {
+        for uuid in uuids.into_iter().take(N / 2) {
             let mgr = mgr.clone();
             handles.push(tokio::spawn(async move { mgr.terminate_call(&uuid).await }));
         }

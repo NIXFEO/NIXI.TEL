@@ -469,7 +469,7 @@ async fn events_endpoint_is_sse() {
     // Read the first frame from the stream
     let mut body = resp.into_body().into_data_stream();
     let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        use http_body_util::BodyExt as _;
+        
         futures_util_next(&mut body).await
     })
     .await

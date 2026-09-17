@@ -25,6 +25,7 @@ pub enum CandidateType {
 }
 
 impl CandidateType {
+    #[allow(clippy::should_implement_trait)] // infallible-by-Option parser, not FromStr
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "host" => Some(Self::Host),
@@ -442,7 +443,7 @@ impl IceAgent {
             let (local_addr, remote_addr, state) = {
                 let pairs = self.pairs.lock().await;
                 let p = &pairs[i];
-                (p.local.address, p.remote.address, p.state.clone())
+                (p.local.address, p.remote.address, p.state)
             };
 
             if state != PairState::Waiting {
@@ -569,12 +570,12 @@ impl IceAgent {
         }
 
         // Check Magic Cookie
-        if &response[4..8] != &0x2112A442u32.to_be_bytes() {
+        if response[4..8] != 0x2112A442u32.to_be_bytes() {
             return Err(Error::Media("ICE: invalid magic cookie in response".to_string()));
         }
 
         // Check transaction ID matches
-        if &response[8..20] != &transaction_id {
+        if response[8..20] != transaction_id {
             return Err(Error::Media("ICE: transaction ID mismatch".to_string()));
         }
 
@@ -808,7 +809,6 @@ mod tests {
         let mut agent = IceAgent::new(true);
 
         // Use loopback but a port that has no listener → timeout
-        let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         // Bind real socket to get assigned port
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bound_local = sock.local_addr().unwrap();

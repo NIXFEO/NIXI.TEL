@@ -30,6 +30,7 @@ pub enum DtlsRole {
 }
 
 impl DtlsRole {
+    #[allow(clippy::should_implement_trait)] // infallible-by-Option parser, not FromStr
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "active" => Some(Self::Active),

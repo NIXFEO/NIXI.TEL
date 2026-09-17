@@ -201,8 +201,8 @@ impl SrtpCrypto {
         // Bytes [0-3] and [14-15] remain zero
 
         // XOR with salt_key (14 bytes → bytes [0-13])
-        for i in 0..14 {
-            iv[i] ^= self.salt_key[i];
+        for (b, s) in iv.iter_mut().zip(self.salt_key.iter()) {
+            *b ^= s;
         }
 
         iv
@@ -519,8 +519,8 @@ impl SrtcpCrypto {
         iv[11] = srtcp_index as u8;
 
         // XOR with salt
-        for i in 0..14 {
-            iv[i] ^= self.salt_key[i];
+        for (b, s) in iv.iter_mut().zip(self.salt_key.iter()) {
+            *b ^= s;
         }
 
         iv
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_srtcp_auth_failure() {
-        let (ck, ak, sk) = derive_srtcp_keys(&vec![0xAAu8; 16], &vec![0xBBu8; 14]).unwrap();
+        let (ck, ak, sk) = derive_srtcp_keys(&[0xAAu8; 16], &[0xBBu8; 14]).unwrap();
         let mut ctx = SrtcpCrypto::new(ck, ak, sk, 10).unwrap();
 
         let rtcp: Vec<u8> = vec![
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_srtcp_index_increments() {
-        let (ck, ak, sk) = derive_srtcp_keys(&vec![0x01u8; 16], &vec![0x02u8; 14]).unwrap();
+        let (ck, ak, sk) = derive_srtcp_keys(&[0x01u8; 16], &[0x02u8; 14]).unwrap();
         let mut ctx = SrtcpCrypto::new(ck, ak, sk, 10).unwrap();
 
         let rtcp: Vec<u8> = vec![

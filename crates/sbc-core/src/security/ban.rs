@@ -162,7 +162,7 @@ impl BanManager {
         let now = Instant::now();
         let window = Duration::from_secs(config.window_secs);
         let mut strikes = self.failures.entry(ip).or_default();
-        while strikes.front().map_or(false, |t| now.duration_since(*t) > window) {
+        while strikes.front().is_some_and(|t| now.duration_since(*t) > window) {
             strikes.pop_front();
         }
         strikes.push_back(now);

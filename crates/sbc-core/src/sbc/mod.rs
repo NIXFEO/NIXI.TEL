@@ -946,7 +946,7 @@ impl Sbc {
                     match tokio::time::timeout(Duration::from_secs(5), rx).await {
                         Ok(Ok(raw)) => {
                             let status = crate::trunk_register::parse_status(&raw);
-                            status >= 200 && status < 500
+                            (200..500).contains(&status)
                         }
                         _ => {
                             pending.remove(&call_id);
@@ -1667,8 +1667,7 @@ fn extract_sdp_rtp_addr(sdp: &str) -> Option<std::net::SocketAddr> {
 
     for line in sdp.lines() {
         let line = line.trim();
-        if line.starts_with("c=IN IP4 ") {
-            let addr_str = &line["c=IN IP4 ".len()..];
+        if let Some(addr_str) = line.strip_prefix("c=IN IP4 ") {
             if let Ok(parsed) = addr_str.trim().parse::<std::net::IpAddr>() {
                 ip = Some(parsed);
             }
@@ -1789,7 +1788,7 @@ fn build_plain_response(status: u16, reason: &str) -> String {
 }
 
 /// Build a proper SIP response echoing Via/From/To/Call-ID/CSeq from the request
-fn build_plain_response_for_request(request: &Request, status: u16, reason: &str) -> Result<SipMessage> {
+fn build_plain_response_for_request(request: &Request, status: u16, _reason: &str) -> Result<SipMessage> {
     let mut headers: rsip::Headers = Default::default();
 
     // Copy ALL Via headers from the request (RFC 3261 §8.2.6.2)
@@ -1903,7 +1902,7 @@ fn build_register_200(
     // Expires header
     let expires_val = bindings.first().map(|b| b.expires).unwrap_or(3600);
     headers.push(rsip::Header::Expires(rsip::headers::Expires::new(
-        &expires_val.to_string(),
+        expires_val.to_string(),
     )));
 
     headers.push(rsip::Header::ContentLength(Default::default()));
@@ -2017,8 +2016,8 @@ fn ban_row_to_entry(row: &sbc_storage::BanRow) -> Option<crate::security::BanEnt
         }
         let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
         let month_len = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for mm_i in 0..(m.saturating_sub(1)) as usize {
-            days += month_len[mm_i];
+        for len in month_len.iter().take(m.saturating_sub(1) as usize) {
+            days += len;
         }
         days += day.saturating_sub(1);
         Some(std::time::UNIX_EPOCH + Duration::from_secs(days * 86400 + hh * 3600 + mm * 60 + ss))

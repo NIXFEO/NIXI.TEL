@@ -49,8 +49,10 @@ impl TransportType {
 
 /// Number format expected by a trunk
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum NumberFormat {
     /// E.164 international: +33612345678 (keep as-is)
+    #[default]
     E164,
     /// National format: 0612345678 (strip country code, add national prefix)
     National,
@@ -58,9 +60,6 @@ pub enum NumberFormat {
     Local,
 }
 
-impl Default for NumberFormat {
-    fn default() -> Self { NumberFormat::E164 }
-}
 
 /// Trunk configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,9 +239,9 @@ impl TrunkConfig {
                 NumberFormat::E164 => {
                     if number.starts_with('+') {
                         number.to_string()
-                    } else if number.starts_with('0') {
+                    } else if let Some(national) = number.strip_prefix('0') {
                         if let Some(ref cc) = self.country_code {
-                            format!("+{}{}", cc, &number[1..])
+                            format!("+{}{}", cc, national)
                         } else {
                             number.to_string()
                         }
@@ -290,9 +289,9 @@ impl TrunkConfig {
             NumberFormat::E164 => {
                 if number.starts_with('+') {
                     number.to_string()
-                } else if number.starts_with('0') {
+                } else if let Some(national) = number.strip_prefix('0') {
                     if let Some(ref cc) = self.country_code {
-                        format!("+{}{}", cc, &number[1..])
+                        format!("+{}{}", cc, national)
                     } else {
                         number.to_string()
                     }

@@ -158,7 +158,7 @@ impl UserLimitsManager {
             let now = Instant::now();
             let window = Duration::from_secs(60);
             let mut attempts = self.rate_windows.entry(user.to_string()).or_default();
-            while attempts.front().map_or(false, |t| now.duration_since(*t) > window) {
+            while attempts.front().is_some_and(|t| now.duration_since(*t) > window) {
                 attempts.pop_front();
             }
             if attempts.len() as u32 >= max_cpm {
@@ -212,7 +212,7 @@ mod tests {
         match mgr.check_and_record("bob", 0) {
             LimitDecision::RateExceeded { current, limit, retry_after_secs } => {
                 assert_eq!((current, limit), (3, 3));
-                assert!(retry_after_secs >= 1 && retry_after_secs <= 60);
+                assert!((1..=60).contains(&retry_after_secs));
             }
             other => panic!("expected RateExceeded, got {:?}", other),
         }

@@ -342,14 +342,13 @@ impl SbcConfig {
 
         // Validate listeners have TLS config when needed
         for listener in &self.network.listeners {
-            if listener.transport.is_secure() {
-                if listener.cert_file.is_none() || listener.key_file.is_none() {
+            if listener.transport.is_secure()
+                && (listener.cert_file.is_none() || listener.key_file.is_none()) {
                     return Err(crate::Error::Config(format!(
                         "TLS listener on port {} requires cert_file and key_file",
                         listener.bind_port
                     )));
                 }
-            }
         }
 
         // Fail closed: never expose the management API on a non-loopback

@@ -1141,7 +1141,7 @@ pub(crate) fn retarget_invite_for_trunk(
         if lower.starts_with("via:") || lower.starts_with("v:") {
             if let Some(pos) = line.find("branch=") {
                 let after = &line[pos + "branch=".len()..];
-                let end = after.find(|c: char| c == ';' || c == ',').map(|i| pos + "branch=".len() + i)
+                let end = after.find([';', ',']).map(|i| pos + "branch=".len() + i)
                     .unwrap_or(line.len());
                 line.replace_range(pos + "branch=".len()..end, &fresh);
             }
@@ -1154,6 +1154,85 @@ pub(crate) fn retarget_invite_for_trunk(
 
     Some(lines.join("\r\n"))
 }
+
+
+/// Make the SBC the sole RFC 4028 negotiator of a raw INVITE: drop every
+/// existing `Session-Expires` (long or compact `x:`) and `Min-SE`, add
+/// `Supported: timer` unless a Supported header already lists it, and
+/// insert `Session-Expires` + `Min-SE` right before Content-Length.
+/// Idempotent — safe on an INVITE that was already stamped (422 retry).
+pub(crate) fn set_session_timer_headers(raw: &str, expires: u32, min_se: u32) -> String {
+    let Ok(mut msg) = crate::topology::RawSipMessage::parse(raw) else {
+        return raw.to_string();
+    };
+    apply_session_timer_headers(&mut msg, expires, min_se);
+    msg.to_string()
+}
+
+fn apply_session_timer_headers(msg: &mut crate::topology::RawSipMessage, expires: u32, min_se: u32) {
+    msg.remove_header("session-expires");
+    msg.remove_header("x"); // compact form — no short-form mapping in RawSipMessage
+    msg.remove_header("min-se");
+    let has_timer = msg
+        .header_values("supported")
+        .iter()
+        .any(|v| v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("timer")));
+    let mut insert = Vec::with_capacity(3);
+    if !has_timer {
+        insert.push("Supported: timer".to_string());
+    }
+    insert.push(format!("Session-Expires: {}", expires));
+    insert.push(format!("Min-SE: {}", min_se));
+    let at = msg
+        .headers
+        .iter()
+        .position(|h| {
+            let name = h.split(':').next().unwrap_or("").trim().to_lowercase();
+            name == "content-length" || name == "l"
+        })
+        .unwrap_or(msg.headers.len());
+    for (i, h) in insert.into_iter().enumerate() {
+        msg.headers.insert(at + i, h);
+    }
+}
+
+/// RFC 4028 §7.4 values for a retry after `422 Min-SE: min_se_422`, given
+/// what the stored INVITE offered and the configured (expires, min_se).
+/// None when a retry cannot help: Min-SE below the RFC 4028 §4 minimum
+/// (malformed), or not above what we already offered (a bogus 422 — an
+/// identical INVITE would be rejected again).
+pub(crate) fn session_interval_retry_values(
+    offered_se: Option<u32>,
+    min_se_422: u32,
+    configured: (u32, u32),
+) -> Option<(u32, u32)> {
+    if min_se_422 < 90 {
+        return None;
+    }
+    if offered_se.is_some_and(|offered| offered >= min_se_422) {
+        return None;
+    }
+    let new_min_se = min_se_422.max(configured.1);
+    let new_se = offered_se.unwrap_or(0).max(configured.0).max(new_min_se);
+    Some((new_se, new_min_se))
+}
+
+/// The INVITE to re-send after a 422: same identity and body, the trunk's
+/// timer values, a fresh transaction (new branch, CSeq+1) and no stale
+/// Proxy-Authorization (the new transaction gets a fresh challenge; a
+/// replayed digest is rejected by nonce-count enforcing servers).
+pub(crate) fn build_session_interval_retry(stored_invite: &str, expires: u32, min_se: u32) -> String {
+    let stamped = match crate::topology::RawSipMessage::parse(stored_invite) {
+        Ok(mut msg) => {
+            msg.remove_header("proxy-authorization");
+            apply_session_timer_headers(&mut msg, expires, min_se);
+            msg.to_string()
+        }
+        Err(_) => stored_invite.to_string(),
+    };
+    crate::sip_builder::renew_invite_transaction(&stamped)
+}
+
 
 #[cfg(test)]
 mod failover_tests {
@@ -1332,81 +1411,4 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(extract_contact_uri("sip:b@1.2.3.4"), "sip:b@1.2.3.4");
     }
-}
-
-/// Make the SBC the sole RFC 4028 negotiator of a raw INVITE: drop every
-/// existing `Session-Expires` (long or compact `x:`) and `Min-SE`, add
-/// `Supported: timer` unless a Supported header already lists it, and
-/// insert `Session-Expires` + `Min-SE` right before Content-Length.
-/// Idempotent — safe on an INVITE that was already stamped (422 retry).
-pub(crate) fn set_session_timer_headers(raw: &str, expires: u32, min_se: u32) -> String {
-    let Ok(mut msg) = crate::topology::RawSipMessage::parse(raw) else {
-        return raw.to_string();
-    };
-    apply_session_timer_headers(&mut msg, expires, min_se);
-    msg.to_string()
-}
-
-fn apply_session_timer_headers(msg: &mut crate::topology::RawSipMessage, expires: u32, min_se: u32) {
-    msg.remove_header("session-expires");
-    msg.remove_header("x"); // compact form — no short-form mapping in RawSipMessage
-    msg.remove_header("min-se");
-    let has_timer = msg
-        .header_values("supported")
-        .iter()
-        .any(|v| v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("timer")));
-    let mut insert = Vec::with_capacity(3);
-    if !has_timer {
-        insert.push("Supported: timer".to_string());
-    }
-    insert.push(format!("Session-Expires: {}", expires));
-    insert.push(format!("Min-SE: {}", min_se));
-    let at = msg
-        .headers
-        .iter()
-        .position(|h| {
-            let name = h.split(':').next().unwrap_or("").trim().to_lowercase();
-            name == "content-length" || name == "l"
-        })
-        .unwrap_or(msg.headers.len());
-    for (i, h) in insert.into_iter().enumerate() {
-        msg.headers.insert(at + i, h);
-    }
-}
-
-/// RFC 4028 §7.4 values for a retry after `422 Min-SE: min_se_422`, given
-/// what the stored INVITE offered and the configured (expires, min_se).
-/// None when a retry cannot help: Min-SE below the RFC 4028 §4 minimum
-/// (malformed), or not above what we already offered (a bogus 422 — an
-/// identical INVITE would be rejected again).
-pub(crate) fn session_interval_retry_values(
-    offered_se: Option<u32>,
-    min_se_422: u32,
-    configured: (u32, u32),
-) -> Option<(u32, u32)> {
-    if min_se_422 < 90 {
-        return None;
-    }
-    if offered_se.is_some_and(|offered| offered >= min_se_422) {
-        return None;
-    }
-    let new_min_se = min_se_422.max(configured.1);
-    let new_se = offered_se.unwrap_or(0).max(configured.0).max(new_min_se);
-    Some((new_se, new_min_se))
-}
-
-/// The INVITE to re-send after a 422: same identity and body, the trunk's
-/// timer values, a fresh transaction (new branch, CSeq+1) and no stale
-/// Proxy-Authorization (the new transaction gets a fresh challenge; a
-/// replayed digest is rejected by nonce-count enforcing servers).
-pub(crate) fn build_session_interval_retry(stored_invite: &str, expires: u32, min_se: u32) -> String {
-    let stamped = match crate::topology::RawSipMessage::parse(stored_invite) {
-        Ok(mut msg) => {
-            msg.remove_header("proxy-authorization");
-            apply_session_timer_headers(&mut msg, expires, min_se);
-            msg.to_string()
-        }
-        Err(_) => stored_invite.to_string(),
-    };
-    crate::sip_builder::renew_invite_transaction(&stamped)
 }

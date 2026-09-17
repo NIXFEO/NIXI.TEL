@@ -102,7 +102,7 @@ impl Router {
             .filter(|t| t.matches_prefix(&user))
             .filter(|t| {
                 self.trunk_manager.get_state(&t.id)
-                    .map_or(true, |s| s.can_accept_call(t))
+                    .is_none_or(|s| s.can_accept_call(t))
             })
             .collect();
 
@@ -159,7 +159,7 @@ impl Router {
             .filter(|t| t.matches_prefix(&user))
             .filter(|t| {
                 self.trunk_manager.get_state(&t.id)
-                    .map_or(true, |s| s.can_accept_call(t))
+                    .is_none_or(|s| s.can_accept_call(t))
             })
             .cloned()
             .collect();
@@ -172,7 +172,7 @@ impl Router {
                 .filter(|t| t.enabled)
                 .filter(|t| {
                     self.trunk_manager.get_state(&t.id)
-                        .map_or(true, |s| s.can_accept_call(t))
+                        .is_none_or(|s| s.can_accept_call(t))
                 })
                 .cloned()
                 .collect();

@@ -188,8 +188,7 @@ impl MediaManager {
         // Look for a=crypto: lines in SDP
         for line in sdp.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("a=crypto:") {
-                let crypto_part = &trimmed["a=crypto:".len()..];
+            if let Some(crypto_part) = trimmed.strip_prefix("a=crypto:") {
                 if let Ok((_tag, suite, key_params)) = parse_crypto_attribute(crypto_part) {
                     info!(
                         "Session {} SRTP: parsed {} from SDP (leg {})",
@@ -228,13 +227,8 @@ impl MediaManager {
         let ports = self.port_allocator.allocate()?;
 
         // Allocate leg-B ports (appears in 200 OK forwarded to caller)
-        let ports_b = match self.port_allocator.allocate() {
-            Ok(p) => Some(p),
-            Err(_) => {
-                // If we can't get a second pair, fall back to single-leg mode
-                None
-            }
-        };
+        // If we can't get a second pair, fall back to single-leg mode
+        let ports_b = self.port_allocator.allocate().ok();
 
         if let Some(pb) = ports_b {
             info!(
@@ -705,9 +699,8 @@ fn rewrite_rtcp_attr(sdp: &str, new_rtcp_port: u16) -> String {
     let mut out = String::with_capacity(sdp.len());
     for line in sdp.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("a=rtcp:") {
+        if let Some(rest) = trimmed.strip_prefix("a=rtcp:") {
             // a=rtcp:<port>  or  a=rtcp:<port> IN IP4 ...
-            let rest = &trimmed["a=rtcp:".len()..];
             // Find end of digits
             let digit_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
             if digit_end > 0 {
@@ -722,11 +715,10 @@ fn rewrite_rtcp_attr(sdp: &str, new_rtcp_port: u16) -> String {
         out.push_str("\r\n");
     }
     // Remove trailing extra \r\n if original didn't end with one
-    if !sdp.ends_with("\r\n") && !sdp.ends_with('\n') {
-        if out.ends_with("\r\n") {
+    if !sdp.ends_with("\r\n") && !sdp.ends_with('\n')
+        && out.ends_with("\r\n") {
             out.truncate(out.len() - 2);
         }
-    }
     out
 }
 

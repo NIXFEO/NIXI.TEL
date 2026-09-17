@@ -147,7 +147,7 @@ impl SessionDescription {
         }
 
         // Parse time (t=) — may be missing in some broken SDPs
-        let time = if lines.peek().map_or(false, |l| l.starts_with("t=")) {
+        let time = if lines.peek().is_some_and(|l| l.starts_with("t=")) {
             Self::parse_time(&mut lines)?
         } else {
             TimeDescription { start_time: "0".to_string(), stop_time: "0".to_string() }
@@ -164,12 +164,12 @@ impl SessionDescription {
         let mut media = Vec::new();
         while lines.peek().is_some() {
             // Skip blank lines between media sections
-            if lines.peek().map_or(false, |l| l.trim().is_empty()) {
+            if lines.peek().is_some_and(|l| l.trim().is_empty()) {
                 lines.next();
                 continue;
             }
             // Only parse if next line is a media line
-            if lines.peek().map_or(false, |l| !l.starts_with("m=")) {
+            if lines.peek().is_some_and(|l| !l.starts_with("m=")) {
                 lines.next(); // skip stray lines
                 continue;
             }
@@ -190,7 +190,7 @@ impl SessionDescription {
     }
 
     /// Serialize SDP to string
-    pub fn to_string(&self) -> String {
+    fn render(&self) -> String {
         let mut sdp = String::new();
 
         // Version
@@ -223,7 +223,7 @@ impl SessionDescription {
 
         // Media descriptions
         for media in &self.media {
-            sdp.push_str(&media.to_string());
+            sdp.push_str(&media.render());
         }
 
         sdp
@@ -421,8 +421,14 @@ impl SessionDescription {
     }
 }
 
+impl std::fmt::Display for SessionDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
 impl MediaDescription {
-    fn to_string(&self) -> String {
+    fn render(&self) -> String {
         let mut s = String::new();
 
         // Media line

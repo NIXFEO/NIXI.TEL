@@ -169,7 +169,7 @@ impl CdrStorage for InMemoryCdrStorage {
     async fn list_recent_cdrs(&self, limit: usize) -> Result<Vec<CdrRecord>> {
         let records = self.records.lock().await;
         let count = records.len();
-        let start = if count > limit { count - limit } else { 0 };
+        let start = count.saturating_sub(limit);
         Ok(records[start..].to_vec())
     }
 
@@ -315,7 +315,7 @@ fn parse_cdr_json(json: &str) -> Option<CdrRecord> {
     let callee = get_str("callee").unwrap_or_default();
 
     Some(CdrRecord {
-        id: get_str("id").unwrap_or_else(|| uuid_v4()),
+        id: get_str("id").unwrap_or_else(uuid_v4),
         call_id,
         caller,
         callee,
@@ -375,6 +375,7 @@ impl CdrManager {
     }
 
     /// Enregistrer un appel terminé
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_call(
         &self,
         call_id: &str,

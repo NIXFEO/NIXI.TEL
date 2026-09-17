@@ -15,6 +15,7 @@ use crate::media::srtp::{CryptoSuite, SrtpContext, generate_key_material};
 
 /// Information extracted from a WebRTC SDP offer/answer
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct WebRtcSdpInfo {
     /// ICE username fragment from SDP (a=ice-ufrag)
     pub ice_ufrag: Option<String>,
@@ -160,21 +161,6 @@ impl WebRtcSdpInfo {
     }
 }
 
-impl Default for WebRtcSdpInfo {
-    fn default() -> Self {
-        Self {
-            ice_ufrag: None,
-            ice_pwd: None,
-            candidates: Vec::new(),
-            fingerprint: None,
-            dtls_role: None,
-            crypto_suites: Vec::new(),
-            is_webrtc: false,
-            media_port: None,
-            mid: None,
-        }
-    }
-}
 
 /// WebRTC session context managed by the SBC
 ///

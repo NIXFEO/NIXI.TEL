@@ -100,6 +100,12 @@ pub struct RawSipMessage {
     pub body: String,
 }
 
+impl std::fmt::Display for RawSipMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
 impl RawSipMessage {
     /// Parse raw SIP text into start line + headers + body
     pub fn parse(raw: &str) -> Result<Self> {
@@ -112,7 +118,7 @@ impl RawSipMessage {
             (raw, String::new())
         };
 
-        let mut lines = header_part.splitn(2, |c| c == '\r' || c == '\n');
+        let mut lines = header_part.splitn(2, ['\r', '\n']);
         let start_line = lines.next()
             .ok_or_else(|| Error::Transport("empty SIP message".into()))?
             .trim()
@@ -140,8 +146,8 @@ impl RawSipMessage {
         Ok(Self { start_line, headers, body })
     }
 
-    /// Serialize back to a raw SIP string
-    pub fn to_string(&self) -> String {
+    /// Serialize back to a raw SIP string (`to_string()` via `Display`).
+    fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&self.start_line);
         out.push_str("\r\n");

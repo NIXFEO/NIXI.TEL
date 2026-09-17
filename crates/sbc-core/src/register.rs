@@ -341,6 +341,7 @@ impl RegisterHandler {
     ///   - `Expires` → expiry (header or Contact param)
     ///   - `Call-ID` → call identifier
     ///   - `CSeq`    → sequence number
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle(
         &self,
         aor: &str,
@@ -357,6 +358,7 @@ impl RegisterHandler {
     /// Extended REGISTER handler that accepts a WebSocket reply channel.
     /// When a WSS client registers, its reply_tx is stored so incoming INVITEs
     /// can be forwarded over the existing WebSocket connection.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_with_tx(
         &self,
         aor: &str,
@@ -540,7 +542,7 @@ mod tests {
         let r = InMemoryRegistrar::new();
         let reg1 = make_reg(3600);
         // Second registration from a DIFFERENT source IP (different device/location)
-        let mut reg2 = Registration::new(
+        let reg2 = Registration::new(
             aor().to_string(),
             "sip:alice@10.0.0.2:5060".to_string(),
             1800,
@@ -685,7 +687,6 @@ mod tests {
     #[test]
     fn test_registration_refresh() {
         let mut reg = make_reg(3600);
-        let old_expires_at = reg.expires_at;
         std::thread::sleep(std::time::Duration::from_millis(10));
         reg.refresh(1800, "new-call-id".to_string(), 2);
         assert_eq!(reg.expires, 1800);

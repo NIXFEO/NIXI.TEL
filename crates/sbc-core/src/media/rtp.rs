@@ -1366,10 +1366,10 @@ mod tests {
         let packet = RtpPacket::parse(&data).unwrap();
 
         assert_eq!(packet.version, 2);
-        assert_eq!(packet.padding, false);
-        assert_eq!(packet.extension, false);
+        assert!(!packet.padding);
+        assert!(!packet.extension);
         assert_eq!(packet.csrc_count, 0);
-        assert_eq!(packet.marker, false);
+        assert!(!packet.marker);
         assert_eq!(packet.payload_type, 0);
         assert_eq!(packet.sequence_number, 12345);
         assert_eq!(packet.timestamp, 67890);

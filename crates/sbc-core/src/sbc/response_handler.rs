@@ -20,7 +20,7 @@ impl Sbc {
 
         // ── Metrics: count SIP responses + error classes ──
         self.metrics.inc_sip_response(status);
-        if status >= 400 && status < 500 {
+        if (400..500).contains(&status) {
             self.metrics.sip_4xx_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else if status >= 500 {
             self.metrics.sip_5xx_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

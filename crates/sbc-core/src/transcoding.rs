@@ -15,7 +15,7 @@
 
 use crate::{Error, Result};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -155,7 +155,7 @@ pub fn pcma_decode_sample(alaw: u8) -> i16 {
     let alaw = (alaw as i32) ^ 0x55;
     let sign  = alaw & 0x80;
     let exp   = (alaw >> 4) & 0x07;
-    let mant  = (alaw & 0x0F) as i32;
+    let mant  = alaw & 0x0F;
 
     let sample = if exp == 0 {
         (mant << 1) | 1
@@ -226,7 +226,7 @@ pub fn upsample_8k_to_48k(samples: &[i16]) -> Vec<i16> {
         let s0 = samples[i] as i32;
         let s1 = if i + 1 < samples.len() { samples[i + 1] as i32 } else { s0 };
         for k in 0..6 {
-            let interp = s0 + (s1 - s0) * k as i32 / 6;
+            let interp = s0 + (s1 - s0) * k / 6;
             out.push(interp as i16);
         }
     }
@@ -717,6 +717,7 @@ pub fn build_opus_sdp(local_ip: &str, rtp_port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::debug;
 
     // ── G.711 µ-law round-trip ────────────────────────────────────────────────
 
@@ -845,7 +846,7 @@ mod tests {
 
         // Encode
         let opus_frame = encoder.encode(&pcm_48k).unwrap();
-        assert!(opus_frame.len() > 0, "Opus frame should not be empty");
+        assert!(!opus_frame.is_empty(), "Opus frame should not be empty");
         assert!(opus_frame.len() < OPUS_MAX_FRAME_SIZE, "Opus frame too large");
         debug!("Opus encoded: {} samples → {} bytes", pcm_48k.len(), opus_frame.len());
 
@@ -875,7 +876,7 @@ mod tests {
 
         // Transcode PCMU → Opus
         let opus_frame = t.transcode(&pcmu).unwrap();
-        assert!(opus_frame.len() > 0 && opus_frame.len() < 200,
+        assert!(!opus_frame.is_empty() && opus_frame.len() < 200,
             "Opus frame should be compact, got {} bytes", opus_frame.len());
     }
 
@@ -945,7 +946,7 @@ mod tests {
         let pcmu = pcmu_encode(&tone_8k);
 
         let opus_frame = pool.transcode_async(transcoder, pcmu).await.unwrap();
-        assert!(opus_frame.len() > 0);
+        assert!(!opus_frame.is_empty());
         assert_eq!(pool.transcoded_count(), 1);
     }
 
