@@ -25,6 +25,13 @@ pub enum TransportEvent {
     },
 }
 
+/// TLS parameters and the client config built from them, once.
+#[derive(Clone)]
+struct TlsDestination {
+    params: crate::transport::tls_connect::TlsClientParams,
+    config: Arc<tokio_rustls::rustls::ClientConfig>,
+}
+
 pub struct TransportManager {
     /// UDP listeners
     udp_listeners: Vec<Arc<UdpListener>>,
@@ -39,9 +46,9 @@ pub struct TransportManager {
     event_rx: mpsc::UnboundedReceiver<TransportEvent>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
 
-    /// Outbound TLS: per-destination parameters (registered from trunk
-    /// config) and established connections.
-    tls_params: Arc<dashmap::DashMap<SocketAddr, crate::transport::tls_connect::TlsClientParams>>,
+    /// Outbound TLS: per-destination parameters + prebuilt client config
+    /// (registered from trunk config) and established connections.
+    tls_params: Arc<dashmap::DashMap<SocketAddr, TlsDestination>>,
     tls_connections: Arc<dashmap::DashMap<SocketAddr, Arc<crate::transport::tls_connect::TlsClientConnection>>>,
 }
 
@@ -212,13 +219,21 @@ impl TransportManager {
         }
     }
 
-    /// Register TLS parameters for an outbound destination (trunk load).
+    /// Register TLS parameters for an outbound destination (trunk load /
+    /// reload). The client config (CA bundle, system roots, mTLS identity)
+    /// is built here, once, so nothing touches the filesystem when a call
+    /// needs the connection. A destination whose config cannot be built is
+    /// not registered: sends to it fail closed instead of at call time.
     pub fn register_tls_destination(
         &self,
         dest: SocketAddr,
         params: crate::transport::tls_connect::TlsClientParams,
-    ) {
-        self.tls_params.insert(dest, params);
+    ) -> Result<()> {
+        let config = crate::transport::tls_connect::build_client_config(&params)?;
+        self.tls_params.insert(dest, TlsDestination { params, config: Arc::new(config) });
+        // A new config must not keep reusing a connection made with the old one
+        self.tls_connections.remove(&dest);
+        Ok(())
     }
 
     /// Send a message via TLS. NEVER falls back to plaintext: a destination
@@ -233,7 +248,7 @@ impl TransportManager {
             self.tls_connections.remove(&dest);
         }
 
-        let params = self
+        let target = self
             .tls_params
             .get(&dest)
             .map(|p| p.clone())
@@ -246,7 +261,8 @@ impl TransportManager {
 
         let conn = crate::transport::tls_connect::TlsClientConnection::connect(
             dest,
-            &params,
+            &target.params,
+            target.config,
             self.message_tx.clone(),
         )
         .await?;
@@ -254,19 +270,25 @@ impl TransportManager {
         conn.send(data)
     }
 
-    /// Send a message via TCP
+    /// Send a message via TCP, reusing the pooled connection. A connection
+    /// whose send fails is dropped from the pool so the next send
+    /// reconnects instead of failing on a dead socket until restart.
     pub async fn send_tcp(&self, data: &[u8], dest: SocketAddr) -> Result<()> {
-        // Get or create TCP connection
-        let conn = if let Some(existing) = self.tcp_connections.get(&dest) {
-            existing.clone()
-        } else {
-            // Create new connection
-            let new_conn = Arc::new(TcpConnection::connect(dest).await?);
-            self.tcp_connections.insert(dest, new_conn.clone());
-            new_conn
+        let conn = match self.tcp_connections.get(&dest) {
+            Some(existing) => existing.clone(),
+            None => {
+                let new_conn = Arc::new(TcpConnection::connect(dest).await?);
+                self.tcp_connections.insert(dest, new_conn.clone());
+                new_conn
+            }
         };
 
-        conn.send(data).await
+        if let Err(e) = conn.send(data).await {
+            self.tcp_connections.remove(&dest);
+            tracing::warn!("TCP send to {} failed, connection dropped from pool: {}", dest, e);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Send a message to the specified destination.
@@ -378,5 +400,57 @@ mod tests {
 
         manager.start_listeners(&config).await.unwrap();
         assert_eq!(manager.stats().udp_listeners, 1);
+    }
+}
+
+#[cfg(test)]
+mod outbound_pool_tests {
+    use super::*;
+    use crate::transport::tls_connect::TlsClientParams;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn send_tcp_drops_a_dead_connection_from_the_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest = listener.local_addr().unwrap();
+        // The peer accepts and closes immediately: the pooled connection is dead.
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            drop(sock);
+        });
+
+        let tm = TransportManager::new();
+        let mut failed = false;
+        for _ in 0..20 {
+            match tm.send_tcp(b"OPTIONS sip:probe SIP/2.0\r\nContent-Length: 0\r\n\r\n", dest).await {
+                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(30)).await,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "writing to a peer that closed must eventually fail");
+        assert!(!tm.tcp_connections.contains_key(&dest), "the dead connection is evicted from the pool");
+    }
+
+    #[test]
+    fn register_tls_destination_prebuilds_the_config_and_fails_closed() {
+        let tm = TransportManager::new();
+        let ok_dest: SocketAddr = "203.0.113.9:5061".parse().unwrap();
+        let params = TlsClientParams {
+            sni: "trunk.example.invalid".to_string(),
+            ca_cert: None,
+            verify: false,
+            client_cert: None,
+            client_key: None,
+        };
+        tm.register_tls_destination(ok_dest, params.clone()).expect("system roots load");
+        assert!(tm.tls_params.contains_key(&ok_dest));
+
+        let bad_dest: SocketAddr = "203.0.113.10:5061".parse().unwrap();
+        let bad = TlsClientParams { ca_cert: Some("/nonexistent/ca.pem".to_string()), ..params };
+        assert!(tm.register_tls_destination(bad_dest, bad).is_err());
+        assert!(!tm.tls_params.contains_key(&bad_dest), "a destination whose config cannot be built is not registered");
     }
 }

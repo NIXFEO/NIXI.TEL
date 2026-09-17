@@ -292,10 +292,13 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
-    /// Create a new TCP connection to a destination
+    /// Create a new TCP connection to a destination, bounded by
+    /// [`OUTBOUND_CONNECT_TIMEOUT`](crate::transport::OUTBOUND_CONNECT_TIMEOUT).
     pub async fn connect(dest: SocketAddr) -> Result<Self> {
-        let stream = TcpStream::connect(dest)
+        let timeout = crate::transport::OUTBOUND_CONNECT_TIMEOUT;
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(dest))
             .await
+            .map_err(|_| Error::Transport(format!("TCP connect to {} timed out after {:?}", dest, timeout)))?
             .map_err(|e| Error::Transport(format!("Failed to connect to {}: {}", dest, e)))?;
 
         debug!("Established TCP connection to {}", dest);
@@ -386,5 +389,24 @@ mod tests {
         let (msg, remaining) = result.unwrap();
         assert_eq!(msg.len(), buffer.len());
         assert_eq!(remaining.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// TEST-NET-3 (RFC 5737) is never routed: the connect either fails at
+    /// once (no route) or hangs — and must then be cut by our timeout, never
+    /// by the kernel's SYN timeout minutes later.
+    #[tokio::test]
+    async fn connect_to_a_black_hole_fails_within_the_timeout() {
+        let dest: SocketAddr = "203.0.113.1:5060".parse().unwrap();
+        let started = Instant::now();
+        let result = TcpConnection::connect(dest).await;
+        assert!(result.is_err());
+        let budget = crate::transport::OUTBOUND_CONNECT_TIMEOUT + Duration::from_secs(1);
+        assert!(started.elapsed() <= budget, "connect took {:?}", started.elapsed());
     }
 }

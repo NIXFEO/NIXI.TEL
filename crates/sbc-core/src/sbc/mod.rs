@@ -584,17 +584,20 @@ impl Sbc {
         for t in self.trunk_manager.list_trunks() {
             if t.transport == crate::routing::TransportType::Tls {
                 if let Some(dest) = t.destination() {
-                    self.transport.register_tls_destination(
-                        dest,
-                        crate::transport::tls_connect::TlsClientParams {
-                            sni: t.tls_sni.clone().unwrap_or_else(|| t.host.clone()),
-                            ca_cert: t.tls_ca_cert.clone(),
-                            verify: t.tls_verify,
-                            client_cert: t.tls_client_cert.clone(),
-                            client_key: t.tls_client_key.clone(),
-                        },
-                    );
-                    info!("TLS trunk '{}': outbound TLS registered for {}", t.name, dest);
+                    let params = crate::transport::tls_connect::TlsClientParams {
+                        sni: t.tls_sni.clone().unwrap_or_else(|| t.host.clone()),
+                        ca_cert: t.tls_ca_cert.clone(),
+                        verify: t.tls_verify,
+                        client_cert: t.tls_client_cert.clone(),
+                        client_key: t.tls_client_key.clone(),
+                    };
+                    match self.transport.register_tls_destination(dest, params) {
+                        Ok(()) => info!("TLS trunk '{}': outbound TLS registered for {}", t.name, dest),
+                        Err(e) => error!(
+                            "TLS trunk '{}': outbound TLS NOT registered for {} ({}) — sends to it will fail closed",
+                            t.name, dest, e
+                        ),
+                    }
                 }
             }
         }

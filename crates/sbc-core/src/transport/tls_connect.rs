@@ -52,23 +52,30 @@ impl TlsClientConnection {
     /// Connect, handshake and spawn reader/writer tasks. Inbound messages
     /// (responses, in-dialog requests from the trunk) are framed and pushed
     /// to `message_tx` with a `reply_tx` bound to this connection.
+    ///
+    /// `config` is built once per destination at trunk registration
+    /// ([`build_client_config`]) so no certificate file or system trust
+    /// store is read on the call path. Connect and handshake are each
+    /// bounded by [`OUTBOUND_CONNECT_TIMEOUT`](crate::transport::OUTBOUND_CONNECT_TIMEOUT).
     pub async fn connect(
         dest: SocketAddr,
         params: &TlsClientParams,
+        config: Arc<ClientConfig>,
         message_tx: mpsc::UnboundedSender<ReceivedMessage>,
     ) -> Result<Arc<Self>> {
-        let config = build_client_config(params)?;
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(config);
+        let timeout = crate::transport::OUTBOUND_CONNECT_TIMEOUT;
 
         let server_name = ServerName::try_from(params.sni.clone())
             .map_err(|e| Error::Transport(format!("invalid TLS SNI '{}': {}", params.sni, e)))?;
 
-        let tcp = TcpStream::connect(dest)
+        let tcp = tokio::time::timeout(timeout, TcpStream::connect(dest))
             .await
+            .map_err(|_| Error::Transport(format!("TLS connect to {} timed out after {:?}", dest, timeout)))?
             .map_err(|e| Error::Transport(format!("TLS connect {}: {}", dest, e)))?;
-        let stream = connector
-            .connect(server_name, tcp)
+        let stream = tokio::time::timeout(timeout, connector.connect(server_name, tcp))
             .await
+            .map_err(|_| Error::Transport(format!("TLS handshake with {} timed out after {:?}", dest, timeout)))?
             .map_err(|e| Error::Transport(format!("TLS handshake with {} failed: {}", dest, e)))?;
 
         info!(
@@ -148,7 +155,10 @@ impl TlsClientConnection {
     }
 }
 
-fn build_client_config(params: &TlsClientParams) -> Result<ClientConfig> {
+/// Build the rustls client configuration for a destination: CA bundle or
+/// system roots, optional mTLS identity. Reads files — call it at trunk
+/// registration (boot / reload), never on the call path.
+pub fn build_client_config(params: &TlsClientParams) -> Result<ClientConfig> {
     let mut roots = RootCertStore::empty();
     match &params.ca_cert {
         Some(path) => {
@@ -305,5 +315,39 @@ mod tests {
         let two = b"OPTIONS sip:x SIP/2.0\r\nContent-Length: 0\r\n\r\nBYE sip:y SIP/2.0\r\n";
         let (end, _) = frame_sip_message(two).unwrap();
         assert!(std::str::from_utf8(&two[..end]).unwrap().starts_with("OPTIONS"));
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn params() -> TlsClientParams {
+        TlsClientParams {
+            sni: "trunk.example.invalid".to_string(),
+            ca_cert: None,
+            verify: false,
+            client_cert: None,
+            client_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_connect_to_a_black_hole_fails_within_the_timeout() {
+        let config = Arc::new(build_client_config(&params()).expect("client config"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let dest: SocketAddr = "203.0.113.1:5061".parse().unwrap();
+        let started = Instant::now();
+        let result = TlsClientConnection::connect(dest, &params(), config, tx).await;
+        assert!(result.is_err());
+        let budget = crate::transport::OUTBOUND_CONNECT_TIMEOUT + Duration::from_secs(1);
+        assert!(started.elapsed() <= budget, "connect took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn build_client_config_fails_closed_on_a_missing_ca_bundle() {
+        let bad = TlsClientParams { ca_cert: Some("/nonexistent/ca.pem".to_string()), ..params() };
+        assert!(build_client_config(&bad).is_err());
     }
 }
