@@ -1,28 +1,8 @@
 //! REGISTER Handling — RFC 3261 §10
 //!
-//! The SBC acts as a SIP Registrar for its served domains.
-//! Registrations are stored in:
-//!   - [`InMemoryRegistrar`]  — for tests and development
-//!   - [`PostgresRegistrar`]  — for production (schema below)
-//!
-//! # PostgreSQL schema
-//! ```sql
-//! CREATE TABLE sip_registrations (
-//!     id           BIGSERIAL PRIMARY KEY,
-//!     aor          TEXT NOT NULL,          -- Address-of-Record (sip:user@domain)
-//!     contact      TEXT NOT NULL,          -- Contact URI
-//!     expires      INTEGER NOT NULL,        -- Expiry in seconds (from client)
-//!     registered_at BIGINT NOT NULL,        -- UNIX timestamp
-//!     expires_at   BIGINT NOT NULL,         -- registered_at + expires
-//!     call_id      TEXT NOT NULL,           -- Call-ID of REGISTER
-//!     cseq         INTEGER NOT NULL,        -- CSeq of REGISTER
-//!     user_agent   TEXT,
-//!     received_ip  TEXT NOT NULL,           -- IP where request came from
-//!     received_port INTEGER NOT NULL,
-//!     transport    TEXT NOT NULL DEFAULT 'UDP'
-//! );
-//! CREATE UNIQUE INDEX idx_reg_aor_contact ON sip_registrations(aor, contact);
-//! ```
+//! The SBC acts as a SIP Registrar for its served domains. Bindings live in
+//! [`InMemoryRegistrar`]: they are lost on restart and re-created by the
+//! clients' next REGISTER (typically within a minute).
 
 use crate::Result;
 use async_trait::async_trait;
@@ -324,135 +304,6 @@ impl Registrar for InMemoryRegistrar {
     async fn all_registrations(&self) -> Result<Vec<Registration>> {
         let map = self.regs.read().await;
         Ok(map.values().cloned().collect())
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PostgreSQL backend (generates SQL without actually executing in unit tests)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// PostgreSQL-backed registrar.
-/// In production this would use sqlx. Here we generate correct SQL
-/// and expose it via `last_sql()` for testing, while delegating actual
-/// storage to an in-memory cache for environments without a DB.
-pub struct PostgresRegistrar {
-    #[allow(dead_code)]
-    db_url: String,
-    /// Fallback in-memory store (used when DB is unavailable)
-    fallback: InMemoryRegistrar,
-    /// Last SQL statement generated (for testing)
-    last_sql: Arc<RwLock<String>>,
-}
-
-impl PostgresRegistrar {
-    pub fn new(db_url: &str) -> Self {
-        Self {
-            db_url: db_url.to_string(),
-            fallback: InMemoryRegistrar::new(),
-            last_sql: Arc::new(RwLock::new(String::new())),
-        }
-    }
-
-    fn upsert_sql(reg: &Registration) -> String {
-        format!(
-            "INSERT INTO sip_registrations \
-             (aor, contact, expires, registered_at, expires_at, call_id, cseq, user_agent, received_ip, received_port, transport) \
-             VALUES ('{aor}', '{contact}', {expires}, {reg_at}, {exp_at}, '{call_id}', {cseq}, {ua}, '{recv_ip}', {recv_port}, '{transport}') \
-             ON CONFLICT (aor, contact) DO UPDATE SET \
-             expires=EXCLUDED.expires, registered_at=EXCLUDED.registered_at, \
-             expires_at=EXCLUDED.expires_at, call_id=EXCLUDED.call_id, cseq=EXCLUDED.cseq",
-            aor       = reg.aor,
-            contact   = reg.contact,
-            expires   = reg.expires,
-            reg_at    = reg.registered_at,
-            exp_at    = reg.expires_at,
-            call_id   = reg.call_id,
-            cseq      = reg.cseq,
-            ua        = reg.user_agent.as_deref().map(|s| format!("'{}'", s)).unwrap_or("NULL".into()),
-            recv_ip   = reg.received_ip,
-            recv_port = reg.received_port,
-            transport = reg.transport,
-        )
-    }
-
-    fn delete_sql(aor: &str, contact: &str) -> String {
-        format!(
-            "DELETE FROM sip_registrations WHERE aor='{}' AND contact='{}'",
-            aor, contact
-        )
-    }
-
-    fn delete_all_sql(aor: &str) -> String {
-        format!("DELETE FROM sip_registrations WHERE aor='{}'", aor)
-    }
-
-    fn select_sql(aor: &str) -> String {
-        format!(
-            "SELECT * FROM sip_registrations WHERE aor='{}' AND expires_at > {}",
-            aor, unix_now()
-        )
-    }
-
-    fn cleanup_sql() -> String {
-        format!(
-            "DELETE FROM sip_registrations WHERE expires_at <= {}",
-            unix_now()
-        )
-    }
-
-    pub async fn last_sql(&self) -> String {
-        self.last_sql.read().await.clone()
-    }
-
-    async fn set_sql(&self, sql: String) {
-        *self.last_sql.write().await = sql;
-    }
-}
-
-#[async_trait]
-impl Registrar for PostgresRegistrar {
-    async fn register(&self, reg: Registration) -> Result<u32> {
-        let sql = Self::upsert_sql(&reg);
-        self.set_sql(sql).await;
-        // Delegate to in-memory fallback
-        self.fallback.register(reg).await
-    }
-
-    async fn unregister(&self, aor: &str, contact: &str) -> Result<()> {
-        let sql = Self::delete_sql(aor, contact);
-        self.set_sql(sql).await;
-        self.fallback.unregister(aor, contact).await
-    }
-
-    async fn unregister_with_call_id(&self, aor: &str, contact: &str, call_id: Option<String>) -> Result<()> {
-        // For Postgres, we'd add WHERE call_id=? but delegate to fallback for now
-        self.fallback.unregister_with_call_id(aor, contact, call_id).await
-    }
-
-    async fn unregister_all(&self, aor: &str) -> Result<u32> {
-        let sql = Self::delete_all_sql(aor);
-        self.set_sql(sql).await;
-        self.fallback.unregister_all(aor).await
-    }
-
-    async fn lookup(&self, aor: &str) -> Result<Vec<Registration>> {
-        let sql = Self::select_sql(aor);
-        self.set_sql(sql).await;
-        self.fallback.lookup(aor).await
-    }
-
-    async fn cleanup_expired(&self) -> Result<u32> {
-        let sql = Self::cleanup_sql();
-        self.set_sql(sql).await;
-        self.fallback.cleanup_expired().await
-    }
-
-    async fn count(&self) -> u64 {
-        self.fallback.count().await
-    }
-
-    async fn all_registrations(&self) -> Result<Vec<Registration>> {
-        self.fallback.all_registrations().await
     }
 }
 
@@ -801,46 +652,6 @@ mod tests {
             RegisterResult::Removed { count } => assert_eq!(count, 2),
             _ => panic!("expected Removed"),
         }
-    }
-
-    // ── PostgresRegistrar ─────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_postgres_generates_upsert_sql() {
-        let r = PostgresRegistrar::new("postgresql://sbc:pass@localhost/sbc_db");
-        r.register(make_reg(3600)).await.unwrap();
-        let sql = r.last_sql().await;
-        assert!(sql.contains("INSERT INTO sip_registrations"), "SQL: {}", sql);
-        assert!(sql.contains("ON CONFLICT"), "SQL should have upsert: {}", sql);
-        assert!(sql.contains(aor()), "SQL should have AOR: {}", sql);
-    }
-
-    #[tokio::test]
-    async fn test_postgres_generates_delete_sql() {
-        let r = PostgresRegistrar::new("postgresql://sbc:pass@localhost/sbc_db");
-        r.register(make_reg(3600)).await.unwrap();
-        r.unregister(aor(), contact()).await.unwrap();
-        let sql = r.last_sql().await;
-        assert!(sql.starts_with("DELETE FROM sip_registrations"), "SQL: {}", sql);
-        assert!(sql.contains(aor()), "SQL should contain AOR: {}", sql);
-    }
-
-    #[tokio::test]
-    async fn test_postgres_generates_select_sql() {
-        let r = PostgresRegistrar::new("postgresql://sbc:pass@localhost/sbc_db");
-        r.register(make_reg(3600)).await.unwrap();
-        r.lookup(aor()).await.unwrap();
-        let sql = r.last_sql().await;
-        assert!(sql.starts_with("SELECT * FROM sip_registrations"), "SQL: {}", sql);
-        assert!(sql.contains(aor()), "SQL should contain AOR: {}", sql);
-    }
-
-    #[tokio::test]
-    async fn test_postgres_generates_cleanup_sql() {
-        let r = PostgresRegistrar::new("postgresql://sbc:pass@localhost/sbc_db");
-        r.cleanup_expired().await.unwrap();
-        let sql = r.last_sql().await;
-        assert!(sql.starts_with("DELETE FROM sip_registrations WHERE expires_at"), "SQL: {}", sql);
     }
 
     // ── 200 OK builder ────────────────────────────────────────────────────────

@@ -1,22 +1,19 @@
-//! SBC Core - Transport, Transaction, Dialog, and Routing
+//! SBC Core - Transport, B2BUA call control, Media and Routing
 //!
 //! This crate provides the core SBC functionality including:
 //! - Transport layer (UDP, TCP, TLS, WebSocket)
-//! - Transaction state machines (RFC 3261 compliant)
-//! - Dialog management
+//! - B2BUA call control (per-attempt INVITE bookkeeping, failover, session timers)
 //! - Call routing between trunks
-//! - Background maintenance tasks
+//! - Background maintenance (bounded in-memory tables)
 //! - Integrated SBC instance
 //! - Media relay (RTP/RTCP proxy, SDP manipulation)
 //! - Audio transcoding (Opus ↔ G.711 PCMU/PCMA)
 //! - Topology hiding (Via/Contact/Record-Route rewriting)
-//! - REGISTER handling + PostgreSQL backend
-//! - TLS client for outbound trunks
+//! - REGISTER handling (in-memory registrar)
+//! - Outbound TLS/mTLS toward trunks
 //! - Dynamic ACL (IP access control lists)
 
 pub mod transport;
-pub mod transaction;
-pub mod dialog;
 pub mod routing;
 pub mod config;
 pub mod error;
@@ -26,9 +23,7 @@ pub mod media;
 pub mod b2bua;
 pub mod auth;
 pub mod metrics;
-pub mod api;
 pub mod events;
-pub mod http_server;
 pub mod storage;
 pub mod dos;
 
@@ -38,7 +33,6 @@ pub mod topology;
 pub mod register;
 pub mod sip_builder;
 pub mod security;
-pub mod tls_client;
 pub mod acl;
 
 pub mod trunk_register;

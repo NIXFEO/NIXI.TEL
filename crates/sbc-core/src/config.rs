@@ -185,28 +185,17 @@ pub struct DatabaseConfig {
     /// Source of truth for everything managed via the REST API.
     #[serde(default = "default_sqlite_path")]
     pub sqlite_path: String,
-    /// Legacy/optional external databases — not required to run the SBC.
-    #[serde(default)]
-    pub postgres_url: Option<String>,
-    #[serde(default = "default_pg_max_conns")]
-    pub postgres_max_connections: u32,
-    #[serde(default)]
-    pub redis_url: Option<String>,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             sqlite_path: default_sqlite_path(),
-            postgres_url: None,
-            postgres_max_connections: default_pg_max_conns(),
-            redis_url: None,
         }
     }
 }
 
 fn default_sqlite_path() -> String { "data/sbc.db".to_string() }
-fn default_pg_max_conns() -> u32 { 5 }
 
 /// Security configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]

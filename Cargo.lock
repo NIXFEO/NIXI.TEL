@@ -2501,8 +2501,6 @@ dependencies = [
  "rsip",
  "sbc-core",
  "sbc-management",
- "sbc-media",
- "sbc-security",
  "sbc-storage",
  "serde",
  "structopt",
@@ -2577,31 +2575,6 @@ dependencies = [
  "tokio-stream",
  "tower 0.4.13",
  "tower-http",
- "tracing",
- "uuid 1.21.0",
-]
-
-[[package]]
-name = "sbc-media"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sbc-security"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dashmap",
- "ipnetwork",
- "rsip",
- "serde",
- "thiserror",
- "tokio",
  "tracing",
  "uuid 1.21.0",
 ]

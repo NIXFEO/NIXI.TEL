@@ -89,8 +89,15 @@ pub struct BanManager {
     /// Failure timestamps per IP (pruned to the window on insert).
     failures: DashMap<IpAddr, VecDeque<Instant>>,
     bans: DashMap<IpAddr, BanEntry>,
-    /// Past offense counts (for repeat-offender escalation), kept after expiry.
-    offenses: DashMap<IpAddr, u32>,
+    /// Past offense counts (for repeat-offender escalation), kept after
+    /// expiry and forgotten by `prune_stale_windows` once cold.
+    offenses: DashMap<IpAddr, Offense>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Offense {
+    count: u32,
+    last: Instant,
 }
 
 impl BanManager {
@@ -167,8 +174,8 @@ impl BanManager {
         }
 
         self.failures.remove(&ip);
-        let offense = self.offenses.entry(ip).or_insert(0).value() + 1;
-        self.offenses.insert(ip, offense);
+        let offense = self.offenses.get(&ip).map(|o| o.count).unwrap_or(0) + 1;
+        self.offenses.insert(ip, Offense { count: offense, last: Instant::now() });
 
         let factor = config
             .repeat_offender_multiplier
@@ -204,7 +211,7 @@ impl BanManager {
             expires_at: SystemTime::now() + duration,
             failures: 0,
             manual: true,
-            offense_count: self.offenses.get(&ip).map(|o| *o).unwrap_or(0) + 1,
+            offense_count: self.offenses.get(&ip).map(|o| o.count).unwrap_or(0) + 1,
         };
         info!(target: "security", "Manual ban: {} for {:?} ({})", ip, duration, reason);
         self.bans.insert(ip, entry.clone());
@@ -227,6 +234,37 @@ impl BanManager {
             .collect()
     }
 
+    /// Drop strike windows whose last strike is older than the window, and
+    /// offense counters of IPs that have been quiet (no ban, no strike) for
+    /// twice the maximum ban length — long enough for repeat-offender
+    /// escalation to still bite a scanner that comes straight back.
+    /// Returns the number of entries removed.
+    pub fn prune_stale_windows(&self) -> usize {
+        let config = self.config.read().unwrap().clone();
+        let now = Instant::now();
+        let window = Duration::from_secs(config.window_secs);
+        let stale: Vec<IpAddr> = self
+            .failures
+            .iter()
+            .filter(|e| e.value().back().is_none_or(|t| now.duration_since(*t) > window))
+            .map(|e| *e.key())
+            .collect();
+        for ip in &stale {
+            self.failures.remove(ip);
+        }
+        let forget_after = Duration::from_secs(config.max_ban_secs.saturating_mul(2).max(config.window_secs));
+        let cold: Vec<IpAddr> = self
+            .offenses
+            .iter()
+            .filter(|e| now.duration_since(e.value().last) > forget_after && !self.bans.contains_key(e.key()))
+            .map(|e| *e.key())
+            .collect();
+        for ip in &cold {
+            self.offenses.remove(ip);
+        }
+        stale.len() + cold.len()
+    }
+
     /// Remove expired bans (periodic maintenance). Returns removed count.
     pub fn cleanup_expired(&self) -> usize {
         let expired: Vec<IpAddr> = self
@@ -244,7 +282,7 @@ impl BanManager {
     /// Restore a persisted ban (startup).
     pub fn restore(&self, entry: BanEntry) {
         if !entry.is_expired() {
-            self.offenses.insert(entry.ip, entry.offense_count);
+            self.offenses.insert(entry.ip, Offense { count: entry.offense_count, last: Instant::now() });
             self.bans.insert(entry.ip, entry);
         }
     }

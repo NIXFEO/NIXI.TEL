@@ -1,240 +1,185 @@
-//! Background Maintenance Tasks
-//!
-//! Handles periodic cleanup and retransmissions for transactions and dialogs
+//! Background maintenance: a periodic sweep of the in-memory tables that
+//! otherwise grow with lifetime traffic — per-IP DoS state, digest nonces,
+//! expired registrations, fail2ban strike windows and per-user rate
+//! windows. A spoofed-source UDP scan must never turn into unbounded
+//! memory on a 2 GB box, and the gauges it exports make growth visible in
+//! Grafana long before it is fatal.
 
-use crate::dialog::DialogManager;
-use crate::transaction::TransactionManager;
+use crate::auth::DigestAuthenticator;
+use crate::dos::DosProtector;
+use crate::metrics::SbcMetrics;
+use crate::register::Registrar;
+use crate::security::SecurityManager;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, info};
 
-/// Configuration for maintenance tasks
+/// Configuration for the maintenance sweeper
 #[derive(Debug, Clone)]
 pub struct MaintenanceConfig {
-    /// Interval between transaction timeout checks (default: 50ms)
-    pub transaction_check_interval: Duration,
-
-    /// Interval between dialog cleanup (default: 30s)
-    pub dialog_cleanup_interval: Duration,
-
-    /// Timeout for idle dialogs (default: 5 minutes)
-    pub dialog_idle_timeout: Duration,
+    /// Interval between sweeps (default: 60 s)
+    pub sweep_interval: Duration,
 }
 
 impl Default for MaintenanceConfig {
     fn default() -> Self {
-        Self {
-            transaction_check_interval: Duration::from_millis(50),
-            dialog_cleanup_interval: Duration::from_secs(30),
-            dialog_idle_timeout: Duration::from_secs(300), // 5 minutes
-        }
+        Self { sweep_interval: Duration::from_secs(60) }
     }
 }
 
-/// Background maintenance task manager
+/// What one sweep removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    pub dos_entries: usize,
+    pub nonces: usize,
+    pub registrations: usize,
+    pub bans: usize,
+    pub ban_windows: usize,
+    pub rate_windows: usize,
+}
+
+impl SweepReport {
+    pub fn total(&self) -> usize {
+        self.dos_entries + self.nonces + self.registrations + self.bans + self.ban_windows + self.rate_windows
+    }
+}
+
+/// Background maintenance sweeper
 pub struct MaintenanceTask {
-    transaction_manager: Arc<TransactionManager>,
-    dialog_manager: Arc<DialogManager>,
+    dos: Arc<DosProtector>,
+    auth: Option<Arc<DigestAuthenticator>>,
+    registrar: Arc<dyn Registrar>,
+    security: Arc<SecurityManager>,
+    metrics: Arc<SbcMetrics>,
     config: MaintenanceConfig,
 }
 
 impl MaintenanceTask {
-    /// Create a new maintenance task manager
     pub fn new(
-        transaction_manager: Arc<TransactionManager>,
-        dialog_manager: Arc<DialogManager>,
+        dos: Arc<DosProtector>,
+        auth: Option<Arc<DigestAuthenticator>>,
+        registrar: Arc<dyn Registrar>,
+        security: Arc<SecurityManager>,
+        metrics: Arc<SbcMetrics>,
         config: MaintenanceConfig,
     ) -> Self {
-        Self {
-            transaction_manager,
-            dialog_manager,
-            config,
-        }
+        Self { dos, auth, registrar, security, metrics, config }
     }
 
-    /// Start background maintenance tasks
-    ///
-    /// Spawns two tokio tasks:
-    /// 1. Transaction timeout checker and retransmission handler
-    /// 2. Dialog cleanup for idle/terminated dialogs
+    /// Spawn the sweeper task.
     pub fn start(self) -> MaintenanceHandle {
-        let config = self.config.clone();
-
-        // Task 1: Transaction maintenance
-        let tx_manager = self.transaction_manager.clone();
-        let tx_config = config.clone();
-        let transaction_task = tokio::spawn(async move {
-            let mut interval = interval(tx_config.transaction_check_interval);
-            info!(
-                "Started transaction maintenance task (interval: {:?})",
-                tx_config.transaction_check_interval
-            );
-
+        let task = tokio::spawn(async move {
+            let mut ticker = interval(self.config.sweep_interval);
+            ticker.tick().await; // consume the immediate first tick
+            info!("Started maintenance sweeper (interval: {:?})", self.config.sweep_interval);
             loop {
-                interval.tick().await;
-
-                // Check for timeouts and trigger retransmissions
-                let timed_out = tx_manager.check_timeouts();
-                if timed_out > 0 {
-                    debug!("Processed {} transaction timeouts", timed_out);
-                }
-
-                // Cleanup terminated transactions
-                let cleaned = tx_manager.cleanup_terminated();
-                if cleaned > 0 {
-                    debug!("Cleaned up {} terminated transactions", cleaned);
-                }
+                ticker.tick().await;
+                self.sweep().await;
             }
         });
+        MaintenanceHandle { task }
+    }
 
-        // Task 2: Dialog maintenance
-        let dlg_manager = self.dialog_manager.clone();
-        let dlg_config = config.clone();
-        let dialog_task = tokio::spawn(async move {
-            let mut interval = interval(dlg_config.dialog_cleanup_interval);
-            info!(
-                "Started dialog maintenance task (interval: {:?})",
-                dlg_config.dialog_cleanup_interval
-            );
+    /// One sweep: prune every table, then refresh the size gauges.
+    /// Public so tests can drive it without waiting for the interval.
+    pub async fn sweep(&self) -> SweepReport {
+        let report = SweepReport {
+            dos_entries: self.dos.cleanup_expired().await,
+            nonces: match &self.auth {
+                Some(auth) => auth.cleanup_nonces().await,
+                None => 0,
+            },
+            registrations: self.registrar.cleanup_expired().await.unwrap_or(0) as usize,
+            bans: self.security.bans.cleanup_expired(),
+            ban_windows: self.security.bans.prune_stale_windows(),
+            rate_windows: self.security.user_limits.prune_idle_windows(),
+        };
 
-            loop {
-                interval.tick().await;
+        self.metrics.set_dos_tracked_ips(self.dos.tracked_ips().await as u64);
+        let nonces = match &self.auth {
+            Some(auth) => auth.active_nonces().await as u64,
+            None => 0,
+        };
+        self.metrics.set_auth_nonces(nonces);
+        // count() runs after cleanup_expired, so expired bindings no longer inflate it
+        self.metrics.set_active_registrations(self.registrar.count().await);
 
-                // Cleanup terminated dialogs
-                let terminated = dlg_manager.cleanup_terminated();
-                if terminated > 0 {
-                    debug!("Cleaned up {} terminated dialogs", terminated);
-                }
-
-                // Cleanup idle dialogs
-                let idle = dlg_manager.cleanup_idle(dlg_config.dialog_idle_timeout);
-                if idle > 0 {
-                    debug!("Cleaned up {} idle dialogs", idle);
-                }
-            }
-        });
-
-        MaintenanceHandle {
-            transaction_task,
-            dialog_task,
+        if report.total() > 0 {
+            debug!("Maintenance sweep: {:?}", report);
         }
+        report
     }
 }
 
-/// Handle to the background maintenance tasks
+/// Handle to the background sweeper
 pub struct MaintenanceHandle {
-    transaction_task: tokio::task::JoinHandle<()>,
-    dialog_task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl MaintenanceHandle {
-    /// Abort all maintenance tasks
+    /// Abort the sweeper
     pub fn abort(&self) {
-        self.transaction_task.abort();
-        self.dialog_task.abort();
-        info!("Aborted maintenance tasks");
+        self.task.abort();
+        info!("Aborted maintenance sweeper");
     }
 
-    /// Wait for all maintenance tasks to complete
+    /// Wait for the sweeper to finish (it only does on abort)
     pub async fn join(self) {
-        let _ = tokio::join!(self.transaction_task, self.dialog_task);
+        let _ = self.task.await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::SipTimers;
+    use crate::dos::RateLimitConfig;
+    use crate::register::InMemoryRegistrar;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
-    #[tokio::test]
-    async fn test_maintenance_config_default() {
-        let config = MaintenanceConfig::default();
-        assert_eq!(config.transaction_check_interval, Duration::from_millis(50));
-        assert_eq!(config.dialog_cleanup_interval, Duration::from_secs(30));
-        assert_eq!(config.dialog_idle_timeout, Duration::from_secs(300));
+    fn task(auth: Option<Arc<DigestAuthenticator>>) -> MaintenanceTask {
+        MaintenanceTask::new(
+            Arc::new(DosProtector::new(RateLimitConfig::default())),
+            auth,
+            Arc::new(InMemoryRegistrar::new()),
+            Arc::new(SecurityManager::new(Default::default())),
+            Arc::new(SbcMetrics::new()),
+            MaintenanceConfig::default(),
+        )
     }
 
     #[tokio::test]
-    async fn test_maintenance_task_creation() {
-        let tx_manager = Arc::new(TransactionManager::new());
-        let dlg_manager = Arc::new(DialogManager::new());
-        let config = MaintenanceConfig::default();
-
-        let task = MaintenanceTask::new(tx_manager, dlg_manager, config);
-        let stats = task.transaction_manager.stats();
-        assert_eq!(stats.client_transactions, 0);
-        assert_eq!(stats.server_transactions, 0);
+    async fn sweep_on_empty_tables_removes_nothing_and_zeroes_gauges() {
+        let t = task(None);
+        let report = t.sweep().await;
+        assert_eq!(report, SweepReport::default());
+        assert_eq!(t.metrics.dos_tracked_ips.load(Ordering::Relaxed), 0);
+        assert_eq!(t.metrics.auth_nonces.load(Ordering::Relaxed), 0);
+        assert_eq!(t.metrics.active_registrations.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn test_maintenance_task_start_abort() {
-        let tx_manager = Arc::new(TransactionManager::new());
-        let dlg_manager = Arc::new(DialogManager::new());
-        let config = MaintenanceConfig {
-            transaction_check_interval: Duration::from_millis(10),
-            dialog_cleanup_interval: Duration::from_millis(10),
-            dialog_idle_timeout: Duration::from_secs(1),
-        };
+    async fn sweep_refreshes_gauges_from_live_tables() {
+        let auth = Arc::new(DigestAuthenticator::new("sip.example.com", HashMap::new()));
+        let t = task(Some(auth.clone()));
+        for _ in 0..3 {
+            let _ = auth.generate_challenge().await;
+        }
+        for ip in ["203.0.113.5:5060", "203.0.113.6:5060"] {
+            let _ = t.dos.check_addr(ip.parse().unwrap()).await;
+        }
+        let report = t.sweep().await;
+        assert_eq!(report.nonces, 0, "fresh nonces are kept");
+        assert_eq!(t.metrics.auth_nonces.load(Ordering::Relaxed), 3);
+        assert_eq!(t.metrics.dos_tracked_ips.load(Ordering::Relaxed), 2);
+    }
 
-        let task = MaintenanceTask::new(tx_manager, dlg_manager, config);
-        let handle = task.start();
-
-        // Let it run for a bit
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Abort the tasks
+    #[tokio::test]
+    async fn sweeper_task_starts_and_aborts() {
+        let handle = task(None).start();
+        tokio::time::sleep(Duration::from_millis(20)).await;
         handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_maintenance_cleanup_transactions() {
-        use crate::transaction::TransactionManager;
-        use rsip::prelude::*;
-        use std::net::SocketAddr;
-
-        let tx_manager = Arc::new(TransactionManager::new());
-        let dlg_manager = Arc::new(DialogManager::new());
-
-        // Create a test transaction
-        let request_str = "INVITE sip:bob@example.com SIP/2.0\r\n\
-            Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK776asdhds\r\n\
-            Max-Forwards: 70\r\n\
-            To: Bob <sip:bob@example.com>\r\n\
-            From: Alice <sip:alice@example.com>;tag=1928301774\r\n\
-            Call-ID: test@127.0.0.1\r\n\
-            CSeq: 314159 INVITE\r\n\
-            Contact: <sip:alice@127.0.0.1:5060>\r\n\
-            Content-Length: 0\r\n\
-            \r\n";
-
-        let request = match rsip::SipMessage::try_from(request_str.as_bytes()).unwrap() {
-            rsip::SipMessage::Request(req) => req,
-            _ => panic!("Expected request"),
-        };
-
-        let dest: SocketAddr = "127.0.0.1:5060".parse().unwrap();
-        let _tx_id = tx_manager
-            .create_client_transaction(request, rsip::Transport::Udp, dest)
-            .unwrap();
-
-        // Start maintenance with short intervals
-        let config = MaintenanceConfig {
-            transaction_check_interval: Duration::from_millis(10),
-            dialog_cleanup_interval: Duration::from_millis(10),
-            dialog_idle_timeout: Duration::from_secs(1),
-        };
-
-        let task = MaintenanceTask::new(tx_manager.clone(), dlg_manager, config);
-        let handle = task.start();
-
-        // Let it run for a bit
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Check stats - transaction might be cleaned up or still active
-        let stats = tx_manager.stats();
-        assert!(stats.client_transactions + stats.server_transactions >= 0);
-
-        handle.abort();
+        handle.join().await;
     }
 }

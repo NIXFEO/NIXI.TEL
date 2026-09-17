@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+/// Upper bound on per-IP entries kept in memory (see `enforce_cap`).
+pub const MAX_TRACKED_IPS: usize = 100_000;
+
 /// Configuration du rate limiting
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
@@ -202,6 +205,9 @@ impl DosProtector {
         let max_violations = self.config.violations_before_blacklist;
 
         let mut states = self.ip_states.lock().await;
+        if !states.contains_key(&addr) {
+            self.enforce_cap(&mut states);
+        }
         let state = states
             .entry(addr)
             .or_insert_with(|| IpState::new(self.config.burst_size));
@@ -272,23 +278,52 @@ impl DosProtector {
         }
     }
 
-    /// Nettoyer les entrées inactives
-    pub async fn cleanup_expired(&self) {
+    /// Drop per-IP entries idle for longer than `cleanup_after_secs`
+    /// (blacklisted ones are kept). Returns the number removed. Run by the
+    /// maintenance sweeper; without it the map grows with every source IP
+    /// ever seen.
+    pub async fn cleanup_expired(&self) -> usize {
         let max_age = Duration::from_secs(self.config.cleanup_after_secs);
         let mut states = self.ip_states.lock().await;
-        let before = states.len();
-        states.retain(|_, state| {
-            // Garder si blacklisté (même si inactif)
-            if state.blacklisted_until.is_some() {
-                return true;
-            }
-            // Supprimer si inactif depuis trop longtemps
-            Instant::now().duration_since(state.last_seen) < max_age
-        });
-        let removed = before - states.len();
+        let removed = Self::evict_idle(&mut states, max_age);
         if removed > 0 {
             debug!("DoS cleanup: removed {} stale IP entries", removed);
         }
+        removed
+    }
+
+    /// Number of source IPs currently tracked (gauge).
+    pub async fn tracked_ips(&self) -> usize {
+        self.ip_states.lock().await.len()
+    }
+
+    fn evict_idle(states: &mut HashMap<IpAddr, IpState>, max_age: Duration) -> usize {
+        let before = states.len();
+        let now = Instant::now();
+        states.retain(|_, state| {
+            state.blacklisted_until.is_some() || now.duration_since(state.last_seen) < max_age
+        });
+        before - states.len()
+    }
+
+    /// Hard cap on tracked IPs: a spoofed-source flood must not grow the
+    /// map faster than the sweeper prunes it. Amortised: only runs when the
+    /// map is full, and each pass frees many entries.
+    fn enforce_cap(&self, states: &mut HashMap<IpAddr, IpState>) {
+        if states.len() < MAX_TRACKED_IPS {
+            return;
+        }
+        let max_age = Duration::from_secs(self.config.cleanup_after_secs);
+        let mut removed = Self::evict_idle(states, max_age / 4);
+        if states.len() >= MAX_TRACKED_IPS {
+            removed += Self::evict_idle(states, Duration::from_secs(10));
+        }
+        if states.len() >= MAX_TRACKED_IPS {
+            let before = states.len();
+            states.retain(|_, state| state.blacklisted_until.is_some());
+            removed += before - states.len();
+        }
+        warn!("DoS: tracked-IP cap {} reached — evicted {} idle entries", MAX_TRACKED_IPS, removed);
     }
 
     /// Statistiques globales

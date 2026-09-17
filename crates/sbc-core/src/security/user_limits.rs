@@ -121,6 +121,23 @@ impl UserLimitsManager {
             .collect()
     }
 
+    /// Drop rate windows with no attempt in the last minute; without this a
+    /// user's entry lives forever after a single call.
+    pub fn prune_idle_windows(&self) -> usize {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let idle: Vec<String> = self
+            .rate_windows
+            .iter()
+            .filter(|e| e.value().back().is_none_or(|t| now.duration_since(*t) > window))
+            .map(|e| e.key().clone())
+            .collect();
+        for user in &idle {
+            self.rate_windows.remove(user);
+        }
+        idle.len()
+    }
+
     /// Check limits for a new call attempt from `user` and record the
     /// attempt in the rate window when allowed.
     /// `current_concurrent` comes from the live B2buaManager.

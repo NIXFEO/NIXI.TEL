@@ -138,12 +138,20 @@ impl Sbc {
             }
         }
 
+        // RFC 3261 §8.1.1.7: the top Via must carry a magic-cookie branch —
+        // it is the transaction identity every CANCEL/ACK/response match
+        // relies on. (Formerly enforced as a side effect of the removed
+        // transaction layer, which answered nothing at all.)
+        if !request_has_rfc3261_branch(&request) {
+            warn!("INVITE from {} without an RFC 3261 Via branch — 400", source);
+            self.metrics.inc_sip_response(400);
+            let r400 = build_plain_response_for_request(&request, 400, "Bad Request - Via branch")?;
+            let data = r400.to_string().into_bytes();
+            return self.transport.reply(&data, source, transport, reply_tx).await;
+        }
+
         // ── Metrics: call attempted ──
         self.metrics.inc_call_attempted();
-
-        // Create server transaction
-        let tx_id = self.transactions.create_server_transaction(request.clone(), transport, source)?;
-        debug!("Created server transaction: {:?}", tx_id);
 
         // Extract Call-ID and caller tag
         let call_id = request.call_id_header()
@@ -1072,6 +1080,17 @@ impl Sbc {
     }
 }
 
+/// Top Via carries a `branch=z9hG4bK…` parameter (RFC 3261 §8.1.1.7).
+fn request_has_rfc3261_branch(request: &Request) -> bool {
+    request
+        .headers
+        .iter()
+        .find(|h| matches!(h, rsip::Header::Via(_)))
+        .map(|h| h.to_string())
+        .and_then(|via| via.find("branch=").map(|pos| via[pos + "branch=".len()..].starts_with("z9hG4bK")))
+        .unwrap_or(false)
+}
+
 /// Extract the URI from a Contact header value: `"Bob" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60`
 /// → `sip:b@1.2.3.4:5060;transport=tcp`. Falls back to the trimmed value.
 pub(crate) fn extract_contact_uri(value: &str) -> String {
@@ -1289,6 +1308,20 @@ Content-Length: 0\r\n\r\n";
         assert!(out.contains("Call-ID: xyz@host\r\n"));
         assert!(out.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
         assert!(out.ends_with("Content-Length: 22\r\n\r\nv=0\r\nm=audio 1 RTP/AVP 0\r\n"), "body intact: {}", out);
+    }
+
+    #[test]
+    fn rfc3261_branch_check() {
+        let parse = |raw: &str| match rsip::SipMessage::try_from(raw.as_bytes().to_vec()).unwrap() {
+            rsip::SipMessage::Request(r) => r,
+            _ => panic!(),
+        };
+        let ok = parse("INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKabc\r\nFrom: <sip:a@b>;tag=1\r\nTo: <sip:x@y>\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n");
+        assert!(request_has_rfc3261_branch(&ok));
+        let rfc2543 = parse("INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=oldstyle\r\nFrom: <sip:a@b>;tag=1\r\nTo: <sip:x@y>\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n");
+        assert!(!request_has_rfc3261_branch(&rfc2543));
+        let none = parse("INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h\r\nFrom: <sip:a@b>;tag=1\r\nTo: <sip:x@y>\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n");
+        assert!(!request_has_rfc3261_branch(&none));
     }
 
     #[test]

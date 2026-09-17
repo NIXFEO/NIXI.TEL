@@ -14,13 +14,10 @@ pub mod ice;
 pub mod dtls;
 // TURN relay is intentionally NOT implemented in the SBC: it runs on a
 // public IP and never needs TURN itself; browsers behind hostile NAT should
-// use an external TURN server (coturn) configured client-side. See docs/WEBRTC.md.
-#[cfg(feature = "turn")]
-pub mod turn;
+// use an external TURN server (coturn) configured client-side. See
+// docs/WEBRTC.md. WebRTC DataChannel (SCTP/DCEP) is out of scope for an
+// audio SBC.
 pub mod webrtc_handler;
-// WebRTC DataChannel (SCTP/DCEP) is out of scope for the audio SBC.
-#[cfg(feature = "data-channel")]
-pub mod data_channel;
 
 // Re-export main types
 pub use sdp::{SessionDescription, MediaDescription, MediaType, Connection, Origin, Attribute};
@@ -32,8 +29,4 @@ pub use srtp_crypto::{SrtpCrypto, SrtcpCrypto, derive_srtp_keys, derive_srtcp_ke
 pub use stun::{StunClient, StunMessage, StunMessageType};
 pub use ice::{IceAgent, IceCandidate, CandidateType, CandidatePair, IceStats};
 pub use dtls::{DtlsContext, DtlsManager, CertificateFingerprint, DtlsRole, DtlsSrtpKeys};
-#[cfg(feature = "turn")]
-pub use turn::{TurnClient, TurnAllocation, TurnStats, TurnMessageType};
 pub use webrtc_handler::{WebRtcSdpInfo, WebRtcSession};
-#[cfg(feature = "data-channel")]
-pub use data_channel::{DataChannelManager, DataChannel, DataChannelMessage, DataChannelStats};

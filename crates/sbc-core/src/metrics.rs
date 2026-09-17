@@ -111,6 +111,12 @@ pub struct SbcMetrics {
     /// Currently active SIP registrations
     pub active_registrations: Arc<AtomicU64>,
 
+    /// Source IPs tracked by the DoS limiter (bounded by the sweeper + cap).
+    pub dos_tracked_ips: Arc<AtomicU64>,
+
+    /// Outstanding digest nonces (bounded by the sweeper + cap).
+    pub auth_nonces: Arc<AtomicU64>,
+
     /// Unix timestamp (seconds) of the most recent CDR successfully written
     /// (0 = none since start). Lets monitoring alert when CDRs stop flowing —
     /// the failure mode where the CDR file silently went empty for weeks.
@@ -154,6 +160,8 @@ impl SbcMetrics {
             active_webrtc_calls:     Arc::new(AtomicU64::new(0)),
             allocated_ports:         Arc::new(AtomicU64::new(0)),
             active_registrations:    Arc::new(AtomicU64::new(0)),
+            dos_tracked_ips:         Arc::new(AtomicU64::new(0)),
+            auth_nonces:             Arc::new(AtomicU64::new(0)),
             last_cdr_written_time:   Arc::new(AtomicU64::new(0)),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -290,6 +298,14 @@ impl SbcMetrics {
         self.allocated_ports.store(n, Ordering::Relaxed);
     }
 
+    pub fn set_dos_tracked_ips(&self, n: u64) {
+        self.dos_tracked_ips.store(n, Ordering::Relaxed);
+    }
+
+    pub fn set_auth_nonces(&self, n: u64) {
+        self.auth_nonces.store(n, Ordering::Relaxed);
+    }
+
     pub fn set_active_registrations(&self, n: u64) {
         self.active_registrations.store(n, Ordering::Relaxed);
     }
@@ -352,6 +368,14 @@ impl SbcMetrics {
         gauge!("sbc_active_registrations",
                "Number of currently active SIP registrations",
                self.active_registrations.load(Ordering::Relaxed));
+
+        gauge!("sbc_dos_tracked_ips",
+               "Source IPs tracked by the DoS limiter",
+               self.dos_tracked_ips.load(Ordering::Relaxed));
+
+        gauge!("sbc_auth_nonces",
+               "Outstanding digest authentication nonces",
+               self.auth_nonces.load(Ordering::Relaxed));
 
         gauge!("sbc_last_cdr_written_timestamp_seconds",
                "Unix time of the last CDR written (0 = none since start)",
@@ -686,6 +710,12 @@ mod tests {
 
         let output = m.render_prometheus();
         assert!(output.contains("sbc_rtp_timeouts_total 2"));
+        m.set_dos_tracked_ips(7);
+        m.set_auth_nonces(3);
+        let output = m.render_prometheus();
+        assert!(output.contains("# TYPE sbc_dos_tracked_ips gauge"));
+        assert!(output.contains("sbc_dos_tracked_ips 7"));
+        assert!(output.contains("sbc_auth_nonces 3"));
         assert!(output.contains("# TYPE sbc_session_timer_422_retries counter"));
         assert!(output.contains("sbc_session_timer_422_retries_total 1"));
         assert!(output.contains("# TYPE sbc_last_cdr_written_timestamp_seconds gauge"));

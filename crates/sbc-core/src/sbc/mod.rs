@@ -16,9 +16,7 @@ use crate::acl::{AclManager, Direction};
 use crate::auth::{DigestAuthenticator, DigestChallenge, generate_digest_response};
 use crate::b2bua::B2buaManager;
 use crate::config::{DidMapping, NetworkConfig, SbcConfig};
-use crate::dialog::DialogManager;
 use crate::dos::{DosProtector, RateLimitConfig};
-use crate::http_server::{HttpServer, HttpServerConfig};
 use crate::maintenance::{MaintenanceConfig, MaintenanceHandle, MaintenanceTask};
 use crate::media::MediaManager;
 use crate::media::dtls::DtlsUdpBridge;
@@ -31,7 +29,6 @@ use crate::routing::trunk::NumberFormat;
 use crate::routing::{TrunkManager, TrunkConfig};
 use crate::storage::CdrManager;
 use crate::topology::{apply_topology_hiding_outbound, SbcIdentity};
-use crate::transaction::TransactionManager;
 use crate::transport::manager::TransportManager;
 use crate::transport::udp::ReceivedMessage;
 use crate::{Error, Result};
@@ -48,12 +45,6 @@ use tracing::{debug, error, info, warn};
 pub struct Sbc {
     /// Transport layer (UDP, TCP, TLS, WSS)
     transport: TransportManager,
-
-    /// Transaction layer (RFC 3261 state machines)
-    transactions: Arc<TransactionManager>,
-
-    /// Dialog layer (call state tracking)
-    dialogs: Arc<DialogManager>,
 
     /// Media layer (RTP proxy, SDP manipulation)
     media: Arc<MediaManager>,
@@ -130,70 +121,12 @@ pub struct Sbc {
 }
 
 impl Sbc {
-    /// Create a new SBC instance from full configuration (with optional Phase 5 management handler).
-    ///
-    /// If `management` is `Some`, the management API endpoints (users, DIDs, config/reload)
-    /// are wired into the HTTP server.  Pass `None` to omit them (existing behaviour).
-    pub async fn new_from_config_with_management(
-        config: &SbcConfig,
-        management: Option<Arc<dyn crate::api::ManagementHandler>>,
-    ) -> Result<Self> {
-        let sbc = Self::_new_from_config_inner(config).await?;
-        sbc.start_http_server(config, management).await;
-        Ok(sbc)
-    }
-
-    /// Create a new SBC instance from full configuration (no management handler).
+    /// Create a new SBC instance from full configuration. Nothing HTTP is
+    /// started here: the management API (axum, `sbc-management`) is
+    /// assembled by the binary from the SBC's handles, fail-closed on the
+    /// API token.
     pub async fn new_from_config(config: &SbcConfig) -> Result<Self> {
-        let sbc = Self::_new_from_config_inner(config).await?;
-        sbc.start_http_server(config, None).await;
-        Ok(sbc)
-    }
-
-    /// Create the SBC without starting the HTTP API — the caller wires the
-    /// management layer (e.g. SQLite-backed) and then calls
-    /// [`Sbc::start_http_server`] itself.
-    pub async fn new_from_config_without_http(config: &SbcConfig) -> Result<Self> {
         Self::_new_from_config_inner(config).await
-    }
-
-    /// Start the HTTP API + /metrics endpoint (no-op when disabled in config).
-    pub async fn start_http_server(
-        &self,
-        config: &SbcConfig,
-        management: Option<Arc<dyn crate::api::ManagementHandler>>,
-    ) {
-        if !config.management.api_enabled {
-            return;
-        }
-        let http_addr: std::net::SocketAddr = format!(
-            "{}:{}",
-            config.management.api_bind_address, config.management.api_port
-        )
-        .parse()
-        .unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap());
-
-        let mut http_config = HttpServerConfig::new(http_addr);
-        if let Some(ref token) = config.management.api_auth_token {
-            http_config = http_config.with_token(token.clone());
-        }
-        let mut http_server = HttpServer::new(
-            http_config,
-            self.metrics.clone(),
-            self.b2bua.clone(),
-            self.trunk_manager.clone(),
-        )
-        .with_registrar(self.register_handler.registrar())
-        .with_reload_notify(self.reload_notify.clone())
-        .with_cdr(self.cdr.clone());
-        if let Some(mgmt) = management {
-            http_server = http_server.with_management(mgmt);
-        }
-        if let Err(e) = http_server.start().await {
-            warn!("HTTP API server failed to start: {}", e);
-        } else {
-            info!("HTTP API + /metrics listening on http://{}", http_addr);
-        }
     }
 
     async fn _new_from_config_inner(config: &SbcConfig) -> Result<Self> {
@@ -422,8 +355,6 @@ impl Sbc {
 
         Ok(Self {
             transport: TransportManager::new(),
-            transactions: Arc::new(TransactionManager::new()),
-            dialogs: Arc::new(DialogManager::new()),
             media,
             b2bua,
             router,
@@ -694,8 +625,6 @@ impl Sbc {
 
         Self {
             transport: TransportManager::new(),
-            transactions: Arc::new(TransactionManager::new()),
-            dialogs: Arc::new(DialogManager::new()),
             media,
             b2bua,
             router,
@@ -1086,15 +1015,18 @@ impl Sbc {
         // Outbound TLS for TLS trunks (no plaintext fallback)
         self.register_trunk_tls_configs();
 
-        // Start maintenance tasks
+        // Start the maintenance sweeper (keeps the in-memory tables bounded)
         let config = maintenance_config.unwrap_or_default();
         let maintenance = MaintenanceTask::new(
-            self.transactions.clone(),
-            self.dialogs.clone(),
+            self.dos.clone(),
+            self.auth.clone(),
+            self.register_handler.registrar(),
+            self.security.clone(),
+            self.metrics.clone(),
             config,
         );
         self._maintenance = Some(maintenance.start());
-        info!("Maintenance tasks started");
+        info!("Maintenance sweeper started");
 
         info!("SBC started successfully");
         Ok(())
@@ -1465,8 +1397,6 @@ impl Sbc {
     // Accessors
     // =========================================================================
 
-    pub fn transactions(&self) -> &Arc<TransactionManager> { &self.transactions }
-    pub fn dialogs(&self) -> &Arc<DialogManager>           { &self.dialogs }
     pub fn transport_mut(&mut self) -> &mut TransportManager { &mut self.transport }
     pub fn media(&self) -> &Arc<MediaManager>              { &self.media }
     pub fn b2bua(&self) -> &Arc<B2buaManager>              { &self.b2bua }
@@ -2086,8 +2016,8 @@ mod tests {
     #[tokio::test]
     async fn test_sbc_creation() {
         let sbc = Sbc::new();
-        assert_eq!(sbc.transactions().stats().client_transactions, 0);
-        assert_eq!(sbc.dialogs().stats().total, 0);
+        assert_eq!(sbc.b2bua().stats().await.total_active, 0);
+        assert_eq!(sbc.media().stats().allocated_ports, 0);
     }
 
     #[tokio::test]

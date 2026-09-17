@@ -27,19 +27,13 @@ rustls-pemfile = "2.0"
 tokio-tungstenite = "0.21"
 
 # WebRTC
-webrtc = "0.9"
 webrtc-ice = "0.9"
 webrtc-dtls = "0.8"
 webrtc-util = { version = "0.8", features = ["conn"] }
 webrtc-srtp = "0.12"
 
 # Media
-rtp = "0.6"
-rtcp = "0.7"
 opus = "0.3"
-g711 = "0.3"
-rubato = "0.14"
-sdp = "0.5"
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate", "uuid", "chrono", "json"] }
@@ -69,7 +63,6 @@ subtle = "2.5"
 rcgen = "0.12"
 
 # Monitoring
-prometheus = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 

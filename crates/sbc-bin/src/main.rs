@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
 
     // Build integrated SBC from config (wires all modules). The management
     // API (axum) is assembled from the SBC's handles and spawned below.
-    let mut sbc = Sbc::new_from_config_without_http(&config).await?;
+    let mut sbc = Sbc::new_from_config(&config).await?;
 
     if config.management.api_enabled {
         // Resolve the management API token (env SBC_API_TOKEN overrides TOML)

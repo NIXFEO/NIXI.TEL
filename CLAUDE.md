@@ -90,15 +90,26 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `topology.rs` | Via/Contact/Record-Route rewriting (RFC 3261) |
 | `auth.rs` · `register.rs` | Digest auth (401/407, nonce); SIP registrar |
 | `metrics.rs` · `storage.rs` · `dos.rs` · `acl.rs` | Prometheus, CDR, rate limiting, IP ACLs |
+| `maintenance.rs` | 60 s sweeper: bounded in-memory tables + size gauges |
 | `crates/sbc-management/src/{server,state,routes/}` | axum API server |
 
-### Inactive / legacy modules
+### Removed legacy code (2026-09, lot 1)
 
-- `media/turn.rs`, `media/data_channel.rs` — feature-gated (`turn`,
-  `data-channel`); TURN is expected to be an external coturn (see docs/WEBRTC.md)
-- `tls_client.rs` — legacy simulated TLS, superseded by `transport/tls_connect.rs`
-- `http_server.rs`, `api.rs` — legacy hand-rolled HTTP, superseded by the axum server
-- `dialog/`, `transaction/` — state machines bypassed (B2BUA + stateless processing)
+The hand-rolled HTTP admin server (`http_server.rs`, `api.rs` — superseded
+by the axum server and fail-open without a token), the simulated TLS client
+(`tls_client.rs`), the unused `transaction/` and `dialog/` state machines
+(the B2BUA keeps per-attempt INVITE state itself in `b2bua.rs`), the
+Postgres stubs, the placeholder `sbc-media`/`sbc-security` crates and the
+feature-gated `media/turn.rs` / `media/data_channel.rs` were deleted. TURN
+is an external coturn (see docs/WEBRTC.md); DataChannel is out of scope.
+
+`maintenance.rs` is now the 60 s **sweeper** that keeps the in-memory tables
+bounded (DoS per-IP state, digest nonces, expired registrations, ban and
+per-user rate windows) and exports their sizes as gauges
+(`sbc_dos_tracked_ips`, `sbc_auth_nonces`, `sbc_active_registrations`).
+`DosProtector` and `DigestAuthenticator` also enforce hard caps
+(`MAX_TRACKED_IPS`, `MAX_NONCES`) so a spoofed-source flood cannot outrun
+the sweeper.
 
 ## REST API
 

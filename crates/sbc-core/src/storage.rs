@@ -1,13 +1,7 @@
-//! Storage — CDR et persistance PostgreSQL
+//! Storage — Call Detail Records (CDR).
 //!
-//! Enregistre les Call Detail Records (CDR) en base de données.
-//! Architecture async avec pool de connexions.
-//!
-//! Tables utilisées :
-//!   - calls       : sessions actives
-//!   - cdr         : historique des appels terminés
-//!   - trunks      : configuration des trunks
-//!   - auth_users  : utilisateurs SIP
+//! Two backends: in-memory (tests) and a JSON-lines file (production,
+//! `[general] cdr_file`). Dynamic configuration lives in `sbc-storage`.
 
 use crate::{Error, Result};
 use std::sync::Arc;
@@ -335,100 +329,6 @@ fn parse_cdr_json(json: &str) -> Option<CdrRecord> {
     })
 }
 
-/// Stockage PostgreSQL (production)
-pub struct PostgresCdrStorage {
-    /// URL de connexion postgres://user:pass@host/db
-    db_url: String,
-    /// Pool simulé : en production on utiliserait sqlx::PgPool
-    /// Pour éviter de compiler sqlx (très lourd), on utilise une implémentation
-    /// qui délègue à l'in-memory avec log des requêtes SQL.
-    inner: InMemoryCdrStorage,
-}
-
-impl PostgresCdrStorage {
-    pub async fn new(db_url: &str) -> Result<Self> {
-        info!("Initializing PostgreSQL CDR storage: {}", mask_password(db_url));
-
-        // En production réelle, on utiliserait:
-        // let pool = sqlx::PgPool::connect(db_url).await?;
-        // Pour l'instant on valide juste l'URL et utilise in-memory comme backend
-
-        if !db_url.starts_with("postgres") {
-            return Err(Error::Config(format!("Invalid PostgreSQL URL: {}", db_url)));
-        }
-
-        Ok(Self {
-            db_url: db_url.to_string(),
-            inner: InMemoryCdrStorage::new(),
-        })
-    }
-
-    /// Générer le SQL d'insertion (pour logging/debug)
-    fn insert_sql(record: &CdrRecord) -> String {
-        format!(
-            "INSERT INTO cdr (id, call_id, caller, callee, duration_secs, is_webrtc, disconnect_reason, started_at, ended_at) \
-             VALUES ('{}', '{}', '{}', '{}', {}, {}, '{}', to_timestamp({}), to_timestamp({}))",
-            record.id,
-            record.call_id.replace('\'', "''"),
-            record.caller.replace('\'', "''"),
-            record.callee.replace('\'', "''"),
-            record.duration_secs,
-            record.is_webrtc,
-            record.disconnect_reason.replace('\'', "''"),
-            record.started_at,
-            record.ended_at,
-        )
-    }
-}
-
-#[async_trait::async_trait]
-impl CdrStorage for PostgresCdrStorage {
-    async fn insert_cdr(&self, record: &CdrRecord) -> Result<()> {
-        debug!("PostgreSQL CDR SQL: {}", Self::insert_sql(record));
-        self.inner.insert_cdr(record).await
-    }
-
-    async fn get_cdr(&self, call_id: &str) -> Result<Option<CdrRecord>> {
-        self.inner.get_cdr(call_id).await
-    }
-
-    async fn list_recent_cdrs(&self, limit: usize) -> Result<Vec<CdrRecord>> {
-        self.inner.list_recent_cdrs(limit).await
-    }
-
-    async fn stats(&self) -> StorageStats {
-        let mut stats = self.inner.stats().await;
-        stats.backend = format!("postgresql:{}", extract_host(&self.db_url));
-        stats
-    }
-}
-
-/// Masquer le mot de passe dans une URL de connexion
-fn mask_password(url: &str) -> String {
-    // postgres://user:PASSWORD@host/db → postgres://user:***@host/db
-    if let Some(at_pos) = url.find('@') {
-        if let Some(colon_pos) = url[..at_pos].rfind(':') {
-            let before = &url[..colon_pos + 1];
-            let after = &url[at_pos..];
-            return format!("{}***{}", before, after);
-        }
-    }
-    url.to_string()
-}
-
-/// Extraire le host d'une URL postgres
-fn extract_host(url: &str) -> String {
-    // postgres://user:pass@HOST:PORT/db
-    if let Some(at_pos) = url.find('@') {
-        let rest = &url[at_pos + 1..];
-        if let Some(slash_pos) = rest.find('/') {
-            return rest[..slash_pos].to_string();
-        }
-        return rest.to_string();
-    }
-    "unknown".to_string()
-}
-
 /// UUID v4 simple (hex aléatoire)
 fn uuid_v4() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -620,28 +520,6 @@ mod tests {
         assert_eq!(stats.total_cdrs, 3);
         assert_eq!(stats.total_inserts, 3);
         assert_eq!(stats.backend, "memory");
-    }
-
-    #[tokio::test]
-    async fn test_postgres_storage_invalid_url() {
-        let result = PostgresCdrStorage::new("mysql://localhost/db").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_postgres_storage_valid_url() {
-        let storage = PostgresCdrStorage::new("postgresql://sbc:pass@localhost/sbc_db").await.unwrap();
-        let stats = storage.stats().await;
-        assert!(stats.backend.contains("postgresql"));
-    }
-
-    #[tokio::test]
-    async fn test_mask_password() {
-        let masked = mask_password("postgresql://sbc:secret123@localhost/sbc_db");
-        assert!(masked.contains("***"));
-        assert!(!masked.contains("secret123"));
-        assert!(masked.contains("sbc"));
-        assert!(masked.contains("localhost"));
     }
 
     #[tokio::test]

@@ -304,6 +304,9 @@ pub struct DigestAuthenticator {
     users: Arc<RwLock<HashMap<String, String>>>,
 }
 
+/// Upper bound on outstanding nonces (see `generate_challenge`).
+pub const MAX_NONCES: usize = 100_000;
+
 impl DigestAuthenticator {
     /// Create with realm and a map of username → plain password
     pub fn new(realm: impl Into<String>, users: HashMap<String, String>) -> Self {
@@ -372,7 +375,23 @@ impl DigestAuthenticator {
             created_at: Self::now_secs(),
             use_count: 0,
         };
-        self.nonces.lock().await.insert(nonce.clone(), record);
+        let mut nonces = self.nonces.lock().await;
+        if nonces.len() >= MAX_NONCES {
+            // A challenge is minted per unauthenticated request: a scanner
+            // can create them faster than the sweeper prunes. Evict the
+            // expired, then the older half, before accepting a new one.
+            let now = Self::now_secs();
+            nonces.retain(|_, r| now.saturating_sub(r.created_at) <= self.nonce_ttl);
+            if nonces.len() >= MAX_NONCES {
+                nonces.retain(|_, r| now.saturating_sub(r.created_at) <= self.nonce_ttl / 2);
+            }
+            if nonces.len() >= MAX_NONCES {
+                nonces.clear();
+            }
+            tracing::warn!("Digest: nonce cap {} reached — evicted old challenges", MAX_NONCES);
+        }
+        nonces.insert(nonce.clone(), record);
+        drop(nonces);
 
         format!(
             r#"Digest realm="{}", nonce="{}", algorithm=MD5, qop="auth""#,
@@ -425,11 +444,14 @@ impl DigestAuthenticator {
         Ok(creds.username.clone())
     }
 
-    /// Remove expired nonces (call periodically)
-    pub async fn cleanup_nonces(&self) {
+    /// Remove expired nonces (run by the maintenance sweeper). Returns the
+    /// number removed.
+    pub async fn cleanup_nonces(&self) -> usize {
         let now = Self::now_secs();
         let mut nonces = self.nonces.lock().await;
+        let before = nonces.len();
         nonces.retain(|_, r| now.saturating_sub(r.created_at) <= self.nonce_ttl);
+        before - nonces.len()
     }
 
 
