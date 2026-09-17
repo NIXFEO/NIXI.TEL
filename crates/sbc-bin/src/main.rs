@@ -8,30 +8,33 @@ use sbc_core::config::SbcConfig;
 use sbc_core::Sbc;
 use sbc_management::state::AppState;
 use std::path::PathBuf;
-use structopt::StructOpt;
+use clap::Parser;
 use tracing::{info, warn};
 
-#[derive(Debug, StructOpt)]
-#[structopt(name = "sbc", about = "NIXI.TEL SBC - Session Border Controller")]
+/// Build identity: crate version + git commit (see build.rs).
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SBC_GIT_SHA"), ")");
+
+#[derive(Debug, Parser)]
+#[command(name = "sbc", about = "NIXI.TEL SBC - Session Border Controller", version = VERSION)]
 struct Opt {
     /// Path to configuration file
-    #[structopt(short, long, default_value = "config/dev.toml")]
+    #[arg(short, long, default_value = "config/dev.toml")]
     config: PathBuf,
 
     /// Enable verbose logging
-    #[structopt(short, long)]
+    #[arg(short, long)]
     verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     // Initialize tracing
     init_logging(opt.verbose);
 
     info!("Starting NIXI.TEL SBC");
-    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    info!("Version: {}", VERSION);
 
     // Load configuration
     let config_path = opt.config.to_str().unwrap().to_string();

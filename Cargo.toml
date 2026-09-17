@@ -8,6 +8,12 @@ members = [
 exclude = ["rsip-nixi"]
 resolver = "2"
 
+[workspace.package]
+version = "0.20.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/NIXFEO/NIXI.TEL"
+
 [workspace.dependencies]
 # rsip pour SIP
 rsip = { version = "0.4", path = "rsip-nixi" }
@@ -36,7 +42,7 @@ webrtc-srtp = "0.12"
 opus = "0.3"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "macros", "uuid", "chrono", "json"] }
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }
@@ -69,10 +75,14 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Configuration
 config = "0.13"
 ipnetwork = "0.20"
-trust-dns-resolver = "0.23"
 
 # Async traits
 async-trait = "0.1"
 
 # OS interface
 libc = "0.2"
+
+[profile.release]
+# Symbols are useless on the box (no debugger there) and cost ~30% of the
+# binary; keep the default codegen so a full build still fits a 2 GB VPS.
+strip = "symbols"

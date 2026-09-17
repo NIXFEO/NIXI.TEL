@@ -322,6 +322,16 @@ against your WSS listener (see [WEBRTC.md](WEBRTC.md)).
 
 ## 10. Upgrades & rollback
 
+`scripts/deploy.sh user@host` automates the whole sequence below for a box
+that builds locally: rsync of the sources, timestamped backups, a temporary
+swapfile and a memory-capped release build (see the small-VPS note), a
+refusal to restart while calls are active, graceful stop, binary swap,
+start, `/health`, the API smoke test and swap removal. `--dry-run` shows what
+would change; `--rollback` restores the most recent backups. The binary
+reports the deployed commit in `sbc --version` and at startup.
+
+Manual equivalent:
+
 ```bash
 git pull && cargo build --release
 sudo cp /usr/local/bin/sbc /usr/local/bin/sbc.bak      # keep previous
