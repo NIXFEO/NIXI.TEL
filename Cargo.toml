@@ -58,7 +58,7 @@ bytes = "1.5"
 thiserror = "1.0"
 anyhow = "1.0"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 
 # Crypto for SRTP and DTLS
 aes = "0.8"
