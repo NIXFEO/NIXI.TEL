@@ -97,6 +97,10 @@ pub struct SbcMetrics {
     /// SIP responses by status code (200, 401, 403, 486, 503 etc.)
     pub sip_responses_by_code: Arc<std::sync::Mutex<HashMap<u16, u64>>>,
 
+    /// SIP messages the SBC could not send, by transport (udp/tcp/tls/ws/wss).
+    /// Any non-zero rate means calls are ending in ghost sessions.
+    pub sip_send_failures: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+
     // ── Gauges (current value) ────────────────────────────────────────────────
 
     /// Currently active calls
@@ -156,6 +160,7 @@ impl SbcMetrics {
             rtp_timeouts_total:      Arc::new(AtomicU64::new(0)),
             session_timer_422_retries_total: Arc::new(AtomicU64::new(0)),
             sip_responses_by_code:   Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sip_send_failures:       Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_calls:            Arc::new(AtomicU64::new(0)),
             active_webrtc_calls:     Arc::new(AtomicU64::new(0)),
             allocated_ports:         Arc::new(AtomicU64::new(0)),
@@ -185,6 +190,21 @@ impl SbcMetrics {
         if (500..600).contains(&code) { self.sip_5xx_total.fetch_add(1, Ordering::Relaxed); }
         if let Ok(mut map) = self.sip_responses_by_code.lock() {
             *map.entry(code).or_insert(0) += 1;
+        }
+    }
+
+    /// Count a SIP message the transport layer failed to send.
+    pub fn inc_sip_send_failure(&self, transport: rsip::Transport) {
+        let label = match transport {
+            rsip::Transport::Udp => "udp",
+            rsip::Transport::Tcp => "tcp",
+            rsip::Transport::Tls => "tls",
+            rsip::Transport::Ws => "ws",
+            rsip::Transport::Wss => "wss",
+            _ => "other",
+        };
+        if let Ok(mut map) = self.sip_send_failures.lock() {
+            *map.entry(label).or_insert(0) += 1;
         }
     }
 
@@ -411,6 +431,16 @@ impl SbcMetrics {
                     "sbc_sip_responses_by_code{{code=\"{}\"}} {}\n",
                     code, count
                 ));
+            }
+        }
+
+        out.push_str("# HELP sbc_sip_send_failures_total SIP messages the SBC could not send, by transport\n");
+        out.push_str("# TYPE sbc_sip_send_failures_total counter\n");
+        if let Ok(map) = self.sip_send_failures.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort();
+            for (transport, count) in entries {
+                out.push_str(&format!("sbc_sip_send_failures_total{{transport=\"{}\"}} {}\n", transport, count));
             }
         }
 

@@ -37,6 +37,16 @@ groups:
         annotations:
           summary: "Trunk demands a Session-Expires above the configured value (422 retries ongoing)"
 
+      - alert: SBCSipSendFailures
+        # The SBC could not deliver SIP messages (dead TCP/TLS peer, closed
+        # WS channel, unregistered TLS destination): calls end in ghost
+        # sessions. Look at the "SIP send failed" warnings for the peer.
+        expr: rate(sbc_sip_send_failures_total[10m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "SIP messages are failing to send ({{ $labels.transport }})"
+
       - alert: SBCAuthFailureSpike
         expr: rate(sbc_auth_failures_total[5m]) > 5
         for: 10m

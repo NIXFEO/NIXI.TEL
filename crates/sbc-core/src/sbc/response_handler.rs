@@ -93,7 +93,7 @@ impl Sbc {
                     {
                         debug!("{} for session refresh CSeq {} (call {}) — duplicate, re-ACKed", status, resp_cseq, uuid);
                         if let Some(ack) = ack {
-                            let _ = self.transport.reply(ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                            self.send_sip("ACK (refresh duplicate) → callee", ack.as_bytes(), dest, tp, tx.as_ref()).await;
                         }
                         return Ok(());
                     }
@@ -144,7 +144,7 @@ impl Sbc {
                             raw
                         };
 
-                        let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+                        self.send_sip("1xx → caller", raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
                     }
                 }
                 200..=299 => {
@@ -573,7 +573,7 @@ impl Sbc {
                         let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
                         let raw = rsip::SipMessage::Response(response_to_relay).to_string();
                         let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref(), caller_cseq);
-                        let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+                        self.send_sip("200 OK → caller", raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
                     }
                 }
                 407 => {
@@ -668,7 +668,7 @@ impl Sbc {
                             }
                             if let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, &to) {
                                 debug!("{} for terminated call (Call-ID {}) — ACK → {}", status, call_id, attempt.dest);
-                                let _ = self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, reply_tx).await;
+                                self.send_sip("ACK (after teardown) → callee", ack.as_bytes(), attempt.dest, attempt.transport, reply_tx).await;
                                 return Ok(());
                             }
                         }
@@ -724,8 +724,8 @@ impl Sbc {
             &crate::sip_builder::DialogInfo { cseq: cseq + 1, ..d },
             Some(reason),
         );
-        let _ = self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, tx).await;
-        let _ = self.transport.reply(bye.as_bytes(), attempt.dest, attempt.transport, tx).await;
+        self.send_sip("ACK (orphan 2xx) → callee", ack.as_bytes(), attempt.dest, attempt.transport, tx).await;
+        self.send_sip("BYE (orphan 2xx) → callee", bye.as_bytes(), attempt.dest, attempt.transport, tx).await;
     }
 
     /// The peer no longer has the dialog (481/408 to our refresh, or the
@@ -736,7 +736,7 @@ impl Sbc {
         if let Some(bye) = self.b2bua.build_relay_bye_toward_caller(uuid, &sbc_ip, sbc_port).await {
             if let Some((tx, addr, tp)) = self.b2bua.get_caller_reply_info(uuid).await {
                 info!("Session refresh {}: dialog lost on the trunk — BYE → caller {} (call {})", status, addr, uuid);
-                let _ = self.transport.reply(bye.as_bytes(), addr, tp, tx.as_ref()).await;
+                self.send_sip("BYE (dialog lost) → caller", bye.as_bytes(), addr, tp, tx.as_ref()).await;
             }
         } else {
             warn!("Session refresh {}: dialog lost on the trunk, no caller dialog identity — releasing call {}", status, uuid);
@@ -787,7 +787,7 @@ impl Sbc {
         if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
             let caller_vias = self.b2bua.get_caller_vias(uuid).await;
             let raw = rewrite_response_for_caller(&raw_response, &caller_vias, self.identity.as_ref(), caller_cseq);
-            let _ = self.transport.reply(raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+            self.send_sip("error response → caller", raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
         }
         self.b2bua.terminate_call(uuid).await;
         self.metrics.inc_call_failed();
@@ -826,7 +826,7 @@ impl Sbc {
                     self.b2bua.complete_session_refresh(uuid, cseq, &sbc_ip, sbc_port).await
                 {
                     info!("Session refresh 200 OK consumed (call {}) — sending ACK", uuid);
-                    let _ = self.transport.reply(ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                    self.send_sip("ACK (refresh) → callee", ack.as_bytes(), dest, tp, tx.as_ref()).await;
                 }
             }
             _ => {
@@ -837,7 +837,7 @@ impl Sbc {
                 };
                 match outcome.ack {
                     Some(ack) => {
-                        let _ = self.transport.reply(ack.as_bytes(), outcome.dest, outcome.transport, outcome.reply_tx.as_ref()).await;
+                        self.send_sip("ACK (refresh rejected) → callee", ack.as_bytes(), outcome.dest, outcome.transport, outcome.reply_tx.as_ref()).await;
                     }
                     None => warn!("Session refresh {} for call {}: no stored re-INVITE — cannot ACK", status, uuid),
                 }
@@ -885,7 +885,7 @@ impl Sbc {
             _ => {
                 if let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to) {
                     debug!("{} for superseded INVITE (call {}, CSeq {}) — ACK → {}, dropped", status, uuid, cseq, attempt.dest);
-                    let _ = self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
+                    self.send_sip("ACK (stale) → callee", ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
                 }
             }
         }

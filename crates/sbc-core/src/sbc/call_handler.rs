@@ -64,7 +64,7 @@ impl Sbc {
                 sbc_ip, &uuid[..8], caller_addr.ip(),
                 call_id
             ));
-            let _ = self.transport.reply(
+            self.send_sip("timeout BYE → caller", 
                 bye_caller.as_bytes(), caller_addr, caller_transport,
                 caller_tx.as_ref(),
             ).await;
@@ -86,7 +86,7 @@ impl Sbc {
                     sbc_ip, &uuid[..8], dest.ip(),
                     callee_call_id
                 ));
-                let _ = self.transport.reply(
+                self.send_sip("timeout BYE → callee", 
                     bye_callee.as_bytes(), dest, callee_transport,
                     callee_tx.as_ref(),
                 ).await;
@@ -165,7 +165,7 @@ impl Sbc {
                 call_id
             ));
             info!("Shutdown BYE → caller {} (call {})", caller_addr, &uuid[..8]);
-            let _ = self.transport.reply(
+            self.send_sip("shutdown BYE → caller", 
                 bye_caller.as_bytes(), caller_addr, caller_transport,
                 caller_tx.as_ref(),
             ).await;
@@ -176,7 +176,7 @@ impl Sbc {
             if let Some(dest) = callee_dest {
                 if let (None, Some(cancel)) = (&bye_toward_callee, &cancel_toward_callee) {
                     info!("Shutdown CANCEL → callee {} (call {}, INVITE pending)", dest, &uuid[..8]);
-                    let _ = self.transport.reply(
+                    self.send_sip("shutdown CANCEL → callee", 
                         cancel.as_bytes(), dest, callee_transport,
                         callee_tx.as_ref(),
                     ).await;
@@ -197,7 +197,7 @@ impl Sbc {
                         callee_call_id
                     ));
                     info!("Shutdown BYE → callee {} (call {})", dest, &uuid[..8]);
-                    let _ = self.transport.reply(
+                    self.send_sip("shutdown BYE → callee", 
                         bye_callee.as_bytes(), dest, callee_transport,
                         callee_tx.as_ref(),
                     ).await;
@@ -321,7 +321,7 @@ impl Sbc {
                 );
 
                 info!("Relaying ACK to callee at {} via {:?}:\n{}", callee_dest, callee_transport, ack_msg.trim());
-                let _ = self.transport.reply(
+                self.send_sip("ACK → callee", 
                     ack_msg.as_bytes(),
                     callee_dest,
                     callee_transport,
@@ -428,7 +428,7 @@ impl Sbc {
                         self.apply_outbound_topology(&raw_bye, callee_transport)
                     };
                     info!("BYE relayed to callee:\n{}", bye_out);
-                    let _ = self.transport.reply(
+                    self.send_sip("BYE → callee", 
                         bye_out.as_bytes(),
                         callee_dest,
                         callee_transport,
@@ -464,7 +464,7 @@ impl Sbc {
                         }
                         self.apply_outbound_topology(&raw_bye, caller_transport)
                     };
-                    let _ = self.transport.reply(
+                    self.send_sip("BYE → caller", 
                         bye_out.as_bytes(),
                         caller_addr,
                         caller_transport,
@@ -571,7 +571,7 @@ impl Sbc {
             if let Some((attempt, tx)) = current_attempt {
                 if let Some(cancel) = crate::sip_builder::build_cancel(&attempt.raw) {
                     info!("B2BUA: CANCEL → callee {} (from INVITE attempt CSeq {})", attempt.dest, attempt.cseq);
-                    let _ = self.transport.reply(cancel.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
+                    self.send_sip("CANCEL → callee", cancel.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
                 } else {
                     warn!("B2BUA: stored INVITE for call {} is not parseable — CANCEL not sent", uuid);
                 }
@@ -581,7 +581,7 @@ impl Sbc {
                 info!("B2BUA: relaying CANCEL to callee at {}", callee_dest);
                 let raw_cancel = rsip::SipMessage::Request(request.clone()).to_string();
                 let cancel_out = self.apply_outbound_topology(&raw_cancel, callee_transport);
-                let _ = self.transport.reply(
+                self.send_sip("CANCEL relay → callee", 
                     cancel_out.as_bytes(),
                     callee_dest,
                     callee_transport,
@@ -685,7 +685,7 @@ impl Sbc {
             warn!("WS closed mid-call: terminating call {} (peer {})", &uuid[..8.min(uuid.len())], peer);
 
             if let (Some(bye), Some(dest)) = (bye, dest) {
-                let _ = self.transport.reply(bye.as_bytes(), dest, tp, tx.as_ref()).await;
+                self.send_sip("ws-close BYE", bye.as_bytes(), dest, tp, tx.as_ref()).await;
             }
             if let Some(mid) = media_id {
                 let _ = self.media.terminate_session(&mid);
@@ -840,12 +840,12 @@ impl Sbc {
                 if let Some((tx, dest, tp)) = self.b2bua.get_callee_reply_info(&uuid).await {
                     info!("B2BUA: relaying INFO (caller→callee) to {}", dest);
                     let out = self.apply_outbound_topology(&raw_info, tp);
-                    let _ = self.transport.reply(out.as_bytes(), dest, tp, tx.as_ref()).await;
+                    self.send_sip("INFO → callee", out.as_bytes(), dest, tp, tx.as_ref()).await;
                 }
             } else if let Some((tx, dest, tp)) = self.b2bua.get_caller_reply_info(&uuid).await {
                 info!("B2BUA: relaying INFO (callee→caller) to {}", dest);
                 let out = self.apply_outbound_topology(&raw_info, tp);
-                let _ = self.transport.reply(out.as_bytes(), dest, tp, tx.as_ref()).await;
+                self.send_sip("INFO → caller", out.as_bytes(), dest, tp, tx.as_ref()).await;
             }
         } else {
             debug!("INFO: no matching call for Call-ID {} — answering 200 anyway", call_id);
@@ -926,7 +926,7 @@ impl Sbc {
             {
                 info!("REFER: relaying to callee at {}", callee_dest);
                 let raw = rsip::SipMessage::Request(request).to_string();
-                let _ = self.transport.reply(
+                self.send_sip("REFER → callee", 
                     raw.as_bytes(), callee_dest, callee_transport,
                     callee_reply_tx.as_ref(),
                 ).await;
@@ -937,7 +937,7 @@ impl Sbc {
             {
                 info!("REFER: relaying to caller at {}", caller_addr);
                 let raw = rsip::SipMessage::Request(request).to_string();
-                let _ = self.transport.reply(
+                self.send_sip("REFER → caller", 
                     raw.as_bytes(), caller_addr, caller_transport,
                     caller_reply_tx.as_ref(),
                 ).await;

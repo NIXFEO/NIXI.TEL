@@ -180,7 +180,7 @@ impl Sbc {
         if let Ok(trying) = build_trying(&request) {
             self.metrics.inc_sip_response(100);
             let data = trying.to_string().into_bytes();
-            let _ = self.transport.reply(&data, source, transport, reply_tx).await;
+            self.send_sip("100 Trying → caller", &data, source, transport, reply_tx).await;
             debug!("Sent 100 Trying to {}", source);
         }
 
@@ -199,7 +199,7 @@ impl Sbc {
                 warn!("B2BUA create_call failed: {}", e);
                 self.metrics.inc_sip_response(500);
                 let response_500 = build_plain_response(500, "Server Internal Error");
-                let _ = self.transport.reply(response_500.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip("500 → caller", response_500.as_bytes(), source, transport, reply_tx).await;
                 return Ok(());
             }
         };
@@ -347,7 +347,7 @@ impl Sbc {
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(480);
                     let response_480 = build_plain_response(480, "Temporarily Unavailable");
-                    let _ = self.transport.reply(response_480.as_bytes(), source, transport, reply_tx).await;
+                    self.send_sip("480 → caller", response_480.as_bytes(), source, transport, reply_tx).await;
                     return Ok(());
                 }
             }
@@ -362,7 +362,7 @@ impl Sbc {
             self.metrics.inc_call_failed();
             self.metrics.inc_sip_response(480);
             let response_480 = build_plain_response(480, "Temporarily Unavailable");
-            let _ = self.transport.reply(response_480.as_bytes(), source, transport, reply_tx).await;
+            self.send_sip("480 → caller", response_480.as_bytes(), source, transport, reply_tx).await;
             return Ok(());
         } else {
             // No DID match and no registered user — fall back to trunk routing
@@ -389,7 +389,7 @@ impl Sbc {
                     self.metrics.inc_sip_response(403);
                     let r403 = build_plain_response_for_request(&request, 403, "Forbidden - Destination Blocked")?;
                     let data = r403.to_string().into_bytes();
-                    let _ = self.transport.reply(&data, source, transport, reply_tx).await;
+                    self.send_sip("403 → caller", &data, source, transport, reply_tx).await;
                     return Ok(());
                 }
             }
@@ -401,7 +401,7 @@ impl Sbc {
                 self.metrics.inc_call_failed();
                 self.metrics.inc_sip_response(503);
                 let response_503 = build_plain_response(503, "Service Unavailable");
-                let _ = self.transport.reply(response_503.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip("503 → caller", response_503.as_bytes(), source, transport, reply_tx).await;
                 return Ok(());
             }
             let trunk = candidates.remove(0);
@@ -447,7 +447,7 @@ impl Sbc {
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(503);
                     let response_503 = build_plain_response(503, "Service Unavailable");
-                    let _ = self.transport.reply(response_503.as_bytes(), source, transport, reply_tx).await;
+                    self.send_sip("503 → caller", response_503.as_bytes(), source, transport, reply_tx).await;
                     return Ok(());
                 }
             };

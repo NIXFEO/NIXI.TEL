@@ -1155,7 +1155,7 @@ impl Sbc {
             if !self.security.bans.silent_drop() {
                 self.metrics.inc_sip_response(403);
                 let response_403 = build_plain_response(403, "Forbidden");
-                let _ = self.transport.reply(response_403.as_bytes(), source, transport, reply_tx.as_ref()).await;
+                self.send_sip("403 (banned) → source", response_403.as_bytes(), source, transport, reply_tx.as_ref()).await;
             }
             return Ok(());
         }
@@ -1175,7 +1175,7 @@ impl Sbc {
             self.metrics.inc_dos_blocked();
             self.metrics.inc_sip_response(503);
             let response_503 = build_plain_response(503, "Service Unavailable");
-            let _ = self.transport.reply(response_503.as_bytes(), source, transport, reply_tx.as_ref()).await;
+            self.send_sip("503 (rate-limited) → source", response_503.as_bytes(), source, transport, reply_tx.as_ref()).await;
             return Ok(());
         }
 
@@ -1218,7 +1218,7 @@ impl Sbc {
                 warn!("Unhandled SIP method: {}", method);
                 self.metrics.inc_sip_response(501);
                 let response_501 = build_plain_response(501, "Not Implemented");
-                let _ = self.transport.reply(response_501.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip("501 → source", response_501.as_bytes(), source, transport, reply_tx).await;
                 Ok(())
             }
         }
@@ -1390,8 +1390,31 @@ impl Sbc {
                 warn!("Registration failed for {}: {}", aor, e);
                 self.metrics.inc_sip_response(500);
                 let response_500 = build_plain_response(500, "Server Internal Error");
-                let _ = self.transport.reply(response_500.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip("500 → REGISTER", response_500.as_bytes(), source, transport, reply_tx).await;
                 Ok(())
+            }
+        }
+    }
+
+    /// Send a SIP message on a leg and account for the outcome. A send that
+    /// fails (no UDP listener, unregistered TLS destination, dead TCP peer,
+    /// closed WS channel) is logged with what was being sent and counted in
+    /// `sbc_sip_send_failures_total{transport}` — a ghost call must never
+    /// hide behind a clean log. Returns whether the send succeeded.
+    pub(crate) async fn send_sip(
+        &self,
+        what: &str,
+        data: &[u8],
+        dest: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+    ) -> bool {
+        match self.transport.reply(data, dest, transport, reply_tx).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("SIP send failed: {} → {} via {:?}: {}", what, dest, transport, e);
+                self.metrics.inc_sip_send_failure(transport);
+                false
             }
         }
     }
@@ -2062,6 +2085,24 @@ mod tests {
         let sbc = Sbc::new_from_config(&config).await.unwrap();
         assert!(sbc.auth.is_some());
         assert!(sbc.enable_digest_auth);
+    }
+}
+
+#[cfg(test)]
+mod send_sip_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_sends_are_counted_per_transport() {
+        let sbc = Sbc::new();
+        let dest: SocketAddr = "203.0.113.1:5061".parse().unwrap();
+        // No WSS connection channel and no listener: the send cannot succeed.
+        let sent = sbc.send_sip("test BYE", b"BYE sip:x SIP/2.0\r\n\r\n", dest, rsip::Transport::Wss, None).await;
+        assert!(!sent);
+        let failures = sbc.metrics.sip_send_failures.lock().unwrap().clone();
+        assert_eq!(failures.get("wss"), Some(&1));
+        let output = sbc.metrics.render_prometheus();
+        assert!(output.contains("sbc_sip_send_failures_total{transport=\"wss\"} 1"), "{}", output);
     }
 }
 
