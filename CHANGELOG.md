@@ -158,6 +158,22 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   that lifts bans).
 
 ### Added
+- Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
+  `consecutive_failures` and the cooldown were only ever touched by the
+  OPTIONS health check, so `max_concurrent_calls` and the failure ladder
+  never applied to traffic. Every call now counts on the trunk its outbound
+  leg (or its inbound source) is on, moves with a failover and is released
+  by `finish_call`; 408/5xx/6xx and unanswered attempts count as trunk
+  failures (3 in a row → 30 s, then 2 min, then 5 min without new calls), a
+  `503 Retry-After` parks the trunk for exactly that long (1 s–1 h), a 200
+  OK resets. New metrics: `sbc_trunk_up{trunk}` (once the trunk answered
+  OPTIONS at least once), `sbc_trunk_registered{trunk}`,
+  `sbc_trunk_active_calls{trunk}`, `sbc_trunk_calls_total{trunk,outcome}`
+  (answered / failed / cancelled / timeout — ASR = answered / all), and the
+  histograms `sbc_call_setup_seconds` (INVITE → answer, answered calls) and
+  `sbc_call_duration_seconds` (billable window). Alert rules
+  `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
+  `SBCTrunkParked` and a "Trunks" Grafana row ship in `monitoring/`.
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP
   state, digest nonces, expired registrations, ban and per-user rate
   windows) with hard caps and gauges `sbc_dos_tracked_ips`,

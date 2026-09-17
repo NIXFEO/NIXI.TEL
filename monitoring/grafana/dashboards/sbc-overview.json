@@ -1255,7 +1255,7 @@
     {
       "id": 27,
       "type": "row",
-      "title": "Health",
+      "title": "Trunks",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1268,6 +1268,543 @@
     {
       "id": 28,
       "type": "stat",
+      "title": "Trunks up",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sum(sbc_trunk_up)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "Trunks down",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "count(sbc_trunk_up == 0) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "Trunk registrations failing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "count(sbc_trunk_registered == 0) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Calls on trunks",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sum(sbc_trunk_active_calls)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Setup p95 (30m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(sbc_call_setup_seconds_bucket[30m])) by (le))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 33,
+      "type": "stat",
+      "title": "Duration p50 (1h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "histogram_quantile(0.5, sum(rate(sbc_call_duration_seconds_bucket[1h])) by (le))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Trunk health (1 = answers OPTIONS)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_trunk_up",
+          "refId": "A",
+          "legendFormat": "{{trunk}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Active calls per trunk",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_trunk_active_calls",
+          "refId": "A",
+          "legendFormat": "{{trunk}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "ASR per trunk (30m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 79
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sum by (trunk)(rate(sbc_trunk_calls_total{outcome=\"answered\"}[30m])) / sum by (trunk)(rate(sbc_trunk_calls_total[30m]))",
+          "refId": "A",
+          "legendFormat": "{{trunk}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Finished calls per trunk by outcome (/min)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 79
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sum by (trunk, outcome)(rate(sbc_trunk_calls_total[5m])) * 60",
+          "refId": "A",
+          "legendFormat": "{{trunk}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 38,
+      "type": "row",
+      "title": "Health",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 87
+      },
+      "panels": []
+    },
+    {
+      "id": 39,
+      "type": "stat",
       "title": "Last CDR age",
       "datasource": {
         "type": "prometheus",
@@ -1277,7 +1814,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 67
+        "y": 88
       },
       "targets": [
         {
@@ -1320,7 +1857,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 40,
       "type": "stat",
       "title": "RTP timeouts (total)",
       "datasource": {
@@ -1331,7 +1868,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 67
+        "y": 88
       },
       "targets": [
         {
@@ -1374,7 +1911,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 41,
       "type": "stat",
       "title": "SIP parse errors (total)",
       "datasource": {
@@ -1385,7 +1922,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 67
+        "y": 88
       },
       "targets": [
         {
@@ -1428,7 +1965,7 @@
       }
     },
     {
-      "id": 31,
+      "id": 42,
       "type": "stat",
       "title": "Failed calls (total)",
       "datasource": {
@@ -1439,7 +1976,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 67
+        "y": 88
       },
       "targets": [
         {
@@ -1482,7 +2019,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 43,
       "type": "stat",
       "title": "Session-timer 422 retries (total)",
       "datasource": {
@@ -1493,7 +2030,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 71
+        "y": 92
       },
       "targets": [
         {

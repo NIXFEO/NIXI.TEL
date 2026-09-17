@@ -315,6 +315,9 @@ pub struct B2buaCall {
 
     /// Trunk name used for this call (e.g. "nixi-trunk-out")
     pub trunk_name: Option<String>,
+    /// The trunk whose active-call counter currently includes this call
+    /// (see `Sbc::count_call_on_trunk`); None once released.
+    pub trunk_counted: Option<String>,
 
     /// Codec negotiated for this call (e.g. "PCMU", "Opus")
     pub codec: Option<String>,
@@ -396,6 +399,7 @@ impl B2buaCall {
             caller_number: None,
             callee_number: None,
             trunk_name: None,
+            trunk_counted: None,
             codec: None,
             callee_is_webrtc: false,
             webrtc_session_b: None,

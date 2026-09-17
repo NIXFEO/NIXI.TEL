@@ -252,6 +252,9 @@ impl Sbc {
                         (csdp, mid)
                     };
 
+                    if let Some(name) = self.outbound_trunk_of(&uuid).await {
+                        self.note_trunk_success(&name);
+                    }
                     let _ = self
                         .b2bua
                         .handle_200_ok(&uuid, callee_tag, callee_sdp_str.clone())
@@ -821,6 +824,18 @@ impl Sbc {
                     // Call-level rejections (486 Busy, 487, 404, 403…) are relayed.
                     let is_trunk_failure = status == 408 || (500..=699).contains(&status);
                     if is_trunk_failure {
+                        // The trunk itself failed: feed its state (cooldown
+                        // ladder, or the exact park a 503 Retry-After asks for).
+                        if let Some(name) = self.outbound_trunk_of(&uuid).await {
+                            let retry_after = if status == 503 {
+                                super::trunk_state::retry_after_secs(
+                                    &rsip::SipMessage::Response(response.clone()).to_string(),
+                                )
+                            } else {
+                                None
+                            };
+                            self.note_trunk_failure(&name, retry_after);
+                        }
                         if let Some(next) = self.b2bua.take_next_failover_candidate(&uuid).await {
                             // Push the candidate back and let the shared path handle it
                             warn!(

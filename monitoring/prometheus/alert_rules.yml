@@ -47,6 +47,49 @@ groups:
         annotations:
           summary: "SIP messages are failing to send ({{ $labels.transport }})"
 
+      - alert: SBCTrunkDown
+        # The trunk used to answer OPTIONS and stopped (sbc_trunk_up is only
+        # exported for trunks that answered at least once). The router
+        # already skips it after 3 consecutive failures; calls fail over.
+        expr: sbc_trunk_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Trunk {{ $labels.trunk }} stopped answering OPTIONS"
+
+      - alert: SBCTrunkRegistrationFailing
+        # Outbound REGISTER toward the trunk keeps failing: inbound calls
+        # from that trunk stop as soon as the last registration expires.
+        expr: sbc_trunk_registered == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Outbound REGISTER to trunk {{ $labels.trunk }} is failing"
+
+      - alert: SBCTrunkAsrLow
+        # Answer-seizure ratio below 30% over 30 minutes with at least 10
+        # attempts: the trunk rejects or does not answer most calls
+        # (routing/number-format problem on our side, or the carrier's).
+        expr: |
+          (sum by (trunk)(increase(sbc_trunk_calls_total{outcome="answered"}[30m]))
+            / sum by (trunk)(increase(sbc_trunk_calls_total[30m]))) < 0.3
+          and sum by (trunk)(increase(sbc_trunk_calls_total[30m])) >= 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "ASR on trunk {{ $labels.trunk }} below 30% over 30 minutes"
+
+      - alert: SBCTrunkParked
+        # A trunk answered 503 Retry-After or failed 3 calls in a row: the
+        # SBC routes nothing there until the cooldown ends. Informational
+        # when failover carries the traffic; check the carrier otherwise.
+        expr: increase(sbc_trunk_calls_total{outcome="failed"}[10m]) >= 3
+              and sbc_trunk_active_calls == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Trunk {{ $labels.trunk }} is failing calls (3+ in 10 minutes)"
+
       - alert: SBCAuthFailureSpike
         expr: rate(sbc_auth_failures_total[5m]) > 5
         for: 10m

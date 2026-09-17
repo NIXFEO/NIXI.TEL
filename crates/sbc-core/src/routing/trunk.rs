@@ -404,6 +404,19 @@ impl TrunkState {
         }
     }
 
+    /// Park the trunk for `secs` (a `503 Retry-After` from it): no new
+    /// call is routed there meanwhile. Counted as a failure; an existing
+    /// longer cooldown is kept.
+    pub fn park_for(&mut self, secs: u64) {
+        self.failed_calls += 1;
+        self.consecutive_failures += 1;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.disabled_until = Some(match self.disabled_until {
+            Some(current) if current > until => current,
+            _ => until,
+        });
+    }
+
     /// Increment active call count
     pub fn increment_calls(&mut self) {
         self.active_calls += 1;
@@ -464,6 +477,24 @@ impl TrunkManager {
         if let Some(mut entry) = self.states.get_mut(id) {
             update_fn(&mut entry);
         }
+    }
+
+    /// Update a trunk's state by name; false when no such trunk.
+    pub fn update_state_by_name<F>(&self, name: &str, update_fn: F) -> bool
+    where
+        F: FnOnce(&mut TrunkState),
+    {
+        match self.find_by_name(name) {
+            Some(t) => {
+                self.update_state(&t.id, update_fn);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn state_by_name(&self, name: &str) -> Option<TrunkState> {
+        self.find_by_name(name).and_then(|t| self.get_state(&t.id))
     }
 
     /// Remove a trunk

@@ -690,6 +690,7 @@ pub(crate) async fn add_call(sbc: &mut Sbc, spec: CallSpec) -> TestCall {
         let mut calls = sbc.b2bua.calls_locked().await;
         calls.get_mut(&uuid).unwrap().trunk_name = Some(TRUNK_NAME.into());
     }
+    sbc.count_call_on_trunk(&uuid, Some(TRUNK_NAME)).await;
     sbc.b2bua
         .push_invite_attempt(
             &uuid,

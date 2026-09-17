@@ -243,6 +243,21 @@ impl Sbc {
             Err(e) => warn!("CDR recording failed ({}): {}", reason, e),
         }
 
+        // Timing histograms and the per-trunk series; then release the
+        // call from its trunk's active counter.
+        if let Some(at) = s.answered_at {
+            if let Ok(setup) = at.duration_since(s.started_wall) {
+                self.metrics.observe_call_setup(setup.as_secs_f64());
+            }
+            self.metrics
+                .observe_call_duration(record.billable_secs as f64);
+        }
+        if let Some(name) = record.trunk_id.as_deref() {
+            self.metrics
+                .inc_trunk_call(name, Self::trunk_outcome_label(&outcome, answered));
+        }
+        self.count_call_on_trunk(uuid, None).await;
+
         if answered {
             self.metrics.inc_call_terminated();
         } else {

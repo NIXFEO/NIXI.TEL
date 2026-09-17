@@ -11,6 +11,7 @@ pub(crate) use response_handler::parse_session_expires as response_handler_sessi
 mod call_handler;
 mod cdr;
 mod invite_tx;
+mod trunk_state;
 pub(crate) use cdr::CallOutcome;
 #[cfg(test)]
 mod flow_tests;
@@ -957,7 +958,14 @@ impl Sbc {
             let identity = identity.clone();
             let sock = udp_socket.clone();
             let pending = pending.clone();
-            tokio::spawn(Self::trunk_register_task(trunk, identity, sock, pending));
+            tokio::spawn(Self::trunk_register_task(
+                trunk,
+                identity,
+                sock,
+                pending,
+                self.trunk_manager.clone(),
+                self.metrics.clone(),
+            ));
         }
     }
 
@@ -968,13 +976,19 @@ impl Sbc {
         identity: Option<SbcIdentity>,
         sock: Arc<tokio::net::UdpSocket>,
         pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
+        trunk_manager: Arc<TrunkManager>,
+        metrics: Arc<SbcMetrics>,
     ) {
         let trunk_name = trunk.name.clone();
         let interval = trunk.registration_interval.as_secs().max(60);
 
         loop {
             info!("Trunk '{}': sending REGISTER", trunk_name);
-            match Self::send_trunk_register(&trunk, &sock, &identity, &pending).await {
+            let result = Self::send_trunk_register(&trunk, &sock, &identity, &pending).await;
+            let registered = result.is_ok();
+            trunk_manager.update_state(&trunk.id, |s| s.registered = registered);
+            metrics.set_trunk_registered(&trunk_name, Some(registered));
+            match result {
                 Ok(expires) => {
                     info!(
                         "Trunk '{}': registered successfully (expires={}s)",
@@ -1229,7 +1243,7 @@ impl Sbc {
         sock: Arc<tokio::net::UdpSocket>,
         pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
         trunk_manager: Arc<TrunkManager>,
-        _metrics: Arc<SbcMetrics>,
+        metrics: Arc<SbcMetrics>,
         events: crate::events::EventBus,
     ) {
         let trunk_name = trunk.name.clone();
@@ -1306,6 +1320,14 @@ impl Sbc {
                     false
                 }
             };
+
+            // sbc_trunk_up: 1/0 once the trunk has answered OPTIONS at
+            // least once; never exported for a trunk that ignores OPTIONS.
+            if is_up {
+                metrics.set_trunk_up(&trunk_name, Some(true));
+            } else if ever_responded {
+                metrics.set_trunk_up(&trunk_name, Some(false));
+            }
 
             // State transition logging
             if is_up {

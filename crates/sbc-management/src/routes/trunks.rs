@@ -411,6 +411,7 @@ pub async fn delete_trunk(
     }
     // Hydration disables manager entries missing from the store; remove outright.
     state.trunks.remove_by_name(&name);
+    state.metrics.remove_trunk(&name);
     apply_and_notify(&state, &store, "trunk", "delete", &name).await;
     info!("API: deleted trunk '{}'", name);
     Ok(Json(json!({ "name": name, "deleted": true })))

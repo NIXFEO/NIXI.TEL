@@ -2047,3 +2047,143 @@ async fn blocked_destination_is_refused_by_the_sbc_and_billed_outbound() {
     assert!(again[0].starts_with("SIP/2.0 403 "));
     assert_eq!(sbc.cdr.get_recent(10).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn trunk_state_and_metrics_follow_real_calls() {
+    let mut sbc = SbcBuilder::new().build();
+    let tid = trunk_id(&sbc);
+    let trunk_cfg = sbc.trunk_manager.get_trunk(&tid).unwrap();
+    let state = |sbc: &Sbc| sbc.trunk_manager.get_state(&tid).unwrap();
+    let series = |sbc: &Sbc| sbc.metrics.trunk_series(TRUNK_NAME).unwrap();
+
+    // 1. An answered call is counted on the trunk while it lives; the 200
+    //    OK resets an earlier failure; the BYE releases it and counts the
+    //    outcome and the timing histograms.
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    assert_eq!(state(&sbc).active_calls, 1);
+    assert_eq!(series(&sbc).active_calls, 1);
+    sbc.trunk_manager
+        .update_state(&tid, |s| s.record_trunk_failure());
+    assert_eq!(state(&sbc).consecutive_failures, 1);
+    connect(&mut sbc, &mut call).await;
+    assert_eq!(
+        state(&sbc).consecutive_failures,
+        0,
+        "200 OK resets failures"
+    );
+    sbc.handle_bye(
+        bye_from_caller(&call.spec, 4),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    let s = state(&sbc);
+    assert_eq!((s.active_calls, s.total_calls), (0, 1));
+    let m = series(&sbc);
+    assert_eq!(m.active_calls, 0);
+    assert_eq!(m.calls.get("answered"), Some(&1));
+    assert_eq!(sbc.metrics.call_setup_seconds.count(), 1);
+    assert_eq!(sbc.metrics.call_duration_seconds.count(), 1);
+
+    // 2. 503 Retry-After from the trunk: relayed to the caller, the trunk
+    //    is parked for that long (the router skips it) and the outcome is
+    //    a failure.
+    let mut call2 = add_call(&mut sbc, CallSpec::numbered(2)).await;
+    assert_eq!(state(&sbc).active_calls, 1);
+    sbc.handle_response(
+        response_for(
+            &call2.spec,
+            "503 Service Unavailable",
+            &call2.spec.branch,
+            call2.spec.cseq,
+            "INVITE",
+            "Retry-After: 120\r\n",
+            "",
+        ),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .unwrap();
+    let to_caller = drain(&mut call2.caller_rx);
+    assert!(
+        to_caller.iter().any(|m| m.starts_with("SIP/2.0 503 ")),
+        "{:?}",
+        to_caller
+    );
+    let s = state(&sbc);
+    assert_eq!(s.active_calls, 0, "released on the final");
+    assert_eq!(s.consecutive_failures, 1);
+    let parked = s
+        .disabled_until
+        .map(|u| u.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or_default();
+    assert!(parked > Duration::from_secs(100), "parked for {:?}", parked);
+    assert!(!s.can_accept_call(&trunk_cfg), "no new call routed there");
+    assert_eq!(series(&sbc).calls.get("failed"), Some(&1));
+    assert_eq!(
+        sbc.metrics.call_setup_seconds.count(),
+        1,
+        "setup time is measured on answered calls only"
+    );
+
+    // 3. 486 Busy Here is the callee's answer, not the trunk's failure:
+    //    relayed, counted as failed for ASR, no cooldown.
+    sbc.trunk_manager.update_state(&tid, |s| s.record_success());
+    let mut call3 = add_call(&mut sbc, CallSpec::numbered(3)).await;
+    sbc.handle_response(
+        response_for(
+            &call3.spec,
+            "486 Busy Here",
+            &call3.spec.branch,
+            call3.spec.cseq,
+            "INVITE",
+            "",
+            "",
+        ),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut call3.caller_rx)
+        .iter()
+        .any(|m| m.starts_with("SIP/2.0 486 ")));
+    let s = state(&sbc);
+    assert_eq!((s.active_calls, s.consecutive_failures), (0, 0));
+    assert!(s.disabled_until.is_none());
+    assert_eq!(series(&sbc).calls.get("failed"), Some(&2));
+
+    // 4. A CANCEL is its own outcome.
+    let mut call4 = add_call(&mut sbc, CallSpec::numbered(4)).await;
+    sbc.handle_cancel(
+        cancel_from_caller(&call4.spec),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call4.caller_tx),
+    )
+    .await
+    .unwrap();
+    drain(&mut call4.caller_rx);
+    assert_eq!(state(&sbc).active_calls, 0);
+    assert_eq!(series(&sbc).calls.get("cancelled"), Some(&1));
+
+    // Exposition: the series carry the trunk label.
+    let out = sbc.metrics.render_prometheus();
+    assert!(
+        out.contains(&format!(
+            "sbc_trunk_calls_total{{trunk=\"{}\",outcome=\"answered\"}} 1\n",
+            TRUNK_NAME
+        )),
+        "{}",
+        out
+    );
+    assert!(out.contains(&format!(
+        "sbc_trunk_active_calls{{trunk=\"{}\"}} 0\n",
+        TRUNK_NAME
+    )));
+}

@@ -99,6 +99,21 @@ P.append(ts("SRTP (packets/s)",[
     tgt("rate(sbc_srtp_decrypted_total[5m])","decrypted"),
 ],12,y,unit="pps"))
 y+=8
+# Trunks — fed by real calls (sbc/trunk_state.rs) and OPTIONS health checks
+P.append(row("Trunks", y)); y+=1
+P += [stat("Trunks up","sum(sbc_trunk_up)",0,y,w=4),
+      stat("Trunks down","count(sbc_trunk_up == 0) or vector(0)",4,y,w=4),
+      stat("Trunk registrations failing","count(sbc_trunk_registered == 0) or vector(0)",8,y,w=4),
+      stat("Calls on trunks","sum(sbc_trunk_active_calls)",12,y,w=4),
+      stat("Setup p95 (30m)","histogram_quantile(0.95, sum(rate(sbc_call_setup_seconds_bucket[30m])) by (le))",16,y,w=4,unit="s"),
+      stat("Duration p50 (1h)","histogram_quantile(0.5, sum(rate(sbc_call_duration_seconds_bucket[1h])) by (le))",20,y,w=4,unit="s")]
+y+=4
+P += [ts("Trunk health (1 = answers OPTIONS)",[tgt("sbc_trunk_up","{{trunk}}")],0,y),
+      ts("Active calls per trunk",[tgt("sbc_trunk_active_calls","{{trunk}}")],12,y,stack=True)]
+y+=8
+P += [ts("ASR per trunk (30m)",[tgt('sum by (trunk)(rate(sbc_trunk_calls_total{outcome="answered"}[30m])) / sum by (trunk)(rate(sbc_trunk_calls_total[30m]))',"{{trunk}}")],0,y,unit="percentunit"),
+      ts("Finished calls per trunk by outcome (/min)",[tgt("sum by (trunk, outcome)(rate(sbc_trunk_calls_total[5m])) * 60","{{trunk}} {{outcome}}")],12,y,stack=True)]
+y+=8
 # Health
 P.append(row("Health", y)); y+=1
 P += [stat("Last CDR age","time() - sbc_last_cdr_written_timestamp_seconds",0,y,w=6,unit="s"),

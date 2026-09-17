@@ -82,6 +82,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `sbc/call_handler.rs` | BYE/CANCEL/ACK/INFO, re-INVITE, timeouts, graceful shutdown |
 | `sbc/cdr.rs` | `CallOutcome`, `finish_call` (single CDR/metrics/release path), `hangup_both_legs`, RTP/setup timeouts, admin kicks |
 | `sbc/invite_tx.rs` | INVITE server-transaction memory: retransmissions replay the last response (RFC 3261 §17.2.1) |
+| `sbc/trunk_state.rs` | Trunk state fed by real calls: per-trunk active-call counting, failure ladder / `503 Retry-After` park, success reset, per-trunk metrics labels |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
@@ -175,6 +176,14 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   the caller's own CSeq back. A 481/408 to the SBC's refresh re-INVITE (or
   three failed refreshes in a row) tears the call down with a BYE to the
   caller instead of refreshing a dead dialog forever.
+
+- **Trunk capacity and cooldown are real** — a call counts on its trunk
+  from the forwarded INVITE (or from the inbound INVITE's source trunk) to
+  `finish_call`; 408/5xx/6xx, unanswered attempts and OPTIONS misses feed
+  the failure ladder (3 → 30 s, 6 → 2 min, 10 → 5 min without new calls), a
+  `503 Retry-After` parks the trunk for that long, a 200 OK resets. The
+  router skips full or parked trunks; failover moves the count. Per-trunk
+  metrics: `sbc_trunk_up/registered/active_calls/calls_total{outcome}`.
 
 Some callees (e.g. Jambonz-based) drop media without sending BYE — after
 `security.rtp_timeout` (90 s) without RTP the SBC BYEs both legs and writes a

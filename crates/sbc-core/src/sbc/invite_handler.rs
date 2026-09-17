@@ -350,7 +350,11 @@ impl Sbc {
                 } else {
                     "outbound"
                 });
-                call.trunk_name = inbound_trunk;
+                call.trunk_name = inbound_trunk.clone();
+            }
+            drop(calls);
+            if let Some(name) = inbound_trunk.as_deref() {
+                self.count_call_on_trunk(&uuid, Some(name)).await;
             }
         }
 
@@ -690,6 +694,7 @@ impl Sbc {
                     call.trunk_name = Some(trunk.name.clone());
                 }
             }
+            self.count_call_on_trunk(&uuid, Some(&trunk.name)).await;
             info!("B2BUA: stored trunk_id={} for call {}", trunk.id, uuid);
 
             let dest = match trunk.destination() {
@@ -1116,6 +1121,9 @@ impl Sbc {
                 attempt,
                 self.invite_timeout
             );
+            if let Some(name) = self.outbound_trunk_of(&uuid).await {
+                self.note_trunk_failure(&name, None);
+            }
             let _ = self.failover_to_next_trunk(&uuid).await;
         }
     }
@@ -1222,6 +1230,7 @@ impl Sbc {
                 }
             }
         }
+        self.count_call_on_trunk(uuid, Some(&trunk.name)).await;
         true
     }
 
