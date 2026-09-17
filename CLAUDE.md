@@ -29,7 +29,7 @@ MIT licensed. Runs in production; contributions welcome — see
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # ~470 tests
+cargo test --workspace          # ~440 tests
 cargo clippy --workspace
 ```
 
@@ -80,6 +80,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
+| `sbc/test_support.rs` · `sbc/flow_tests.rs` | Handler test harness (real `Sbc`, call legs on channels, raw SIP builders) and the call-flow tests built on it |
 | `events.rs` | `EventBus` → SSE `/api/v1/events` |
 | `security/` | fail2ban banning, anti-IRSF destination rules, per-user limits |
 | `routing/{trunk,router}.rs` | TrunkConfig, LCR, `route_request_candidates()` for failover |

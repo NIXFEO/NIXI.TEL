@@ -513,3 +513,438 @@ async fn futures_util_next(
     use tokio_stream::StreamExt;
     stream.next().await.unwrap().unwrap()
 }
+
+// ── Security / anti-fraud ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn security_bans_crud_applies_to_the_ban_manager() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/security/bans",
+            Some(r#"{"ip":"not-an-ip"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/security/bans",
+            Some(r#"{"ip":"198.51.100.7","duration_secs":120,"reason":"abuse"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp).await;
+    assert_eq!(body["ip"], "198.51.100.7");
+    assert_eq!(body["reason"], "abuse");
+    assert_eq!(body["manual"], true);
+    assert!(state.security.bans.is_banned(ip), "applied immediately");
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/security/bans", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = body_json(resp).await;
+    assert_eq!(list.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(list[0]["ip"], "198.51.100.7");
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/security/status", None, true))
+        .await
+        .unwrap();
+    let status = body_json(resp).await;
+    assert_eq!(status["bans"]["active"], 1);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/security/bans/198.51.100.7",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["unbanned"], true);
+    assert!(!state.security.bans.is_banned(ip));
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/security/bans/198.51.100.7",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "already unbanned");
+}
+
+#[tokio::test]
+async fn security_destination_rules_crud() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    // The policy ships with built-in premium-rate prefixes; count relative to them.
+    let builtin = state.security.destinations.list_rules().len();
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/security/destination-rules",
+            Some(r#"{"prefix":"+33899","action":"maybe"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "action must be allow|deny"
+    );
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/security/destination-rules",
+            Some(r#"{"prefix":"","action":"deny"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "prefix required");
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/security/destination-rules",
+            Some(r#"{"prefix":"+33899","action":"deny","description":"premium rate"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let rule = body_json(resp).await;
+    let id = rule["id"].as_str().expect("rule id").to_string();
+    assert_eq!(rule["prefix"], "+33899");
+    assert_eq!(rule["deny"], true);
+    assert_eq!(state.security.destinations.list_rules().len(), builtin + 1);
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/security/destination-rules", None, true))
+        .await
+        .unwrap();
+    let list = body_json(resp).await;
+    let rules = list["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), builtin + 1);
+    let mine = rules
+        .iter()
+        .find(|r| r["id"] == id.as_str())
+        .expect("the new rule is listed");
+    assert_eq!(mine["description"], "premium rate");
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            &format!("/api/v1/security/destination-rules/{}", id),
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(state.security.destinations.list_rules().len(), builtin);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            &format!("/api/v1/security/destination-rules/{}", id),
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn security_user_limits_defaults_and_overrides() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/v1/security/user-limits",
+            Some(r#"{"default_max_concurrent_calls":3,"default_max_calls_per_minute":10}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/v1/security/user-limits/alice",
+            Some(r#"{"max_concurrent_calls":1}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/security/user-limits", None, true))
+        .await
+        .unwrap();
+    let limits = body_json(resp).await;
+    assert_eq!(limits["default_max_concurrent_calls"], 3);
+    assert_eq!(limits["default_max_calls_per_minute"], 10);
+    let overrides = limits["overrides"].as_array().expect("overrides array");
+    assert_eq!(overrides.len(), 1);
+    assert_eq!(overrides[0]["user"], "alice");
+    assert_eq!(overrides[0]["max_concurrent_calls"], 1);
+    assert!(overrides[0]["max_calls_per_minute"].is_null());
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/security/user-limits/alice",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.security.user_limits.overrides().is_empty());
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/security/user-limits/alice",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── DIDs ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn did_crud_persists_and_applies_to_the_runtime() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/dids",
+            Some(r#"{"number":"+33123456789"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "sip_user required");
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/dids",
+            Some(r#"{"number":"+33123456789","sip_user":"alice","display_name":"Alice"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["created"], true);
+    {
+        let dids = state.dids.read().await;
+        assert_eq!(dids.len(), 1, "applied to the live DID table");
+        assert_eq!(dids[0].number, "+33123456789");
+        assert_eq!(dids[0].user, "alice");
+        assert_eq!(dids[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/dids",
+            Some(r#"{"number":"+33123456789","sip_user":"bob"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "duplicate number");
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/dids", None, true))
+        .await
+        .unwrap();
+    let list = body_json(resp).await;
+    assert_eq!(list.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(list[0]["sip_user"], "alice");
+    assert_eq!(list[0]["enabled"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(req("DELETE", "/api/v1/dids/+33123456789", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.dids.read().await.is_empty());
+
+    let resp = app
+        .clone()
+        .oneshot(req("DELETE", "/api/v1/dids/+33123456789", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── CDRs and calls ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cdrs_are_paged_and_need_a_token() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    for n in 0..3 {
+        state
+            .cdr
+            .record_call(
+                &format!("cid-{}", n),
+                "alice",
+                "+33612345678",
+                10 + n,
+                false,
+                Some("PCMU"),
+                "normal-clearing",
+            )
+            .await
+            .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/cdrs", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/cdrs?limit=2&offset=0", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+    let page = body_json(resp).await;
+    assert_eq!(page["count"], 2);
+    assert_eq!(page["limit"], 2);
+    assert_eq!(page["has_more"], true);
+    let items = page["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["caller"], "alice");
+    assert_eq!(items[0]["codec"], "PCMU");
+    assert_eq!(items[0]["disconnect_reason"], "normal-clearing");
+    assert!(items[0]["trunk_id"].is_null());
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/cdrs?limit=2&offset=2", None, true))
+        .await
+        .unwrap();
+    let page = body_json(resp).await;
+    assert_eq!(page["count"], 1);
+    assert_eq!(page["has_more"], false);
+}
+
+#[tokio::test]
+async fn delete_call_tears_it_down_and_releases_media() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    const SDP: &str =
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+    let uuid = state
+        .b2bua
+        .create_call(
+            "cid-kick".to_string(),
+            "tag-1".to_string(),
+            "10.0.0.5:5060".parse().unwrap(),
+            Some(SDP),
+            None,
+            sbc_core::rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.b2bua.active_calls().await.len(), 1);
+
+    let resp = app
+        .clone()
+        .oneshot(req("DELETE", "/api/v1/calls/does-not-exist", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            &format!("/api/v1/calls/{}", uuid),
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["terminated"], true);
+    assert!(state.b2bua.active_calls().await.is_empty());
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            &format!("/api/v1/calls/{}", uuid),
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "gone");
+}

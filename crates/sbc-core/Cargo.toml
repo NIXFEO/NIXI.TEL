@@ -55,3 +55,6 @@ futures-util = "0.3"
 # Transcoding
 opus = { workspace = true }
 rayon = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] } # start_paused tests

@@ -464,6 +464,47 @@ impl B2buaCall {
             transport: transport_token(self.callee_transport),
         })
     }
+
+    /// CSeq for the next request the SBC sends toward the callee: above the
+    /// live INVITE attempt (a 407/422 retry raised it past the first INVITE)
+    /// and above whatever the leg counter already used (RFC 3261 §12.2.1.1).
+    pub fn next_outbound_cseq(&self) -> u32 {
+        let invite_cseq = self
+            .invite_attempts
+            .last()
+            .map(|a| a.cseq)
+            .or_else(|| {
+                self.original_outbound_invite
+                    .as_deref()
+                    .and_then(parse_cseq_number)
+            })
+            .unwrap_or(0);
+        let leg = self.outbound.as_ref().map(|l| l.cseq).unwrap_or(0);
+        invite_cseq.max(leg) + 1
+    }
+
+    /// In-dialog BYE toward the callee for a call the SBC tears down on its
+    /// own (max duration, shutdown, lost WS connection). None until the
+    /// callee leg is established (a pending INVITE must be CANCELed instead).
+    pub fn bye_toward_callee(
+        &self,
+        local_ip: &str,
+        local_port: u16,
+        reason: Option<&str>,
+    ) -> Option<String> {
+        let mut d = self.dialog_info_toward_callee(local_ip, local_port)?;
+        d.cseq = self.next_outbound_cseq();
+        Some(crate::sip_builder::build_bye(&d, reason))
+    }
+}
+
+/// True when both addresses are IPv4 and share a /24 (clustered trunks
+/// answer from sibling hosts of the one the INVITE was sent to).
+fn same_ipv4_subnet24(a: std::net::IpAddr, b: std::net::IpAddr) -> bool {
+    match (a, b) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => a.octets()[..3] == b.octets()[..3],
+        _ => false,
+    }
 }
 
 /// Extract the body (after the blank line) from a raw SIP message.
@@ -1025,9 +1066,16 @@ impl B2buaManager {
     }
 
     /// Get the callee's Request-URI (for ACK relay)
+    /// Remote target for requests toward the callee: the Contact of its
+    /// 2xx once known (RFC 3261 §12.1.2 — the ACK and every in-dialog
+    /// request go there), else the Request-URI the INVITE was sent to.
     pub async fn get_callee_contact_uri(&self, uuid: &CallUuid) -> Option<String> {
         let calls = self.calls.lock().await;
-        calls.get(uuid).and_then(|c| c.callee_request_uri.clone())
+        let call = calls.get(uuid)?;
+        call.outbound
+            .as_ref()
+            .and_then(|leg| leg.remote_target.clone())
+            .or_else(|| call.callee_request_uri.clone())
     }
 
     /// Set the callee's Request-URI (stored when INVITE is forwarded)
@@ -1241,15 +1289,10 @@ impl B2buaManager {
         let mut calls = self.calls.lock().await;
         let call = calls.get_mut(uuid)?;
         let mut d = call.dialog_info_toward_callee(local_ip, local_port)?;
-        // In-dialog CSeq must exceed the INVITE's: derive from the outbound
-        // INVITE we sent, fall back to the leg counter.
-        let invite_cseq = call
-            .original_outbound_invite
-            .as_deref()
-            .and_then(parse_cseq_number);
-        let leg = call.outbound.as_mut()?;
-        d.cseq = invite_cseq.map(|n| n + 1).unwrap_or_else(|| leg.cseq + 1);
-        leg.cseq = d.cseq;
+        // In-dialog CSeq must exceed the live INVITE attempt's (not just the
+        // first INVITE's: a 407/422 retry raised it) and the leg counter.
+        d.cseq = call.next_outbound_cseq();
+        call.outbound.as_mut()?.cseq = d.cseq;
         Some(crate::sip_builder::build_bye(&d, None))
     }
 
@@ -1389,6 +1432,19 @@ impl B2buaManager {
                 }
                 if caller_ip == src_ip && callee_ip != Some(src_ip) {
                     return Some((call.uuid.clone(), true)); // from caller
+                }
+
+                // Clustered trunks (Genesys) send the BYE from a sibling host
+                // of the one the INVITE went to: attribute by /24 before the
+                // "prefer inbound" fallback hands an outbound call's BYE to
+                // the wrong leg.
+                let callee_near = callee_ip.is_some_and(|ip| same_ipv4_subnet24(ip, src_ip));
+                let caller_near = same_ipv4_subnet24(caller_ip, src_ip);
+                if callee_near && !caller_near {
+                    return Some((call.uuid.clone(), false)); // from callee's cluster
+                }
+                if caller_near && !callee_near {
+                    return Some((call.uuid.clone(), true)); // from caller's cluster
                 }
             }
 

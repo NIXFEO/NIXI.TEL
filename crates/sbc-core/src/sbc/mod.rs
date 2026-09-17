@@ -9,8 +9,12 @@ pub(crate) use invite_handler::extract_contact_uri as invite_handler_contact_uri
 mod response_handler;
 pub(crate) use response_handler::parse_session_expires as response_handler_session_expires;
 mod call_handler;
+#[cfg(test)]
+mod flow_tests;
 pub mod hydrate;
 pub mod import;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use crate::acl::{AclManager, Direction};
 use crate::auth::{generate_digest_response, DigestAuthenticator, DigestChallenge};
@@ -112,6 +116,11 @@ pub struct Sbc {
 
     /// Outbound INVITE answer timeout before trunk failover.
     invite_timeout: Duration,
+
+    /// Hard cap on a connected call (`security.max_call_duration`): past it
+    /// the SBC BYEs both legs, so a callee that vanished without BYE cannot
+    /// pin a trunk session forever.
+    max_call_duration: Duration,
 
     /// RFC 4028 session timers (None = disabled): (session_expires, min_se).
     session_timer: Option<(u32, u32)>,
@@ -397,6 +406,7 @@ impl Sbc {
             config_store,
             events,
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
+            max_call_duration: Duration::from_secs(config.security.max_call_duration.max(60)),
             security,
             session_timer: config.security.session_timer_enabled.then(|| {
                 (
@@ -492,6 +502,15 @@ impl Sbc {
                 self.session_timer, session_timer
             );
             self.session_timer = session_timer;
+        }
+        let max_call_duration = Duration::from_secs(config.security.max_call_duration.max(60));
+        if max_call_duration != self.max_call_duration {
+            info!(
+                "Reload: max_call_duration {}s → {}s",
+                self.max_call_duration.as_secs(),
+                max_call_duration.as_secs()
+            );
+            self.max_call_duration = max_call_duration;
         }
 
         // ── SQLite store present: it is the source of truth for dynamic
@@ -692,6 +711,7 @@ impl Sbc {
             config_store: None,
             events: crate::events::EventBus::new(),
             invite_timeout: Duration::from_secs(5),
+            max_call_duration: Duration::from_secs(14400),
             session_timer: None,
             security: Arc::new(crate::security::SecurityManager::new(Default::default())),
         }

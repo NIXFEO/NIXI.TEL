@@ -1,11 +1,11 @@
 use super::*;
 
 impl Sbc {
-    /// Check for calls that have exceeded the maximum duration and terminate them.
-    /// This prevents phantom sessions when the callee drops without sending BYE.
-    /// Max duration: 7200 seconds (2 hours). Check runs every 30s from the event loop.
+    /// Check for calls that have exceeded `security.max_call_duration` and
+    /// terminate them (BYE on both legs). This prevents phantom sessions when
+    /// the callee drops without sending BYE. Runs every 30 s from the event loop.
     pub(crate) async fn check_call_timeouts(&mut self) {
-        const MAX_CALL_DURATION_SECS: u64 = 7200; // 2 hours
+        let max_duration = self.max_call_duration;
 
         let (sbc_ip, sbc_port) = self
             .identity
@@ -17,7 +17,7 @@ impl Sbc {
         let calls = self.b2bua.calls_locked().await;
         let timed_out: Vec<_> = calls
             .values()
-            .filter(|c| c.started_at.elapsed().as_secs() > MAX_CALL_DURATION_SECS)
+            .filter(|c| c.started_at.elapsed() > max_duration)
             .map(|c| {
                 (
                     c.uuid.clone(),
@@ -33,8 +33,7 @@ impl Sbc {
                     c.started_at.elapsed().as_secs(),
                     c.dialog_info_toward_caller(&sbc_ip, sbc_port)
                         .map(|d| crate::sip_builder::build_bye(&d, Some(TIMEOUT_REASON))),
-                    c.dialog_info_toward_callee(&sbc_ip, sbc_port)
-                        .map(|d| crate::sip_builder::build_bye(&d, Some(TIMEOUT_REASON))),
+                    c.bye_toward_callee(&sbc_ip, sbc_port, Some(TIMEOUT_REASON)),
                 )
             })
             .collect();
@@ -61,7 +60,7 @@ impl Sbc {
         ) in timed_out
         {
             warn!("Call timeout: {} (Call-ID: {}) exceeded {}s (active {}s) — sending BYE to both sides",
-                &uuid[..8], call_id, MAX_CALL_DURATION_SECS, duration);
+                &uuid[..8], call_id, max_duration.as_secs(), duration);
 
             // BYE to caller (trunk) — real dialog identity when captured,
             // legacy best-effort otherwise
@@ -165,8 +164,7 @@ impl Sbc {
                     c.outbound.as_ref().map(|l| l.call_id.clone()),
                     c.dialog_info_toward_caller(&sbc_ip, sbc_port)
                         .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
-                    c.dialog_info_toward_callee(&sbc_ip, sbc_port)
-                        .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
+                    c.bye_toward_callee(&sbc_ip, sbc_port, Some(SHUTDOWN_REASON)),
                     // INVITE still pending toward the callee (no 200 OK yet): a
                     // BYE cannot match — CANCEL the live attempt instead.
                     c.invite_attempts
@@ -854,18 +852,16 @@ impl Sbc {
                     let bye = if caller_died {
                         // Dialog established → BYE; INVITE still pending →
                         // CANCEL the live attempt (a BYE cannot match yet).
-                        c.dialog_info_toward_callee(&sbc_ip, sbc_port)
-                            .map(|d| {
-                                crate::sip_builder::build_bye(
-                                    &d,
-                                    Some("SIP;cause=200;text=\"ws-closed\""),
-                                )
-                            })
-                            .or_else(|| {
-                                c.invite_attempts
-                                    .last()
-                                    .and_then(|a| crate::sip_builder::build_cancel(&a.raw))
-                            })
+                        c.bye_toward_callee(
+                            &sbc_ip,
+                            sbc_port,
+                            Some("SIP;cause=200;text=\"ws-closed\""),
+                        )
+                        .or_else(|| {
+                            c.invite_attempts
+                                .last()
+                                .and_then(|a| crate::sip_builder::build_cancel(&a.raw))
+                        })
                     } else {
                         c.dialog_info_toward_caller(&sbc_ip, sbc_port).map(|d| {
                             crate::sip_builder::build_bye(

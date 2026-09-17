@@ -26,6 +26,16 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 - Outbound TCP/TLS connects and the TLS handshake are bounded (3 s): an
   unreachable peer no longer stalls the SIP event loop; dead pooled TCP
   sockets are evicted; TLS client configs are built once per trunk.
+- The ACK toward the callee uses the Contact of its 200 OK as Request-URI
+  (RFC 3261 §13.2.2.4) instead of the INVITE's Request-URI.
+- A BYE from another host of the trunk's /24 (Genesys clusters) on an
+  outbound call is attributed to the trunk leg and relayed to the caller;
+  it used to be treated as the caller's BYE and sent back to the trunk.
+- Synthetic BYEs the SBC sends on its own (max duration, shutdown, lost WS
+  connection, relayed BYE after a 407/422 retry) carry a CSeq above the live
+  INVITE attempt's (RFC 3261 §12.2.1.1), not the leg counter's 1.
+- `security.max_call_duration` is now honoured (default 14400 s, applied on
+  reload); the limit was hard-coded to 7200 s.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP
@@ -38,6 +48,13 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 - `[security]` session-timer values apply on SIGHUP / `POST /api/v1/reload`.
 - `scripts/deploy.sh` (build-on-host deployment with backups and rollback);
   `sbc --version` and the startup log carry the git commit.
+- Handler test harness (`sbc/test_support.rs`): a real `Sbc` with both call
+  legs on channels, raw SIP builders, `SbcBuilder`; call-flow tests for
+  INVITE/200/ACK/BYE, BYE from a trunk sibling host, CANCEL of the live
+  attempt after a 422 retry, INVITE-timeout failover to a real UDP peer, max
+  duration, graceful shutdown, re-INVITE, and a 100-call churn; management
+  API tests for `/security/*`, `/dids`, `/cdrs`, `DELETE /calls/{uuid}`.
+- `sbc_core::rsip` re-export (the SIP types appear in the public API).
 - CI: rustfmt and clippy are blocking, `cargo deny` checks advisories and
   bans against a `deny.toml` whose every exception is dated and justified,
   Dependabot watches cargo and actions.
