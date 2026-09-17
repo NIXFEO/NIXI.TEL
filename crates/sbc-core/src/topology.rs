@@ -376,6 +376,10 @@ pub fn apply_topology_hiding_outbound(
     let mut msg = RawSipMessage::parse(raw)?;
 
     if msg.is_request() {
+        // One hop consumed (RFC 3261 §16.6 step 3). A request that arrived
+        // with 0 was already answered 483 upstream; leave it untouched here.
+        let _ = msg.decrement_max_forwards();
+
         // Replace Via
         msg.remove_header("via");
         let branch = new_branch();
@@ -489,6 +493,28 @@ Content-Length: 0\r\n\
         msg.set_header("Max-Forwards", "50");
         let mf = msg.header_values("max-forwards");
         assert_eq!(mf[0], "50");
+    }
+
+    #[test]
+    fn outbound_hiding_consumes_one_hop() {
+        let id = SbcIdentity::new("203.0.113.1", "sbc.example", 5060, false);
+        let raw = "INVITE sip:bob@203.0.113.9 SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcaller\r\n\
+                   Max-Forwards: 70\r\n\
+                   From: <sip:alice@a.example.com>;tag=1\r\n\
+                   To: <sip:bob@b.example.com>\r\n\
+                   Call-ID: c1\r\n\
+                   CSeq: 1 INVITE\r\n\
+                   Content-Length: 0\r\n\r\n";
+        let out = apply_topology_hiding_outbound(raw, &id, "UDP").unwrap();
+        assert!(out.contains("Max-Forwards: 69\r\n"), "{}", out);
+        assert_eq!(out.matches("Max-Forwards:").count(), 1);
+
+        // Absent: the default budget is inserted (RFC 3261 §8.1.1.6)
+        let out =
+            apply_topology_hiding_outbound(&raw.replace("Max-Forwards: 70\r\n", ""), &id, "UDP")
+                .unwrap();
+        assert!(out.contains("Max-Forwards: 70\r\n"), "{}", out);
     }
 
     #[test]

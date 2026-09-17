@@ -44,6 +44,15 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 - Every response the SBC builds or relays carries the RFC reason phrase
   ("487 Request Terminated", "422 Session Interval Too Small"); the vendored
   rsip rendered variant names ("RequestTerminated") for every known code.
+- Every locally generated final (480 unregistered DID target / dead WS
+  contact, 503 no trunk / rate-limited / auth exhausted, 500, 501, 403
+  banned) now echoes the request's Via, From, To, Call-ID and CSeq (RFC 3261
+  §8.2.6.2); they were bare status lines the peer could not match to its
+  transaction, so e.g. a 480 left the trunk ringing until its own timeout.
+- An inbound trunk call to a number that is neither a DID nor a registered
+  user is answered 404 instead of being routed back out to a trunk by LCR.
+- Max-Forwards is decremented on the trunk leg and an INVITE arriving with
+  Max-Forwards: 0 is answered 483 (RFC 3261 §16.3, §16.6).
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

@@ -222,6 +222,18 @@ impl Sbc {
                 .await;
         }
 
+        // RFC 3261 §16.3 step 4: a request that already exhausted its hop
+        // budget is not forwarded (loop protection); §8.1.1.6 makes
+        // Max-Forwards mandatory, so a missing header is treated as 70.
+        if max_forwards(&request) == Some(0) {
+            warn!("INVITE from {} with Max-Forwards: 0 — 483", source);
+            self.metrics.inc_sip_response(483);
+            let r483 = response_for_request(&request, 483, "Too Many Hops");
+            self.send_sip("483 → caller", r483.as_bytes(), source, transport, reply_tx)
+                .await;
+            return Ok(());
+        }
+
         // ── Metrics: call attempted ──
         self.metrics.inc_call_attempted();
 
@@ -283,7 +295,7 @@ impl Sbc {
             Err(e) => {
                 warn!("B2BUA create_call failed: {}", e);
                 self.metrics.inc_sip_response(500);
-                let response_500 = build_plain_response(500, "Server Internal Error");
+                let response_500 = response_for_request(&request, 500, "Server Internal Error");
                 self.send_sip(
                     "500 → caller",
                     response_500.as_bytes(),
@@ -462,7 +474,8 @@ impl Sbc {
                     self.b2bua.terminate_call(&uuid).await;
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(480);
-                    let response_480 = build_plain_response(480, "Temporarily Unavailable");
+                    let response_480 =
+                        response_for_request(&request, 480, "Temporarily Unavailable");
                     self.send_sip(
                         "480 → caller",
                         response_480.as_bytes(),
@@ -484,10 +497,33 @@ impl Sbc {
             self.b2bua.terminate_call(&uuid).await;
             self.metrics.inc_call_failed();
             self.metrics.inc_sip_response(480);
-            let response_480 = build_plain_response(480, "Temporarily Unavailable");
+            let response_480 = response_for_request(&request, 480, "Temporarily Unavailable");
             self.send_sip(
                 "480 → caller",
                 response_480.as_bytes(),
+                source,
+                transport,
+                reply_tx,
+            )
+            .await;
+            return Ok(());
+        } else if is_trunk_ip {
+            // Inbound trunk call to a number that is neither a DID nor a
+            // registered user: 404, never LCR it back out to a trunk (the
+            // SBC is not a transit switch — that would be a billed call
+            // to an unknown number, or a loop through the same trunk).
+            let number = request.uri.user().unwrap_or("?");
+            warn!(
+                "INVITE from trunk {} to unknown number {} — 404",
+                source, number
+            );
+            self.b2bua.terminate_call(&uuid).await;
+            self.metrics.inc_call_failed();
+            self.metrics.inc_sip_response(404);
+            let response_404 = response_for_request(&request, 404, "Not Found");
+            self.send_sip(
+                "404 → trunk",
+                response_404.as_bytes(),
                 source,
                 transport,
                 reply_tx,
@@ -543,7 +579,7 @@ impl Sbc {
                 self.b2bua.terminate_call(&uuid).await;
                 self.metrics.inc_call_failed();
                 self.metrics.inc_sip_response(503);
-                let response_503 = build_plain_response(503, "Service Unavailable");
+                let response_503 = response_for_request(&request, 503, "Service Unavailable");
                 self.send_sip(
                     "503 → caller",
                     response_503.as_bytes(),
@@ -610,7 +646,7 @@ impl Sbc {
                     self.b2bua.terminate_call(&uuid).await;
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(503);
-                    let response_503 = build_plain_response(503, "Service Unavailable");
+                    let response_503 = response_for_request(&request, 503, "Service Unavailable");
                     self.send_sip(
                         "503 → caller",
                         response_503.as_bytes(),
@@ -1412,6 +1448,14 @@ fn request_has_rfc3261_branch(request: &Request) -> bool {
 
 /// Extract the URI from a Contact header value: `"Bob" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60`
 /// → `sip:b@1.2.3.4:5060;transport=tcp`. Falls back to the trimmed value.
+/// Value of the request's Max-Forwards header, None when absent or unparsable.
+pub(crate) fn max_forwards(request: &Request) -> Option<u32> {
+    request
+        .max_forwards_header()
+        .ok()
+        .and_then(|h| h.value().trim().parse().ok())
+}
+
 pub(crate) fn extract_contact_uri(value: &str) -> String {
     if let (Some(start), Some(end)) = (value.find('<'), value.find('>')) {
         if end > start {

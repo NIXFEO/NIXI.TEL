@@ -1302,7 +1302,7 @@ impl Sbc {
             self.metrics.inc_security_ban_drop();
             if !self.security.bans.silent_drop() {
                 self.metrics.inc_sip_response(403);
-                let response_403 = build_plain_response(403, "Forbidden");
+                let response_403 = response_for_message(&received.message, 403, "Forbidden");
                 self.send_sip(
                     "403 (banned) → source",
                     response_403.as_bytes(),
@@ -1329,7 +1329,7 @@ impl Sbc {
             debug!("DoS rate limited message from {}", source);
             self.metrics.inc_dos_blocked();
             self.metrics.inc_sip_response(503);
-            let response_503 = build_plain_response(503, "Service Unavailable");
+            let response_503 = response_for_message(&received.message, 503, "Service Unavailable");
             self.send_sip(
                 "503 (rate-limited) → source",
                 response_503.as_bytes(),
@@ -1396,7 +1396,7 @@ impl Sbc {
             method => {
                 warn!("Unhandled SIP method: {}", method);
                 self.metrics.inc_sip_response(501);
-                let response_501 = build_plain_response(501, "Not Implemented");
+                let response_501 = response_for_request(&request, 501, "Not Implemented");
                 self.send_sip(
                     "501 → source",
                     response_501.as_bytes(),
@@ -1628,7 +1628,7 @@ impl Sbc {
             Err(e) => {
                 warn!("Registration failed for {}: {}", aor, e);
                 self.metrics.inc_sip_response(500);
-                let response_500 = build_plain_response(500, "Server Internal Error");
+                let response_500 = response_for_request(request, 500, "Server Internal Error");
                 self.send_sip(
                     "500 → REGISTER",
                     response_500.as_bytes(),
@@ -2073,6 +2073,26 @@ fn rewrite_response_for_caller(
 /// Build a minimal SIP response string (no request headers — last resort)
 fn build_plain_response(status: u16, reason: &str) -> String {
     format!("SIP/2.0 {} {}\r\nContent-Length: 0\r\n\r\n", status, reason)
+}
+
+/// A response to `request` that the peer can match to its transaction
+/// (Via/From/To/Call-ID/CSeq echoed, RFC 3261 §8.2.6.2), falling back to a
+/// header-less status line only when the request lacks those headers.
+pub(super) fn response_for_request(request: &Request, status: u16, reason: &str) -> String {
+    match build_plain_response_for_request(request, status, reason) {
+        Ok(r) => r.to_string(),
+        Err(_) => build_plain_response(status, reason),
+    }
+}
+
+/// Same for a message that may be a request or a response (pipeline
+/// rejections before dispatch): a response gets no answer body but the
+/// status line.
+fn response_for_message(msg: &SipMessage, status: u16, reason: &str) -> String {
+    match msg {
+        SipMessage::Request(r) => response_for_request(r, status, reason),
+        SipMessage::Response(_) => build_plain_response(status, reason),
+    }
 }
 
 /// Build a proper SIP response echoing Via/From/To/Call-ID/CSeq from the request.

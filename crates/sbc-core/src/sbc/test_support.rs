@@ -260,6 +260,39 @@ pub(crate) fn bye_from_trunk(spec: &CallSpec, cseq: u32) -> rsip::Request {
     ))
 }
 
+/// A fresh INVITE from the trunk (inbound PSTN call) to `number`, as
+/// `handle_invite` receives it. Call-ID `cid-in-1`, CSeq 1, branch
+/// `z9hG4bKtrk1`.
+pub(crate) fn invite_from_trunk(number: &str, max_forwards: u32) -> rsip::Request {
+    request(format!(
+        "INVITE sip:{}@127.0.0.1:5060 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKtrk1;rport\r\n\
+         Max-Forwards: {}\r\n\
+         From: <sip:+33612345678@203.0.113.9>;tag=g1\r\n\
+         To: <sip:{}@127.0.0.1>\r\n\
+         Call-ID: cid-in-1\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:203.0.113.9:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        number,
+        max_forwards,
+        number,
+        TRUNK_SDP.len(),
+        TRUNK_SDP
+    ))
+}
+
+/// Make the harness trunk's IP known as a trunk source (what hydration
+/// does from the trunks table), so its INVITEs bypass the anti-spam gate.
+pub(crate) async fn register_trunk_ip(sbc: &Sbc) {
+    let mut ips = sbc.trunk_ips.write().await;
+    let ip = trunk_addr().ip().to_string();
+    if !ips.contains(&ip) {
+        ips.push(ip);
+    }
+}
+
 /// Everything queued on a leg, as text, oldest first.
 pub(crate) fn drain(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<String> {
     let mut out = Vec::new();
@@ -393,13 +426,7 @@ pub(crate) struct TestCall {
 /// outbound leg attached, one attempt recorded).
 pub(crate) async fn add_call(sbc: &mut Sbc, spec: CallSpec) -> TestCall {
     let trunk_id = trunk_id(sbc);
-    {
-        let mut ips = sbc.trunk_ips.write().await;
-        let ip = trunk_addr().ip().to_string();
-        if !ips.contains(&ip) {
-            ips.push(ip);
-        }
-    }
+    register_trunk_ip(sbc).await;
     let (caller_tx, caller_rx) = unbounded_channel();
     let (callee_tx, callee_rx) = unbounded_channel();
     let uuid = sbc

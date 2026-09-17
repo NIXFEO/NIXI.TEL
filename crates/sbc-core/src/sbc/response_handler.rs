@@ -756,7 +756,21 @@ impl Sbc {
                                 "B2BUA: 407 auth retry failed for call {}, relaying to caller",
                                 uuid
                             );
-                            let response_503 = build_plain_response(503, "Service Unavailable");
+                            // Same dialog identity as the 407 (From/To/Call-ID),
+                            // status replaced, challenge stripped; Via/CSeq are
+                            // restored for the caller by relay_error_and_terminate.
+                            let response_503 = {
+                                let raw = rsip::SipMessage::Response(response.clone()).to_string();
+                                match crate::topology::RawSipMessage::parse(&raw) {
+                                    Ok(mut m) => {
+                                        m.start_line = "SIP/2.0 503 Service Unavailable".into();
+                                        m.remove_header("proxy-authenticate");
+                                        m.remove_header("www-authenticate");
+                                        m.to_string()
+                                    }
+                                    Err(_) => build_plain_response(503, "Service Unavailable"),
+                                }
+                            };
                             self.relay_error_and_terminate(
                                 &uuid,
                                 response_503,

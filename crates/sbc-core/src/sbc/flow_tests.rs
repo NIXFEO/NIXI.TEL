@@ -548,3 +548,75 @@ async fn cancelled_calls_leave_no_state_behind() {
     assert_eq!(sbc.b2bua.stats().await.total_active, 0);
     assert_eq!(sbc.media.stats().allocated_ports, 0);
 }
+
+/// An inbound trunk call to a number that is neither a DID nor a
+/// registered user is answered 404 (never routed back out to a trunk).
+#[tokio::test]
+async fn trunk_call_to_an_unknown_number_is_answered_404() {
+    let mut sbc = SbcBuilder::new().build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_trunk("+33999000111", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 2, "100 Trying then 404: {:?}", out);
+    assert!(out[0].starts_with("SIP/2.0 100 Trying\r\n"), "{}", out[0]);
+    let nf = &out[1];
+    assert!(nf.starts_with("SIP/2.0 404 Not Found\r\n"), "{}", nf);
+    assert!(
+        nf.contains("Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKtrk1"),
+        "{}",
+        nf
+    );
+    assert!(nf.contains("From: <sip:+33612345678@203.0.113.9>;tag=g1\r\n"));
+    assert!(
+        nf.contains("To: <sip:+33999000111@127.0.0.1>;tag="),
+        "final gets a To tag: {}",
+        nf
+    );
+    assert!(nf.contains("Call-ID: cid-in-1\r\n"));
+    assert!(nf.contains("CSeq: 1 INVITE\r\n"));
+
+    assert!(
+        sbc.b2bua.calls_locked().await.is_empty(),
+        "no call left behind"
+    );
+    assert_eq!(sbc.media.stats().allocated_ports, 0, "media released");
+}
+
+/// RFC 3261 §16.3: Max-Forwards: 0 is answered 483 before any work.
+#[tokio::test]
+async fn invite_with_exhausted_max_forwards_is_answered_483() {
+    let mut sbc = SbcBuilder::new().build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_trunk("+33999000111", 0),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "483 only, no 100 Trying: {:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 483 Too Many Hops\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("branch=z9hG4bKtrk1"));
+    assert!(out[0].contains("CSeq: 1 INVITE\r\n"));
+    assert!(sbc.b2bua.calls_locked().await.is_empty());
+    assert_eq!(sbc.media.stats().allocated_ports, 0);
+}
