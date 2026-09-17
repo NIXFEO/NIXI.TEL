@@ -1857,3 +1857,57 @@ async fn trunk_invite_presenting_a_local_user_is_flagged() {
     let _ = drain(&mut rx);
     assert_eq!(identity_events(&sbc).len(), 1);
 }
+
+/// A registered user's asserted identities never reach the trunk; its
+/// verified From does.
+#[tokio::test]
+async fn local_users_asserted_identity_headers_never_reach_the_trunk() {
+    const REALM: &str = "sip.example.com";
+    let phone: SocketAddr = "10.0.0.9:5080".parse().unwrap();
+    let mut sbc = SbcBuilder::new()
+        .identity("127.0.0.1", 5060)
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .build();
+    sbc.start(&udp_loopback(), None).await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let mut trunk = crate::routing::TrunkConfig::new("loop".to_string());
+    trunk.host = "127.0.0.1".to_string();
+    trunk.port = peer_addr.port();
+    sbc.add_trunk(trunk);
+    assert!(sbc.trunk_manager.disable_trunk(&trunk_id(&sbc)));
+    register(&mut sbc, "alice", "s3cret", REALM, phone).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_user(
+            "alice",
+            REALM,
+            "+33612345678",
+            "P-Asserted-Identity: <sip:+33100000000@sip.example.com>\r\nP-Preferred-Identity: <sip:ceo@sip.example.com>\r\nRemote-Party-ID: <sip:boss@sip.example.com>;party=calling\r\n",
+        ),
+        phone,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 100 Trying\r\n"), "{:?}", out);
+
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        .await
+        .expect("the INVITE reaches the trunk")
+        .unwrap();
+    let invite = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(invite.starts_with("INVITE sip:"), "{}", invite);
+    assert!(!invite.contains("P-Asserted-Identity"), "{}", invite);
+    assert!(!invite.contains("P-Preferred-Identity"), "{}", invite);
+    assert!(!invite.contains("Remote-Party-ID"), "{}", invite);
+    assert!(
+        invite.contains("From: <sip:alice@sip.example.com>;tag=alice-tag\r\n"),
+        "the verified From is what the trunk sees: {}",
+        invite
+    );
+}

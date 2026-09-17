@@ -402,6 +402,35 @@ pub fn apply_topology_hiding_outbound(
     Ok(msg.to_string())
 }
 
+/// Headers by which a request asserts an identity on someone's behalf
+/// (RFC 3325 P-Asserted-Identity / P-Preferred-Identity, the legacy
+/// Remote-Party-ID) or leaks the path it took. A registered user is not a
+/// trusted node (RFC 3325 §4): whatever it asserts is dropped before the
+/// request leaves toward a trunk — its verified From is its identity.
+pub const UNTRUSTED_IDENTITY_HEADERS: &[&str] = &[
+    "p-asserted-identity",
+    "p-preferred-identity",
+    "remote-party-id",
+    "p-charging-vector",
+    "x-forwarded-for",
+    "x-real-ip",
+];
+
+/// Strip `UNTRUSTED_IDENTITY_HEADERS` from a raw request.
+pub fn strip_untrusted_identity_headers(raw: &str) -> String {
+    let Ok(mut msg) = RawSipMessage::parse(raw) else {
+        return raw.to_string();
+    };
+    let before = msg.headers.len();
+    for name in UNTRUSTED_IDENTITY_HEADERS {
+        msg.remove_header(name);
+    }
+    if msg.headers.len() == before {
+        return raw.to_string();
+    }
+    msg.to_string()
+}
+
 /// Drop from `Supported` (and its compact form `k`) every extension the
 /// SBC does not implement, so a peer never negotiates one with us in the
 /// middle (e.g. `100rel`: the trunk would send reliable provisionals,
@@ -552,6 +581,19 @@ Content-Length: 0\r\n\
         msg.set_header("Max-Forwards", "50");
         let mf = msg.header_values("max-forwards");
         assert_eq!(mf[0], "50");
+    }
+
+    #[test]
+    fn untrusted_identity_headers_are_stripped() {
+        let raw = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nFrom: <sip:alice@h>;tag=1\r\nP-Asserted-Identity: <sip:+33100000000@h>\r\nP-Preferred-Identity: <sip:ceo@h>\r\nRemote-Party-ID: <sip:boss@h>;party=calling\r\nX-Forwarded-For: 10.0.0.1\r\nContent-Length: 0\r\n\r\n";
+        let out = strip_untrusted_identity_headers(raw);
+        assert!(!out.contains("P-Asserted-Identity"), "{}", out);
+        assert!(!out.contains("P-Preferred-Identity"));
+        assert!(!out.contains("Remote-Party-ID"));
+        assert!(!out.contains("X-Forwarded-For"));
+        assert!(out.contains("From: <sip:alice@h>;tag=1\r\n"), "From kept");
+        let clean = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(strip_untrusted_identity_headers(clean), clean);
     }
 
     #[test]

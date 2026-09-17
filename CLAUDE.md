@@ -29,7 +29,7 @@ MIT licensed. Runs in production; contributions welcome — see
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # ~440 tests
+cargo test --workspace          # ~480 tests
 cargo clippy --workspace
 ```
 
@@ -63,8 +63,11 @@ Key modules: `sbc/import.rs` (first-boot seed), `sbc/hydrate.rs`
 ### Call flow
 
 Inbound message → `sbc/mod.rs` pipeline: **ban → ACL → DoS → dispatch**.
-INVITEs go through `sbc/invite_handler.rs` (routing, DID mapping, trunk
-selection with failover, topology hiding); responses through
+INVITEs go through `sbc/invite_handler.rs` (retransmission absorb, identity
+gate `classify_caller` — trunk / loopback / registered user / 407-proven
+user, routing, DID mapping, trunk selection with failover, topology
+hiding, unsupported extensions and untrusted identity headers stripped);
+responses through
 `sbc/response_handler.rs` (SDP rewriting, WebRTC/SRTP, session-timer 200s);
 BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 (`b2bua.rs`) holds per-call dialog state for both legs.
@@ -78,6 +81,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `sbc/response_handler.rs` | Response relay, non-2xx ACK + per-attempt attribution, SDP, WebRTC/DTLS/SRTP, session-timer completion |
 | `sbc/call_handler.rs` | BYE/CANCEL/ACK/INFO, re-INVITE, timeouts, graceful shutdown |
 | `sbc/cdr.rs` | `CallOutcome`, `finish_call` (single CDR/metrics/release path), `hangup_both_legs`, RTP/setup timeouts, admin kicks |
+| `sbc/invite_tx.rs` | INVITE server-transaction memory: retransmissions replay the last response (RFC 3261 §17.2.1) |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
@@ -155,6 +159,13 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   once with the trunk's Min-SE (RFC 4028 §7.4); raise `session_expires` to
   14400 to skip that round trip (applied on SIGHUP). Timer headers are
   *replaced* on the trunk leg, never appended to the caller's own.
+- **Identity** — a Digest-authenticated user binds only its own AOR on a
+  served domain (`register_aor_check`); an INVITE from a registered phone
+  must carry one of that phone's users; an unregistered source claiming a
+  local user is challenged (407); a stranger reaches a registered user only
+  from a trunk's /24; a trunk presenting a local user is flagged
+  (`trunk_local_from`). Stale nonces are re-challenged with `stale=true`,
+  never banned.
 - **Non-2xx finals are ACKed and attributed by Via branch** — every INVITE
   attempt toward a trunk (initial, 407/422 retry, failover) is remembered;
   a late 487/422 from a superseded attempt is ACKed and dropped instead of

@@ -888,6 +888,15 @@ impl Sbc {
         let raw_request = crate::topology::strip_unsupported_extensions(
             &rsip::SipMessage::Request(request_with_sdp).to_string(),
         );
+        // A local user asserts nobody's identity toward the carrier (RFC
+        // 3325 §4): its verified From is what the trunk sees. Trunk-side
+        // headers (PAI of a PSTN caller) are kept toward our own users.
+        let raw_request = match caller {
+            CallerIdentity::Local(_) => {
+                crate::topology::strip_untrusted_identity_headers(&raw_request)
+            }
+            CallerIdentity::Trunk | CallerIdentity::Localhost => raw_request,
+        };
         // Use the OUTBOUND transport name (not the inbound one), so the Via header
         // reflects the correct transport the callee must use to reply.
         let outbound_transport_name = match outbound_transport {
