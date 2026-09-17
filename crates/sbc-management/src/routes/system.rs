@@ -17,7 +17,11 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, [("content-type", "application/json")], report.to_json())
+    (
+        status,
+        [("content-type", "application/json")],
+        report.to_json(),
+    )
 }
 
 pub async fn ready() -> impl IntoResponse {

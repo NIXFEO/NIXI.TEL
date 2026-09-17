@@ -19,7 +19,13 @@ fn store(state: &AppState) -> ApiResult<Arc<ConfigStore>> {
     state.store.clone().ok_or_else(ApiError::store_unavailable)
 }
 
-async fn apply_and_notify(state: &AppState, store: &ConfigStore, entity: &str, action: &str, id: &str) {
+async fn apply_and_notify(
+    state: &AppState,
+    store: &ConfigStore,
+    entity: &str,
+    action: &str,
+    id: &str,
+) {
     let _ = apply_trunks_and_routes(&state.trunks, store).await;
     state.refresh_trunk_ips().await;
     state.events.publish(SbcEvent::ConfigChanged {
@@ -79,14 +85,30 @@ pub struct TrunkBody {
     pub tls_client_key: Option<String>,
 }
 
-fn default_true() -> bool { true }
-fn default_port() -> u16 { 5060 }
-fn default_udp() -> String { "UDP".to_string() }
-fn default_reg_interval() -> u64 { 300 }
-fn default_priority() -> u32 { 100 }
-fn default_number_format() -> String { "e164".to_string() }
-fn default_codecs() -> Vec<String> { vec!["PCMU".to_string(), "PCMA".to_string()] }
-fn default_max_calls() -> u32 { 100 }
+fn default_true() -> bool {
+    true
+}
+fn default_port() -> u16 {
+    5060
+}
+fn default_udp() -> String {
+    "UDP".to_string()
+}
+fn default_reg_interval() -> u64 {
+    300
+}
+fn default_priority() -> u32 {
+    100
+}
+fn default_number_format() -> String {
+    "e164".to_string()
+}
+fn default_codecs() -> Vec<String> {
+    vec!["PCMU".to_string(), "PCMA".to_string()]
+}
+fn default_max_calls() -> u32 {
+    100
+}
 
 impl TrunkBody {
     fn into_row(self, name: String) -> ApiResult<TrunkRow> {
@@ -96,7 +118,9 @@ impl TrunkBody {
             .ok_or_else(|| ApiError::bad_request("missing required field: host"))?;
         let transport = self.transport.to_uppercase();
         if !matches!(transport.as_str(), "UDP" | "TCP" | "TLS" | "WS" | "WSS") {
-            return Err(ApiError::bad_request("transport must be UDP, TCP, TLS, WS or WSS"));
+            return Err(ApiError::bad_request(
+                "transport must be UDP, TCP, TLS, WS or WSS",
+            ));
         }
         Ok(TrunkRow {
             name,
@@ -251,8 +275,16 @@ pub async fn create_trunk(
         .filter(|n| !n.is_empty())
         .ok_or_else(|| ApiError::bad_request("missing required field: name"))?;
 
-    if store.get_trunk(&name).await.map_err(ApiError::internal)?.is_some() {
-        return Err(ApiError::conflict(format!("trunk '{}' already exists", name)));
+    if store
+        .get_trunk(&name)
+        .await
+        .map_err(ApiError::internal)?
+        .is_some()
+    {
+        return Err(ApiError::conflict(format!(
+            "trunk '{}' already exists",
+            name
+        )));
     }
 
     let row = body.into_row(name.clone())?;
@@ -268,7 +300,12 @@ pub async fn update_trunk(
     Json(body): Json<TrunkBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
-    if store.get_trunk(&name).await.map_err(ApiError::internal)?.is_none() {
+    if store
+        .get_trunk(&name)
+        .await
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
         return Err(ApiError::not_found(format!("trunk '{}' not found", name)));
     }
     let row = body.into_row(name.clone())?;
@@ -296,7 +333,11 @@ pub async fn delete_trunk(
         )));
     }
 
-    if !store.delete_trunk(&name).await.map_err(ApiError::internal)? {
+    if !store
+        .delete_trunk(&name)
+        .await
+        .map_err(ApiError::internal)?
+    {
         return Err(ApiError::not_found(format!("trunk '{}' not found", name)));
     }
     // Hydration disables manager entries missing from the store; remove outright.
@@ -319,8 +360,14 @@ async fn set_trunk_enabled(
         .ok_or_else(|| ApiError::not_found(format!("trunk '{}' not found", name)))?;
     row.enabled = enabled;
     store.upsert_trunk(&row).await.map_err(ApiError::internal)?;
-    apply_and_notify(&state, &store, "trunk", if enabled { "enable" } else { "disable" }, &name)
-        .await;
+    apply_and_notify(
+        &state,
+        &store,
+        "trunk",
+        if enabled { "enable" } else { "disable" },
+        &name,
+    )
+    .await;
     Ok(Json(json!({ "name": name, "enabled": enabled })))
 }
 
@@ -365,7 +412,9 @@ fn route_json(r: &RouteRow) -> serde_json::Value {
 pub async fn list_routes(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
     let rows = store.list_routes().await.map_err(ApiError::internal)?;
-    Ok(Json(serde_json::Value::Array(rows.iter().map(route_json).collect())))
+    Ok(Json(serde_json::Value::Array(
+        rows.iter().map(route_json).collect(),
+    )))
 }
 
 pub async fn create_route(
@@ -375,10 +424,22 @@ pub async fn create_route(
     let store = store(&state)?;
     let (prefix, trunk_name) = match (body.prefix.clone(), body.trunk_name.clone()) {
         (Some(p), Some(t)) if !p.is_empty() && !t.is_empty() => (p, t),
-        _ => return Err(ApiError::bad_request("missing required fields: prefix, trunk_name")),
+        _ => {
+            return Err(ApiError::bad_request(
+                "missing required fields: prefix, trunk_name",
+            ))
+        }
     };
-    if store.get_trunk(&trunk_name).await.map_err(ApiError::internal)?.is_none() {
-        return Err(ApiError::bad_request(format!("unknown trunk '{}'", trunk_name)));
+    if store
+        .get_trunk(&trunk_name)
+        .await
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(ApiError::bad_request(format!(
+            "unknown trunk '{}'",
+            trunk_name
+        )));
     }
 
     let mut row = RouteRow {

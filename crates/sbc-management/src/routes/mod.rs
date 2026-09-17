@@ -22,13 +22,25 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, code: "bad_request", message: message.into() }
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
+            message: message.into(),
+        }
     }
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::NOT_FOUND, code: "not_found", message: message.into() }
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+        }
     }
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self { status: StatusCode::CONFLICT, code: "conflict", message: message.into() }
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: message.into(),
+        }
     }
     pub fn internal(message: impl std::fmt::Display) -> Self {
         Self {
@@ -49,7 +61,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response()
+        (
+            self.status,
+            Json(json!({ "error": self.message, "code": self.code })),
+        )
+            .into_response()
     }
 }
 

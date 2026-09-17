@@ -48,8 +48,7 @@ impl TransportType {
 }
 
 /// Number format expected by a trunk
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum NumberFormat {
     /// E.164 international: +33612345678 (keep as-is)
     #[default]
@@ -59,7 +58,6 @@ pub enum NumberFormat {
     /// Local format: 612345678 (strip country code and national prefix)
     Local,
 }
-
 
 /// Trunk configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,7 +207,9 @@ impl TrunkConfig {
 
     /// Check if a codec is allowed for this trunk
     pub fn is_codec_allowed(&self, codec: &str) -> bool {
-        self.allowed_codecs.iter().any(|c| c.eq_ignore_ascii_case(codec))
+        self.allowed_codecs
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(codec))
     }
 
     /// Check if this trunk can route a given phone number (prefix matching)
@@ -227,10 +227,17 @@ impl TrunkConfig {
 
     /// Normalize the CALLER number for this trunk.
     /// Returns (number, display_name) — either rewritten or original.
-    pub fn normalize_caller(&self, number: &str, display_name: Option<&str>) -> (String, Option<String>) {
+    pub fn normalize_caller(
+        &self,
+        number: &str,
+        display_name: Option<&str>,
+    ) -> (String, Option<String>) {
         // Override takes highest priority
         if let Some(ref override_num) = self.caller_number_override {
-            let dn = self.caller_display_name.clone().or_else(|| display_name.map(|s| s.to_string()));
+            let dn = self
+                .caller_display_name
+                .clone()
+                .or_else(|| display_name.map(|s| s.to_string()));
             return (override_num.clone(), dn);
         }
         // Apply format conversion if configured
@@ -278,7 +285,10 @@ impl TrunkConfig {
         } else {
             number.to_string()
         };
-        let dn = self.caller_display_name.clone().or_else(|| display_name.map(|s| s.to_string()));
+        let dn = self
+            .caller_display_name
+            .clone()
+            .or_else(|| display_name.map(|s| s.to_string()));
         (new_number, dn)
     }
 
@@ -389,9 +399,8 @@ impl TrunkState {
             _ => 300,
         };
         if cooldown_secs > 0 {
-            self.disabled_until = Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(cooldown_secs)
-            );
+            self.disabled_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(cooldown_secs));
         }
     }
 
@@ -550,10 +559,7 @@ impl TrunkManager {
 
     /// Count total active calls across all trunks
     pub fn total_active_calls(&self) -> u32 {
-        self.states
-            .iter()
-            .map(|entry| entry.active_calls)
-            .sum()
+        self.states.iter().map(|entry| entry.active_calls).sum()
     }
 }
 
@@ -692,7 +698,10 @@ mod tests {
 
         // With resolved_addr set (from DNS), it works
         trunk.resolved_addr = Some("1.2.3.4:5060".parse().unwrap());
-        assert_eq!(trunk.destination().unwrap(), "1.2.3.4:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            trunk.destination().unwrap(),
+            "1.2.3.4:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     // ── matches_prefix tests ─────────────────────────────────────────
@@ -702,10 +711,22 @@ mod tests {
         let mut trunk = TrunkConfig::new("fr-trunk".into());
         trunk.prefix_patterns = vec!["+33".into(), "0".into()];
 
-        assert!(trunk.matches_prefix("+33612345678"), "E.164 French number should match");
-        assert!(trunk.matches_prefix("0612345678"), "National French number should match");
-        assert!(!trunk.matches_prefix("+44123456789"), "UK number should not match French trunk");
-        assert!(!trunk.matches_prefix("+1555123456"), "US number should not match French trunk");
+        assert!(
+            trunk.matches_prefix("+33612345678"),
+            "E.164 French number should match"
+        );
+        assert!(
+            trunk.matches_prefix("0612345678"),
+            "National French number should match"
+        );
+        assert!(
+            !trunk.matches_prefix("+44123456789"),
+            "UK number should not match French trunk"
+        );
+        assert!(
+            !trunk.matches_prefix("+1555123456"),
+            "US number should not match French trunk"
+        );
     }
 
     #[test]
@@ -713,9 +734,18 @@ mod tests {
         let trunk = TrunkConfig::new("catch-all".into());
         // prefix_patterns is empty by default
 
-        assert!(trunk.matches_prefix("+33612345678"), "Empty prefix should match any number");
-        assert!(trunk.matches_prefix("+1555123456"), "Empty prefix should match any number");
-        assert!(trunk.matches_prefix("anything"), "Empty prefix should match anything");
+        assert!(
+            trunk.matches_prefix("+33612345678"),
+            "Empty prefix should match any number"
+        );
+        assert!(
+            trunk.matches_prefix("+1555123456"),
+            "Empty prefix should match any number"
+        );
+        assert!(
+            trunk.matches_prefix("anything"),
+            "Empty prefix should match anything"
+        );
     }
 
     #[test]
@@ -723,10 +753,22 @@ mod tests {
         let mut trunk = TrunkConfig::new("intl-trunk".into());
         trunk.prefix_patterns = vec!["+44".into(), "+1".into(), "+49".into()];
 
-        assert!(trunk.matches_prefix("+44207123456"), "UK number should match");
-        assert!(trunk.matches_prefix("+12125551234"), "US number should match");
-        assert!(trunk.matches_prefix("+4930123456"), "German number should match");
-        assert!(!trunk.matches_prefix("+33612345678"), "French number should not match");
+        assert!(
+            trunk.matches_prefix("+44207123456"),
+            "UK number should match"
+        );
+        assert!(
+            trunk.matches_prefix("+12125551234"),
+            "US number should match"
+        );
+        assert!(
+            trunk.matches_prefix("+4930123456"),
+            "German number should match"
+        );
+        assert!(
+            !trunk.matches_prefix("+33612345678"),
+            "French number should not match"
+        );
     }
 
     // ── normalize_caller tests ───────────────────────────────────────
@@ -739,7 +781,11 @@ mod tests {
 
         let (num, dn) = trunk.normalize_caller("+33612345678", Some("Alice"));
         assert_eq!(num, "+33978370000", "Override should replace caller number");
-        assert_eq!(dn, Some("NIXI.TEL".to_string()), "Override should replace display name");
+        assert_eq!(
+            dn,
+            Some("NIXI.TEL".to_string()),
+            "Override should replace display name"
+        );
     }
 
     #[test]
@@ -750,7 +796,11 @@ mod tests {
 
         let (num, dn) = trunk.normalize_caller("+33612345678", Some("Alice"));
         assert_eq!(num, "+33978370000");
-        assert_eq!(dn, Some("Alice".to_string()), "Should keep original display name when not overridden");
+        assert_eq!(
+            dn,
+            Some("Alice".to_string()),
+            "Should keep original display name when not overridden"
+        );
     }
 
     #[test]
@@ -760,7 +810,10 @@ mod tests {
         trunk.country_code = Some("33".into());
 
         let (num, dn) = trunk.normalize_caller("0612345678", None);
-        assert_eq!(num, "+33612345678", "National caller should be converted to E.164");
+        assert_eq!(
+            num, "+33612345678",
+            "National caller should be converted to E.164"
+        );
         assert_eq!(dn, None);
     }
 
@@ -772,7 +825,10 @@ mod tests {
         trunk.national_prefix = Some("0".into());
 
         let (num, _dn) = trunk.normalize_caller("+33612345678", None);
-        assert_eq!(num, "0612345678", "E.164 caller should be converted to national");
+        assert_eq!(
+            num, "0612345678",
+            "E.164 caller should be converted to national"
+        );
     }
 
     #[test]
@@ -803,7 +859,11 @@ mod tests {
         trunk.number_format = NumberFormat::E164;
         trunk.country_code = Some("33".into());
 
-        assert_eq!(trunk.normalize_number("+33612345678"), "+33612345678", "Already E.164 → no change");
+        assert_eq!(
+            trunk.normalize_number("+33612345678"),
+            "+33612345678",
+            "Already E.164 → no change"
+        );
     }
 
     #[test]
@@ -813,8 +873,11 @@ mod tests {
         trunk.country_code = Some("33".into());
         trunk.national_prefix = Some("0".into());
 
-        assert_eq!(trunk.normalize_number("+44207123456"), "+44207123456",
-            "Foreign E.164 should pass through on National trunk");
+        assert_eq!(
+            trunk.normalize_number("+44207123456"),
+            "+44207123456",
+            "Foreign E.164 should pass through on National trunk"
+        );
     }
 
     #[test]
@@ -823,8 +886,11 @@ mod tests {
         trunk.number_format = NumberFormat::E164;
         trunk.country_code = Some("33".into());
 
-        assert_eq!(trunk.normalize_number("612345678"), "612345678",
-            "Number without + or 0 prefix → passthrough (ambiguous)");
+        assert_eq!(
+            trunk.normalize_number("612345678"),
+            "612345678",
+            "Number without + or 0 prefix → passthrough (ambiguous)"
+        );
     }
 
     #[test]
@@ -834,7 +900,10 @@ mod tests {
         trunk.host = "46.28.168.58".into();
         mgr.add_trunk(trunk);
 
-        assert_eq!(mgr.name_for_ip("46.28.168.58").as_deref(), Some("nixi-trunk-out"));
+        assert_eq!(
+            mgr.name_for_ip("46.28.168.58").as_deref(),
+            Some("nixi-trunk-out")
+        );
         assert_eq!(mgr.name_for_ip("1.2.3.4"), None);
     }
 }

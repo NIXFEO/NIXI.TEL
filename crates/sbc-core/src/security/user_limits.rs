@@ -22,9 +22,15 @@ pub struct UserLimitsConfig {
     pub overrides: Vec<UserLimitOverride>,
 }
 
-fn default_enabled() -> bool { true }
-fn default_concurrent() -> u32 { 4 }
-fn default_cpm() -> u32 { 10 }
+fn default_enabled() -> bool {
+    true
+}
+fn default_concurrent() -> u32 {
+    4
+}
+fn default_cpm() -> u32 {
+    10
+}
 
 impl Default for UserLimitsConfig {
     fn default() -> Self {
@@ -53,8 +59,15 @@ pub struct UserLimits {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LimitDecision {
     Allowed,
-    ConcurrentExceeded { current: u32, limit: u32 },
-    RateExceeded { current: u32, limit: u32, retry_after_secs: u64 },
+    ConcurrentExceeded {
+        current: u32,
+        limit: u32,
+    },
+    RateExceeded {
+        current: u32,
+        limit: u32,
+        retry_after_secs: u64,
+    },
 }
 
 pub struct UserLimitsManager {
@@ -129,7 +142,11 @@ impl UserLimitsManager {
         let idle: Vec<String> = self
             .rate_windows
             .iter()
-            .filter(|e| e.value().back().is_none_or(|t| now.duration_since(*t) > window))
+            .filter(|e| {
+                e.value()
+                    .back()
+                    .is_none_or(|t| now.duration_since(*t) > window)
+            })
             .map(|e| e.key().clone())
             .collect();
         for user in &idle {
@@ -158,7 +175,10 @@ impl UserLimitsManager {
             let now = Instant::now();
             let window = Duration::from_secs(60);
             let mut attempts = self.rate_windows.entry(user.to_string()).or_default();
-            while attempts.front().is_some_and(|t| now.duration_since(*t) > window) {
+            while attempts
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > window)
+            {
                 attempts.pop_front();
             }
             if attempts.len() as u32 >= max_cpm {
@@ -199,7 +219,10 @@ mod tests {
         assert_eq!(mgr.check_and_record("alice", 1), LimitDecision::Allowed);
         assert!(matches!(
             mgr.check_and_record("alice", 2),
-            LimitDecision::ConcurrentExceeded { current: 2, limit: 2 }
+            LimitDecision::ConcurrentExceeded {
+                current: 2,
+                limit: 2
+            }
         ));
     }
 
@@ -210,7 +233,11 @@ mod tests {
             assert_eq!(mgr.check_and_record("bob", 0), LimitDecision::Allowed);
         }
         match mgr.check_and_record("bob", 0) {
-            LimitDecision::RateExceeded { current, limit, retry_after_secs } => {
+            LimitDecision::RateExceeded {
+                current,
+                limit,
+                retry_after_secs,
+            } => {
                 assert_eq!((current, limit), (3, 3));
                 assert!((1..=60).contains(&retry_after_secs));
             }
@@ -223,10 +250,13 @@ mod tests {
     #[test]
     fn zero_means_unlimited_and_overrides_beat_defaults() {
         let mgr = manager(1, 1);
-        mgr.set_override("pbx", UserLimits {
-            max_concurrent_calls: Some(0),
-            max_calls_per_minute: Some(0),
-        });
+        mgr.set_override(
+            "pbx",
+            UserLimits {
+                max_concurrent_calls: Some(0),
+                max_calls_per_minute: Some(0),
+            },
+        );
         for _ in 0..10 {
             assert_eq!(mgr.check_and_record("pbx", 100), LimitDecision::Allowed);
         }

@@ -13,27 +13,27 @@
 //! - Outbound TLS/mTLS toward trunks
 //! - Dynamic ACL (IP access control lists)
 
-pub mod transport;
-pub mod routing;
-pub mod config;
-pub mod error;
-pub mod maintenance;
-pub mod sbc;
-pub mod media;
-pub mod b2bua;
 pub mod auth;
-pub mod metrics;
-pub mod events;
-pub mod storage;
+pub mod b2bua;
+pub mod config;
 pub mod dos;
+pub mod error;
+pub mod events;
+pub mod maintenance;
+pub mod media;
+pub mod metrics;
+pub mod routing;
+pub mod sbc;
+pub mod storage;
+pub mod transport;
 
 // Phase 7 modules
-pub mod transcoding;
-pub mod topology;
-pub mod register;
-pub mod sip_builder;
-pub mod security;
 pub mod acl;
+pub mod register;
+pub mod security;
+pub mod sip_builder;
+pub mod topology;
+pub mod transcoding;
 
 pub mod trunk_register;
 

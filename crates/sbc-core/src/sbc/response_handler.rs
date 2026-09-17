@@ -2,7 +2,11 @@ use super::*;
 
 /// Caller reply channel + address + transport, as returned by
 /// `B2buaManager::get_caller_reply_info`.
-type CallerReplyInfo = Option<(Option<UnboundedSender<Vec<u8>>>, SocketAddr, rsip::Transport)>;
+type CallerReplyInfo = Option<(
+    Option<UnboundedSender<Vec<u8>>>,
+    SocketAddr,
+    rsip::Transport,
+)>;
 
 impl Sbc {
     /// Handle incoming SIP response (from trunk/callee) — relay back to caller
@@ -21,13 +25,18 @@ impl Sbc {
         // ── Metrics: count SIP responses + error classes ──
         self.metrics.inc_sip_response(status);
         if (400..500).contains(&status) {
-            self.metrics.sip_4xx_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .sip_4xx_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else if status >= 500 {
-            self.metrics.sip_5xx_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .sip_5xx_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Extract Call-ID to find associated B2BUA call
-        let call_id = response.call_id_header()
+        let call_id = response
+            .call_id_header()
             .ok()
             .map(|h| h.value().to_string())
             .unwrap_or_default();
@@ -42,9 +51,15 @@ impl Sbc {
             if let Some((_, tx)) = self.pending_register_responses.remove(&call_id) {
                 let raw = rsip::SipMessage::Response(response).to_string();
                 let _ = tx.send(raw);
-                debug!("Routed trunk task response (Call-ID: {}) to waiting task", call_id);
+                debug!(
+                    "Routed trunk task response (Call-ID: {}) to waiting task",
+                    call_id
+                );
             } else {
-                debug!("No pending channel for Call-ID: {} (stale or already consumed)", call_id);
+                debug!(
+                    "No pending channel for Call-ID: {} (stale or already consumed)",
+                    call_id
+                );
             }
             return Ok(());
         }
@@ -67,7 +82,10 @@ impl Sbc {
             //    peers stop retransmitting it for 32 s.
             if let Some((resp_cseq, method)) = response_cseq(&response) {
                 if method.eq_ignore_ascii_case("CANCEL") || method.eq_ignore_ascii_case("BYE") {
-                    debug!("{} to our {} on call {} — SBC-originated transaction, dropped", status, method, uuid);
+                    debug!(
+                        "{} to our {} on call {} — SBC-originated transaction, dropped",
+                        status, method, uuid
+                    );
                     return Ok(());
                 }
                 if method.eq_ignore_ascii_case("INVITE") {
@@ -79,7 +97,14 @@ impl Sbc {
                         .unwrap_or_default();
 
                     if self.b2bua.is_pending_refresh(&uuid, resp_cseq).await {
-                        self.handle_refresh_response(&uuid, status, resp_cseq, &raw_resp, &response_to).await;
+                        self.handle_refresh_response(
+                            &uuid,
+                            status,
+                            resp_cseq,
+                            &raw_resp,
+                            &response_to,
+                        )
+                        .await;
                         return Ok(());
                     }
                     // Retransmitted answer to a refresh whose outcome was already
@@ -88,12 +113,29 @@ impl Sbc {
                     let (sbc_ip, sbc_port) = self.sbc_addr();
                     if let Some((ack, dest, tp, tx)) = self
                         .b2bua
-                        .refresh_duplicate_ack(&uuid, resp_cseq, status, &response_to, &sbc_ip, sbc_port)
+                        .refresh_duplicate_ack(
+                            &uuid,
+                            resp_cseq,
+                            status,
+                            &response_to,
+                            &sbc_ip,
+                            sbc_port,
+                        )
                         .await
                     {
-                        debug!("{} for session refresh CSeq {} (call {}) — duplicate, re-ACKed", status, resp_cseq, uuid);
+                        debug!(
+                            "{} for session refresh CSeq {} (call {}) — duplicate, re-ACKed",
+                            status, resp_cseq, uuid
+                        );
                         if let Some(ack) = ack {
-                            self.send_sip("ACK (refresh duplicate) → callee", ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                            self.send_sip(
+                                "ACK (refresh duplicate) → callee",
+                                ack.as_bytes(),
+                                dest,
+                                tp,
+                                tx.as_ref(),
+                            )
+                            .await;
                         }
                         return Ok(());
                     }
@@ -104,8 +146,15 @@ impl Sbc {
                         .classify_invite_response(&uuid, branch.as_deref(), resp_cseq)
                         .await
                     {
-                        self.handle_stale_invite_response(&uuid, status, resp_cseq, &response, &response_to, attempt)
-                            .await;
+                        self.handle_stale_invite_response(
+                            &uuid,
+                            status,
+                            resp_cseq,
+                            &response,
+                            &response_to,
+                            attempt,
+                        )
+                        .await;
                         return Ok(());
                     }
 
@@ -132,7 +181,12 @@ impl Sbc {
                         // We MUST replace the Via with the caller's original Via.
                         let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
                         let raw = rsip::SipMessage::Response(response).to_string();
-                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref(), caller_cseq);
+                        let raw = rewrite_response_for_caller(
+                            &raw,
+                            &caller_vias,
+                            self.identity.as_ref(),
+                            caller_cseq,
+                        );
 
                         // ── WebRTC: strip SDP body from 183 Session Progress ────
                         // The trunk sends PCMA/AVP SDP in 183 which is incompatible
@@ -144,7 +198,14 @@ impl Sbc {
                             raw
                         };
 
-                        self.send_sip("1xx → caller", raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+                        self.send_sip(
+                            "1xx → caller",
+                            raw.as_bytes(),
+                            caller_addr,
+                            caller_transport,
+                            reply_tx.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 200..=299 => {
@@ -152,18 +213,25 @@ impl Sbc {
                     // the prelude above — they never reach this arm.)
 
                     // Final success (200 OK) — rewrite SDP + relay to caller + start RTP proxy
-                    let callee_tag = response.to_header()
+                    let callee_tag = response
+                        .to_header()
                         .ok()
                         .and_then(|h| h.typed().ok())
                         .and_then(|to: rsip::typed::To| {
                             to.params.iter().find_map(|p| {
-                                if let rsip::Param::Tag(t) = p { Some(t.value().to_string()) } else { None }
+                                if let rsip::Param::Tag(t) = p {
+                                    Some(t.value().to_string())
+                                } else {
+                                    None
+                                }
                             })
                         })
                         .unwrap_or_default();
 
                     let callee_sdp_str = if !response.body.is_empty() {
-                        std::str::from_utf8(&response.body).ok().map(|s| s.to_string())
+                        std::str::from_utf8(&response.body)
+                            .ok()
+                            .map(|s| s.to_string())
                     } else {
                         None
                     };
@@ -175,11 +243,14 @@ impl Sbc {
                         let calls = self.b2bua.calls_locked().await;
                         let c = calls.get(&uuid);
                         let csdp = c.and_then(|c| c.caller_sdp.clone());
-                        let mid  = c.and_then(|c| c.media_session_id.clone());
+                        let mid = c.and_then(|c| c.media_session_id.clone());
                         (csdp, mid)
                     };
 
-                    let _ = self.b2bua.handle_200_ok(&uuid, callee_tag, callee_sdp_str.clone()).await;
+                    let _ = self
+                        .b2bua
+                        .handle_200_ok(&uuid, callee_tag, callee_sdp_str.clone())
+                        .await;
 
                     // ── Record the negotiated codec (from the SDP answer) for the CDR ──
                     if let Some(ref sdp) = callee_sdp_str {
@@ -219,11 +290,15 @@ impl Sbc {
                         // SBC deliberately offered no timers and must not refresh.
                         let toward_trunk = {
                             let calls = self.b2bua.calls_locked().await;
-                            calls.get(&uuid).map(|c| c.trunk_id.is_some()).unwrap_or(false)
+                            calls
+                                .get(&uuid)
+                                .map(|c| c.trunk_id.is_some())
+                                .unwrap_or(false)
                         };
                         if toward_trunk {
                             let raw_resp = rsip::SipMessage::Response(response.clone()).to_string();
-                            let offered = self.b2bua.current_attempt(&uuid).await.map(|(a, _)| a.raw);
+                            let offered =
+                                self.b2bua.current_attempt(&uuid).await.map(|(a, _)| a.raw);
                             let offered_se = offered.as_deref().and_then(parse_session_expires);
                             let min_se = offered
                                 .as_deref()
@@ -234,19 +309,26 @@ impl Sbc {
                                 .or(offered_se)
                                 .unwrap_or(configured)
                                 .max(min_se);
-                            self.b2bua.set_session_timer(&uuid, negotiated, min_se).await;
+                            self.b2bua
+                                .set_session_timer(&uuid, negotiated, min_se)
+                                .await;
                         }
                     }
 
                     // ── Start RTP proxy after 200 OK ───────────────────────────────────
                     // Guard: only start once (200 OK retransmissions must not re-bind ports)
                     if let Some(media_id) = media_id_pre {
-                        let rtp_already_started = self.media.get_session(&media_id)
+                        let rtp_already_started = self
+                            .media
+                            .get_session(&media_id)
                             .map(|s| s.rtp_shutdown_tx.is_some())
                             .unwrap_or(false);
 
                         if rtp_already_started {
-                            debug!("RTP proxy already running for {} — skipping (200 OK retransmit)", media_id);
+                            debug!(
+                                "RTP proxy already running for {} — skipping (200 OK retransmit)",
+                                media_id
+                            );
                         } else {
                             // First 200 OK for this session — count as connected
                             self.metrics.inc_call_connected();
@@ -282,7 +364,10 @@ impl Sbc {
                                             info!("RTP proxy: caller endpoint A = {} (NAT: SDP had {})", fixed, sdp_addr);
                                             fixed
                                         } else {
-                                            info!("RTP proxy: caller endpoint A = {} (from SDP)", sdp_addr);
+                                            info!(
+                                                "RTP proxy: caller endpoint A = {} (from SDP)",
+                                                sdp_addr
+                                            );
                                             sdp_addr
                                         }
                                     } else {
@@ -308,7 +393,10 @@ impl Sbc {
                                             info!("RTP proxy: callee endpoint B = {} (NAT: SDP had {})", fixed, sdp_addr);
                                             fixed
                                         } else {
-                                            info!("RTP proxy: callee endpoint B = {} (from SDP)", sdp_addr);
+                                            info!(
+                                                "RTP proxy: callee endpoint B = {} (from SDP)",
+                                                sdp_addr
+                                            );
                                             sdp_addr
                                         }
                                     } else {
@@ -343,12 +431,15 @@ impl Sbc {
                             match self.media.start_rtp_session(&media_id).await {
                                 Ok((webrtc_info, webrtc_info_b)) => {
                                     info!("RTP proxy started for media session {}", media_id);
-                                    self.metrics.set_allocated_ports(self.media.stats().allocated_ports as u64);
+                                    self.metrics.set_allocated_ports(
+                                        self.media.stats().allocated_ports as u64,
+                                    );
 
                                     // ── Spawn DTLS handshake if caller is WebRTC (leg-A) ──
                                     if let Some(winfo) = webrtc_info {
                                         // Get the WebRTC session (contains DtlsContext)
-                                        let webrtc_session = self.b2bua.get_webrtc_session(&uuid).await;
+                                        let webrtc_session =
+                                            self.b2bua.get_webrtc_session(&uuid).await;
                                         if let Some(ws) = webrtc_session {
                                             let media_id_dtls = media_id.clone();
                                             let srtp_recv_shared = winfo.srtp_recv_ctx_a;
@@ -359,16 +450,23 @@ impl Sbc {
                                             // handshake, which would block the 200 OK relay if we tried
                                             // to generate the SDP later.
                                             {
-                                                let leg_a_port = self.media.get_session(&media_id)
+                                                let leg_a_port = self
+                                                    .media
+                                                    .get_session(&media_id)
                                                     .map(|s| s.ports.rtp)
                                                     .unwrap_or(10000);
-                                                let sbc_ip = self.identity.as_ref()
+                                                let sbc_ip = self
+                                                    .identity
+                                                    .as_ref()
                                                     .map(|id| id.public_ip.clone())
                                                     .unwrap_or_else(|| "127.0.0.1".to_string());
                                                 let sess = ws.lock().await;
-                                                let sdp_answer = sess.generate_sdp_answer(leg_a_port, &sbc_ip);
+                                                let sdp_answer =
+                                                    sess.generate_sdp_answer(leg_a_port, &sbc_ip);
                                                 drop(sess);
-                                                self.b2bua.set_webrtc_sdp_answer(&uuid, sdp_answer).await;
+                                                self.b2bua
+                                                    .set_webrtc_sdp_answer(&uuid, sdp_answer)
+                                                    .await;
                                             }
 
                                             info!("Spawning DTLS handshake task for call {} (media {})", uuid, media_id_dtls);
@@ -383,18 +481,28 @@ impl Sbc {
 
                                                 // Perform the real DTLS handshake
                                                 let sess = ws.lock().await;
-                                                match sess.dtls_context.perform_handshake(bridge).await {
+                                                match sess
+                                                    .dtls_context
+                                                    .perform_handshake(bridge)
+                                                    .await
+                                                {
                                                     Ok(()) => {
                                                         info!("DTLS handshake complete for media session {}", media_id_dtls);
 
                                                         // Create SRTP contexts from DTLS keys
-                                                        match sess.dtls_context.create_srtp_contexts().await {
+                                                        match sess
+                                                            .dtls_context
+                                                            .create_srtp_contexts()
+                                                            .await
+                                                        {
                                                             Ok((recv_ctx, send_ctx)) => {
                                                                 // Hot-swap: inject SRTP contexts into the running relay task.
                                                                 // recv_ctx: decrypts incoming SRTP from browser (client keys)
                                                                 // send_ctx: encrypts outgoing RTP to browser (server keys)
-                                                                *srtp_recv_shared.lock().await = Some(recv_ctx);
-                                                                *srtp_send_shared.lock().await = Some(send_ctx);
+                                                                *srtp_recv_shared.lock().await =
+                                                                    Some(recv_ctx);
+                                                                *srtp_send_shared.lock().await =
+                                                                    Some(send_ctx);
                                                                 info!("DTLS-SRTP hot-swap complete for media session {} — audio should flow", media_id_dtls);
                                                             }
                                                             Err(e) => {
@@ -412,7 +520,8 @@ impl Sbc {
 
                                     // ── Spawn DTLS handshake if callee is WebRTC (leg-B) ──
                                     if let Some(winfo_b) = webrtc_info_b {
-                                        let webrtc_session_b = self.b2bua.get_webrtc_session_b(&uuid).await;
+                                        let webrtc_session_b =
+                                            self.b2bua.get_webrtc_session_b(&uuid).await;
                                         if let Some(ws_b) = webrtc_session_b {
                                             let media_id_dtls_b = media_id.clone();
                                             let srtp_recv_shared_b = winfo_b.srtp_recv_ctx_b;
@@ -428,14 +537,24 @@ impl Sbc {
                                                 ));
 
                                                 let sess = ws_b.lock().await;
-                                                match sess.dtls_context.perform_handshake(bridge).await {
+                                                match sess
+                                                    .dtls_context
+                                                    .perform_handshake(bridge)
+                                                    .await
+                                                {
                                                     Ok(()) => {
                                                         info!("DTLS handshake complete for leg-B media session {}", media_id_dtls_b);
 
-                                                        match sess.dtls_context.create_srtp_contexts().await {
+                                                        match sess
+                                                            .dtls_context
+                                                            .create_srtp_contexts()
+                                                            .await
+                                                        {
                                                             Ok((recv_ctx, send_ctx)) => {
-                                                                *srtp_recv_shared_b.lock().await = Some(recv_ctx);
-                                                                *srtp_send_shared_b.lock().await = Some(send_ctx);
+                                                                *srtp_recv_shared_b.lock().await =
+                                                                    Some(recv_ctx);
+                                                                *srtp_send_shared_b.lock().await =
+                                                                    Some(send_ctx);
                                                                 info!("DTLS-SRTP hot-swap complete for leg-B media session {} — audio should flow", media_id_dtls_b);
                                                             }
                                                             Err(e) => {
@@ -451,7 +570,9 @@ impl Sbc {
                                         }
                                     }
                                 }
-                                Err(e) => warn!("Failed to start RTP proxy for {}: {}", media_id, e),
+                                Err(e) => {
+                                    warn!("Failed to start RTP proxy for {}: {}", media_id, e)
+                                }
                             }
                         }
                     }
@@ -469,7 +590,9 @@ impl Sbc {
                         // was inside an `else` branch and skipped for WebRTC→WebRTC calls.
                         let callee_is_webrtc = self.b2bua.is_callee_webrtc(&uuid).await;
                         if callee_is_webrtc && !response_to_relay.body.is_empty() {
-                            if let Ok(callee_webrtc_sdp) = std::str::from_utf8(&response_to_relay.body) {
+                            if let Ok(callee_webrtc_sdp) =
+                                std::str::from_utf8(&response_to_relay.body)
+                            {
                                 info!("200 OK from WebRTC callee — SDP:\n{}", callee_webrtc_sdp);
 
                                 // Set remote SDP on the WebRTC session for leg-B (DTLS needs this)
@@ -488,7 +611,9 @@ impl Sbc {
 
                         // Log both-WebRTC calls for Phase 13 debugging
                         if is_webrtc_call && callee_is_webrtc {
-                            info!("WebRTC ↔ WebRTC call detected — Opus passthrough, dual DTLS-SRTP");
+                            info!(
+                                "WebRTC ↔ WebRTC call detected — Opus passthrough, dual DTLS-SRTP"
+                            );
                         }
 
                         if is_webrtc_call {
@@ -505,11 +630,16 @@ impl Sbc {
                                 warn!("WebRTC call {} but no pre-generated SDP answer — falling back to standard SDP rewrite", uuid);
                                 // Fallback: standard SDP rewrite
                                 if !response_to_relay.body.is_empty() {
-                                    if let Ok(sdp_str) = std::str::from_utf8(&response_to_relay.body) {
+                                    if let Ok(sdp_str) =
+                                        std::str::from_utf8(&response_to_relay.body)
+                                    {
                                         let media_id = self.b2bua.get_media_session_id(&uuid).await;
                                         let rewritten = if let Some(ref mid) = media_id {
                                             if let Some(session) = self.media.get_session(mid) {
-                                                self.media.rewrite_sdp_for_proxy(sdp_str, session.ports.rtp)
+                                                self.media.rewrite_sdp_for_proxy(
+                                                    sdp_str,
+                                                    session.ports.rtp,
+                                                )
                                             } else {
                                                 self.media.rewrite_sdp_ip(sdp_str)
                                             }
@@ -524,20 +654,32 @@ impl Sbc {
                         } else if callee_is_webrtc && !response_to_relay.body.is_empty() {
                             // Caller is NOT WebRTC (PSTN/SIP), callee IS WebRTC:
                             // Transform WebRTC SDP → trunk PCMA/AVP for the non-WebRTC caller.
-                            if let Ok(callee_webrtc_sdp) = std::str::from_utf8(&response_to_relay.body) {
-                                let sbc_ip = self.identity.as_ref()
+                            if let Ok(callee_webrtc_sdp) =
+                                std::str::from_utf8(&response_to_relay.body)
+                            {
+                                let sbc_ip = self
+                                    .identity
+                                    .as_ref()
                                     .map(|id| id.public_ip.clone())
                                     .unwrap_or_else(|| "127.0.0.1".to_string());
                                 let media_id = self.b2bua.get_media_session_id(&uuid).await;
                                 let trunk_port = if let Some(ref mid) = media_id {
-                                    self.media.get_session(mid)
+                                    self.media
+                                        .get_session(mid)
                                         .map(|s| s.ports.rtp)
                                         .unwrap_or(10000)
                                 } else {
                                     10000
                                 };
-                                let trunk_sdp = transform_webrtc_to_trunk(callee_webrtc_sdp, &sbc_ip, trunk_port);
-                                info!("WebRTC→Trunk 200 OK SDP transformation (port {}):\n{}", trunk_port, trunk_sdp);
+                                let trunk_sdp = transform_webrtc_to_trunk(
+                                    callee_webrtc_sdp,
+                                    &sbc_ip,
+                                    trunk_port,
+                                );
+                                info!(
+                                    "WebRTC→Trunk 200 OK SDP transformation (port {}):\n{}",
+                                    trunk_port, trunk_sdp
+                                );
                                 response_to_relay.body = trunk_sdp.into_bytes();
                                 update_content_length_response(&mut response_to_relay);
                             }
@@ -560,7 +702,9 @@ impl Sbc {
                                 } else {
                                     info!("SDP 200 OK outbound (unchanged):\n{}", rewritten);
                                 }
-                                self.b2bua.set_last_sdp_to_caller(&uuid, rewritten.clone()).await;
+                                self.b2bua
+                                    .set_last_sdp_to_caller(&uuid, rewritten.clone())
+                                    .await;
                                 response_to_relay.body = rewritten.into_bytes();
                                 // Update Content-Length to match new body size (critical for TCP framing)
                                 update_content_length_response(&mut response_to_relay);
@@ -572,8 +716,20 @@ impl Sbc {
                         // We MUST replace the Via with the caller's original Via.
                         let caller_vias = self.b2bua.get_caller_vias(&uuid).await;
                         let raw = rsip::SipMessage::Response(response_to_relay).to_string();
-                        let raw = rewrite_response_for_caller(&raw, &caller_vias, self.identity.as_ref(), caller_cseq);
-                        self.send_sip("200 OK → caller", raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+                        let raw = rewrite_response_for_caller(
+                            &raw,
+                            &caller_vias,
+                            self.identity.as_ref(),
+                            caller_cseq,
+                        );
+                        self.send_sip(
+                            "200 OK → caller",
+                            raw.as_bytes(),
+                            caller_addr,
+                            caller_transport,
+                            reply_tx.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 407 => {
@@ -589,13 +745,25 @@ impl Sbc {
                     match retry_result {
                         Ok(true) => {
                             // Successfully resent INVITE with auth — wait for next response
-                            info!("B2BUA: retrying INVITE with Proxy-Authorization for call {}", uuid);
+                            info!(
+                                "B2BUA: retrying INVITE with Proxy-Authorization for call {}",
+                                uuid
+                            );
                         }
                         Ok(false) | Err(_) => {
                             // Auth retry failed or exhausted — 503 to caller (don't leak trunk's 407)
-                            warn!("B2BUA: 407 auth retry failed for call {}, relaying to caller", uuid);
+                            warn!(
+                                "B2BUA: 407 auth retry failed for call {}, relaying to caller",
+                                uuid
+                            );
                             let response_503 = build_plain_response(503, "Service Unavailable");
-                            self.relay_error_and_terminate(&uuid, response_503, caller_info, caller_cseq).await;
+                            self.relay_error_and_terminate(
+                                &uuid,
+                                response_503,
+                                caller_info,
+                                caller_cseq,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -605,15 +773,25 @@ impl Sbc {
                     // on its leg: re-send the INVITE with its floor. The caller
                     // never offered the rejected value, so it only sees the 422
                     // when a retry is impossible (already retried, no Min-SE…).
-                    info!("B2BUA: received 422 Session Interval Too Small for call {}", uuid);
-                    match self.handle_422_session_interval_retry(&uuid, &response, source).await {
+                    info!(
+                        "B2BUA: received 422 Session Interval Too Small for call {}",
+                        uuid
+                    );
+                    match self
+                        .handle_422_session_interval_retry(&uuid, &response, source)
+                        .await
+                    {
                         Ok(true) => {
-                            info!("B2BUA: retrying INVITE with the trunk's Min-SE for call {}", uuid);
+                            info!(
+                                "B2BUA: retrying INVITE with the trunk's Min-SE for call {}",
+                                uuid
+                            );
                         }
                         Ok(false) | Err(_) => {
                             info!("B2BUA: relaying 422 to caller, terminating call {}", uuid);
                             let raw = rsip::SipMessage::Response(response).to_string();
-                            self.relay_error_and_terminate(&uuid, raw, caller_info, caller_cseq).await;
+                            self.relay_error_and_terminate(&uuid, raw, caller_info, caller_cseq)
+                                .await;
                         }
                     }
                 }
@@ -626,10 +804,15 @@ impl Sbc {
                     if is_trunk_failure {
                         if let Some(next) = self.b2bua.take_next_failover_candidate(&uuid).await {
                             // Push the candidate back and let the shared path handle it
-                            warn!("B2BUA: trunk answered {} — failing over (call {})", status, uuid);
+                            warn!(
+                                "B2BUA: trunk answered {} — failing over (call {})",
+                                status, uuid
+                            );
                             {
                                 let mut calls = self.b2bua.calls_locked().await;
-                                if let Some(fo) = calls.get_mut(&uuid).and_then(|c| c.failover.as_mut()) {
+                                if let Some(fo) =
+                                    calls.get_mut(&uuid).and_then(|c| c.failover.as_mut())
+                                {
                                     fo.candidates.insert(0, next);
                                     fo.attempt = fo.attempt.saturating_sub(1);
                                 }
@@ -640,9 +823,13 @@ impl Sbc {
                     }
 
                     // Error response (4xx/5xx/6xx) — relay to caller, terminate call
-                    info!("B2BUA: relaying error {} to caller, terminating call", status);
+                    info!(
+                        "B2BUA: relaying error {} to caller, terminating call",
+                        status
+                    );
                     let raw = rsip::SipMessage::Response(response).to_string();
-                    self.relay_error_and_terminate(&uuid, raw, caller_info, caller_cseq).await;
+                    self.relay_error_and_terminate(&uuid, raw, caller_info, caller_cseq)
+                        .await;
                 }
             }
         } else {
@@ -657,25 +844,52 @@ impl Sbc {
                 if status >= 200 && method.eq_ignore_ascii_case("INVITE") {
                     if let Some(attempt) = self.b2bua.recent_attempt_for_call_id(&call_id) {
                         if attempt.cseq == cseq {
-                            let to = response.to_header().ok().map(|h| h.value().to_string()).unwrap_or_default();
+                            let to = response
+                                .to_header()
+                                .ok()
+                                .map(|h| h.value().to_string())
+                                .unwrap_or_default();
                             if status < 300 {
-                                warn!("{} for terminated call (Call-ID {}) — ACK + BYE → {}", status, call_id, attempt.dest);
+                                warn!(
+                                    "{} for terminated call (Call-ID {}) — ACK + BYE → {}",
+                                    status, call_id, attempt.dest
+                                );
                                 self.ack_and_bye_answered_dialog(
-                                    &attempt, &response, cseq, &to, reply_tx,
+                                    &attempt,
+                                    &response,
+                                    cseq,
+                                    &to,
+                                    reply_tx,
                                     "Q.850;cause=31;text=\"Call already cancelled\"",
-                                ).await;
+                                )
+                                .await;
                                 return Ok(());
                             }
-                            if let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, &to) {
-                                debug!("{} for terminated call (Call-ID {}) — ACK → {}", status, call_id, attempt.dest);
-                                self.send_sip("ACK (after teardown) → callee", ack.as_bytes(), attempt.dest, attempt.transport, reply_tx).await;
+                            if let Some(ack) =
+                                crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, &to)
+                            {
+                                debug!(
+                                    "{} for terminated call (Call-ID {}) — ACK → {}",
+                                    status, call_id, attempt.dest
+                                );
+                                self.send_sip(
+                                    "ACK (after teardown) → callee",
+                                    ack.as_bytes(),
+                                    attempt.dest,
+                                    attempt.transport,
+                                    reply_tx,
+                                )
+                                .await;
                                 return Ok(());
                             }
                         }
                     }
                 }
             }
-            info!("No B2BUA call found for response Call-ID: {} from {} (stray response)", call_id, source);
+            info!(
+                "No B2BUA call found for response Call-ID: {} from {} (stray response)",
+                call_id, source
+            );
         }
 
         Ok(())
@@ -683,7 +897,8 @@ impl Sbc {
 
     /// SBC IP/port for synthetic requests (identity when configured).
     fn sbc_addr(&self) -> (String, u16) {
-        self.identity.as_ref()
+        self.identity
+            .as_ref()
             .map(|id| (id.public_ip.clone(), id.sip_port))
             .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060))
     }
@@ -702,8 +917,16 @@ impl Sbc {
         reason: &str,
     ) {
         let (sbc_ip, sbc_port) = self.sbc_addr();
-        let from_raw = response.from_header().ok().map(|h| h.value().to_string()).unwrap_or_default();
-        let call_id = response.call_id_header().ok().map(|h| h.value().to_string()).unwrap_or_default();
+        let from_raw = response
+            .from_header()
+            .ok()
+            .map(|h| h.value().to_string())
+            .unwrap_or_default();
+        let call_id = response
+            .call_id_header()
+            .ok()
+            .map(|h| h.value().to_string())
+            .unwrap_or_default();
         let request_uri = response
             .contact_header()
             .ok()
@@ -721,11 +944,28 @@ impl Sbc {
         };
         let ack = crate::sip_builder::build_ack_for_2xx(&d, cseq);
         let bye = crate::sip_builder::build_bye(
-            &crate::sip_builder::DialogInfo { cseq: cseq + 1, ..d },
+            &crate::sip_builder::DialogInfo {
+                cseq: cseq + 1,
+                ..d
+            },
             Some(reason),
         );
-        self.send_sip("ACK (orphan 2xx) → callee", ack.as_bytes(), attempt.dest, attempt.transport, tx).await;
-        self.send_sip("BYE (orphan 2xx) → callee", bye.as_bytes(), attempt.dest, attempt.transport, tx).await;
+        self.send_sip(
+            "ACK (orphan 2xx) → callee",
+            ack.as_bytes(),
+            attempt.dest,
+            attempt.transport,
+            tx,
+        )
+        .await;
+        self.send_sip(
+            "BYE (orphan 2xx) → callee",
+            bye.as_bytes(),
+            attempt.dest,
+            attempt.transport,
+            tx,
+        )
+        .await;
     }
 
     /// The peer no longer has the dialog (481/408 to our refresh, or the
@@ -733,10 +973,24 @@ impl Sbc {
     /// release the call — a dead dialog must not be refreshed for hours.
     async fn teardown_lost_dialog(&mut self, uuid: &crate::b2bua::CallUuid, status: u16) {
         let (sbc_ip, sbc_port) = self.sbc_addr();
-        if let Some(bye) = self.b2bua.build_relay_bye_toward_caller(uuid, &sbc_ip, sbc_port).await {
+        if let Some(bye) = self
+            .b2bua
+            .build_relay_bye_toward_caller(uuid, &sbc_ip, sbc_port)
+            .await
+        {
             if let Some((tx, addr, tp)) = self.b2bua.get_caller_reply_info(uuid).await {
-                info!("Session refresh {}: dialog lost on the trunk — BYE → caller {} (call {})", status, addr, uuid);
-                self.send_sip("BYE (dialog lost) → caller", bye.as_bytes(), addr, tp, tx.as_ref()).await;
+                info!(
+                    "Session refresh {}: dialog lost on the trunk — BYE → caller {} (call {})",
+                    status, addr, uuid
+                );
+                self.send_sip(
+                    "BYE (dialog lost) → caller",
+                    bye.as_bytes(),
+                    addr,
+                    tp,
+                    tx.as_ref(),
+                )
+                .await;
             }
         } else {
             warn!("Session refresh {}: dialog lost on the trunk, no caller dialog identity — releasing call {}", status, uuid);
@@ -744,15 +998,17 @@ impl Sbc {
 
         let cdr = {
             let calls = self.b2bua.calls_locked().await;
-            calls.get(uuid).map(|c| (
-                c.inbound.call_id.clone(),
-                c.caller_number.clone().unwrap_or_default(),
-                c.callee_number.clone().unwrap_or_default(),
-                c.duration_secs(),
-                c.caller_is_webrtc,
-                c.codec.clone(),
-                c.trunk_name.clone(),
-            ))
+            calls.get(uuid).map(|c| {
+                (
+                    c.inbound.call_id.clone(),
+                    c.caller_number.clone().unwrap_or_default(),
+                    c.callee_number.clone().unwrap_or_default(),
+                    c.duration_secs(),
+                    c.caller_is_webrtc,
+                    c.codec.clone(),
+                    c.trunk_name.clone(),
+                )
+            })
         };
         if let Some((call_id, caller, callee, duration, is_webrtc, codec, trunk_name)) = cdr {
             let mut record = crate::storage::CdrRecord::new(call_id, caller, callee)
@@ -772,7 +1028,8 @@ impl Sbc {
 
         self.metrics.inc_call_terminated();
         self.b2bua.terminate_call(uuid).await;
-        self.metrics.set_allocated_ports(self.media.stats().allocated_ports as u64);
+        self.metrics
+            .set_allocated_ports(self.media.stats().allocated_ports as u64);
     }
 
     /// Relay a final error to the caller (Vias + CSeq restored) and tear the
@@ -786,26 +1043,54 @@ impl Sbc {
     ) {
         if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
             let caller_vias = self.b2bua.get_caller_vias(uuid).await;
-            let raw = rewrite_response_for_caller(&raw_response, &caller_vias, self.identity.as_ref(), caller_cseq);
-            self.send_sip("error response → caller", raw.as_bytes(), caller_addr, caller_transport, reply_tx.as_ref()).await;
+            let raw = rewrite_response_for_caller(
+                &raw_response,
+                &caller_vias,
+                self.identity.as_ref(),
+                caller_cseq,
+            );
+            self.send_sip(
+                "error response → caller",
+                raw.as_bytes(),
+                caller_addr,
+                caller_transport,
+                reply_tx.as_ref(),
+            )
+            .await;
         }
         self.b2bua.terminate_call(uuid).await;
         self.metrics.inc_call_failed();
-        self.metrics.set_allocated_ports(self.media.stats().allocated_ports as u64);
+        self.metrics
+            .set_allocated_ports(self.media.stats().allocated_ports as u64);
     }
 
     /// ACK a non-2xx final of the live callee-leg INVITE (RFC 3261
     /// §17.1.1.3), sent where the INVITE went — clustered trunks answer
     /// from other IPs than the one we dialled.
     async fn ack_callee_final(&self, uuid: &crate::b2bua::CallUuid, response_to: &str) {
-        let Some((attempt, tx)) = self.b2bua.current_attempt(uuid).await else { return };
-        let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to) else {
-            warn!("ACK (non-2xx): stored INVITE for call {} is not parseable — no ACK sent", uuid);
+        let Some((attempt, tx)) = self.b2bua.current_attempt(uuid).await else {
             return;
         };
-        match self.transport.reply(ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await {
-            Ok(()) => debug!("ACK (non-2xx) → {} for call {} (CSeq {})", attempt.dest, uuid, attempt.cseq),
-            Err(e) => warn!("ACK (non-2xx) → {} failed for call {}: {}", attempt.dest, uuid, e),
+        let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to) else {
+            warn!(
+                "ACK (non-2xx): stored INVITE for call {} is not parseable — no ACK sent",
+                uuid
+            );
+            return;
+        };
+        match self
+            .transport
+            .reply(ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref())
+            .await
+        {
+            Ok(()) => debug!(
+                "ACK (non-2xx) → {} for call {} (CSeq {})",
+                attempt.dest, uuid, attempt.cseq
+            ),
+            Err(e) => warn!(
+                "ACK (non-2xx) → {} failed for call {}: {}",
+                attempt.dest, uuid, e
+            ),
         }
     }
 
@@ -822,24 +1107,49 @@ impl Sbc {
             100..=199 => debug!("{} to session refresh (call {}) — ignored", status, uuid),
             200..=299 => {
                 let (sbc_ip, sbc_port) = self.sbc_addr();
-                if let Some((ack, dest, tp, tx)) =
-                    self.b2bua.complete_session_refresh(uuid, cseq, &sbc_ip, sbc_port).await
+                if let Some((ack, dest, tp, tx)) = self
+                    .b2bua
+                    .complete_session_refresh(uuid, cseq, &sbc_ip, sbc_port)
+                    .await
                 {
-                    info!("Session refresh 200 OK consumed (call {}) — sending ACK", uuid);
-                    self.send_sip("ACK (refresh) → callee", ack.as_bytes(), dest, tp, tx.as_ref()).await;
+                    info!(
+                        "Session refresh 200 OK consumed (call {}) — sending ACK",
+                        uuid
+                    );
+                    self.send_sip(
+                        "ACK (refresh) → callee",
+                        ack.as_bytes(),
+                        dest,
+                        tp,
+                        tx.as_ref(),
+                    )
+                    .await;
                 }
             }
             _ => {
                 let min_se = (status == 422).then(|| parse_min_se(raw_resp)).flatten();
-                let Some(outcome) = self.b2bua.fail_session_refresh(uuid, cseq, status, min_se, response_to).await
+                let Some(outcome) = self
+                    .b2bua
+                    .fail_session_refresh(uuid, cseq, status, min_se, response_to)
+                    .await
                 else {
                     return;
                 };
                 match outcome.ack {
                     Some(ack) => {
-                        self.send_sip("ACK (refresh rejected) → callee", ack.as_bytes(), outcome.dest, outcome.transport, outcome.reply_tx.as_ref()).await;
+                        self.send_sip(
+                            "ACK (refresh rejected) → callee",
+                            ack.as_bytes(),
+                            outcome.dest,
+                            outcome.transport,
+                            outcome.reply_tx.as_ref(),
+                        )
+                        .await;
                     }
-                    None => warn!("Session refresh {} for call {}: no stored re-INVITE — cannot ACK", status, uuid),
+                    None => warn!(
+                        "Session refresh {} for call {}: no stored re-INVITE — cannot ACK",
+                        status, uuid
+                    ),
                 }
                 if outcome.dialog_gone {
                     self.teardown_lost_dialog(uuid, status).await;
@@ -862,7 +1172,10 @@ impl Sbc {
         attempt: Option<crate::b2bua::InviteAttempt>,
     ) {
         let Some(attempt) = attempt else {
-            debug!("{} for a superseded INVITE of call {} (CSeq {}) — no attempt record, dropped", status, uuid, cseq);
+            debug!(
+                "{} for a superseded INVITE of call {} (CSeq {}) — no attempt record, dropped",
+                status, uuid, cseq
+            );
             return;
         };
         // Reuse the live connection only when the stale attempt went to the
@@ -872,26 +1185,48 @@ impl Sbc {
             _ => None,
         };
         match status {
-            100..=199 => debug!("{} for superseded INVITE (call {}, CSeq {}) — dropped", status, uuid, cseq),
+            100..=199 => debug!(
+                "{} for superseded INVITE (call {}, CSeq {}) — dropped",
+                status, uuid, cseq
+            ),
             200..=299 => {
                 // Glare: an attempt we abandoned was answered. Honour the
                 // dialog (ACK) and end it (BYE) — the caller is on another leg.
-                warn!("{} for superseded INVITE (call {}, CSeq {}) — ACK + BYE → {}", status, uuid, cseq, attempt.dest);
+                warn!(
+                    "{} for superseded INVITE (call {}, CSeq {}) — ACK + BYE → {}",
+                    status, uuid, cseq, attempt.dest
+                );
                 self.ack_and_bye_answered_dialog(
-                    &attempt, response, cseq, response_to, tx.as_ref(),
+                    &attempt,
+                    response,
+                    cseq,
+                    response_to,
+                    tx.as_ref(),
                     "Q.850;cause=31;text=\"Superseded INVITE answered\"",
-                ).await;
+                )
+                .await;
             }
             _ => {
-                if let Some(ack) = crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to) {
-                    debug!("{} for superseded INVITE (call {}, CSeq {}) — ACK → {}, dropped", status, uuid, cseq, attempt.dest);
-                    self.send_sip("ACK (stale) → callee", ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref()).await;
+                if let Some(ack) =
+                    crate::sip_builder::build_ack_for_non_2xx(&attempt.raw, response_to)
+                {
+                    debug!(
+                        "{} for superseded INVITE (call {}, CSeq {}) — ACK → {}, dropped",
+                        status, uuid, cseq, attempt.dest
+                    );
+                    self.send_sip(
+                        "ACK (stale) → callee",
+                        ack.as_bytes(),
+                        attempt.dest,
+                        attempt.transport,
+                        tx.as_ref(),
+                    )
+                    .await;
                 }
             }
         }
     }
 }
-
 
 /// CSeq number and method of a response.
 fn response_cseq(response: &Response) -> Option<(u32, String)> {
@@ -936,7 +1271,6 @@ pub(crate) fn parse_min_se(raw: &str) -> Option<u32> {
     header_u32(raw, &["min-se:"])
 }
 
-
 #[cfg(test)]
 mod session_timer_tests {
     #[test]
@@ -950,15 +1284,32 @@ mod session_timer_tests {
         let compact = "INVITE sip:x SIP/2.0\r\nx: 600\r\n\r\n";
         assert_eq!(super::parse_session_expires(compact), Some(600));
         let in_body_only = "SIP/2.0 200 OK\r\n\r\nSession-Expires: 5\r\n";
-        assert_eq!(super::parse_session_expires(in_body_only), None, "headers end at the blank line");
+        assert_eq!(
+            super::parse_session_expires(in_body_only),
+            None,
+            "headers end at the blank line"
+        );
     }
 
     #[test]
     fn parse_min_se_forms() {
-        assert_eq!(super::parse_min_se("SIP/2.0 422 Session Interval Too Small\r\nMin-SE: 14400\r\n\r\n"), Some(14400));
-        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\nmin-se:  90;foo=bar\r\n\r\n"), Some(90));
-        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\nMin-SE: abc\r\n\r\n"), None);
-        assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\nMin-Expires: 3600\r\n\r\n"), None, "Min-Expires is not Min-SE");
+        assert_eq!(
+            super::parse_min_se("SIP/2.0 422 Session Interval Too Small\r\nMin-SE: 14400\r\n\r\n"),
+            Some(14400)
+        );
+        assert_eq!(
+            super::parse_min_se("SIP/2.0 422 x\r\nmin-se:  90;foo=bar\r\n\r\n"),
+            Some(90)
+        );
+        assert_eq!(
+            super::parse_min_se("SIP/2.0 422 x\r\nMin-SE: abc\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            super::parse_min_se("SIP/2.0 422 x\r\nMin-Expires: 3600\r\n\r\n"),
+            None,
+            "Min-Expires is not Min-SE"
+        );
         assert_eq!(super::parse_min_se("SIP/2.0 422 x\r\n\r\n"), None);
     }
 
@@ -984,8 +1335,12 @@ mod transaction_tests {
 
     const SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
 
-    fn caller_addr() -> SocketAddr { "10.0.0.9:5060".parse().unwrap() }
-    fn trunk_addr() -> SocketAddr { "203.0.113.9:5060".parse().unwrap() }
+    fn caller_addr() -> SocketAddr {
+        "10.0.0.9:5060".parse().unwrap()
+    }
+    fn trunk_addr() -> SocketAddr {
+        "203.0.113.9:5060".parse().unwrap()
+    }
 
     fn invite(branch: &str, cseq: u32) -> String {
         format!(
@@ -1001,7 +1356,10 @@ mod transaction_tests {
              Min-SE: 90\r\n\
              Content-Type: application/sdp\r\n\
              Content-Length: {}\r\n\r\n{}",
-            branch, cseq, SDP.len(), SDP
+            branch,
+            cseq,
+            SDP.len(),
+            SDP
         )
     }
 
@@ -1032,7 +1390,12 @@ mod transaction_tests {
 
     /// One outbound trunk call with its INVITE (branch aaa, CSeq 3) in flight.
     /// Returns the SBC plus the caller-leg and callee-leg receivers.
-    async fn sbc_with_call() -> (Sbc, crate::b2bua::CallUuid, UnboundedReceiver<Vec<u8>>, UnboundedReceiver<Vec<u8>>) {
+    async fn sbc_with_call() -> (
+        Sbc,
+        crate::b2bua::CallUuid,
+        UnboundedReceiver<Vec<u8>>,
+        UnboundedReceiver<Vec<u8>>,
+    ) {
         let mut sbc = Sbc::new();
         sbc.session_timer = Some((1800, 90));
         let mut trunk = TrunkConfig::new("genesys".to_string());
@@ -1042,15 +1405,44 @@ mod transaction_tests {
 
         let (caller_tx, caller_rx) = unbounded_channel();
         let (callee_tx, callee_rx) = unbounded_channel();
-        let uuid = sbc.b2bua
-            .create_call("cid-1".into(), "al-1".into(), caller_addr(), Some(SDP), Some(caller_tx), rsip::Transport::Udp)
+        let uuid = sbc
+            .b2bua
+            .create_call(
+                "cid-1".into(),
+                "al-1".into(),
+                caller_addr(),
+                Some(SDP),
+                Some(caller_tx),
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
-        sbc.b2bua.set_caller_vias(&uuid, vec!["Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcaller".into()], Some(3)).await;
-        sbc.b2bua.set_inbound_dialog(&uuid, "<sip:alice@a.example.com>;tag=al-1".into(), Some("sip:alice@10.0.0.9:5060".into())).await;
-        sbc.b2bua.store_outbound_invite(&uuid, String::new(), trunk_id).await;
         sbc.b2bua
-            .attach_outbound(&uuid, "cid-1".into(), "sbc-tag".into(), trunk_addr(), Some(callee_tx), rsip::Transport::Udp)
+            .set_caller_vias(
+                &uuid,
+                vec!["Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcaller".into()],
+                Some(3),
+            )
+            .await;
+        sbc.b2bua
+            .set_inbound_dialog(
+                &uuid,
+                "<sip:alice@a.example.com>;tag=al-1".into(),
+                Some("sip:alice@10.0.0.9:5060".into()),
+            )
+            .await;
+        sbc.b2bua
+            .store_outbound_invite(&uuid, String::new(), trunk_id)
+            .await;
+        sbc.b2bua
+            .attach_outbound(
+                &uuid,
+                "cid-1".into(),
+                "sbc-tag".into(),
+                trunk_addr(),
+                Some(callee_tx),
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
         {
@@ -1058,7 +1450,13 @@ mod transaction_tests {
             calls.get_mut(&uuid).unwrap().trunk_name = Some("genesys".into());
         }
         sbc.b2bua
-            .push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), trunk_addr(), rsip::Transport::Udp, Some(trunk_id))
+            .push_invite_attempt(
+                &uuid,
+                invite("z9hG4bKaaa", 3),
+                trunk_addr(),
+                rsip::Transport::Udp,
+                Some(trunk_id),
+            )
             .await;
         (sbc, uuid, caller_rx, callee_rx)
     }
@@ -1070,27 +1468,53 @@ mod transaction_tests {
     #[tokio::test]
     async fn current_final_is_acked_relayed_with_caller_cseq_and_terminates() {
         let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
-        assert!(sbc.media.stats().allocated_ports > 0, "the call holds an RTP port pair");
+        assert!(
+            sbc.media.stats().allocated_ports > 0,
+            "the call holds an RTP port pair"
+        );
 
-        sbc.handle_response(response("487 Request Terminated", "z9hG4bKaaa", 3, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response("487 Request Terminated", "z9hG4bKaaa", 3, "INVITE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
 
         let to_trunk = drain(&mut callee_rx);
-        assert_eq!(to_trunk.len(), 1, "exactly one ACK toward the trunk: {:?}", to_trunk);
+        assert_eq!(
+            to_trunk.len(),
+            1,
+            "exactly one ACK toward the trunk: {:?}",
+            to_trunk
+        );
         assert!(to_trunk[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"));
-        assert!(to_trunk[0].contains("branch=z9hG4bKaaa"), "ACK reuses the INVITE branch");
+        assert!(
+            to_trunk[0].contains("branch=z9hG4bKaaa"),
+            "ACK reuses the INVITE branch"
+        );
         assert!(to_trunk[0].contains("CSeq: 3 ACK\r\n"));
-        assert!(to_trunk[0].contains("To: <sip:bob@b.example.com>;tag=trunk-1\r\n"), "To copied from the response");
+        assert!(
+            to_trunk[0].contains("To: <sip:bob@b.example.com>;tag=trunk-1\r\n"),
+            "To copied from the response"
+        );
 
         let to_caller = drain(&mut caller_rx);
         assert_eq!(to_caller.len(), 1);
         assert!(to_caller[0].starts_with("SIP/2.0 487"), "{}", to_caller[0]);
-        assert!(to_caller[0].contains("branch=z9hG4bKcaller"), "caller's own Via restored");
+        assert!(
+            to_caller[0].contains("branch=z9hG4bKcaller"),
+            "caller's own Via restored"
+        );
         assert!(to_caller[0].contains("CSeq: 3 INVITE\r\n"));
 
         assert!(!alive(&sbc).await);
-        assert_eq!(sbc.media.stats().allocated_ports, 0, "media released on error relay");
+        assert_eq!(
+            sbc.media.stats().allocated_ports,
+            0,
+            "media released on error relay"
+        );
     }
 
     #[tokio::test]
@@ -1098,58 +1522,133 @@ mod transaction_tests {
         let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
 
         // 1. Genesys: 422 Min-SE 14400 → ACK + INVITE re-sent with the floor
-        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", "Min-SE: 14400\r\n"), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "422 Session Interval Too Small",
+                "z9hG4bKaaa",
+                3,
+                "INVITE",
+                "Min-SE: 14400\r\n",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let to_trunk = drain(&mut callee_rx);
-        assert_eq!(to_trunk.len(), 2, "ACK then the retried INVITE: {:?}", to_trunk);
+        assert_eq!(
+            to_trunk.len(),
+            2,
+            "ACK then the retried INVITE: {:?}",
+            to_trunk
+        );
         assert!(to_trunk[0].starts_with("ACK "));
         assert!(to_trunk[0].contains("CSeq: 3 ACK\r\n"));
         assert!(to_trunk[0].contains("branch=z9hG4bKaaa"));
         let retry = &to_trunk[1];
-        assert!(retry.starts_with("INVITE sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", retry);
+        assert!(
+            retry.starts_with("INVITE sip:bob@203.0.113.9:5060 SIP/2.0\r\n"),
+            "{}",
+            retry
+        );
         assert!(retry.contains("CSeq: 4 INVITE\r\n"));
         assert!(!retry.contains("z9hG4bKaaa"), "new transaction, new branch");
         assert_eq!(retry.matches("Session-Expires:").count(), 1);
         assert_eq!(retry.matches("Min-SE:").count(), 1);
-        assert!(retry.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\n"), "{}", retry);
+        assert!(
+            retry.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\n"),
+            "{}",
+            retry
+        );
         assert_eq!(retry.matches("Supported: timer").count(), 1);
         assert!(retry.ends_with(SDP), "body intact");
-        assert!(drain(&mut caller_rx).is_empty(), "the caller never sees the 422");
+        assert!(
+            drain(&mut caller_rx).is_empty(),
+            "the caller never sees the 422"
+        );
         assert!(alive(&sbc).await);
         assert_eq!(sbc.b2bua.get_session_timer_retry_count(&uuid).await, 1);
-        assert_eq!(sbc.metrics.session_timer_422_retries_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sbc.metrics
+                .session_timer_422_retries_total
+                .load(Ordering::Relaxed),
+            1
+        );
         let (attempt, _) = sbc.b2bua.current_attempt(&uuid).await.unwrap();
         assert_eq!(attempt.cseq, 4);
         let retry_branch = attempt.branch.clone().expect("retry branch recorded");
         assert!(retry.contains(&retry_branch));
 
         // 2. UDP retransmission of the first 422 (our ACK got lost): ACK only
-        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", "Min-SE: 14400\r\n"), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "422 Session Interval Too Small",
+                "z9hG4bKaaa",
+                3,
+                "INVITE",
+                "Min-SE: 14400\r\n",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let dup = drain(&mut callee_rx);
         assert_eq!(dup.len(), 1, "{:?}", dup);
-        assert!(dup[0].starts_with("ACK ") && dup[0].contains("branch=z9hG4bKaaa") && dup[0].contains("CSeq: 3 ACK"));
+        assert!(
+            dup[0].starts_with("ACK ")
+                && dup[0].contains("branch=z9hG4bKaaa")
+                && dup[0].contains("CSeq: 3 ACK")
+        );
         assert!(drain(&mut caller_rx).is_empty());
         assert!(alive(&sbc).await);
-        assert_eq!(sbc.b2bua.get_session_timer_retry_count(&uuid).await, 1, "no second retry");
+        assert_eq!(
+            sbc.b2bua.get_session_timer_retry_count(&uuid).await,
+            1,
+            "no second retry"
+        );
 
         // 3. The trunk raises its floor again on the retried INVITE: budget is
         //    one per attempt → ACK, relay the 422 with the caller's CSeq, tear down
-        sbc.handle_response(response("422 Session Interval Too Small", &retry_branch, 4, "INVITE", "Min-SE: 20000\r\n"), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "422 Session Interval Too Small",
+                &retry_branch,
+                4,
+                "INVITE",
+                "Min-SE: 20000\r\n",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let last = drain(&mut callee_rx);
         assert_eq!(last.len(), 1, "ACK only, no third INVITE: {:?}", last);
-        assert!(last[0].starts_with("ACK ") && last[0].contains("CSeq: 4 ACK") && last[0].contains(&retry_branch));
+        assert!(
+            last[0].starts_with("ACK ")
+                && last[0].contains("CSeq: 4 ACK")
+                && last[0].contains(&retry_branch)
+        );
         let to_caller = drain(&mut caller_rx);
         assert_eq!(to_caller.len(), 1);
         assert!(to_caller[0].starts_with("SIP/2.0 422"), "{}", to_caller[0]);
-        assert!(to_caller[0].contains("CSeq: 3 INVITE\r\n"), "caller's CSeq restored: {}", to_caller[0]);
+        assert!(
+            to_caller[0].contains("CSeq: 3 INVITE\r\n"),
+            "caller's CSeq restored: {}",
+            to_caller[0]
+        );
         assert!(to_caller[0].contains("Min-SE: 20000"), "diagnostics kept");
         assert!(!alive(&sbc).await);
-        assert_eq!(sbc.metrics.session_timer_422_retries_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sbc.metrics
+                .session_timer_422_retries_total
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1157,9 +1656,20 @@ mod transaction_tests {
         // Timers off: the caller's own offer was rejected → relay
         let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
         sbc.session_timer = None;
-        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", "Min-SE: 14400\r\n"), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "422 Session Interval Too Small",
+                "z9hG4bKaaa",
+                3,
+                "INVITE",
+                "Min-SE: 14400\r\n",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let to_trunk = drain(&mut callee_rx);
         assert_eq!(to_trunk.len(), 1, "ACK only: {:?}", to_trunk);
         assert!(to_trunk[0].starts_with("ACK "));
@@ -1168,9 +1678,20 @@ mod transaction_tests {
 
         // 422 without Min-SE (RFC 4028 §6 violation): nothing to retry with → relay
         let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
-        sbc.handle_response(response("422 Session Interval Too Small", "z9hG4bKaaa", 3, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "422 Session Interval Too Small",
+                "z9hG4bKaaa",
+                3,
+                "INVITE",
+                "",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(drain(&mut callee_rx).len(), 1, "ACK only");
         assert!(drain(&mut caller_rx)[0].starts_with("SIP/2.0 422"));
         assert!(!alive(&sbc).await);
@@ -1180,24 +1701,56 @@ mod transaction_tests {
     async fn stale_2xx_is_acked_and_byed_caller_untouched() {
         let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
         // A 407 retry superseded the first attempt (same trunk, CSeq 4)
-        sbc.b2bua.push_invite_attempt(&uuid, invite("z9hG4bKbbb", 4), trunk_addr(), rsip::Transport::Udp, None).await;
+        sbc.b2bua
+            .push_invite_attempt(
+                &uuid,
+                invite("z9hG4bKbbb", 4),
+                trunk_addr(),
+                rsip::Transport::Udp,
+                None,
+            )
+            .await;
 
         // Late 200 OK for the FIRST attempt (glare)
         sbc.handle_response(
-            response("200 OK", "z9hG4bKaaa", 3, "INVITE", "Contact: <sip:bob@203.0.113.9:5060>\r\n"),
-            trunk_addr(), rsip::Transport::Udp, None,
-        ).await.unwrap();
+            response(
+                "200 OK",
+                "z9hG4bKaaa",
+                3,
+                "INVITE",
+                "Contact: <sip:bob@203.0.113.9:5060>\r\n",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
 
         let to_trunk = drain(&mut callee_rx);
         assert_eq!(to_trunk.len(), 2, "ACK then BYE: {:?}", to_trunk);
-        assert!(to_trunk[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", to_trunk[0]);
+        assert!(
+            to_trunk[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"),
+            "{}",
+            to_trunk[0]
+        );
         assert!(to_trunk[0].contains("CSeq: 3 ACK\r\n"));
-        assert!(to_trunk[1].starts_with("BYE sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", to_trunk[1]);
-        assert!(to_trunk[1].contains("CSeq: 4 BYE\r\n"), "BYE CSeq above the ACK's");
+        assert!(
+            to_trunk[1].starts_with("BYE sip:bob@203.0.113.9:5060 SIP/2.0\r\n"),
+            "{}",
+            to_trunk[1]
+        );
+        assert!(
+            to_trunk[1].contains("CSeq: 4 BYE\r\n"),
+            "BYE CSeq above the ACK's"
+        );
         assert!(to_trunk[1].contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
         assert!(to_trunk[1].contains("To: <sip:bob@b.example.com>;tag=trunk-1\r\n"));
         assert!(to_trunk[1].contains("Reason: Q.850;cause=31"));
-        assert!(drain(&mut caller_rx).is_empty(), "never relayed to the caller");
+        assert!(
+            drain(&mut caller_rx).is_empty(),
+            "never relayed to the caller"
+        );
         assert!(alive(&sbc).await, "the live attempt is untouched");
         let calls = sbc.b2bua.calls_locked().await;
         assert_ne!(calls[&uuid].state, crate::b2bua::CallState::Connected);
@@ -1206,12 +1759,28 @@ mod transaction_tests {
     #[tokio::test]
     async fn responses_to_our_cancel_or_bye_are_dropped() {
         let (mut sbc, _uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
-        sbc.handle_response(response("481 Call/Transaction Does Not Exist", "z9hG4bKaaa", 3, "CANCEL", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
-        sbc.handle_response(response("200 OK", "z9hG4bKbye", 4, "BYE", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "481 Call/Transaction Does Not Exist",
+                "z9hG4bKaaa",
+                3,
+                "CANCEL",
+                "",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
+        sbc.handle_response(
+            response("200 OK", "z9hG4bKbye", 4, "BYE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(drain(&mut callee_rx).is_empty());
         assert!(drain(&mut caller_rx).is_empty());
         assert!(alive(&sbc).await);
@@ -1219,13 +1788,19 @@ mod transaction_tests {
 
     /// Bring the call to Connected with an armed session timer and force a
     /// refresh re-INVITE out; returns (its CSeq, its Via branch).
-    async fn arm_and_refresh(sbc: &Sbc, uuid: &crate::b2bua::CallUuid, callee_rx: &mut UnboundedReceiver<Vec<u8>>) -> (u32, String) {
-        sbc.b2bua.set_established_dialog(
-            uuid,
-            "<sip:alice@a.example.com>;tag=al-1".into(),
-            "<sip:bob@b.example.com>;tag=trunk-1".into(),
-            Some("sip:bob@203.0.113.9:5060".into()),
-        ).await;
+    async fn arm_and_refresh(
+        sbc: &Sbc,
+        uuid: &crate::b2bua::CallUuid,
+        callee_rx: &mut UnboundedReceiver<Vec<u8>>,
+    ) -> (u32, String) {
+        sbc.b2bua
+            .set_established_dialog(
+                uuid,
+                "<sip:alice@a.example.com>;tag=al-1".into(),
+                "<sip:bob@b.example.com>;tag=trunk-1".into(),
+                Some("sip:bob@203.0.113.9:5060".into()),
+            )
+            .await;
         {
             let mut calls = sbc.b2bua.calls_locked().await;
             calls.get_mut(uuid).unwrap().state = crate::b2bua::CallState::Connected;
@@ -1244,7 +1819,10 @@ mod transaction_tests {
         let reinvite = due[0].1.clone();
         // (due_session_refreshes only builds; the tick would send it — not needed here)
         let _ = drain(callee_rx);
-        (crate::b2bua::parse_cseq_number(&reinvite).unwrap(), crate::sip_builder::top_via_branch(&reinvite).unwrap())
+        (
+            crate::b2bua::parse_cseq_number(&reinvite).unwrap(),
+            crate::sip_builder::top_via_branch(&reinvite).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -1254,38 +1832,73 @@ mod transaction_tests {
         assert_eq!(cseq, 4, "refresh CSeq follows the stored INVITE");
 
         // 500 to the refresh: ACK, session kept, caller untouched
-        sbc.handle_response(response("500 Server Internal Error", &branch, cseq, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response("500 Server Internal Error", &branch, cseq, "INVITE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let out = drain(&mut callee_rx);
         assert_eq!(out.len(), 1, "{:?}", out);
-        assert!(out[0].starts_with("ACK ") && out[0].contains(&format!("CSeq: {} ACK", cseq)) && out[0].contains(&branch));
+        assert!(
+            out[0].starts_with("ACK ")
+                && out[0].contains(&format!("CSeq: {} ACK", cseq))
+                && out[0].contains(&branch)
+        );
         assert!(drain(&mut caller_rx).is_empty());
         assert!(alive(&sbc).await);
 
         // The same 500 retransmitted (branch unknown to the attempts, CSeq above
         // the live INVITE): re-ACKed, NOT treated as the INVITE's final
-        sbc.handle_response(response("500 Server Internal Error", &branch, cseq, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response("500 Server Internal Error", &branch, cseq, "INVITE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let out = drain(&mut callee_rx);
         assert_eq!(out.len(), 1, "{:?}", out);
         assert!(out[0].starts_with("ACK "));
-        assert!(drain(&mut caller_rx).is_empty(), "no error relayed mid-call");
-        assert!(alive(&sbc).await, "the established call survives a duplicate answer");
+        assert!(
+            drain(&mut caller_rx).is_empty(),
+            "no error relayed mid-call"
+        );
+        assert!(
+            alive(&sbc).await,
+            "the established call survives a duplicate answer"
+        );
 
         // Next refresh gets 481: the trunk lost the dialog → ACK, BYE the caller, release
         let (cseq2, branch2) = arm_and_refresh(&sbc, &uuid, &mut callee_rx).await;
         assert!(cseq2 > cseq);
-        sbc.handle_response(response("481 Call/Transaction Does Not Exist", &branch2, cseq2, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, None)
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response(
+                "481 Call/Transaction Does Not Exist",
+                &branch2,
+                cseq2,
+                "INVITE",
+                "",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
         let out = drain(&mut callee_rx);
         assert_eq!(out.len(), 1, "ACK toward the trunk: {:?}", out);
         assert!(out[0].starts_with("ACK ") && out[0].contains(&format!("CSeq: {} ACK", cseq2)));
         let to_caller = drain(&mut caller_rx);
         assert_eq!(to_caller.len(), 1, "BYE toward the caller: {:?}", to_caller);
-        assert!(to_caller[0].starts_with("BYE sip:alice@10.0.0.9:5060 SIP/2.0\r\n"), "{}", to_caller[0]);
+        assert!(
+            to_caller[0].starts_with("BYE sip:alice@10.0.0.9:5060 SIP/2.0\r\n"),
+            "{}",
+            to_caller[0]
+        );
         assert!(to_caller[0].contains("From: <sip:bob@b.example.com>;tag=trunk-1\r\n"));
         assert!(to_caller[0].contains("To: <sip:alice@a.example.com>;tag=al-1\r\n"));
         assert!(!alive(&sbc).await);
@@ -1301,25 +1914,53 @@ mod transaction_tests {
         let (stray_tx, mut stray_rx) = unbounded_channel();
 
         // 487 that follows the CANCEL: ACK back over the connection it arrived on
-        sbc.handle_response(response("487 Request Terminated", "z9hG4bKaaa", 3, "INVITE", ""), trunk_addr(), rsip::Transport::Udp, Some(&stray_tx))
-            .await
-            .unwrap();
+        sbc.handle_response(
+            response("487 Request Terminated", "z9hG4bKaaa", 3, "INVITE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            Some(&stray_tx),
+        )
+        .await
+        .unwrap();
         let out = drain(&mut stray_rx);
         assert_eq!(out.len(), 1, "{:?}", out);
-        assert!(out[0].starts_with("ACK ") && out[0].contains("CSeq: 3 ACK") && out[0].contains("branch=z9hG4bKaaa"));
+        assert!(
+            out[0].starts_with("ACK ")
+                && out[0].contains("CSeq: 3 ACK")
+                && out[0].contains("branch=z9hG4bKaaa")
+        );
 
         // 200 OK that crossed the CANCEL on the wire: ACK + BYE, no ghost session
         sbc.handle_response(
-            response("200 OK", "z9hG4bKaaa", 3, "INVITE", "Contact: <sip:bob@203.0.113.9:5060>\r\n"),
-            trunk_addr(), rsip::Transport::Udp, Some(&stray_tx),
-        ).await.unwrap();
+            response(
+                "200 OK",
+                "z9hG4bKaaa",
+                3,
+                "INVITE",
+                "Contact: <sip:bob@203.0.113.9:5060>\r\n",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            Some(&stray_tx),
+        )
+        .await
+        .unwrap();
         let out = drain(&mut stray_rx);
         assert_eq!(out.len(), 2, "ACK then BYE: {:?}", out);
-        assert!(out[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n") && out[0].contains("CSeq: 3 ACK"));
-        assert!(out[1].starts_with("BYE sip:bob@203.0.113.9:5060 SIP/2.0\r\n") && out[1].contains("CSeq: 4 BYE"));
+        assert!(
+            out[0].starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n")
+                && out[0].contains("CSeq: 3 ACK")
+        );
+        assert!(
+            out[1].starts_with("BYE sip:bob@203.0.113.9:5060 SIP/2.0\r\n")
+                && out[1].contains("CSeq: 4 BYE")
+        );
         assert!(out[1].contains("Reason: Q.850;cause=31"));
 
         assert!(drain(&mut caller_rx).is_empty());
-        assert!(drain(&mut callee_rx).is_empty(), "nothing on the old callee channel");
+        assert!(
+            drain(&mut callee_rx).is_empty(),
+            "nothing on the old callee channel"
+        );
     }
 }

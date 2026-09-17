@@ -33,12 +33,24 @@ pub struct BanConfig {
     pub whitelist: Vec<String>,
 }
 
-fn default_enabled() -> bool { true }
-fn default_max_failures() -> u32 { 5 }
-fn default_window() -> u64 { 60 }
-fn default_ban_duration() -> u64 { 3600 }
-fn default_multiplier() -> u32 { 4 }
-fn default_max_ban() -> u64 { 86400 }
+fn default_enabled() -> bool {
+    true
+}
+fn default_max_failures() -> u32 {
+    5
+}
+fn default_window() -> u64 {
+    60
+}
+fn default_ban_duration() -> u64 {
+    3600
+}
+fn default_multiplier() -> u32 {
+    4
+}
+fn default_max_ban() -> u64 {
+    86400
+}
 
 impl Default for BanConfig {
     fn default() -> Self {
@@ -80,7 +92,9 @@ impl BanEntry {
     }
 
     pub fn ts_rfc_secs(t: SystemTime) -> u64 {
-        t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+        t.duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 }
 
@@ -162,7 +176,10 @@ impl BanManager {
         let now = Instant::now();
         let window = Duration::from_secs(config.window_secs);
         let mut strikes = self.failures.entry(ip).or_default();
-        while strikes.front().is_some_and(|t| now.duration_since(*t) > window) {
+        while strikes
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > window)
+        {
             strikes.pop_front();
         }
         strikes.push_back(now);
@@ -175,14 +192,19 @@ impl BanManager {
 
         self.failures.remove(&ip);
         let offense = self.offenses.get(&ip).map(|o| o.count).unwrap_or(0) + 1;
-        self.offenses.insert(ip, Offense { count: offense, last: Instant::now() });
+        self.offenses.insert(
+            ip,
+            Offense {
+                count: offense,
+                last: Instant::now(),
+            },
+        );
 
         let factor = config
             .repeat_offender_multiplier
             .saturating_pow(offense.saturating_sub(1))
             .max(1) as u64;
-        let duration = (config.ban_duration_secs.saturating_mul(factor))
-            .min(config.max_ban_secs);
+        let duration = (config.ban_duration_secs.saturating_mul(factor)).min(config.max_ban_secs);
 
         let entry = BanEntry {
             ip,
@@ -246,17 +268,29 @@ impl BanManager {
         let stale: Vec<IpAddr> = self
             .failures
             .iter()
-            .filter(|e| e.value().back().is_none_or(|t| now.duration_since(*t) > window))
+            .filter(|e| {
+                e.value()
+                    .back()
+                    .is_none_or(|t| now.duration_since(*t) > window)
+            })
             .map(|e| *e.key())
             .collect();
         for ip in &stale {
             self.failures.remove(ip);
         }
-        let forget_after = Duration::from_secs(config.max_ban_secs.saturating_mul(2).max(config.window_secs));
+        let forget_after = Duration::from_secs(
+            config
+                .max_ban_secs
+                .saturating_mul(2)
+                .max(config.window_secs),
+        );
         let cold: Vec<IpAddr> = self
             .offenses
             .iter()
-            .filter(|e| now.duration_since(e.value().last) > forget_after && !self.bans.contains_key(e.key()))
+            .filter(|e| {
+                now.duration_since(e.value().last) > forget_after
+                    && !self.bans.contains_key(e.key())
+            })
             .map(|e| *e.key())
             .collect();
         for ip in &cold {
@@ -282,7 +316,13 @@ impl BanManager {
     /// Restore a persisted ban (startup).
     pub fn restore(&self, entry: BanEntry) {
         if !entry.is_expired() {
-            self.offenses.insert(entry.ip, Offense { count: entry.offense_count, last: Instant::now() });
+            self.offenses.insert(
+                entry.ip,
+                Offense {
+                    count: entry.offense_count,
+                    last: Instant::now(),
+                },
+            );
             self.bans.insert(entry.ip, entry);
         }
     }
@@ -323,8 +363,12 @@ mod tests {
             whitelist: vec!["10.0.0.0/8".to_string()],
             ..Default::default()
         });
-        assert!(mgr.record_failure("127.0.0.1".parse().unwrap(), "x").is_none());
-        assert!(mgr.record_failure("10.1.2.3".parse().unwrap(), "x").is_none());
+        assert!(mgr
+            .record_failure("127.0.0.1".parse().unwrap(), "x")
+            .is_none());
+        assert!(mgr
+            .record_failure("10.1.2.3".parse().unwrap(), "x")
+            .is_none());
         assert!(mgr.record_failure(ip(9), "x").is_some());
     }
 

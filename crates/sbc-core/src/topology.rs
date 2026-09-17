@@ -35,7 +35,7 @@ pub struct SbcIdentity {
 impl SbcIdentity {
     pub fn new(public_ip: &str, sip_domain: &str, sip_port: u16, tls: bool) -> Self {
         Self {
-            public_ip:  public_ip.to_string(),
+            public_ip: public_ip.to_string(),
             sip_domain: sip_domain.to_string(),
             sip_port,
             tls,
@@ -56,7 +56,10 @@ impl SbcIdentity {
     pub fn contact_uri(&self) -> String {
         let scheme = if self.tls { "sips" } else { "sip" };
         if self.tls {
-            format!("{}:sbc@{}:{};transport=tls", scheme, self.public_ip, self.sip_port)
+            format!(
+                "{}:sbc@{}:{};transport=tls",
+                scheme, self.public_ip, self.sip_port
+            )
         } else {
             format!("{}:sbc@{}:{}", scheme, self.public_ip, self.sip_port)
         }
@@ -67,9 +70,9 @@ impl SbcIdentity {
         format!(
             "SIP/2.0/{transport} {ip}:{port};branch={branch}",
             transport = transport.to_uppercase(),
-            ip        = self.public_ip,
-            port      = self.sip_port,
-            branch    = branch,
+            ip = self.public_ip,
+            port = self.sip_port,
+            branch = branch,
         )
     }
 
@@ -119,7 +122,8 @@ impl RawSipMessage {
         };
 
         let mut lines = header_part.splitn(2, ['\r', '\n']);
-        let start_line = lines.next()
+        let start_line = lines
+            .next()
             .ok_or_else(|| Error::Transport("empty SIP message".into()))?
             .trim()
             .to_string();
@@ -135,15 +139,25 @@ impl RawSipMessage {
                     h.push_str(line.trim());
                 }
             } else if line.is_empty() {
-                if let Some(h) = current.take() { headers.push(h); }
+                if let Some(h) = current.take() {
+                    headers.push(h);
+                }
             } else {
-                if let Some(h) = current.take() { headers.push(h); }
+                if let Some(h) = current.take() {
+                    headers.push(h);
+                }
                 current = Some(line.to_string());
             }
         }
-        if let Some(h) = current { headers.push(h); }
+        if let Some(h) = current {
+            headers.push(h);
+        }
 
-        Ok(Self { start_line, headers, body })
+        Ok(Self {
+            start_line,
+            headers,
+            body,
+        })
     }
 
     /// Serialize back to a raw SIP string (`to_string()` via `Display`).
@@ -163,7 +177,8 @@ impl RawSipMessage {
     /// Return all values of a named header (case-insensitive).
     pub fn header_values(&self, name: &str) -> Vec<String> {
         let name_lc = name.to_lowercase();
-        self.headers.iter()
+        self.headers
+            .iter()
             .filter_map(|h| {
                 let colon = h.find(':')?;
                 let hname = h[..colon].trim().to_lowercase();
@@ -265,7 +280,7 @@ fn short_form(name: &str) -> &str {
         "c" => "content-type",
         "s" => "subject",
         "k" => "supported",
-        _   => name,
+        _ => name,
     }
 }
 
@@ -391,8 +406,8 @@ pub fn strip_privacy_headers(raw: &str) -> Result<String> {
     msg.remove_header("p-preferred-identity");
     msg.remove_header("x-forwarded-for");
     msg.remove_header("x-real-ip");
-    msg.remove_header("server");       // SIP Server header
-    msg.remove_header("user-agent");   // optionally mask UA
+    msg.remove_header("server"); // SIP Server header
+    msg.remove_header("user-agent"); // optionally mask UA
     Ok(msg.to_string())
 }
 
@@ -501,7 +516,11 @@ Content-Length: 0\r\n\
         let vias = msg.header_values("via");
         // Only SBC's Via should remain
         assert_eq!(vias.len(), 1);
-        assert!(vias[0].contains("203.0.113.1"), "Via should contain SBC IP: {:?}", vias);
+        assert!(
+            vias[0].contains("203.0.113.1"),
+            "Via should contain SBC IP: {:?}",
+            vias
+        );
     }
 
     #[test]
@@ -511,8 +530,11 @@ Content-Length: 0\r\n\
         let msg = RawSipMessage::parse(&out).unwrap();
         let contacts = msg.header_values("contact");
         assert!(!contacts.is_empty(), "Contact should be present");
-        assert!(contacts[0].contains("203.0.113.1") || contacts[0].contains("sip.nixi.tel"),
-            "Contact should contain SBC address: {:?}", contacts);
+        assert!(
+            contacts[0].contains("203.0.113.1") || contacts[0].contains("sip.nixi.tel"),
+            "Contact should contain SBC address: {:?}",
+            contacts
+        );
     }
 
     #[test]
@@ -521,7 +543,11 @@ Content-Length: 0\r\n\
         let out = apply_topology_hiding_inbound(INVITE, &id, "UDP").unwrap();
         let msg = RawSipMessage::parse(&out).unwrap();
         let rr = msg.header_values("record-route");
-        assert!(rr.is_empty(), "Record-Route should be removed from inbound: {:?}", rr);
+        assert!(
+            rr.is_empty(),
+            "Record-Route should be removed from inbound: {:?}",
+            rr
+        );
     }
 
     #[test]
@@ -542,8 +568,11 @@ Content-Length: 0\r\n\
         let msg = RawSipMessage::parse(&out).unwrap();
         let rr = msg.header_values("record-route");
         assert!(!rr.is_empty(), "Record-Route should be inserted");
-        assert!(rr[0].contains("sip.nixi.tel") || rr[0].contains("203.0.113.1"),
-            "Record-Route should contain SBC address: {:?}", rr);
+        assert!(
+            rr[0].contains("sip.nixi.tel") || rr[0].contains("203.0.113.1"),
+            "Record-Route should contain SBC address: {:?}",
+            rr
+        );
     }
 
     #[test]
@@ -553,7 +582,10 @@ Content-Length: 0\r\n\
         let msg = RawSipMessage::parse(&out).unwrap();
         let vias = msg.header_values("via");
         assert_eq!(vias.len(), 1);
-        assert!(vias[0].contains("z9hG4bK"), "Via branch should have magic cookie");
+        assert!(
+            vias[0].contains("z9hG4bK"),
+            "Via branch should have magic cookie"
+        );
     }
 
     // ── SBC identity helpers ─────────────────────────────────────────────────

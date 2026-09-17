@@ -96,7 +96,7 @@ impl CertificateFingerprint {
 
     /// Verify fingerprint matches certificate
     pub fn verify(&self, cert_der: &[u8]) -> Result<bool> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         if self.algorithm != "sha-256" {
             return Err(Error::Media(format!(
@@ -176,9 +176,11 @@ impl DtlsContext {
     pub fn new(role: DtlsRole) -> Result<Self> {
         // Generate self-signed certificate via webrtc-dtls (which uses rcgen internally).
         // This is the SAME certificate used in perform_handshake().
-        let dtls_certificate = webrtc_dtls::crypto::Certificate::generate_self_signed(
-            vec!["webrtc.local".to_string()]
-        ).map_err(|e| Error::Media(format!("DTLS certificate generation failed: {}", e)))?;
+        let dtls_certificate =
+            webrtc_dtls::crypto::Certificate::generate_self_signed(
+                vec!["webrtc.local".to_string()],
+            )
+            .map_err(|e| Error::Media(format!("DTLS certificate generation failed: {}", e)))?;
 
         // Extract DER bytes from the certificate for fingerprint computation
         let cert_der = dtls_certificate.certificate[0].0.clone();
@@ -186,7 +188,10 @@ impl DtlsContext {
         // Compute SHA-256 fingerprint from the SAME certificate
         let fingerprint = Self::compute_fingerprint(&cert_der)?;
 
-        info!("DTLS context created (role={:?}, fingerprint={})", role, fingerprint.fingerprint);
+        info!(
+            "DTLS context created (role={:?}, fingerprint={})",
+            role, fingerprint.fingerprint
+        );
 
         Ok(Self {
             local_fingerprint: fingerprint,
@@ -201,7 +206,7 @@ impl DtlsContext {
 
     /// Compute SHA-256 fingerprint of a DER-encoded certificate.
     fn compute_fingerprint(cert_der: &[u8]) -> Result<CertificateFingerprint> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
         hasher.update(cert_der);
@@ -235,10 +240,7 @@ impl DtlsContext {
     /// and sends DTLS responses back via the same RTP socket.
     ///
     /// After handshake completes, SRTP keying material is exported.
-    pub async fn perform_handshake(
-        &self,
-        bridge: Arc<DtlsUdpBridge>,
-    ) -> Result<()> {
+    pub async fn perform_handshake(&self, bridge: Arc<DtlsUdpBridge>) -> Result<()> {
         use webrtc_dtls::config::Config;
         use webrtc_dtls::conn::DTLSConn;
         use webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile;
@@ -255,9 +257,7 @@ impl DtlsContext {
         // DTLS and sends a fatal alert, killing the connection.
         let config = Config {
             certificates: vec![self.dtls_certificate.clone()],
-            srtp_protection_profiles: vec![
-                SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80,
-            ],
+            srtp_protection_profiles: vec![SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80],
             insecure_skip_verify: true, // We verify fingerprint via SDP, not via X.509 chain
             ..Default::default()
         };
@@ -320,8 +320,9 @@ impl DtlsContext {
     /// - recv_context: decrypts SRTP packets FROM the browser
     /// - send_context: encrypts RTP packets TO the browser
     pub async fn create_srtp_contexts(&self) -> Result<(SrtpContext, SrtpContext)> {
-        let keys = self.srtp_keys.lock().await.clone()
-            .ok_or_else(|| Error::Media("DTLS handshake not complete — no SRTP keys".to_string()))?;
+        let keys = self.srtp_keys.lock().await.clone().ok_or_else(|| {
+            Error::Media("DTLS handshake not complete — no SRTP keys".to_string())
+        })?;
 
         // Determine which key is for receive vs send based on DTLS role.
         // If SBC is DTLS client (Active): SBC uses client_key for sending, server_key for receiving.
@@ -351,16 +352,8 @@ impl DtlsContext {
             }
         };
 
-        let recv_ctx = SrtpContext::new(
-            recv_key,
-            recv_salt,
-            CryptoSuite::AesCm128HmacSha1_80,
-        )?;
-        let send_ctx = SrtpContext::new(
-            send_key,
-            send_salt,
-            CryptoSuite::AesCm128HmacSha1_80,
-        )?;
+        let recv_ctx = SrtpContext::new(recv_key, recv_salt, CryptoSuite::AesCm128HmacSha1_80)?;
+        let send_ctx = SrtpContext::new(send_key, send_salt, CryptoSuite::AesCm128HmacSha1_80)?;
 
         info!(
             "SRTP contexts created from DTLS keys (role: {:?}, suite: AES_CM_128_HMAC_SHA1_80)",
@@ -474,7 +467,9 @@ impl webrtc_util::conn::Conn for DtlsUdpBridge {
                 .await
                 .map_err(|e| webrtc_util::Error::Other(format!("UDP send error: {}", e)))
         } else {
-            Err(webrtc_util::Error::Other("No remote address known".to_string()))
+            Err(webrtc_util::Error::Other(
+                "No remote address known".to_string(),
+            ))
         }
     }
 
@@ -522,9 +517,16 @@ impl DtlsManager {
     }
 
     /// Create DTLS context for session
-    pub async fn create_context(&self, session_id: String, role: DtlsRole) -> Result<Arc<DtlsContext>> {
+    pub async fn create_context(
+        &self,
+        session_id: String,
+        role: DtlsRole,
+    ) -> Result<Arc<DtlsContext>> {
         let context = Arc::new(DtlsContext::new(role)?);
-        self.contexts.lock().await.insert(session_id, context.clone());
+        self.contexts
+            .lock()
+            .await
+            .insert(session_id, context.clone());
         Ok(context)
     }
 

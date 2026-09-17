@@ -40,9 +40,15 @@ pub struct AclRuleBody {
     pub comment: Option<String>,
 }
 
-fn default_direction() -> String { "both".to_string() }
-fn default_priority() -> u32 { 100 }
-fn default_true() -> bool { true }
+fn default_direction() -> String {
+    "both".to_string()
+}
+fn default_priority() -> u32 {
+    100
+}
+fn default_true() -> bool {
+    true
+}
 
 fn rule_json(r: &AclRuleRow) -> serde_json::Value {
     json!({
@@ -59,7 +65,9 @@ fn rule_json(r: &AclRuleRow) -> serde_json::Value {
 pub async fn list_rules(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
     let rows = store.list_acl_rules().await.map_err(ApiError::internal)?;
-    Ok(Json(serde_json::Value::Array(rows.iter().map(rule_json).collect())))
+    Ok(Json(serde_json::Value::Array(
+        rows.iter().map(rule_json).collect(),
+    )))
 }
 
 pub async fn create_rule(
@@ -78,11 +86,16 @@ pub async fn create_rule(
         _ => return Err(ApiError::bad_request("action must be 'allow' or 'deny'")),
     };
     if !matches!(body.direction.as_str(), "inbound" | "outbound" | "both") {
-        return Err(ApiError::bad_request("direction must be inbound, outbound or both"));
+        return Err(ApiError::bad_request(
+            "direction must be inbound, outbound or both",
+        ));
     }
     // Validate the CIDR before storing (single IPs accepted too).
     if cidr.parse::<std::net::IpAddr>().is_err() && !cidr.contains('/') {
-        return Err(ApiError::bad_request(format!("invalid CIDR or IP: {}", cidr)));
+        return Err(ApiError::bad_request(format!(
+            "invalid CIDR or IP: {}",
+            cidr
+        )));
     }
 
     let row = AclRuleRow {
@@ -94,7 +107,10 @@ pub async fn create_rule(
         enabled: body.enabled,
         comment: body.comment.clone(),
     };
-    store.upsert_acl_rule(&row).await.map_err(ApiError::internal)?;
+    store
+        .upsert_acl_rule(&row)
+        .await
+        .map_err(ApiError::internal)?;
     apply_and_notify(&state, &store, "create", &row.id).await;
     Ok((StatusCode::CREATED, Json(rule_json(&row))))
 }
@@ -104,7 +120,11 @@ pub async fn delete_rule(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
-    if !store.delete_acl_rule(&id).await.map_err(ApiError::internal)? {
+    if !store
+        .delete_acl_rule(&id)
+        .await
+        .map_err(ApiError::internal)?
+    {
         return Err(ApiError::not_found(format!("ACL rule '{}' not found", id)));
     }
     apply_and_notify(&state, &store, "delete", &id).await;

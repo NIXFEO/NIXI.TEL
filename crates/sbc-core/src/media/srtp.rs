@@ -5,8 +5,8 @@
 //! Delegates real encryption to srtp_crypto.rs (AES-CM + HMAC-SHA1).
 
 use crate::media::srtp_crypto::{derive_srtp_keys, SrtpCrypto};
-use rand::Rng;
 use crate::{Error, Result};
+use rand::Rng;
 use std::fmt;
 
 /// SRTP Crypto Suite
@@ -92,7 +92,11 @@ pub struct SrtpContext {
 
 impl SrtpContext {
     /// Create new SRTP context with master key and salt
-    pub fn new(master_key: Vec<u8>, master_salt: Vec<u8>, crypto_suite: CryptoSuite) -> Result<Self> {
+    pub fn new(
+        master_key: Vec<u8>,
+        master_salt: Vec<u8>,
+        crypto_suite: CryptoSuite,
+    ) -> Result<Self> {
         if master_key.len() != crypto_suite.master_key_len() {
             return Err(Error::Media(format!(
                 "Invalid master key length: expected {}, got {}",
@@ -126,12 +130,15 @@ impl SrtpContext {
     pub fn from_key_params(key_params: &str, crypto_suite: CryptoSuite) -> Result<Self> {
         let inline_prefix = "inline:";
         if !key_params.starts_with(inline_prefix) {
-            return Err(Error::Media("Key params must start with 'inline:'".to_string()));
+            return Err(Error::Media(
+                "Key params must start with 'inline:'".to_string(),
+            ));
         }
 
         let base64_data = &key_params[inline_prefix.len()..];
         use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(base64_data)
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(base64_data)
             .map_err(|e| Error::Media(format!("Invalid base64 in key params: {}", e)))?;
 
         let key_len = crypto_suite.master_key_len();
@@ -175,8 +182,12 @@ impl SrtpContext {
     /// Clone this context for the send direction (creates fresh crypto state).
     /// Used for SDES-SRTP where the same key material is used in both directions.
     pub fn clone_for_send(&self) -> Self {
-        Self::new(self.master_key.clone(), self.master_salt.clone(), self.crypto_suite)
-            .expect("clone_for_send: same params that worked in new() should work again")
+        Self::new(
+            self.master_key.clone(),
+            self.master_salt.clone(),
+            self.crypto_suite,
+        )
+        .expect("clone_for_send: same params that worked in new() should work again")
     }
 
     /// Export key material for SDP a=crypto: attribute
@@ -185,7 +196,10 @@ impl SrtpContext {
         key_material.extend_from_slice(&self.master_key);
         key_material.extend_from_slice(&self.master_salt);
         use base64::Engine;
-        format!("inline:{}", base64::engine::general_purpose::STANDARD.encode(&key_material))
+        format!(
+            "inline:{}",
+            base64::engine::general_purpose::STANDARD.encode(&key_material)
+        )
     }
 }
 
@@ -268,11 +282,13 @@ mod tests {
             master_key.clone(),
             master_salt.clone(),
             CryptoSuite::AesCm128HmacSha1_80,
-        ).unwrap();
+        )
+        .unwrap();
         let key_params = ctx.to_key_params();
         assert!(key_params.starts_with("inline:"));
 
-        let ctx2 = SrtpContext::from_key_params(&key_params, CryptoSuite::AesCm128HmacSha1_80).unwrap();
+        let ctx2 =
+            SrtpContext::from_key_params(&key_params, CryptoSuite::AesCm128HmacSha1_80).unwrap();
         assert_eq!(ctx2.master_key, master_key);
         assert_eq!(ctx2.master_salt, master_salt);
     }
@@ -292,20 +308,21 @@ mod tests {
     fn test_encrypt_decrypt_real_aes_cm() {
         // Test avec une vraie paire clé/sel
         let master_key = vec![
-            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
-            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+            0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+            0x0b, 0x0b,
         ];
         let master_salt = vec![
-            0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
-            0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
+            0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c,
         ];
 
         let mut ctx_enc = SrtpContext::new(
-            master_key.clone(), master_salt.clone(), CryptoSuite::AesCm128HmacSha1_80
-        ).unwrap();
-        let mut ctx_dec = SrtpContext::new(
-            master_key, master_salt, CryptoSuite::AesCm128HmacSha1_80
-        ).unwrap();
+            master_key.clone(),
+            master_salt.clone(),
+            CryptoSuite::AesCm128HmacSha1_80,
+        )
+        .unwrap();
+        let mut ctx_dec =
+            SrtpContext::new(master_key, master_salt, CryptoSuite::AesCm128HmacSha1_80).unwrap();
 
         // Build a minimal RTP packet (12-byte header + payload)
         let mut rtp = vec![

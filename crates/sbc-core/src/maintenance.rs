@@ -24,7 +24,9 @@ pub struct MaintenanceConfig {
 
 impl Default for MaintenanceConfig {
     fn default() -> Self {
-        Self { sweep_interval: Duration::from_secs(60) }
+        Self {
+            sweep_interval: Duration::from_secs(60),
+        }
     }
 }
 
@@ -41,7 +43,12 @@ pub struct SweepReport {
 
 impl SweepReport {
     pub fn total(&self) -> usize {
-        self.dos_entries + self.nonces + self.registrations + self.bans + self.ban_windows + self.rate_windows
+        self.dos_entries
+            + self.nonces
+            + self.registrations
+            + self.bans
+            + self.ban_windows
+            + self.rate_windows
     }
 }
 
@@ -64,7 +71,14 @@ impl MaintenanceTask {
         metrics: Arc<SbcMetrics>,
         config: MaintenanceConfig,
     ) -> Self {
-        Self { dos, auth, registrar, security, metrics, config }
+        Self {
+            dos,
+            auth,
+            registrar,
+            security,
+            metrics,
+            config,
+        }
     }
 
     /// Spawn the sweeper task.
@@ -72,7 +86,10 @@ impl MaintenanceTask {
         let task = tokio::spawn(async move {
             let mut ticker = interval(self.config.sweep_interval);
             ticker.tick().await; // consume the immediate first tick
-            info!("Started maintenance sweeper (interval: {:?})", self.config.sweep_interval);
+            info!(
+                "Started maintenance sweeper (interval: {:?})",
+                self.config.sweep_interval
+            );
             loop {
                 ticker.tick().await;
                 self.sweep().await;
@@ -96,14 +113,16 @@ impl MaintenanceTask {
             rate_windows: self.security.user_limits.prune_idle_windows(),
         };
 
-        self.metrics.set_dos_tracked_ips(self.dos.tracked_ips().await as u64);
+        self.metrics
+            .set_dos_tracked_ips(self.dos.tracked_ips().await as u64);
         let nonces = match &self.auth {
             Some(auth) => auth.active_nonces().await as u64,
             None => 0,
         };
         self.metrics.set_auth_nonces(nonces);
         // count() runs after cleanup_expired, so expired bindings no longer inflate it
-        self.metrics.set_active_registrations(self.registrar.count().await);
+        self.metrics
+            .set_active_registrations(self.registrar.count().await);
 
         if report.total() > 0 {
             debug!("Maintenance sweep: {:?}", report);

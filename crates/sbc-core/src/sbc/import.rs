@@ -172,8 +172,7 @@ mod tests {
     fn config_with_seeds() -> SbcConfig {
         let mut config = SbcConfig::default();
         config.security.sip_realm = "sip.example.com".to_string();
-        config.security.sip_users =
-            HashMap::from([("alice".to_string(), "secret".to_string())]);
+        config.security.sip_users = HashMap::from([("alice".to_string(), "secret".to_string())]);
         config.dids = vec![crate::config::DidMapping {
             number: "+33123456789".to_string(),
             user: "alice".to_string(),
@@ -191,7 +190,11 @@ mod tests {
         let user = store.get_user("alice").await.unwrap().unwrap();
         assert_eq!(user.ha1, compute_ha1("alice", "sip.example.com", "secret"));
         assert!(store.get_did("+33123456789").await.unwrap().is_some());
-        assert!(store.get_setting("toml_imported_at").await.unwrap().is_some());
+        assert!(store
+            .get_setting("toml_imported_at")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

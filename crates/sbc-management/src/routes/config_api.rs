@@ -72,7 +72,9 @@ fn resolve_ha1(realm: &str, username: &str, body: &UserBody) -> ApiResult<String
             Ok(h.to_lowercase())
         }
         (None, Some(_)) => Err(ApiError::bad_request("ha1 must be 32 hex chars")),
-        (None, None) => Err(ApiError::bad_request("missing required field: password (or ha1)")),
+        (None, None) => Err(ApiError::bad_request(
+            "missing required field: password (or ha1)",
+        )),
     }
 }
 
@@ -95,8 +97,16 @@ pub async fn create_user(
         .filter(|u| !u.is_empty())
         .ok_or_else(|| ApiError::bad_request("missing required field: username"))?;
 
-    if store.get_user(&username).await.map_err(ApiError::internal)?.is_some() {
-        return Err(ApiError::conflict(format!("user '{}' already exists", username)));
+    if store
+        .get_user(&username)
+        .await
+        .map_err(ApiError::internal)?
+        .is_some()
+    {
+        return Err(ApiError::conflict(format!(
+            "user '{}' already exists",
+            username
+        )));
     }
 
     let row = UserRow {
@@ -153,8 +163,15 @@ pub async fn delete_user(
     Path(username): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
-    if !store.delete_user(&username).await.map_err(ApiError::internal)? {
-        return Err(ApiError::not_found(format!("user '{}' not found", username)));
+    if !store
+        .delete_user(&username)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found(format!(
+            "user '{}' not found",
+            username
+        )));
     }
     rehydrate_users(&state, &store).await;
     config_changed(&state, "user", "delete", &username);
@@ -197,11 +214,23 @@ pub async fn create_did(
     let store = store(&state)?;
     let (number, sip_user) = match (body.number.clone(), body.sip_user.clone()) {
         (Some(n), Some(u)) if !n.is_empty() && !u.is_empty() => (n, u),
-        _ => return Err(ApiError::bad_request("missing required fields: number, sip_user")),
+        _ => {
+            return Err(ApiError::bad_request(
+                "missing required fields: number, sip_user",
+            ))
+        }
     };
 
-    if store.get_did(&number).await.map_err(ApiError::internal)?.is_some() {
-        return Err(ApiError::conflict(format!("DID '{}' already exists", number)));
+    if store
+        .get_did(&number)
+        .await
+        .map_err(ApiError::internal)?
+        .is_some()
+    {
+        return Err(ApiError::conflict(format!(
+            "DID '{}' already exists",
+            number
+        )));
     }
 
     let row = DidRow {
@@ -225,7 +254,11 @@ pub async fn delete_did(
     Path(number): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
-    if !store.delete_did(&number).await.map_err(ApiError::internal)? {
+    if !store
+        .delete_did(&number)
+        .await
+        .map_err(ApiError::internal)?
+    {
         return Err(ApiError::not_found(format!("DID '{}' not found", number)));
     }
     let _ = apply_dids(&state.dids, &store).await;

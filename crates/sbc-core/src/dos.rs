@@ -140,7 +140,10 @@ pub enum RateLimitResult {
 
 impl RateLimitResult {
     pub fn is_allowed(&self) -> bool {
-        matches!(self, RateLimitResult::Allowed | RateLimitResult::Whitelisted)
+        matches!(
+            self,
+            RateLimitResult::Allowed | RateLimitResult::Whitelisted
+        )
     }
 }
 
@@ -194,7 +197,8 @@ impl DosProtector {
     pub async fn check(&self, addr: IpAddr) -> RateLimitResult {
         // Whitelist check
         if self.whitelist.contains(&addr) {
-            self.allowed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.allowed_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return RateLimitResult::Whitelisted;
         }
 
@@ -218,17 +222,19 @@ impl DosProtector {
         if state.is_blacklisted() {
             let remaining = state
                 .blacklisted_until
-                .map(|t| {
-                    t.duration_since(Instant::now()).as_secs()
-                })
+                .map(|t| t.duration_since(Instant::now()).as_secs())
                 .unwrap_or(0);
-            self.blacklisted_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return RateLimitResult::Blacklisted { remaining_secs: remaining };
+            self.blacklisted_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return RateLimitResult::Blacklisted {
+                remaining_secs: remaining,
+            };
         }
 
         // Consommer un token
         if state.consume() {
-            self.allowed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.allowed_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             RateLimitResult::Allowed
         } else {
             // Rate exceeded
@@ -244,10 +250,14 @@ impl DosProtector {
                     addr, blacklist_dur, violations
                 );
             } else {
-                debug!("IP {} rate limited (violation {}/{})", addr, violations, max_violations);
+                debug!(
+                    "IP {} rate limited (violation {}/{})",
+                    addr, violations, max_violations
+                );
             }
 
-            self.blocked_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.blocked_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             RateLimitResult::RateLimited { violations }
         }
     }
@@ -264,7 +274,10 @@ impl DosProtector {
             .entry(addr)
             .or_insert_with(|| IpState::new(self.config.burst_size));
         state.blacklisted_until = Some(Instant::now() + Duration::from_secs(duration_secs));
-        warn!("IP {} manually blacklisted for {} seconds", addr, duration_secs);
+        warn!(
+            "IP {} manually blacklisted for {} seconds",
+            addr, duration_secs
+        );
     }
 
     /// Débloquer une IP manuellement
@@ -322,7 +335,10 @@ impl DosProtector {
             states.retain(|_, state| state.blacklisted_until.is_some());
             removed += before - states.len();
         }
-        warn!("DoS: tracked-IP cap {} reached — evicted {} idle entries", MAX_TRACKED_IPS, removed);
+        warn!(
+            "DoS: tracked-IP cap {} reached — evicted {} idle entries",
+            MAX_TRACKED_IPS, removed
+        );
     }
 
     /// Statistiques globales
@@ -330,13 +346,23 @@ impl DosProtector {
         let states = self.ip_states.lock().await;
         let blacklisted = states
             .values()
-            .filter(|s| s.blacklisted_until.map(|t| Instant::now() < t).unwrap_or(false))
+            .filter(|s| {
+                s.blacklisted_until
+                    .map(|t| Instant::now() < t)
+                    .unwrap_or(false)
+            })
             .count();
 
         DosStats {
-            total_allowed: self.allowed_count.load(std::sync::atomic::Ordering::Relaxed),
-            total_blocked: self.blocked_count.load(std::sync::atomic::Ordering::Relaxed),
-            total_blacklisted: self.blacklisted_count.load(std::sync::atomic::Ordering::Relaxed),
+            total_allowed: self
+                .allowed_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_blocked: self
+                .blocked_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_blacklisted: self
+                .blacklisted_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             active_tracked_ips: states.len(),
             blacklisted_ips: blacklisted,
         }

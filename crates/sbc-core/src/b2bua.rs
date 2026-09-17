@@ -7,14 +7,14 @@
 //! This allows full control over call routing, NAT traversal,
 //! codec normalisation, and media anchoring.
 
-use crate::media::{MediaManager, WebRtcSdpInfo};
 use crate::media::webrtc_handler::WebRtcSession;
+use crate::media::{MediaManager, WebRtcSdpInfo};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Unique call identifier for a B2BUA call (different from SIP Call-ID)
@@ -45,12 +45,12 @@ pub enum CallState {
 impl CallState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Initiated    => "initiated",
-            Self::Proceeding   => "proceeding",
-            Self::Ringing      => "ringing",
-            Self::Connected    => "connected",
-            Self::Terminating  => "terminating",
-            Self::Terminated   => "terminated",
+            Self::Initiated => "initiated",
+            Self::Proceeding => "proceeding",
+            Self::Ringing => "ringing",
+            Self::Connected => "connected",
+            Self::Terminating => "terminating",
+            Self::Terminated => "terminated",
         }
     }
 }
@@ -570,7 +570,11 @@ impl B2buaManager {
 
         // Allocate media session for RTP proxying
         if let Some(sdp) = caller_sdp {
-            match self.media.create_session(inbound_call_id.clone(), Some(sdp)).await {
+            match self
+                .media
+                .create_session(inbound_call_id.clone(), Some(sdp))
+                .await
+            {
                 Ok(session) => {
                     info!(
                         "B2BUA: allocated RTP ports {}/{} for call {}",
@@ -615,9 +619,9 @@ impl B2buaManager {
         callee_transport: rsip::Transport,
     ) -> Result<()> {
         let mut calls = self.calls.lock().await;
-        let call = calls.get_mut(uuid).ok_or_else(|| {
-            Error::Dialog(format!("B2BUA call {} not found", uuid))
-        })?;
+        let call = calls
+            .get_mut(uuid)
+            .ok_or_else(|| Error::Dialog(format!("B2BUA call {} not found", uuid)))?;
 
         call.set_outbound(outbound_call_id, local_tag, callee_addr);
         call.callee_reply_tx = callee_reply_tx;
@@ -709,10 +713,7 @@ impl B2buaManager {
 
     /// Calls still waiting on their outbound INVITE past `timeout`:
     /// (uuid, attempt, has_remaining_candidates).
-    pub async fn invite_attempts_timed_out(
-        &self,
-        timeout: Duration,
-    ) -> Vec<(CallUuid, u32, bool)> {
+    pub async fn invite_attempts_timed_out(&self, timeout: Duration) -> Vec<(CallUuid, u32, bool)> {
         let calls = self.calls.lock().await;
         calls
             .values()
@@ -746,7 +747,10 @@ impl B2buaManager {
             });
             info!(
                 "Session timer armed for call {}: {}s (refresh every {}s, Min-SE {})",
-                uuid, interval_secs, (interval_secs / 2).max(30), min_se
+                uuid,
+                interval_secs,
+                (interval_secs / 2).max(30),
+                min_se
             );
         }
     }
@@ -795,8 +799,10 @@ impl B2buaManager {
         } else {
             st.refresh_failures += 1;
         }
-        let dialog_gone = matches!(status, 408 | 481) || st.refresh_failures >= MAX_REFRESH_FAILURES;
-        let backoff_secs = (30u64 << st.refresh_failures.min(4)).min((st.interval_secs / 2).max(30) as u64);
+        let dialog_gone =
+            matches!(status, 408 | 481) || st.refresh_failures >= MAX_REFRESH_FAILURES;
+        let backoff_secs =
+            (30u64 << st.refresh_failures.min(4)).min((st.interval_secs / 2).max(30) as u64);
         st.next_refresh_at = std::time::Instant::now() + Duration::from_secs(backoff_secs);
         if dialog_gone {
             warn!(
@@ -831,7 +837,12 @@ impl B2buaManager {
         response_to: &str,
         local_ip: &str,
         local_port: u16,
-    ) -> Option<(Option<String>, SocketAddr, rsip::Transport, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+    ) -> Option<(
+        Option<String>,
+        SocketAddr,
+        rsip::Transport,
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+    )> {
         let calls = self.calls.lock().await;
         let call = calls.get(uuid)?;
         let st = call.session_timer.as_ref()?;
@@ -846,7 +857,12 @@ impl B2buaManager {
                 .map(|d| crate::sip_builder::build_ack_for_2xx(&d, cseq)),
             _ => crate::sip_builder::build_ack_for_non_2xx(raw, response_to),
         };
-        Some((ack, call.callee_dest?, call.callee_transport, call.callee_reply_tx.clone()))
+        Some((
+            ack,
+            call.callee_dest?,
+            call.callee_transport,
+            call.callee_reply_tx.clone(),
+        ))
     }
 
     /// Record the negotiated media codec for a call (from the SDP answer),
@@ -867,7 +883,13 @@ impl B2buaManager {
         &self,
         local_ip: &str,
         local_port: u16,
-    ) -> Vec<(CallUuid, String, SocketAddr, rsip::Transport, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+    ) -> Vec<(
+        CallUuid,
+        String,
+        SocketAddr,
+        rsip::Transport,
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+    )> {
         let mut out = Vec::new();
         let mut calls = self.calls.lock().await;
         let now = std::time::Instant::now();
@@ -875,8 +897,12 @@ impl B2buaManager {
             if call.state != CallState::Connected {
                 continue;
             }
-            let Some(dest) = call.callee_dest else { continue };
-            let Some(st) = call.session_timer.as_ref() else { continue };
+            let Some(dest) = call.callee_dest else {
+                continue;
+            };
+            let Some(st) = call.session_timer.as_ref() else {
+                continue;
+            };
             if st.next_refresh_at > now || st.pending_refresh_cseq.is_some() {
                 continue;
             }
@@ -917,8 +943,7 @@ impl B2buaManager {
                 st.pending_refresh_cseq = Some(d.cseq);
                 st.pending_refresh_raw = Some(reinvite.clone());
                 st.last_refresh = Some((d.cseq, reinvite.clone()));
-                st.next_refresh_at =
-                    now + Duration::from_secs((interval / 2).max(30) as u64);
+                st.next_refresh_at = now + Duration::from_secs((interval / 2).max(30) as u64);
             }
             out.push((
                 call.uuid.clone(),
@@ -940,7 +965,12 @@ impl B2buaManager {
         cseq: u32,
         local_ip: &str,
         local_port: u16,
-    ) -> Option<(String, SocketAddr, rsip::Transport, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
+    ) -> Option<(
+        String,
+        SocketAddr,
+        rsip::Transport,
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+    )> {
         let mut calls = self.calls.lock().await;
         let call = calls.get_mut(uuid)?;
         let st = call.session_timer.as_mut()?;
@@ -950,10 +980,18 @@ impl B2buaManager {
         st.pending_refresh_cseq = None;
         st.pending_refresh_raw = None;
         st.refresh_failures = 0;
-        info!("Session refresh confirmed for call {} (CSeq {})", uuid, cseq);
+        info!(
+            "Session refresh confirmed for call {} (CSeq {})",
+            uuid, cseq
+        );
         let d = call.dialog_info_toward_callee(local_ip, local_port)?;
         let ack = crate::sip_builder::build_ack_for_2xx(&d, cseq);
-        Some((ack, call.callee_dest?, call.callee_transport, call.callee_reply_tx.clone()))
+        Some((
+            ack,
+            call.callee_dest?,
+            call.callee_transport,
+            call.callee_reply_tx.clone(),
+        ))
     }
 
     /// Store the SDP as last sent to the caller (rewritten 200 OK body).
@@ -971,14 +1009,18 @@ impl B2buaManager {
     }
 
     /// Get the callee's reply channel and transport info (for sending BYE to callee)
-    pub async fn get_callee_reply_info(&self, uuid: &CallUuid) -> Option<(Option<mpsc::UnboundedSender<Vec<u8>>>, SocketAddr, rsip::Transport)> {
+    pub async fn get_callee_reply_info(
+        &self,
+        uuid: &CallUuid,
+    ) -> Option<(
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+        SocketAddr,
+        rsip::Transport,
+    )> {
         let calls = self.calls.lock().await;
         calls.get(uuid).and_then(|c| {
-            c.callee_dest.map(|dest| (
-                c.callee_reply_tx.clone(),
-                dest,
-                c.callee_transport,
-            ))
+            c.callee_dest
+                .map(|dest| (c.callee_reply_tx.clone(), dest, c.callee_transport))
         })
     }
 
@@ -1005,9 +1047,9 @@ impl B2buaManager {
 
     pub async fn handle_ringing(&self, uuid: &CallUuid) -> Result<()> {
         let mut calls = self.calls.lock().await;
-        let call = calls.get_mut(uuid).ok_or_else(|| {
-            Error::Dialog(format!("B2BUA call {} not found", uuid))
-        })?;
+        let call = calls
+            .get_mut(uuid)
+            .ok_or_else(|| Error::Dialog(format!("B2BUA call {} not found", uuid)))?;
         call.state = CallState::Ringing;
         info!("B2BUA: call {} ringing", uuid);
         Ok(())
@@ -1021,9 +1063,9 @@ impl B2buaManager {
         callee_sdp: Option<String>,
     ) -> Result<()> {
         let mut calls = self.calls.lock().await;
-        let call = calls.get_mut(uuid).ok_or_else(|| {
-            Error::Dialog(format!("B2BUA call {} not found", uuid))
-        })?;
+        let call = calls
+            .get_mut(uuid)
+            .ok_or_else(|| Error::Dialog(format!("B2BUA call {} not found", uuid)))?;
 
         call.callee_sdp = callee_sdp.clone();
         call.establish_outbound(callee_tag);
@@ -1047,9 +1089,9 @@ impl B2buaManager {
     /// Handle ACK from caller (inbound leg established)
     pub async fn handle_ack(&self, uuid: &CallUuid) -> Result<()> {
         let mut calls = self.calls.lock().await;
-        let call = calls.get_mut(uuid).ok_or_else(|| {
-            Error::Dialog(format!("B2BUA call {} not found", uuid))
-        })?;
+        let call = calls
+            .get_mut(uuid)
+            .ok_or_else(|| Error::Dialog(format!("B2BUA call {} not found", uuid)))?;
 
         call.establish_inbound(call.inbound.remote_tag.clone().unwrap_or_default());
 
@@ -1057,16 +1099,20 @@ impl B2buaManager {
             call.state = CallState::Connected;
         }
 
-        info!("B2BUA: ACK received, call {} state → {}", uuid, call.state.as_str());
+        info!(
+            "B2BUA: ACK received, call {} state → {}",
+            uuid,
+            call.state.as_str()
+        );
         Ok(())
     }
 
     /// Handle BYE (from either leg) — tears down both legs
     pub async fn handle_bye(&self, uuid: &CallUuid) -> Result<()> {
         let mut calls = self.calls.lock().await;
-        let call = calls.get_mut(uuid).ok_or_else(|| {
-            Error::Dialog(format!("B2BUA call {} not found", uuid))
-        })?;
+        let call = calls
+            .get_mut(uuid)
+            .ok_or_else(|| Error::Dialog(format!("B2BUA call {} not found", uuid)))?;
 
         call.state = CallState::Terminating;
 
@@ -1086,7 +1132,11 @@ impl B2buaManager {
         let mut calls = self.calls.lock().await;
         let duration = if let Some(call) = calls.get_mut(uuid) {
             call.state = CallState::Terminated;
-            info!("B2BUA: call {} terminated (duration {}s)", uuid, call.duration_secs());
+            info!(
+                "B2BUA: call {} terminated (duration {}s)",
+                uuid,
+                call.duration_secs()
+            );
             Some(call.duration_secs())
         } else {
             None
@@ -1232,7 +1282,8 @@ impl B2buaManager {
     /// Look up a call by inbound Call-ID
     pub async fn find_by_inbound_call_id(&self, call_id: &str) -> Option<CallUuid> {
         let calls = self.calls.lock().await;
-        calls.values()
+        calls
+            .values()
             .find(|c| c.inbound.call_id == call_id)
             .map(|c| c.uuid.clone())
     }
@@ -1245,7 +1296,8 @@ impl B2buaManager {
     /// This method finds a call where the stored inbound call_id ends with the given suffix.
     pub async fn find_by_inbound_call_id_suffix(&self, call_id: &str) -> Option<CallUuid> {
         let calls = self.calls.lock().await;
-        calls.values()
+        calls
+            .values()
             .find(|c| c.inbound.call_id.ends_with(call_id) && c.inbound.call_id != *call_id)
             .map(|c| c.uuid.clone())
     }
@@ -1253,8 +1305,13 @@ impl B2buaManager {
     /// Look up a call by outbound Call-ID (the leg SBC→callee)
     pub async fn find_by_outbound_call_id(&self, call_id: &str) -> Option<CallUuid> {
         let calls = self.calls.lock().await;
-        calls.values()
-            .find(|c| c.outbound.as_ref().is_some_and(|leg| leg.call_id == call_id))
+        calls
+            .values()
+            .find(|c| {
+                c.outbound
+                    .as_ref()
+                    .is_some_and(|leg| leg.call_id == call_id)
+            })
             .map(|c| c.uuid.clone())
     }
 
@@ -1278,7 +1335,10 @@ impl B2buaManager {
         let calls = self.calls.lock().await;
         for call in calls.values() {
             let inbound_matches = call.inbound.call_id == call_id;
-            let outbound_matches = call.outbound.as_ref().is_some_and(|leg| leg.call_id == call_id);
+            let outbound_matches = call
+                .outbound
+                .as_ref()
+                .is_some_and(|leg| leg.call_id == call_id);
 
             // Also try suffix match: Genesys-based trunks adds prefixes to Call-IDs
             // e.g. INVITE Call-ID = "14823298-118e8248-104858689_65703785@host"
@@ -1287,17 +1347,20 @@ impl B2buaManager {
                 && call.inbound.call_id.ends_with(call_id)
                 && call.inbound.call_id != *call_id;
             let outbound_suffix = !outbound_matches
-                && call.outbound.as_ref().is_some_and(|leg| {
-                    leg.call_id.ends_with(call_id) && leg.call_id != *call_id
-                });
+                && call
+                    .outbound
+                    .as_ref()
+                    .is_some_and(|leg| leg.call_id.ends_with(call_id) && leg.call_id != *call_id);
 
             if !inbound_matches && !outbound_matches && !inbound_suffix && !outbound_suffix {
                 continue;
             }
 
             if inbound_suffix || outbound_suffix {
-                info!("Call-ID suffix match: BYE '{}' matched stored '{}'",
-                    call_id, call.inbound.call_id);
+                info!(
+                    "Call-ID suffix match: BYE '{}' matched stored '{}'",
+                    call_id, call.inbound.call_id
+                );
             }
 
             // If we have a source address, use it to disambiguate
@@ -1341,13 +1404,22 @@ impl B2buaManager {
     }
 
     /// Get the caller's reply channel and transport info (for sending provisional/final responses)
-    pub async fn get_caller_reply_info(&self, uuid: &CallUuid) -> Option<(Option<mpsc::UnboundedSender<Vec<u8>>>, SocketAddr, rsip::Transport)> {
+    pub async fn get_caller_reply_info(
+        &self,
+        uuid: &CallUuid,
+    ) -> Option<(
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+        SocketAddr,
+        rsip::Transport,
+    )> {
         let calls = self.calls.lock().await;
-        calls.get(uuid).map(|c| (
-            c.caller_reply_tx.clone(),
-            c.caller_source,
-            c.caller_transport,
-        ))
+        calls.get(uuid).map(|c| {
+            (
+                c.caller_reply_tx.clone(),
+                c.caller_source,
+                c.caller_transport,
+            )
+        })
     }
 
     /// Get the stored Call-IDs for a call (inbound + outbound).
@@ -1355,18 +1427,29 @@ impl B2buaManager {
     /// trunk (e.g. Genesys-based trunks) sends BYE with a shortened Call-ID.
     pub async fn get_call_ids(&self, uuid: &CallUuid) -> Option<(String, Option<String>)> {
         let calls = self.calls.lock().await;
-        calls.get(uuid).map(|c| (
-            c.inbound.call_id.clone(),
-            c.outbound.as_ref().map(|l| l.call_id.clone()),
-        ))
+        calls.get(uuid).map(|c| {
+            (
+                c.inbound.call_id.clone(),
+                c.outbound.as_ref().map(|l| l.call_id.clone()),
+            )
+        })
     }
 
     /// Store the caller's original Via headers (before topology hiding strips
     /// them) and the caller's INVITE CSeq (restored in relayed responses).
-    pub async fn set_caller_vias(&self, uuid: &CallUuid, vias: Vec<String>, invite_cseq: Option<u32>) {
+    pub async fn set_caller_vias(
+        &self,
+        uuid: &CallUuid,
+        vias: Vec<String>,
+        invite_cseq: Option<u32>,
+    ) {
         let mut calls = self.calls.lock().await;
         if let Some(call) = calls.get_mut(uuid) {
-            debug!("B2BUA: stored {} original Via header(s) for call {}", vias.len(), uuid);
+            debug!(
+                "B2BUA: stored {} original Via header(s) for call {}",
+                vias.len(),
+                uuid
+            );
             call.caller_original_vias = vias;
             call.caller_invite_cseq = invite_cseq;
         }
@@ -1406,13 +1489,26 @@ impl B2buaManager {
             if let Some(fo) = call.failover.as_mut() {
                 fo.invite_sent_at = std::time::Instant::now();
             }
-            call.invite_attempts.push(InviteAttempt { raw, branch, cseq, dest, transport, trunk_id });
+            call.invite_attempts.push(InviteAttempt {
+                raw,
+                branch,
+                cseq,
+                dest,
+                transport,
+                trunk_id,
+            });
             if call.invite_attempts.len() > MAX_INVITE_ATTEMPTS {
                 call.invite_attempts.remove(0);
             }
             debug!(
                 "B2BUA: INVITE attempt #{} for call {} (CSeq {}, branch {:?}) → {}",
-                call.invite_attempts.len(), uuid, cseq, call.invite_attempts.last().and_then(|a| a.branch.as_deref()), dest
+                call.invite_attempts.len(),
+                uuid,
+                cseq,
+                call.invite_attempts
+                    .last()
+                    .and_then(|a| a.branch.as_deref()),
+                dest
             );
         }
     }
@@ -1424,13 +1520,19 @@ impl B2buaManager {
     ) -> Option<(InviteAttempt, Option<mpsc::UnboundedSender<Vec<u8>>>)> {
         let calls = self.calls.lock().await;
         let call = calls.get(uuid)?;
-        Some((call.invite_attempts.last()?.clone(), call.callee_reply_tx.clone()))
+        Some((
+            call.invite_attempts.last()?.clone(),
+            call.callee_reply_tx.clone(),
+        ))
     }
 
     /// CSeq number of the live INVITE toward the callee (None before it is sent).
     pub async fn outbound_invite_cseq(&self, uuid: &CallUuid) -> Option<u32> {
         let calls = self.calls.lock().await;
-        calls.get(uuid).and_then(|c| c.invite_attempts.last()).map(|a| a.cseq)
+        calls
+            .get(uuid)
+            .and_then(|c| c.invite_attempts.last())
+            .map(|a| a.cseq)
     }
 
     /// Attribute a callee-leg INVITE response to an attempt. Via branch is
@@ -1496,7 +1598,10 @@ impl B2buaManager {
     /// RFC 4028 422 retries already done for the current trunk attempt.
     pub async fn get_session_timer_retry_count(&self, uuid: &CallUuid) -> u32 {
         let calls = self.calls.lock().await;
-        calls.get(uuid).map(|c| c.session_timer_retry_count).unwrap_or(0)
+        calls
+            .get(uuid)
+            .map(|c| c.session_timer_retry_count)
+            .unwrap_or(0)
     }
 
     /// Count a 422 retry (call after re-sending the INVITE).
@@ -1510,7 +1615,8 @@ impl B2buaManager {
     /// Get the caller's original Via headers (to restore in responses)
     pub async fn get_caller_vias(&self, uuid: &CallUuid) -> Vec<String> {
         let calls = self.calls.lock().await;
-        calls.get(uuid)
+        calls
+            .get(uuid)
             .map(|c| c.caller_original_vias.clone())
             .unwrap_or_default()
     }
@@ -1671,7 +1777,13 @@ impl B2buaManager {
     pub async fn get_callee_cancel_info(
         &self,
         uuid: &CallUuid,
-    ) -> Option<(String, u32, SocketAddr, Option<mpsc::UnboundedSender<Vec<u8>>>, rsip::Transport)> {
+    ) -> Option<(
+        String,
+        u32,
+        SocketAddr,
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+        rsip::Transport,
+    )> {
         let calls = self.calls.lock().await;
         let call = calls.get(uuid)?;
         let outbound = call.outbound.as_ref()?;
@@ -1689,25 +1801,39 @@ impl B2buaManager {
     pub async fn stats(&self) -> B2buaStats {
         let calls = self.calls.lock().await;
         let total = calls.len();
-        let connected = calls.values().filter(|c| c.state == CallState::Connected).count();
-        let ringing  = calls.values().filter(|c| c.state == CallState::Ringing).count();
-        let webrtc   = calls.values().filter(|c| c.caller_is_webrtc).count();
-        B2buaStats { total_active: total, connected, ringing, webrtc_calls: webrtc }
+        let connected = calls
+            .values()
+            .filter(|c| c.state == CallState::Connected)
+            .count();
+        let ringing = calls
+            .values()
+            .filter(|c| c.state == CallState::Ringing)
+            .count();
+        let webrtc = calls.values().filter(|c| c.caller_is_webrtc).count();
+        B2buaStats {
+            total_active: total,
+            connected,
+            ringing,
+            webrtc_calls: webrtc,
+        }
     }
 
     /// Get snapshot of all active calls (for REST API / metrics)
     pub async fn active_calls(&self) -> Vec<CallSnapshot> {
         let calls = self.calls.lock().await;
-        calls.values().map(|c| CallSnapshot {
-            uuid: c.uuid.clone(),
-            state: c.state.as_str().to_string(),
-            inbound_call_id: c.inbound.call_id.clone(),
-            caller_addr: c.inbound.remote_addr.to_string(),
-            callee_addr: c.outbound.as_ref().map(|l| l.remote_addr.to_string()),
-            duration_secs: c.duration_secs(),
-            is_webrtc: c.caller_is_webrtc,
-            media_session_id: c.media_session_id.clone(),
-        }).collect()
+        calls
+            .values()
+            .map(|c| CallSnapshot {
+                uuid: c.uuid.clone(),
+                state: c.state.as_str().to_string(),
+                inbound_call_id: c.inbound.call_id.clone(),
+                caller_addr: c.inbound.remote_addr.to_string(),
+                callee_addr: c.outbound.as_ref().map(|l| l.remote_addr.to_string()),
+                duration_secs: c.duration_secs(),
+                is_webrtc: c.caller_is_webrtc,
+                media_session_id: c.media_session_id.clone(),
+            })
+            .collect()
     }
 }
 
@@ -1742,47 +1868,79 @@ mod tests {
         B2buaManager::new(media)
     }
 
-    fn caller_addr() -> SocketAddr { "192.168.1.100:5060".parse().unwrap() }
-    fn callee_addr() -> SocketAddr { "192.168.1.200:5060".parse().unwrap() }
+    fn caller_addr() -> SocketAddr {
+        "192.168.1.100:5060".parse().unwrap()
+    }
+    fn callee_addr() -> SocketAddr {
+        "192.168.1.200:5060".parse().unwrap()
+    }
 
     const SIMPLE_SDP: &str = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
 
     #[tokio::test]
     async fn dialog_identity_and_synthetic_byes() {
         let mgr = make_manager();
-        let uuid = mgr.create_call(
-            "full-call-id@host".to_string(), "caller-tag".to_string(),
-            caller_addr(), Some(SIMPLE_SDP), None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "full-call-id@host".to_string(),
+                "caller-tag".to_string(),
+                caller_addr(),
+                Some(SIMPLE_SDP),
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         // Before identity capture: no synthetic BYE possible
-        assert!(mgr.build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060).await.is_none());
+        assert!(mgr
+            .build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060)
+            .await
+            .is_none());
 
         mgr.set_inbound_dialog(
             &uuid,
             "<sip:caller@pstn.example.com>;tag=caller-tag".to_string(),
             Some("sip:caller@192.168.1.100:5060".to_string()),
-        ).await;
+        )
+        .await;
         mgr.attach_outbound(
-            &uuid, "full-call-id@host".to_string(), "sbc-tag".to_string(),
-            callee_addr(), None, rsip::Transport::Udp,
-        ).await.unwrap();
+            &uuid,
+            "full-call-id@host".to_string(),
+            "sbc-tag".to_string(),
+            callee_addr(),
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
         mgr.set_established_dialog(
             &uuid,
             "<sip:caller@pstn.example.com>;tag=caller-tag".to_string(),
             "<sip:callee@sip.example.com>;tag=callee-tag".to_string(),
             Some("sip:callee@192.168.1.200:5060".to_string()),
-        ).await;
+        )
+        .await;
 
         // Toward caller: From = answered To (callee side), To = caller's From
-        let bye = mgr.build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060).await.unwrap();
-        assert!(bye.contains("From: <sip:callee@sip.example.com>;tag=callee-tag\r\n"), "{}", bye);
+        let bye = mgr
+            .build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060)
+            .await
+            .unwrap();
+        assert!(
+            bye.contains("From: <sip:callee@sip.example.com>;tag=callee-tag\r\n"),
+            "{}",
+            bye
+        );
         assert!(bye.contains("To: <sip:caller@pstn.example.com>;tag=caller-tag\r\n"));
         assert!(bye.starts_with("BYE sip:caller@192.168.1.100:5060 SIP/2.0"));
         rsip::SipMessage::try_from(bye.as_bytes().to_vec()).unwrap();
 
         // Toward callee: From/To as sent on the outbound leg
-        let bye2 = mgr.build_relay_bye_toward_callee(&uuid, "1.2.3.4", 5060).await.unwrap();
+        let bye2 = mgr
+            .build_relay_bye_toward_callee(&uuid, "1.2.3.4", 5060)
+            .await
+            .unwrap();
         assert!(bye2.contains("From: <sip:caller@pstn.example.com>;tag=caller-tag\r\n"));
         assert!(bye2.contains("To: <sip:callee@sip.example.com>;tag=callee-tag\r\n"));
         rsip::SipMessage::try_from(bye2.as_bytes().to_vec()).unwrap();
@@ -1791,10 +1949,17 @@ mod tests {
     #[tokio::test]
     async fn recently_terminated_matches_full_and_truncated_call_ids() {
         let mgr = make_manager();
-        let uuid = mgr.create_call(
-            "prefix-prefix-core@host".to_string(), "t1".to_string(),
-            caller_addr(), None, None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "prefix-prefix-core@host".to_string(),
+                "t1".to_string(),
+                caller_addr(),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         assert!(!mgr.was_recently_terminated("core@host"));
         mgr.terminate_call(&uuid).await;
@@ -1806,18 +1971,20 @@ mod tests {
         assert!(!mgr.was_recently_terminated(""));
     }
 
-
     #[tokio::test]
     async fn test_create_call() {
         let mgr = make_manager();
-        let uuid = mgr.create_call(
-            "call-id-1".to_string(),
-            "tag-a".to_string(),
-            caller_addr(),
-            Some(SIMPLE_SDP),
-            None,
-            rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "call-id-1".to_string(),
+                "tag-a".to_string(),
+                caller_addr(),
+                Some(SIMPLE_SDP),
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         assert!(!uuid.is_empty());
 
@@ -1829,10 +1996,17 @@ mod tests {
     #[tokio::test]
     async fn test_call_state_progression() {
         let mgr = make_manager();
-        let uuid = mgr.create_call(
-            "call-2".to_string(), "tag-b".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "call-2".to_string(),
+                "tag-b".to_string(),
+                caller_addr(),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         // Proceeding after create
         {
@@ -1841,9 +2015,16 @@ mod tests {
         }
 
         // Attach outbound leg
-        mgr.attach_outbound(&uuid, "call-2-out".to_string(), "tag-sbc".to_string(), callee_addr(),
-            None, rsip::Transport::Udp)
-            .await.unwrap();
+        mgr.attach_outbound(
+            &uuid,
+            "call-2-out".to_string(),
+            "tag-sbc".to_string(),
+            callee_addr(),
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         // 180 Ringing
         mgr.handle_ringing(&uuid).await.unwrap();
@@ -1853,7 +2034,9 @@ mod tests {
         }
 
         // 200 OK from callee
-        mgr.handle_200_ok(&uuid, "tag-callee".to_string(), None).await.unwrap();
+        mgr.handle_200_ok(&uuid, "tag-callee".to_string(), None)
+            .await
+            .unwrap();
 
         // ACK from caller → Connected
         mgr.handle_ack(&uuid).await.unwrap();
@@ -1869,10 +2052,17 @@ mod tests {
     #[tokio::test]
     async fn test_bye_terminates_call() {
         let mgr = make_manager();
-        let uuid = mgr.create_call(
-            "call-3".to_string(), "tag-c".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "call-3".to_string(),
+                "tag-c".to_string(),
+                caller_addr(),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         mgr.handle_bye(&uuid).await.unwrap();
         {
@@ -1888,9 +2078,16 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_inbound_call_id() {
         let mgr = make_manager();
-        mgr.create_call("my-call-id".to_string(), "t".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp)
-            .await.unwrap();
+        mgr.create_call(
+            "my-call-id".to_string(),
+            "t".to_string(),
+            caller_addr(),
+            None,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         let found = mgr.find_by_inbound_call_id("my-call-id").await;
         assert!(found.is_some());
@@ -1905,9 +2102,15 @@ mod tests {
 
         for i in 0..5 {
             mgr.create_call(
-                format!("call-{}", i), format!("tag-{}", i), caller_addr(), None,
-                None, rsip::Transport::Udp,
-            ).await.unwrap();
+                format!("call-{}", i),
+                format!("tag-{}", i),
+                caller_addr(),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
         }
 
         let stats = mgr.stats().await;
@@ -1931,10 +2134,17 @@ mod tests {
         for i in 0..N {
             let mgr = mgr.clone();
             handles.push(tokio::spawn(async move {
-                let uuid = mgr.create_call(
-                    format!("storm-{}", i), format!("tag-{}", i), caller_addr(), None,
-                    None, rsip::Transport::Udp,
-                ).await.unwrap();
+                let uuid = mgr
+                    .create_call(
+                        format!("storm-{}", i),
+                        format!("tag-{}", i),
+                        caller_addr(),
+                        None,
+                        None,
+                        rsip::Transport::Udp,
+                    )
+                    .await
+                    .unwrap();
                 // Exercise several independent locked mutators + a read.
                 mgr.set_codec(&uuid, "PCMU").await;
                 mgr.set_session_timer(&uuid, 1800, 90).await;
@@ -1943,8 +2153,15 @@ mod tests {
             }));
         }
         let uuids: Vec<CallUuid> = futures_util::future::join_all(handles)
-            .await.into_iter().map(|r| r.unwrap()).collect();
-        assert_eq!(mgr.stats().await.total_active, N, "all calls must be present");
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            mgr.stats().await.total_active,
+            N,
+            "all calls must be present"
+        );
 
         // Phase 2 — terminate half concurrently while the rest stay live.
         let mut handles = Vec::with_capacity(N / 2);
@@ -1954,8 +2171,17 @@ mod tests {
         }
         futures_util::future::join_all(handles).await;
 
-        assert_eq!(mgr.stats().await.total_active, N - N / 2, "exactly half remain");
-        eprintln!("call storm: {} creates + {} terminates in {:?}", N, N / 2, start.elapsed());
+        assert_eq!(
+            mgr.stats().await.total_active,
+            N - N / 2,
+            "exactly half remain"
+        );
+        eprintln!(
+            "call storm: {} creates + {} terminates in {:?}",
+            N,
+            N / 2,
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1963,10 +2189,17 @@ mod tests {
         let webrtc_sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=ice-ufrag:abc\r\na=ice-pwd:xyz\r\na=fingerprint:sha-256 AA:BB\r\n";
 
         let mgr = make_manager();
-        let uuid = mgr.create_call(
-            "webrtc-call".to_string(), "t".to_string(), caller_addr(), Some(webrtc_sdp),
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "webrtc-call".to_string(),
+                "t".to_string(),
+                caller_addr(),
+                Some(webrtc_sdp),
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         {
             let calls = mgr.calls.lock().await;
@@ -1980,10 +2213,26 @@ mod tests {
     #[tokio::test]
     async fn test_active_calls_snapshot() {
         let mgr = make_manager();
-        mgr.create_call("snap-1".to_string(), "t1".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp).await.unwrap();
-        mgr.create_call("snap-2".to_string(), "t2".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp).await.unwrap();
+        mgr.create_call(
+            "snap-1".to_string(),
+            "t1".to_string(),
+            caller_addr(),
+            None,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
+        mgr.create_call(
+            "snap-2".to_string(),
+            "t2".to_string(),
+            caller_addr(),
+            None,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         let snaps = mgr.active_calls().await;
         assert_eq!(snaps.len(), 2);
@@ -1993,9 +2242,17 @@ mod tests {
     #[tokio::test]
     async fn test_call_duration() {
         let mgr = make_manager();
-        let uuid = mgr.create_call("dur-call".to_string(), "t".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp)
-            .await.unwrap();
+        let uuid = mgr
+            .create_call(
+                "dur-call".to_string(),
+                "t".to_string(),
+                caller_addr(),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         let calls = mgr.calls.lock().await;
         // Duration should be 0 or very small at creation
@@ -2014,9 +2271,15 @@ mod tests {
         let truncated_call_id = "104858689_65703785@46.28.168.46";
 
         mgr.create_call(
-            full_call_id.to_string(), "tag-trunk".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+            full_call_id.to_string(),
+            "tag-trunk".to_string(),
+            caller_addr(),
+            None,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         // Exact match should work
         let found = mgr.find_by_inbound_call_id(full_call_id).await;
@@ -2024,10 +2287,15 @@ mod tests {
 
         // Suffix match should find the call
         let found = mgr.find_by_inbound_call_id_suffix(truncated_call_id).await;
-        assert!(found.is_some(), "Suffix match should find the call with truncated Call-ID");
+        assert!(
+            found.is_some(),
+            "Suffix match should find the call with truncated Call-ID"
+        );
 
         // Unrelated Call-ID should not match
-        let found = mgr.find_by_inbound_call_id_suffix("completely-different@host").await;
+        let found = mgr
+            .find_by_inbound_call_id_suffix("completely-different@host")
+            .await;
         assert!(found.is_none(), "Unrelated Call-ID should not match");
     }
 
@@ -2038,13 +2306,22 @@ mod tests {
         let call_id = "simple-call-id@host";
 
         mgr.create_call(
-            call_id.to_string(), "tag".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+            call_id.to_string(),
+            "tag".to_string(),
+            caller_addr(),
+            None,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         // Exact same Call-ID should NOT be found by suffix match
         let found = mgr.find_by_inbound_call_id_suffix(call_id).await;
-        assert!(found.is_none(), "Exact same Call-ID should not trigger suffix match");
+        assert!(
+            found.is_none(),
+            "Exact same Call-ID should not trigger suffix match"
+        );
     }
 
     #[tokio::test]
@@ -2055,29 +2332,52 @@ mod tests {
         let trunk_addr: SocketAddr = "198.51.100.10:5060".parse().unwrap();
         let user_addr: SocketAddr = "10.0.0.50:5060".parse().unwrap();
 
-        let uuid = mgr.create_call(
-            call_id.to_string(), "tag-caller".to_string(), user_addr, None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                call_id.to_string(),
+                "tag-caller".to_string(),
+                user_addr,
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         mgr.attach_outbound(
-            &uuid, call_id.to_string(), "tag-sbc".to_string(), trunk_addr,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+            &uuid,
+            call_id.to_string(),
+            "tag-sbc".to_string(),
+            trunk_addr,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         // BYE from trunk (callee) → should return is_from_caller = false
-        let result = mgr.find_by_any_call_id_with_source(call_id, Some(trunk_addr)).await;
+        let result = mgr
+            .find_by_any_call_id_with_source(call_id, Some(trunk_addr))
+            .await;
         assert!(result.is_some());
         let (found_uuid, is_from_caller) = result.unwrap();
         assert_eq!(found_uuid, uuid);
-        assert!(!is_from_caller, "BYE from trunk IP should be identified as from callee");
+        assert!(
+            !is_from_caller,
+            "BYE from trunk IP should be identified as from callee"
+        );
 
         // BYE from user (caller) → should return is_from_caller = true
-        let result = mgr.find_by_any_call_id_with_source(call_id, Some(user_addr)).await;
+        let result = mgr
+            .find_by_any_call_id_with_source(call_id, Some(user_addr))
+            .await;
         assert!(result.is_some());
         let (found_uuid, is_from_caller) = result.unwrap();
         assert_eq!(found_uuid, uuid);
-        assert!(is_from_caller, "BYE from user IP should be identified as from caller");
+        assert!(
+            is_from_caller,
+            "BYE from user IP should be identified as from caller"
+        );
     }
 
     #[tokio::test]
@@ -2089,21 +2389,39 @@ mod tests {
         let trunk_invite_addr: SocketAddr = "198.51.100.10:5060".parse().unwrap();
         let trunk_bye_addr: SocketAddr = "198.51.100.10:6789".parse().unwrap();
 
-        let uuid = mgr.create_call(
-            call_id.to_string(), "tag".to_string(), user_addr, None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                call_id.to_string(),
+                "tag".to_string(),
+                user_addr,
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         mgr.attach_outbound(
-            &uuid, call_id.to_string(), "tag-out".to_string(), trunk_invite_addr,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+            &uuid,
+            call_id.to_string(),
+            "tag-out".to_string(),
+            trunk_invite_addr,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         // BYE from trunk with different port → IP-only fallback should match callee
-        let result = mgr.find_by_any_call_id_with_source(call_id, Some(trunk_bye_addr)).await;
+        let result = mgr
+            .find_by_any_call_id_with_source(call_id, Some(trunk_bye_addr))
+            .await;
         assert!(result.is_some());
         let (_uuid, is_from_caller) = result.unwrap();
-        assert!(!is_from_caller, "BYE from trunk IP (different port) should be from callee via IP fallback");
+        assert!(
+            !is_from_caller,
+            "BYE from trunk IP (different port) should be from callee via IP fallback"
+        );
     }
 
     #[tokio::test]
@@ -2115,22 +2433,40 @@ mod tests {
         let trunk_addr: SocketAddr = "198.51.100.10:5060".parse().unwrap();
         let user_addr: SocketAddr = "10.0.0.50:5060".parse().unwrap();
 
-        let uuid = mgr.create_call(
-            full_call_id.to_string(), "tag".to_string(), user_addr, None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                full_call_id.to_string(),
+                "tag".to_string(),
+                user_addr,
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         mgr.attach_outbound(
-            &uuid, full_call_id.to_string(), "tag-out".to_string(), trunk_addr,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+            &uuid,
+            full_call_id.to_string(),
+            "tag-out".to_string(),
+            trunk_addr,
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
 
         // BYE with truncated Call-ID from trunk → suffix match + callee disambiguation
-        let result = mgr.find_by_any_call_id_with_source(truncated, Some(trunk_addr)).await;
+        let result = mgr
+            .find_by_any_call_id_with_source(truncated, Some(trunk_addr))
+            .await;
         assert!(result.is_some());
         let (found_uuid, is_from_caller) = result.unwrap();
         assert_eq!(found_uuid, uuid);
-        assert!(!is_from_caller, "Suffix match + trunk IP should identify callee");
+        assert!(
+            !is_from_caller,
+            "Suffix match + trunk IP should identify callee"
+        );
     }
 
     #[tokio::test]
@@ -2140,10 +2476,17 @@ mod tests {
         let mgr = make_manager();
         let call_id = "orphan-bye-test@host";
 
-        let uuid = mgr.create_call(
-            call_id.to_string(), "tag".to_string(), caller_addr(), None,
-            None, rsip::Transport::Udp,
-        ).await.unwrap();
+        let uuid = mgr
+            .create_call(
+                call_id.to_string(),
+                "tag".to_string(),
+                caller_addr(),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
+            .await
+            .unwrap();
 
         // Terminate the call
         mgr.handle_bye(&uuid).await.unwrap();
@@ -2151,7 +2494,10 @@ mod tests {
 
         // Orphan BYE arrives — call should not be found
         let result = mgr.find_by_any_call_id(call_id).await;
-        assert!(result.is_none(), "Terminated call should not be found by orphan BYE");
+        assert!(
+            result.is_none(),
+            "Terminated call should not be found by orphan BYE"
+        );
     }
 }
 
@@ -2180,29 +2526,63 @@ mod invite_attempt_tests {
              CSeq: {} INVITE\r\n\
              Content-Type: application/sdp\r\n\
              Content-Length: {}\r\n\r\n{}",
-            branch, cseq, SDP.len(), SDP
+            branch,
+            cseq,
+            SDP.len(),
+            SDP
         )
     }
 
     async fn call_with_attempts(mgr: &B2buaManager) -> (CallUuid, SocketAddr, SocketAddr) {
         let uuid = mgr
-            .create_call("cid-1".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .create_call(
+                "cid-1".into(),
+                "t".into(),
+                addr("192.168.1.100:5060"),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
         mgr.set_failover_candidates(&uuid, vec![]).await;
         let trunk_a = addr("203.0.113.9:5060");
         let trunk_b = addr("203.0.113.10:5060");
         // initial INVITE, 407 retry (CSeq+1), failover (same CSeq, new branch, other trunk)
-        mgr.push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), trunk_a, rsip::Transport::Udp, None).await;
+        mgr.push_invite_attempt(
+            &uuid,
+            invite("z9hG4bKaaa", 3),
+            trunk_a,
+            rsip::Transport::Udp,
+            None,
+        )
+        .await;
         assert_eq!(mgr.outbound_invite_cseq(&uuid).await, Some(3));
-        mgr.push_invite_attempt(&uuid, invite("z9hG4bKbbb", 4), trunk_a, rsip::Transport::Udp, None).await;
+        mgr.push_invite_attempt(
+            &uuid,
+            invite("z9hG4bKbbb", 4),
+            trunk_a,
+            rsip::Transport::Udp,
+            None,
+        )
+        .await;
         // Everything stamped so far (set_failover_candidates, two pushes) is
         // strictly before this marker: only the third push can move the clock past it.
         let marker = std::time::Instant::now();
-        mgr.push_invite_attempt(&uuid, invite("z9hG4bKccc", 4), trunk_b, rsip::Transport::Udp, None).await;
+        mgr.push_invite_attempt(
+            &uuid,
+            invite("z9hG4bKccc", 4),
+            trunk_b,
+            rsip::Transport::Udp,
+            None,
+        )
+        .await;
         {
             let calls = mgr.calls.lock().await;
-            assert!(calls[&uuid].failover.as_ref().unwrap().invite_sent_at >= marker, "push restarts the no-answer clock");
+            assert!(
+                calls[&uuid].failover.as_ref().unwrap().invite_sent_at >= marker,
+                "push restarts the no-answer clock"
+            );
         }
         (uuid, trunk_a, trunk_b)
     }
@@ -2217,9 +2597,14 @@ mod invite_attempt_tests {
         assert_eq!(current.dest, trunk_b);
         assert_eq!(current.branch.as_deref(), Some("z9hG4bKccc"));
 
-        let classify = |branch: Option<&'static str>, cseq: u32| mgr.classify_invite_response(&uuid, branch, cseq);
+        let classify = |branch: Option<&'static str>, cseq: u32| {
+            mgr.classify_invite_response(&uuid, branch, cseq)
+        };
 
-        assert!(matches!(classify(Some("z9hG4bKccc"), 4).await, Some(InviteResponseClass::Current)));
+        assert!(matches!(
+            classify(Some("z9hG4bKccc"), 4).await,
+            Some(InviteResponseClass::Current)
+        ));
         // Late 422 from trunk A's retry: same CSeq as the live attempt, old branch
         match classify(Some("z9hG4bKbbb"), 4).await {
             Some(InviteResponseClass::Stale(Some(a))) => {
@@ -2230,7 +2615,9 @@ mod invite_attempt_tests {
         }
         // Retransmitted 407 of the very first attempt
         match classify(Some("z9hG4bKaaa"), 3).await {
-            Some(InviteResponseClass::Stale(Some(a))) => assert_eq!(a.branch.as_deref(), Some("z9hG4bKaaa")),
+            Some(InviteResponseClass::Stale(Some(a))) => {
+                assert_eq!(a.branch.as_deref(), Some("z9hG4bKaaa"))
+            }
             other => panic!("{:?}", other),
         }
         // No branch echoed: CSeq fallback
@@ -2238,24 +2625,45 @@ mod invite_attempt_tests {
             Some(InviteResponseClass::Stale(Some(a))) => assert_eq!(a.cseq, 3),
             other => panic!("{:?}", other),
         }
-        assert!(matches!(classify(None, 4).await, Some(InviteResponseClass::Current)));
+        assert!(matches!(
+            classify(None, 4).await,
+            Some(InviteResponseClass::Current)
+        ));
         // Unknown branch: current when CSeq is the live one, stale by CSeq when older
-        assert!(matches!(classify(Some("z9hG4bKzzz"), 4).await, Some(InviteResponseClass::Current)));
+        assert!(matches!(
+            classify(Some("z9hG4bKzzz"), 4).await,
+            Some(InviteResponseClass::Current)
+        ));
         match classify(Some("z9hG4bKzzz"), 3).await {
             Some(InviteResponseClass::Stale(Some(a))) => assert_eq!(a.cseq, 3),
             other => panic!("{:?}", other),
         }
         // CSeq above the live INVITE (a consumed refresh re-INVITE's answer,
         // retransmitted): never the INVITE's final — dropped, not "current"
-        assert!(matches!(classify(Some("z9hG4bKrefresh"), 5).await, Some(InviteResponseClass::Stale(None))));
-        assert!(matches!(classify(None, 5).await, Some(InviteResponseClass::Stale(None))));
+        assert!(matches!(
+            classify(Some("z9hG4bKrefresh"), 5).await,
+            Some(InviteResponseClass::Stale(None))
+        ));
+        assert!(matches!(
+            classify(None, 5).await,
+            Some(InviteResponseClass::Stale(None))
+        ));
         // Unknown call
-        assert!(mgr.classify_invite_response(&"nope".to_string(), Some("z9hG4bKccc"), 4).await.is_none());
+        assert!(mgr
+            .classify_invite_response(&"nope".to_string(), Some("z9hG4bKccc"), 4)
+            .await
+            .is_none());
 
         let calls = mgr.calls.lock().await;
         let c = &calls[&uuid];
         assert_eq!(c.invite_attempts.len(), 3);
-        assert!(c.original_outbound_invite.as_deref().unwrap().contains("z9hG4bKccc"), "mirror follows the live attempt");
+        assert!(
+            c.original_outbound_invite
+                .as_deref()
+                .unwrap()
+                .contains("z9hG4bKccc"),
+            "mirror follows the live attempt"
+        );
         assert_eq!(c.callee_dest, Some(trunk_b));
     }
 
@@ -2263,41 +2671,86 @@ mod invite_attempt_tests {
     async fn no_attempt_means_current_and_attempts_are_bounded() {
         let mgr = make_manager();
         let uuid = mgr
-            .create_call("cid-2".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .create_call(
+                "cid-2".into(),
+                "t".into(),
+                addr("192.168.1.100:5060"),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
         assert!(matches!(
-            mgr.classify_invite_response(&uuid, Some("z9hG4bKx"), 1).await,
+            mgr.classify_invite_response(&uuid, Some("z9hG4bKx"), 1)
+                .await,
             Some(InviteResponseClass::Current)
         ));
         assert!(mgr.current_attempt(&uuid).await.is_none());
         assert_eq!(mgr.outbound_invite_cseq(&uuid).await, None);
 
         for i in 0..12u32 {
-            mgr.push_invite_attempt(&uuid, invite(&format!("z9hG4bK{}", i), 3 + i), addr("203.0.113.9:5060"), rsip::Transport::Udp, None).await;
+            mgr.push_invite_attempt(
+                &uuid,
+                invite(&format!("z9hG4bK{}", i), 3 + i),
+                addr("203.0.113.9:5060"),
+                rsip::Transport::Udp,
+                None,
+            )
+            .await;
         }
         let calls = mgr.calls.lock().await;
         assert_eq!(calls[&uuid].invite_attempts.len(), MAX_INVITE_ATTEMPTS);
-        assert_eq!(calls[&uuid].invite_attempts.last().unwrap().cseq, 14, "newest attempt kept");
+        assert_eq!(
+            calls[&uuid].invite_attempts.last().unwrap().cseq,
+            14,
+            "newest attempt kept"
+        );
     }
 
     #[tokio::test]
     async fn terminate_call_releases_media_and_remembers_last_attempt() {
         let mgr = make_manager();
         let uuid = mgr
-            .create_call("cid-3".into(), "t".into(), addr("192.168.1.100:5060"), Some(SDP), None, rsip::Transport::Udp)
+            .create_call(
+                "cid-3".into(),
+                "t".into(),
+                addr("192.168.1.100:5060"),
+                Some(SDP),
+                None,
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
         let before = mgr.media.stats().allocated_ports;
-        assert!(before > 0, "create_call with SDP allocates an RTP port pair");
-        mgr.push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), addr("203.0.113.9:5060"), rsip::Transport::Udp, None).await;
+        assert!(
+            before > 0,
+            "create_call with SDP allocates an RTP port pair"
+        );
+        mgr.push_invite_attempt(
+            &uuid,
+            invite("z9hG4bKaaa", 3),
+            addr("203.0.113.9:5060"),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await;
 
         mgr.terminate_call(&uuid).await;
 
-        assert_eq!(mgr.media.stats().allocated_ports, 0, "terminate_call must free the media session");
-        let a = mgr.recent_attempt_for_call_id("cid-3").expect("last attempt remembered");
+        assert_eq!(
+            mgr.media.stats().allocated_ports,
+            0,
+            "terminate_call must free the media session"
+        );
+        let a = mgr
+            .recent_attempt_for_call_id("cid-3")
+            .expect("last attempt remembered");
         assert_eq!(a.cseq, 3);
-        assert!(mgr.recent_attempt_for_call_id("id-3").is_some(), "truncated Call-ID suffix");
+        assert!(
+            mgr.recent_attempt_for_call_id("id-3").is_some(),
+            "truncated Call-ID suffix"
+        );
         assert!(mgr.recent_attempt_for_call_id("other").is_none());
         assert!(mgr.recent_attempt_for_call_id("").is_none());
     }
@@ -2306,18 +2759,31 @@ mod invite_attempt_tests {
     async fn auth_retry_reset_and_caller_cseq() {
         let mgr = make_manager();
         let uuid = mgr
-            .create_call("cid-4".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .create_call(
+                "cid-4".into(),
+                "t".into(),
+                addr("192.168.1.100:5060"),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
         let trunk_id = uuid::Uuid::new_v4();
-        mgr.store_outbound_invite(&uuid, String::new(), trunk_id).await;
+        mgr.store_outbound_invite(&uuid, String::new(), trunk_id)
+            .await;
         mgr.increment_auth_retry(&uuid).await;
         assert_eq!(mgr.get_auth_retry_info(&uuid).await.unwrap().2, 1);
         mgr.reset_auth_retry(&uuid).await;
         assert_eq!(mgr.get_auth_retry_info(&uuid).await.unwrap().2, 0);
 
         assert_eq!(mgr.get_caller_invite_cseq(&uuid).await, None);
-        mgr.set_caller_vias(&uuid, vec!["Via: SIP/2.0/UDP 10.0.0.9;branch=z9hG4bKc".into()], Some(7)).await;
+        mgr.set_caller_vias(
+            &uuid,
+            vec!["Via: SIP/2.0/UDP 10.0.0.9;branch=z9hG4bKc".into()],
+            Some(7),
+        )
+        .await;
         assert_eq!(mgr.get_caller_invite_cseq(&uuid).await, Some(7));
         assert_eq!(mgr.get_caller_vias(&uuid).await.len(), 1);
     }
@@ -2326,49 +2792,106 @@ mod invite_attempt_tests {
     async fn refresh_failure_clears_pending_and_rearms_on_422() {
         let mgr = make_manager();
         let uuid = mgr
-            .create_call("cid-5".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .create_call(
+                "cid-5".into(),
+                "t".into(),
+                addr("192.168.1.100:5060"),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
-        mgr.set_inbound_dialog(&uuid, "<sip:caller@pstn.example.com>;tag=caller-tag".into(), None).await;
-        mgr.attach_outbound(&uuid, "cid-5".into(), "sbc-tag".into(), addr("203.0.113.9:5060"), None, rsip::Transport::Udp).await.unwrap();
+        mgr.set_inbound_dialog(
+            &uuid,
+            "<sip:caller@pstn.example.com>;tag=caller-tag".into(),
+            None,
+        )
+        .await;
+        mgr.attach_outbound(
+            &uuid,
+            "cid-5".into(),
+            "sbc-tag".into(),
+            addr("203.0.113.9:5060"),
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
         mgr.set_established_dialog(
             &uuid,
             "<sip:caller@pstn.example.com>;tag=caller-tag".into(),
             "<sip:bob@b.example.com>;tag=callee-tag".into(),
             Some("sip:bob@203.0.113.9:5060".into()),
-        ).await;
-        mgr.push_invite_attempt(&uuid, invite("z9hG4bKaaa", 3), addr("203.0.113.9:5060"), rsip::Transport::Udp, None).await;
+        )
+        .await;
+        mgr.push_invite_attempt(
+            &uuid,
+            invite("z9hG4bKaaa", 3),
+            addr("203.0.113.9:5060"),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await;
         mgr.set_session_timer(&uuid, 1800, 90).await;
         {
             let mut calls = mgr.calls.lock().await;
             let c = calls.get_mut(&uuid).unwrap();
             c.state = CallState::Connected;
-            c.session_timer.as_mut().unwrap().next_refresh_at = std::time::Instant::now() - Duration::from_secs(1);
+            c.session_timer.as_mut().unwrap().next_refresh_at =
+                std::time::Instant::now() - Duration::from_secs(1);
         }
 
         let due = mgr.due_session_refreshes("1.2.3.4", 5060).await;
         assert_eq!(due.len(), 1);
         let reinvite = due[0].1.clone();
-        assert!(reinvite.contains("Session-Expires: 1800;refresher=uac\r\n"), "{}", reinvite);
-        assert!(reinvite.contains("Min-SE: 90\r\n"), "refresh carries Min-SE: {}", reinvite);
+        assert!(
+            reinvite.contains("Session-Expires: 1800;refresher=uac\r\n"),
+            "{}",
+            reinvite
+        );
+        assert!(
+            reinvite.contains("Min-SE: 90\r\n"),
+            "refresh carries Min-SE: {}",
+            reinvite
+        );
         let cseq = parse_cseq_number(&reinvite).unwrap();
         assert_eq!(cseq, 4, "refresh CSeq follows the stored INVITE");
         assert!(mgr.is_pending_refresh(&uuid, cseq).await);
         assert!(!mgr.is_pending_refresh(&uuid, cseq + 1).await);
-        assert!(mgr.due_session_refreshes("1.2.3.4", 5060).await.is_empty(), "no second refresh while one is pending");
+        assert!(
+            mgr.due_session_refreshes("1.2.3.4", 5060).await.is_empty(),
+            "no second refresh while one is pending"
+        );
 
         // Trunk answers 422 Min-SE 14400 to the refresh
         let outcome = mgr
-            .fail_session_refresh(&uuid, cseq, 422, Some(14400), "<sip:bob@b.example.com>;tag=callee-tag")
+            .fail_session_refresh(
+                &uuid,
+                cseq,
+                422,
+                Some(14400),
+                "<sip:bob@b.example.com>;tag=callee-tag",
+            )
             .await
             .expect("pending refresh recognised");
         let ack = outcome.ack.expect("ACK built from the stored re-INVITE");
         assert_eq!(outcome.dest, addr("203.0.113.9:5060"));
-        assert!(!outcome.dialog_gone, "a 422 that raised the interval is progress");
-        assert!(ack.starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"), "{}", ack);
+        assert!(
+            !outcome.dialog_gone,
+            "a 422 that raised the interval is progress"
+        );
+        assert!(
+            ack.starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"),
+            "{}",
+            ack
+        );
         assert!(ack.contains(&format!("CSeq: {} ACK\r\n", cseq)));
         let reinvite_branch = crate::sip_builder::top_via_branch(&reinvite).unwrap();
-        assert!(ack.contains(&reinvite_branch), "ACK reuses the re-INVITE's branch");
+        assert!(
+            ack.contains(&reinvite_branch),
+            "ACK reuses the re-INVITE's branch"
+        );
         assert!(!mgr.is_pending_refresh(&uuid, cseq).await);
         {
             let calls = mgr.calls.lock().await;
@@ -2379,17 +2902,36 @@ mod invite_attempt_tests {
             assert_eq!(st.interval_secs, 14400);
             assert_eq!(st.min_se, 14400);
             assert!(st.next_refresh_at > std::time::Instant::now());
-            assert_eq!(st.last_refresh.as_ref().map(|(c, _)| *c), Some(cseq), "last refresh kept for duplicates");
+            assert_eq!(
+                st.last_refresh.as_ref().map(|(c, _)| *c),
+                Some(cseq),
+                "last refresh kept for duplicates"
+            );
         }
         // Not pending any more → a second failure report is ignored…
-        assert!(mgr.fail_session_refresh(&uuid, cseq, 481, None, "x").await.is_none());
+        assert!(mgr
+            .fail_session_refresh(&uuid, cseq, 481, None, "x")
+            .await
+            .is_none());
         // …but a retransmitted answer to that refresh is still recognised and re-ACKed
         let (dup_ack, _, _, _) = mgr
-            .refresh_duplicate_ack(&uuid, cseq, 422, "<sip:bob@b.example.com>;tag=callee-tag", "1.2.3.4", 5060)
+            .refresh_duplicate_ack(
+                &uuid,
+                cseq,
+                422,
+                "<sip:bob@b.example.com>;tag=callee-tag",
+                "1.2.3.4",
+                5060,
+            )
             .await
             .expect("known refresh CSeq");
-        assert!(dup_ack.unwrap().contains(&format!("CSeq: {} ACK\r\n", cseq)));
-        assert!(mgr.refresh_duplicate_ack(&uuid, cseq + 7, 422, "x", "1.2.3.4", 5060).await.is_none());
+        assert!(dup_ack
+            .unwrap()
+            .contains(&format!("CSeq: {} ACK\r\n", cseq)));
+        assert!(mgr
+            .refresh_duplicate_ack(&uuid, cseq + 7, 422, "x", "1.2.3.4", 5060)
+            .await
+            .is_none());
         // The call itself survived
         assert_eq!(mgr.stats().await.total_active, 1);
     }
@@ -2398,27 +2940,66 @@ mod invite_attempt_tests {
     async fn refresh_failures_back_off_then_give_up_and_481_is_fatal() {
         let mgr = make_manager();
         let uuid = mgr
-            .create_call("cid-6".into(), "t".into(), addr("192.168.1.100:5060"), None, None, rsip::Transport::Udp)
+            .create_call(
+                "cid-6".into(),
+                "t".into(),
+                addr("192.168.1.100:5060"),
+                None,
+                None,
+                rsip::Transport::Udp,
+            )
             .await
             .unwrap();
-        mgr.attach_outbound(&uuid, "cid-6".into(), "sbc-tag".into(), addr("203.0.113.9:5060"), None, rsip::Transport::Udp).await.unwrap();
+        mgr.attach_outbound(
+            &uuid,
+            "cid-6".into(),
+            "sbc-tag".into(),
+            addr("203.0.113.9:5060"),
+            None,
+            rsip::Transport::Udp,
+        )
+        .await
+        .unwrap();
         mgr.set_session_timer(&uuid, 1800, 90).await;
-        async fn fail(mgr: &B2buaManager, uuid: &CallUuid, cseq: u32, status: u16) -> RefreshFailure {
+        async fn fail(
+            mgr: &B2buaManager,
+            uuid: &CallUuid,
+            cseq: u32,
+            status: u16,
+        ) -> RefreshFailure {
             {
                 let mut calls = mgr.calls.lock().await;
                 let st = calls.get_mut(uuid).unwrap().session_timer.as_mut().unwrap();
                 st.pending_refresh_cseq = Some(cseq);
                 st.pending_refresh_raw = None;
             }
-            mgr.fail_session_refresh(uuid, cseq, status, None, "x").await.unwrap()
+            mgr.fail_session_refresh(uuid, cseq, status, None, "x")
+                .await
+                .unwrap()
         }
         // 500, 500 → kept with growing backoff; third consecutive failure → give up
         assert!(!fail(&mgr, &uuid, 10, 500).await.dialog_gone);
-        let after_one = mgr.calls.lock().await[&uuid].session_timer.as_ref().unwrap().next_refresh_at;
+        let after_one = mgr.calls.lock().await[&uuid]
+            .session_timer
+            .as_ref()
+            .unwrap()
+            .next_refresh_at;
         assert!(!fail(&mgr, &uuid, 11, 500).await.dialog_gone);
-        let after_two = mgr.calls.lock().await[&uuid].session_timer.as_ref().unwrap().next_refresh_at;
-        assert!(after_two > after_one, "backoff grows: {:?} vs {:?}", after_two, after_one);
-        assert!(fail(&mgr, &uuid, 12, 500).await.dialog_gone, "third consecutive failure exhausts the budget");
+        let after_two = mgr.calls.lock().await[&uuid]
+            .session_timer
+            .as_ref()
+            .unwrap()
+            .next_refresh_at;
+        assert!(
+            after_two > after_one,
+            "backoff grows: {:?} vs {:?}",
+            after_two,
+            after_one
+        );
+        assert!(
+            fail(&mgr, &uuid, 12, 500).await.dialog_gone,
+            "third consecutive failure exhausts the budget"
+        );
 
         // A 481 / 408 is fatal immediately, whatever the counter says
         mgr.set_session_timer(&uuid, 1800, 90).await;

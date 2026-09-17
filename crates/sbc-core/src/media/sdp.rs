@@ -34,24 +34,24 @@ pub struct Origin {
     pub username: String,
     pub session_id: String,
     pub session_version: String,
-    pub network_type: String,  // Usually "IN"
-    pub address_type: String,  // Usually "IP4" or "IP6"
+    pub network_type: String, // Usually "IN"
+    pub address_type: String, // Usually "IP4" or "IP6"
     pub address: String,
 }
 
 /// Connection line (c=)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Connection {
-    pub network_type: String,  // Usually "IN"
-    pub address_type: String,  // Usually "IP4" or "IP6"
+    pub network_type: String, // Usually "IN"
+    pub address_type: String, // Usually "IP4" or "IP6"
     pub address: String,
 }
 
 /// Time description (t=)
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeDescription {
-    pub start_time: String,  // Usually "0"
-    pub stop_time: String,   // Usually "0"
+    pub start_time: String, // Usually "0"
+    pub stop_time: String,  // Usually "0"
 }
 
 /// Media description (m=)
@@ -110,7 +110,11 @@ impl SessionDescription {
 
         // Skip leading blank lines (some implementations add them)
         while let Some(&line) = lines.peek() {
-            if line.trim().is_empty() { lines.next(); } else { break; }
+            if line.trim().is_empty() {
+                lines.next();
+            } else {
+                break;
+            }
         }
 
         // Parse version (v=)
@@ -141,7 +145,9 @@ impl SessionDescription {
                 }
                 Some(&line) if line.starts_with("t=") => break,
                 Some(&line) if line.starts_with("m=") => break,
-                Some(_) => { lines.next(); } // skip i=, u=, e=, p=, b=, etc.
+                Some(_) => {
+                    lines.next();
+                } // skip i=, u=, e=, p=, b=, etc.
                 None => break,
             }
         }
@@ -150,13 +156,21 @@ impl SessionDescription {
         let time = if lines.peek().is_some_and(|l| l.starts_with("t=")) {
             Self::parse_time(&mut lines)?
         } else {
-            TimeDescription { start_time: "0".to_string(), stop_time: "0".to_string() }
+            TimeDescription {
+                start_time: "0".to_string(),
+                stop_time: "0".to_string(),
+            }
         };
 
         // Skip any lines between t= and first m= (r=, z=, k=, a= at session level)
         while let Some(&line) = lines.peek() {
-            if line.starts_with("m=") { break; }
-            if line.trim().is_empty() { lines.next(); continue; }
+            if line.starts_with("m=") {
+                break;
+            }
+            if line.trim().is_empty() {
+                lines.next();
+                continue;
+            }
             lines.next(); // skip session-level a=, b=, k=, etc.
         }
 
@@ -219,7 +233,10 @@ impl SessionDescription {
         }
 
         // Time
-        sdp.push_str(&format!("t={} {}\r\n", self.time.start_time, self.time.stop_time));
+        sdp.push_str(&format!(
+            "t={} {}\r\n",
+            self.time.start_time, self.time.stop_time
+        ));
 
         // Media descriptions
         for media in &self.media {
@@ -266,18 +283,26 @@ impl SessionDescription {
     where
         I: Iterator<Item = &'a str>,
     {
-        let line = lines.next().ok_or_else(|| Error::Parse("Missing version line".to_string()))?;
-        let value = line.strip_prefix("v=")
+        let line = lines
+            .next()
+            .ok_or_else(|| Error::Parse("Missing version line".to_string()))?;
+        let value = line
+            .strip_prefix("v=")
             .ok_or_else(|| Error::Parse("Invalid version line".to_string()))?;
-        value.parse().map_err(|_| Error::Parse("Invalid version number".to_string()))
+        value
+            .parse()
+            .map_err(|_| Error::Parse("Invalid version number".to_string()))
     }
 
     fn parse_origin<'a, I>(lines: &mut std::iter::Peekable<I>) -> Result<Origin>
     where
         I: Iterator<Item = &'a str>,
     {
-        let line = lines.next().ok_or_else(|| Error::Parse("Missing origin line".to_string()))?;
-        let value = line.strip_prefix("o=")
+        let line = lines
+            .next()
+            .ok_or_else(|| Error::Parse("Missing origin line".to_string()))?;
+        let value = line
+            .strip_prefix("o=")
             .ok_or_else(|| Error::Parse("Invalid origin line".to_string()))?;
 
         let parts: Vec<&str> = value.split_whitespace().collect();
@@ -299,8 +324,11 @@ impl SessionDescription {
     where
         I: Iterator<Item = &'a str>,
     {
-        let line = lines.next().ok_or_else(|| Error::Parse("Missing session name".to_string()))?;
-        let value = line.strip_prefix("s=")
+        let line = lines
+            .next()
+            .ok_or_else(|| Error::Parse("Missing session name".to_string()))?;
+        let value = line
+            .strip_prefix("s=")
             .ok_or_else(|| Error::Parse("Invalid session name line".to_string()))?;
         Ok(value.to_string())
     }
@@ -332,8 +360,11 @@ impl SessionDescription {
     where
         I: Iterator<Item = &'a str>,
     {
-        let line = lines.next().ok_or_else(|| Error::Parse("Missing time line".to_string()))?;
-        let value = line.strip_prefix("t=")
+        let line = lines
+            .next()
+            .ok_or_else(|| Error::Parse("Missing time line".to_string()))?;
+        let value = line
+            .strip_prefix("t=")
             .ok_or_else(|| Error::Parse("Invalid time line".to_string()))?;
 
         let parts: Vec<&str> = value.split_whitespace().collect();
@@ -352,8 +383,11 @@ impl SessionDescription {
         I: Iterator<Item = &'a str>,
     {
         // Parse media line (m=)
-        let line = lines.next().ok_or_else(|| Error::Parse("Missing media line".to_string()))?;
-        let value = line.strip_prefix("m=")
+        let line = lines
+            .next()
+            .ok_or_else(|| Error::Parse("Missing media line".to_string()))?;
+        let value = line
+            .strip_prefix("m=")
             .ok_or_else(|| Error::Parse("Invalid media line".to_string()))?;
 
         let parts: Vec<&str> = value.split_whitespace().collect();
@@ -364,13 +398,11 @@ impl SessionDescription {
         let media_type = MediaType::from_str(parts[0])?;
         // Port may be "port" or "port/numports" (RFC 4566 §5.14)
         let port_str = parts[1].split('/').next().unwrap_or(parts[1]);
-        let port: u16 = port_str.parse()
+        let port: u16 = port_str
+            .parse()
             .map_err(|_| Error::Parse(format!("Invalid port number: {}", parts[1])))?;
         let protocol = parts[2].to_string();
-        let formats: Vec<u8> = parts[3..]
-            .iter()
-            .filter_map(|f| f.parse().ok())
-            .collect();
+        let formats: Vec<u8> = parts[3..].iter().filter_map(|f| f.parse().ok()).collect();
 
         // Parse connection and attributes for this media
         let mut connection = None;
@@ -467,9 +499,25 @@ impl MediaDescription {
 /// WebRTC-specific attributes to strip when transforming SDP for a PSTN trunk.
 #[allow(dead_code)]
 const WEBRTC_STRIP_ATTRS: &[&str] = &[
-    "fingerprint", "setup", "ice-ufrag", "ice-pwd", "ice-options", "ice-lite",
-    "candidate", "rtcp-mux", "rtcp-rsize", "mid", "extmap", "ssrc", "ssrc-group",
-    "msid", "msid-semantic", "group", "rtcp-fb", "fmtp", "crypto",
+    "fingerprint",
+    "setup",
+    "ice-ufrag",
+    "ice-pwd",
+    "ice-options",
+    "ice-lite",
+    "candidate",
+    "rtcp-mux",
+    "rtcp-rsize",
+    "mid",
+    "extmap",
+    "ssrc",
+    "ssrc-group",
+    "msid",
+    "msid-semantic",
+    "group",
+    "rtcp-fb",
+    "fmtp",
+    "crypto",
 ];
 
 /// Transform a WebRTC SDP offer into a plain RTP SDP suitable for a PSTN trunk.
@@ -548,7 +596,6 @@ impl MediaType {
         }
     }
 }
-
 
 /// Extract the negotiated telephone-event payload type (RFC 4733) and its
 /// clock rate from an SDP body. Returns the first `a=rtpmap:<pt> telephone-event/<rate>`.
@@ -764,7 +811,11 @@ a=sendrecv\r\n";
         let trunk_sdp = transform_webrtc_to_trunk(webrtc_sdp, "203.0.113.1", 15000);
 
         // Must have plain RTP/AVP protocol
-        assert!(trunk_sdp.contains("m=audio 15000 RTP/AVP 8"), "got: {}", trunk_sdp);
+        assert!(
+            trunk_sdp.contains("m=audio 15000 RTP/AVP 8"),
+            "got: {}",
+            trunk_sdp
+        );
         // Must have SBC IP
         assert!(trunk_sdp.contains("c=IN IP4 203.0.113.1"));
         // Must have PCMA
@@ -794,10 +845,20 @@ c=IN IP4 10.0.0.1\r\n\
 a=rtpmap:0 PCMU/8000\r\n";
 
         let sdp = SessionDescription::parse(sdp_str);
-        assert!(sdp.is_ok(), "SDP without session-level c= should parse: {:?}", sdp.err());
+        assert!(
+            sdp.is_ok(),
+            "SDP without session-level c= should parse: {:?}",
+            sdp.err()
+        );
         let sdp = sdp.unwrap();
-        assert!(sdp.connection.is_none(), "Session-level connection should be None");
-        assert!(sdp.media[0].connection.is_some(), "Media-level connection should be present");
+        assert!(
+            sdp.connection.is_none(),
+            "Session-level connection should be None"
+        );
+        assert!(
+            sdp.media[0].connection.is_some(),
+            "Media-level connection should be present"
+        );
     }
 
     #[test]
@@ -813,7 +874,10 @@ c=IN IP4 10.0.0.1\r\n";
         let mut sdp = SessionDescription::parse(sdp_str).unwrap();
         sdp.replace_ip("203.0.113.1".parse().unwrap());
 
-        assert_eq!(sdp.media[0].connection.as_ref().unwrap().address, "203.0.113.1");
+        assert_eq!(
+            sdp.media[0].connection.as_ref().unwrap().address,
+            "203.0.113.1"
+        );
         assert_eq!(sdp.origin.address, "203.0.113.1");
     }
 
@@ -833,7 +897,9 @@ a=fmtp:101 0-16\r\n";
 
         let sdp = SessionDescription::parse(sdp_str).unwrap();
         assert_eq!(sdp.media[0].formats, vec![0u8, 8, 101]);
-        let has_tel_event = sdp.media[0].attributes.iter()
+        let has_tel_event = sdp.media[0]
+            .attributes
+            .iter()
             .any(|a| a.value.as_deref().unwrap_or("").contains("telephone-event"));
         assert!(has_tel_event, "telephone-event attribute should be present");
     }
@@ -854,7 +920,11 @@ a=fingerprint:sha-256 AA:BB\r\n";
 
         let trunk_sdp = transform_webrtc_to_trunk(webrtc_sdp, "203.0.113.1", 15000);
 
-        assert!(trunk_sdp.contains("m=audio 15000 RTP/AVP"), "Should have RTP/AVP: {}", trunk_sdp);
+        assert!(
+            trunk_sdp.contains("m=audio 15000 RTP/AVP"),
+            "Should have RTP/AVP: {}",
+            trunk_sdp
+        );
         assert!(trunk_sdp.contains("PCMA/8000"), "Should offer PCMA");
         assert!(!trunk_sdp.contains("opus"), "Should not contain opus");
     }
@@ -867,7 +937,10 @@ a=fingerprint:sha-256 AA:BB\r\n";
 
         sdp.replace_port(MediaType::Video, 9999); // No video in SAMPLE_SDP
 
-        assert_eq!(sdp.media[0].port, original_port, "Audio port should be unchanged");
+        assert_eq!(
+            sdp.media[0].port, original_port,
+            "Audio port should be unchanged"
+        );
     }
 
     #[test]
@@ -884,7 +957,11 @@ a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:8 PCMA/8000\r\n";
 
         let result = SessionDescription::parse(sdp_str);
-        assert!(result.is_ok(), "Linphone-style SDP with attributes before t= should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Linphone-style SDP with attributes before t= should parse: {:?}",
+            result.err()
+        );
     }
 
     use super::negotiated_audio_codec;

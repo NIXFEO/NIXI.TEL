@@ -73,7 +73,7 @@ impl CdrRecord {
         for c in s.chars() {
             match c {
                 '\\' => out.push_str("\\\\"),
-                '"'  => out.push_str("\\\""),
+                '"' => out.push_str("\\\""),
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
@@ -87,10 +87,14 @@ impl CdrRecord {
     }
 
     pub fn to_json(&self) -> String {
-        let trunk = self.trunk_id.as_deref()
+        let trunk = self
+            .trunk_id
+            .as_deref()
             .map(|t| format!("\"{}\"", Self::json_escape(t)))
             .unwrap_or_else(|| "null".to_string());
-        let codec = self.codec.as_deref()
+        let codec = self
+            .codec
+            .as_deref()
             .map(|c| format!("\"{}\"", Self::json_escape(c)))
             .unwrap_or_else(|| "null".to_string());
         format!(
@@ -156,7 +160,8 @@ impl CdrStorage for InMemoryCdrStorage {
     async fn insert_cdr(&self, record: &CdrRecord) -> Result<()> {
         let mut records = self.records.lock().await;
         records.push(record.clone());
-        self.insert_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.insert_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("CDR inserted in memory: call_id={}", record.call_id);
         Ok(())
     }
@@ -198,8 +203,9 @@ impl FileCdrStorage {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             if !parent.exists() {
-                tokio::fs::create_dir_all(parent).await
-                    .map_err(|e| Error::Config(format!("Cannot create CDR directory {:?}: {}", parent, e)))?;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    Error::Config(format!("Cannot create CDR directory {:?}: {}", parent, e))
+                })?;
             }
         }
         // Load existing CDRs from file (if it exists)
@@ -221,10 +227,16 @@ impl FileCdrStorage {
                             loaded += 1;
                         }
                     }
-                    info!("CDR file storage: loaded {} existing records from {:?}", loaded, path);
+                    info!(
+                        "CDR file storage: loaded {} existing records from {:?}",
+                        loaded, path
+                    );
                 }
                 Err(e) => {
-                    warn!("CDR file storage: could not read {:?}: {} (starting fresh)", path, e);
+                    warn!(
+                        "CDR file storage: could not read {:?}: {} (starting fresh)",
+                        path, e
+                    );
                 }
             }
         } else {
@@ -336,7 +348,8 @@ fn uuid_v4() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
         t,
         (t >> 16) & 0xffff,
         (t >> 8) & 0x0fff,
@@ -386,14 +399,11 @@ impl CdrManager {
         codec: Option<&str>,
         reason: &str,
     ) -> Result<()> {
-        let mut record = CdrRecord::new(
-            call_id.to_string(),
-            caller.to_string(),
-            callee.to_string(),
-        )
-        .with_duration(duration_secs)
-        .with_webrtc(is_webrtc)
-        .with_disconnect_reason(reason);
+        let mut record =
+            CdrRecord::new(call_id.to_string(), caller.to_string(), callee.to_string())
+                .with_duration(duration_secs)
+                .with_webrtc(is_webrtc)
+                .with_disconnect_reason(reason);
 
         if let Some(c) = codec {
             record = record.with_codec(c);
@@ -415,7 +425,10 @@ impl CdrManager {
     /// The fetch window is capped at offset+limit, so the returned count only
     /// signals whether more pages may exist.
     pub async fn get_page(&self, limit: usize, offset: usize) -> Result<(Vec<CdrRecord>, usize)> {
-        let window = self.storage.list_recent_cdrs(offset.saturating_add(limit)).await?;
+        let window = self
+            .storage
+            .list_recent_cdrs(offset.saturating_add(limit))
+            .await?;
         let total = window.len();
         let page = window.into_iter().skip(offset).collect();
         Ok((page, total))
@@ -468,10 +481,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_cdr_record_to_json() {
-        let record = CdrRecord::new("call-003".to_string(), "alice".to_string(), "bob".to_string())
-            .with_duration(60)
-            .with_codec("PCMU")
-            .with_webrtc(true);
+        let record = CdrRecord::new(
+            "call-003".to_string(),
+            "alice".to_string(),
+            "bob".to_string(),
+        )
+        .with_duration(60)
+        .with_codec("PCMU")
+        .with_webrtc(true);
         let json = record.to_json();
         assert!(json.contains("call-003"));
         assert!(json.contains("alice"));
@@ -526,9 +543,17 @@ mod tests {
     #[tokio::test]
     async fn test_cdr_manager_record_call() {
         let mgr = CdrManager::new_memory();
-        mgr.record_call("call-200", "alice", "bob", 300, false, Some("PCMA"), "normal")
-            .await
-            .unwrap();
+        mgr.record_call(
+            "call-200",
+            "alice",
+            "bob",
+            300,
+            false,
+            Some("PCMA"),
+            "normal",
+        )
+        .await
+        .unwrap();
 
         let stats = mgr.stats().await;
         assert_eq!(stats.total_cdrs, 1);

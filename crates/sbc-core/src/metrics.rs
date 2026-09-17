@@ -4,14 +4,13 @@
 //! Compatible with Prometheus scraping format (text/plain).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// All SBC counters and gauges
 pub struct SbcMetrics {
     // ── Counters (monotonically increasing) ──────────────────────────────────
-
     /// Total SIP requests received
     pub sip_requests_total: Arc<AtomicU64>,
 
@@ -102,7 +101,6 @@ pub struct SbcMetrics {
     pub sip_send_failures: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
 
     // ── Gauges (current value) ────────────────────────────────────────────────
-
     /// Currently active calls
     pub active_calls: Arc<AtomicU64>,
 
@@ -133,41 +131,41 @@ pub struct SbcMetrics {
 impl SbcMetrics {
     pub fn new() -> Self {
         Self {
-            sip_requests_total:      Arc::new(AtomicU64::new(0)),
-            sip_requests_by_method:  Arc::new(std::sync::Mutex::new(HashMap::new())),
-            sip_responses_total:     Arc::new(AtomicU64::new(0)),
-            sip_4xx_total:           Arc::new(AtomicU64::new(0)),
-            sip_5xx_total:           Arc::new(AtomicU64::new(0)),
-            calls_total:             Arc::new(AtomicU64::new(0)),
-            calls_connected_total:   Arc::new(AtomicU64::new(0)),
-            calls_failed_total:      Arc::new(AtomicU64::new(0)),
-            calls_terminated_total:  Arc::new(AtomicU64::new(0)),
-            auth_challenges_total:   Arc::new(AtomicU64::new(0)),
-            auth_failures_total:     Arc::new(AtomicU64::new(0)),
-            rtp_packets_total:       Arc::new(AtomicU64::new(0)),
-            srtp_encrypted_total:    Arc::new(AtomicU64::new(0)),
-            srtp_decrypted_total:    Arc::new(AtomicU64::new(0)),
-            transcoded_total:        Arc::new(AtomicU64::new(0)),
-            registrations_total:     Arc::new(AtomicU64::new(0)),
-            spam_blocked_total:      Arc::new(AtomicU64::new(0)),
-            sip_parse_errors_total:  Arc::new(AtomicU64::new(0)),
-            dos_blocked_total:       Arc::new(AtomicU64::new(0)),
-            acl_denied_total:        Arc::new(AtomicU64::new(0)),
-            security_bans_total:                 Arc::new(AtomicU64::new(0)),
-            security_ban_drops_total:            Arc::new(AtomicU64::new(0)),
-            security_destination_blocked_total:  Arc::new(AtomicU64::new(0)),
+            sip_requests_total: Arc::new(AtomicU64::new(0)),
+            sip_requests_by_method: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sip_responses_total: Arc::new(AtomicU64::new(0)),
+            sip_4xx_total: Arc::new(AtomicU64::new(0)),
+            sip_5xx_total: Arc::new(AtomicU64::new(0)),
+            calls_total: Arc::new(AtomicU64::new(0)),
+            calls_connected_total: Arc::new(AtomicU64::new(0)),
+            calls_failed_total: Arc::new(AtomicU64::new(0)),
+            calls_terminated_total: Arc::new(AtomicU64::new(0)),
+            auth_challenges_total: Arc::new(AtomicU64::new(0)),
+            auth_failures_total: Arc::new(AtomicU64::new(0)),
+            rtp_packets_total: Arc::new(AtomicU64::new(0)),
+            srtp_encrypted_total: Arc::new(AtomicU64::new(0)),
+            srtp_decrypted_total: Arc::new(AtomicU64::new(0)),
+            transcoded_total: Arc::new(AtomicU64::new(0)),
+            registrations_total: Arc::new(AtomicU64::new(0)),
+            spam_blocked_total: Arc::new(AtomicU64::new(0)),
+            sip_parse_errors_total: Arc::new(AtomicU64::new(0)),
+            dos_blocked_total: Arc::new(AtomicU64::new(0)),
+            acl_denied_total: Arc::new(AtomicU64::new(0)),
+            security_bans_total: Arc::new(AtomicU64::new(0)),
+            security_ban_drops_total: Arc::new(AtomicU64::new(0)),
+            security_destination_blocked_total: Arc::new(AtomicU64::new(0)),
             security_user_limit_rejections_total: Arc::new(AtomicU64::new(0)),
-            rtp_timeouts_total:      Arc::new(AtomicU64::new(0)),
+            rtp_timeouts_total: Arc::new(AtomicU64::new(0)),
             session_timer_422_retries_total: Arc::new(AtomicU64::new(0)),
-            sip_responses_by_code:   Arc::new(std::sync::Mutex::new(HashMap::new())),
-            sip_send_failures:       Arc::new(std::sync::Mutex::new(HashMap::new())),
-            active_calls:            Arc::new(AtomicU64::new(0)),
-            active_webrtc_calls:     Arc::new(AtomicU64::new(0)),
-            allocated_ports:         Arc::new(AtomicU64::new(0)),
-            active_registrations:    Arc::new(AtomicU64::new(0)),
-            dos_tracked_ips:         Arc::new(AtomicU64::new(0)),
-            auth_nonces:             Arc::new(AtomicU64::new(0)),
-            last_cdr_written_time:   Arc::new(AtomicU64::new(0)),
+            sip_responses_by_code: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sip_send_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_calls: Arc::new(AtomicU64::new(0)),
+            active_webrtc_calls: Arc::new(AtomicU64::new(0)),
+            allocated_ports: Arc::new(AtomicU64::new(0)),
+            active_registrations: Arc::new(AtomicU64::new(0)),
+            dos_tracked_ips: Arc::new(AtomicU64::new(0)),
+            auth_nonces: Arc::new(AtomicU64::new(0)),
+            last_cdr_written_time: Arc::new(AtomicU64::new(0)),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
@@ -186,8 +184,12 @@ impl SbcMetrics {
 
     pub fn inc_sip_response(&self, code: u16) {
         self.sip_responses_total.fetch_add(1, Ordering::Relaxed);
-        if (400..500).contains(&code) { self.sip_4xx_total.fetch_add(1, Ordering::Relaxed); }
-        if (500..600).contains(&code) { self.sip_5xx_total.fetch_add(1, Ordering::Relaxed); }
+        if (400..500).contains(&code) {
+            self.sip_4xx_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if (500..600).contains(&code) {
+            self.sip_5xx_total.fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(mut map) = self.sip_responses_by_code.lock() {
             *map.entry(code).or_insert(0) += 1;
         }
@@ -282,17 +284,20 @@ impl SbcMetrics {
 
     /// Count a packet/request dropped because its source is banned.
     pub fn inc_security_ban_drop(&self) {
-        self.security_ban_drops_total.fetch_add(1, Ordering::Relaxed);
+        self.security_ban_drops_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a call blocked by destination rules (anti-IRSF).
     pub fn inc_security_destination_blocked(&self) {
-        self.security_destination_blocked_total.fetch_add(1, Ordering::Relaxed);
+        self.security_destination_blocked_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a call rejected by per-user limits.
     pub fn inc_security_user_limit_rejection(&self) {
-        self.security_user_limit_rejections_total.fetch_add(1, Ordering::Relaxed);
+        self.security_user_limit_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a call torn down by the RTP inactivity timeout.
@@ -302,7 +307,8 @@ impl SbcMetrics {
 
     /// Count an INVITE re-sent after a 422 Session Interval Too Small.
     pub fn inc_session_timer_422_retry(&self) {
-        self.session_timer_422_retries_total.fetch_add(1, Ordering::Relaxed);
+        self.session_timer_422_retries_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
@@ -368,43 +374,61 @@ impl SbcMetrics {
         }
 
         // ── Uptime ────────────────────────────────────────────────────────────
-        gauge!("sbc_uptime_seconds",
-               "SBC uptime in seconds",
-               self.uptime_secs());
+        gauge!(
+            "sbc_uptime_seconds",
+            "SBC uptime in seconds",
+            self.uptime_secs()
+        );
 
         // ── Active gauges ─────────────────────────────────────────────────────
-        gauge!("sbc_active_calls",
-               "Number of currently active calls",
-               self.active_calls.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_active_calls",
+            "Number of currently active calls",
+            self.active_calls.load(Ordering::Relaxed)
+        );
 
-        gauge!("sbc_active_webrtc_calls",
-               "Number of currently active WebRTC calls",
-               self.active_webrtc_calls.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_active_webrtc_calls",
+            "Number of currently active WebRTC calls",
+            self.active_webrtc_calls.load(Ordering::Relaxed)
+        );
 
-        gauge!("sbc_allocated_rtp_ports",
-               "Number of currently allocated RTP port pairs",
-               self.allocated_ports.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_allocated_rtp_ports",
+            "Number of currently allocated RTP port pairs",
+            self.allocated_ports.load(Ordering::Relaxed)
+        );
 
-        gauge!("sbc_active_registrations",
-               "Number of currently active SIP registrations",
-               self.active_registrations.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_active_registrations",
+            "Number of currently active SIP registrations",
+            self.active_registrations.load(Ordering::Relaxed)
+        );
 
-        gauge!("sbc_dos_tracked_ips",
-               "Source IPs tracked by the DoS limiter",
-               self.dos_tracked_ips.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_dos_tracked_ips",
+            "Source IPs tracked by the DoS limiter",
+            self.dos_tracked_ips.load(Ordering::Relaxed)
+        );
 
-        gauge!("sbc_auth_nonces",
-               "Outstanding digest authentication nonces",
-               self.auth_nonces.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_auth_nonces",
+            "Outstanding digest authentication nonces",
+            self.auth_nonces.load(Ordering::Relaxed)
+        );
 
-        gauge!("sbc_last_cdr_written_timestamp_seconds",
-               "Unix time of the last CDR written (0 = none since start)",
-               self.last_cdr_written_time.load(Ordering::Relaxed));
+        gauge!(
+            "sbc_last_cdr_written_timestamp_seconds",
+            "Unix time of the last CDR written (0 = none since start)",
+            self.last_cdr_written_time.load(Ordering::Relaxed)
+        );
 
         // ── SIP counters ──────────────────────────────────────────────────────
-        counter!("sbc_sip_requests",
-                 "Total SIP requests received",
-                 self.sip_requests_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_sip_requests",
+            "Total SIP requests received",
+            self.sip_requests_total.load(Ordering::Relaxed)
+        );
 
         // Per-method counters
         if let Ok(map) = self.sip_requests_by_method.lock() {
@@ -418,9 +442,11 @@ impl SbcMetrics {
             }
         }
 
-        counter!("sbc_sip_responses",
-                 "Total SIP responses sent",
-                 self.sip_responses_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_sip_responses",
+            "Total SIP responses sent",
+            self.sip_responses_total.load(Ordering::Relaxed)
+        );
 
         // Per-code response counters
         if let Ok(map) = self.sip_responses_by_code.lock() {
@@ -440,114 +466,165 @@ impl SbcMetrics {
             let mut entries: Vec<_> = map.iter().collect();
             entries.sort();
             for (transport, count) in entries {
-                out.push_str(&format!("sbc_sip_send_failures_total{{transport=\"{}\"}} {}\n", transport, count));
+                out.push_str(&format!(
+                    "sbc_sip_send_failures_total{{transport=\"{}\"}} {}\n",
+                    transport, count
+                ));
             }
         }
 
-        counter!("sbc_sip_4xx",
-                 "Total SIP 4xx responses",
-                 self.sip_4xx_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_sip_4xx",
+            "Total SIP 4xx responses",
+            self.sip_4xx_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_sip_5xx",
-                 "Total SIP 5xx responses",
-                 self.sip_5xx_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_sip_5xx",
+            "Total SIP 5xx responses",
+            self.sip_5xx_total.load(Ordering::Relaxed)
+        );
 
         // ── Call counters ─────────────────────────────────────────────────────
-        counter!("sbc_calls",
-                 "Total call attempts",
-                 self.calls_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_calls",
+            "Total call attempts",
+            self.calls_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_calls_connected",
-                 "Total calls successfully connected",
-                 self.calls_connected_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_calls_connected",
+            "Total calls successfully connected",
+            self.calls_connected_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_calls_failed",
-                 "Total calls that failed",
-                 self.calls_failed_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_calls_failed",
+            "Total calls that failed",
+            self.calls_failed_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_calls_terminated",
-                 "Total calls terminated via BYE",
-                 self.calls_terminated_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_calls_terminated",
+            "Total calls terminated via BYE",
+            self.calls_terminated_total.load(Ordering::Relaxed)
+        );
 
         // ── Auth counters ─────────────────────────────────────────────────────
-        counter!("sbc_auth_challenges",
-                 "Total authentication challenges issued",
-                 self.auth_challenges_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_auth_challenges",
+            "Total authentication challenges issued",
+            self.auth_challenges_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_auth_failures",
-                 "Total authentication failures",
-                 self.auth_failures_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_auth_failures",
+            "Total authentication failures",
+            self.auth_failures_total.load(Ordering::Relaxed)
+        );
 
         // ── Registration counters ───────────────────────────────────────────────
-        counter!("sbc_registrations",
-                 "Total successful REGISTER requests",
-                 self.registrations_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_registrations",
+            "Total successful REGISTER requests",
+            self.registrations_total.load(Ordering::Relaxed)
+        );
 
         // ── Security counters ──────────────────────────────────────────────────
-        counter!("sbc_spam_blocked",
-                 "Total INVITE rejected from unregistered sources",
-                 self.spam_blocked_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_spam_blocked",
+            "Total INVITE rejected from unregistered sources",
+            self.spam_blocked_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_sip_parse_errors",
-                 "Total SIP messages with parse errors (scanners)",
-                 self.sip_parse_errors_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_sip_parse_errors",
+            "Total SIP messages with parse errors (scanners)",
+            self.sip_parse_errors_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_dos_blocked",
-                 "Total requests blocked by rate limiter (503)",
-                 self.dos_blocked_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_dos_blocked",
+            "Total requests blocked by rate limiter (503)",
+            self.dos_blocked_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_acl_denied",
-                 "Total requests denied by ACL rules",
-                 self.acl_denied_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_acl_denied",
+            "Total requests denied by ACL rules",
+            self.acl_denied_total.load(Ordering::Relaxed)
+        );
 
         // ── Anti-fraud counters (fail2ban / IRSF / per-user limits) ────────────
-        counter!("sbc_security_bans",
-                 "Total fail2ban bans issued (auth-failure threshold reached)",
-                 self.security_bans_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_security_bans",
+            "Total fail2ban bans issued (auth-failure threshold reached)",
+            self.security_bans_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_security_ban_drops",
-                 "Total requests dropped because their source IP was banned",
-                 self.security_ban_drops_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_security_ban_drops",
+            "Total requests dropped because their source IP was banned",
+            self.security_ban_drops_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_security_destination_blocked",
-                 "Total calls blocked by destination rules (anti-IRSF)",
-                 self.security_destination_blocked_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_security_destination_blocked",
+            "Total calls blocked by destination rules (anti-IRSF)",
+            self.security_destination_blocked_total
+                .load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_security_user_limit_rejections",
-                 "Total calls rejected by per-user limits (concurrent + rate)",
-                 self.security_user_limit_rejections_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_security_user_limit_rejections",
+            "Total calls rejected by per-user limits (concurrent + rate)",
+            self.security_user_limit_rejections_total
+                .load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_rtp_timeouts",
-                 "Total calls torn down by the RTP inactivity timeout",
-                 self.rtp_timeouts_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_rtp_timeouts",
+            "Total calls torn down by the RTP inactivity timeout",
+            self.rtp_timeouts_total.load(Ordering::Relaxed)
+        );
 
         counter!("sbc_session_timer_422_retries",
                  "Total outbound INVITEs re-sent after a trunk 422 Session Interval Too Small (RFC 4028)",
                  self.session_timer_422_retries_total.load(Ordering::Relaxed));
 
         // ── Media counters ────────────────────────────────────────────────────
-        counter!("sbc_rtp_packets",
-                 "Total RTP packets forwarded",
-                 self.rtp_packets_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_rtp_packets",
+            "Total RTP packets forwarded",
+            self.rtp_packets_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_srtp_encrypted",
-                 "Total SRTP packets encrypted",
-                 self.srtp_encrypted_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_srtp_encrypted",
+            "Total SRTP packets encrypted",
+            self.srtp_encrypted_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_srtp_decrypted",
-                 "Total SRTP packets decrypted",
-                 self.srtp_decrypted_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_srtp_decrypted",
+            "Total SRTP packets decrypted",
+            self.srtp_decrypted_total.load(Ordering::Relaxed)
+        );
 
-        counter!("sbc_transcoded_packets",
-                 "Total RTP packets transcoded (Opus/G.711)",
-                 self.transcoded_total.load(Ordering::Relaxed));
+        counter!(
+            "sbc_transcoded_packets",
+            "Total RTP packets transcoded (Opus/G.711)",
+            self.transcoded_total.load(Ordering::Relaxed)
+        );
 
         out
     }
 }
 
 impl Default for SbcMetrics {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Health check ───────────────────────────────────────────────────────────────
@@ -563,9 +640,9 @@ pub enum HealthStatus {
 impl HealthStatus {
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Healthy       => "healthy",
-            Self::Degraded(_)   => "degraded",
-            Self::Unhealthy(_)  => "unhealthy",
+            Self::Healthy => "healthy",
+            Self::Degraded(_) => "degraded",
+            Self::Unhealthy(_) => "unhealthy",
         }
     }
 
@@ -603,18 +680,23 @@ impl HealthReport {
         let auth_check = if auth_total == 0 || auth_fail * 100 / auth_total.max(1) < 50 {
             HealthStatus::Healthy
         } else {
-            HealthStatus::Degraded(format!("High auth failure rate: {}/{}", auth_fail, auth_total))
+            HealthStatus::Degraded(format!(
+                "High auth failure rate: {}/{}",
+                auth_fail, auth_total
+            ))
         };
         checks.push(("auth_health".to_string(), auth_check));
 
         // Overall status: worst of all checks
-        let status = checks.iter().fold(HealthStatus::Healthy, |worst, (_, s)| {
-            match (&worst, s) {
+        let status = checks
+            .iter()
+            .fold(HealthStatus::Healthy, |worst, (_, s)| match (&worst, s) {
                 (_, HealthStatus::Unhealthy(m)) => HealthStatus::Unhealthy(m.clone()),
-                (HealthStatus::Healthy, HealthStatus::Degraded(m)) => HealthStatus::Degraded(m.clone()),
+                (HealthStatus::Healthy, HealthStatus::Degraded(m)) => {
+                    HealthStatus::Degraded(m.clone())
+                }
                 _ => worst,
-            }
-        });
+            });
 
         Self {
             status,
@@ -626,7 +708,9 @@ impl HealthReport {
 
     /// Render as JSON string
     pub fn to_json(&self) -> String {
-        let checks_json: String = self.checks.iter()
+        let checks_json: String = self
+            .checks
+            .iter()
             .map(|(name, status)| {
                 let detail = match status {
                     HealthStatus::Healthy => String::new(),
@@ -634,7 +718,12 @@ impl HealthReport {
                         format!(", \"detail\": \"{}\"", m)
                     }
                 };
-                format!("{{\"name\": \"{}\", \"status\": \"{}\"{}}}", name, status.as_str(), detail)
+                format!(
+                    "{{\"name\": \"{}\", \"status\": \"{}\"{}}}",
+                    name,
+                    status.as_str(),
+                    detail
+                )
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -775,6 +864,9 @@ mod tests {
     fn test_health_status_as_str() {
         assert_eq!(HealthStatus::Healthy.as_str(), "healthy");
         assert_eq!(HealthStatus::Degraded("x".to_string()).as_str(), "degraded");
-        assert_eq!(HealthStatus::Unhealthy("y".to_string()).as_str(), "unhealthy");
+        assert_eq!(
+            HealthStatus::Unhealthy("y".to_string()).as_str(),
+            "unhealthy"
+        );
     }
 }

@@ -46,8 +46,8 @@ impl fmt::Display for AclAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Allow => write!(f, "allow"),
-            Self::Deny  => write!(f, "deny"),
-            Self::Log   => write!(f, "log"),
+            Self::Deny => write!(f, "deny"),
+            Self::Log => write!(f, "log"),
         }
     }
 }
@@ -57,8 +57,8 @@ impl FromStr for AclAction {
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "allow" | "permit" | "accept" => Ok(Self::Allow),
-            "deny"  | "drop"   | "block"  => Ok(Self::Deny),
-            "log"   | "warn"              => Ok(Self::Log),
+            "deny" | "drop" | "block" => Ok(Self::Deny),
+            "log" | "warn" => Ok(Self::Log),
             other => Err(Error::Config(format!("unknown ACL action: '{}'", other))),
         }
     }
@@ -96,14 +96,9 @@ pub struct AclRule {
 }
 
 impl AclRule {
-    pub fn new(
-        id: &str,
-        name: &str,
-        cidr: &str,
-        action: AclAction,
-        priority: i32,
-    ) -> Result<Self> {
-        let cidr = cidr.parse::<IpNetwork>()
+    pub fn new(id: &str, name: &str, cidr: &str, action: AclAction, priority: i32) -> Result<Self> {
+        let cidr = cidr
+            .parse::<IpNetwork>()
             .map_err(|e| Error::Config(format!("invalid CIDR '{}': {}", cidr, e)))?;
         Ok(Self {
             id: id.to_string(),
@@ -125,8 +120,7 @@ impl AclRule {
 
     /// Apply a direction filter
     pub fn applies_to(&self, dir: Direction) -> bool {
-        matches!(self.direction, Direction::Both)
-            || self.direction == dir
+        matches!(self.direction, Direction::Both) || self.direction == dir
     }
 
     pub fn with_direction(mut self, dir: Direction) -> Self {
@@ -157,17 +151,19 @@ pub enum AclResult {
     /// Traffic allowed
     Allowed { rule_id: Option<String> },
     /// Traffic denied
-    Denied  { rule_id: String, reason: String },
+    Denied { rule_id: String, reason: String },
     /// Traffic allowed but logged
-    Logged  { rule_id: String },
+    Logged { rule_id: String },
     /// No rule matched — default policy applied
     Default { allowed: bool },
 }
 
 impl AclResult {
     pub fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allowed { .. } | Self::Logged { .. }
-            | Self::Default { allowed: true })
+        matches!(
+            self,
+            Self::Allowed { .. } | Self::Logged { .. } | Self::Default { allowed: true }
+        )
     }
 }
 
@@ -189,7 +185,7 @@ pub struct AclConfig {
 impl Default for AclConfig {
     fn default() -> Self {
         Self {
-            default_action: AclAction::Allow,  // permissive by default
+            default_action: AclAction::Allow, // permissive by default
             log_denied: true,
             log_allowed: false,
         }
@@ -199,7 +195,10 @@ impl Default for AclConfig {
 impl AclConfig {
     /// Deny-by-default (whitelist mode)
     pub fn deny_default() -> Self {
-        Self { default_action: AclAction::Deny, ..Default::default() }
+        Self {
+            default_action: AclAction::Deny,
+            ..Default::default()
+        }
     }
 }
 
@@ -282,11 +281,16 @@ impl AclManager {
     /// Enable or disable a rule without removing it
     pub async fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let mut rules = self.rules.write().await;
-        let rule = rules.get_mut(id)
+        let rule = rules
+            .get_mut(id)
             .ok_or_else(|| Error::Config(format!("ACL rule '{}' not found", id)))?;
         rule.enabled = enabled;
         rule.updated_at = unix_now();
-        info!("ACL: rule '{}' {}", id, if enabled { "enabled" } else { "disabled" });
+        info!(
+            "ACL: rule '{}' {}",
+            id,
+            if enabled { "enabled" } else { "disabled" }
+        );
         Ok(())
     }
 
@@ -296,9 +300,8 @@ impl AclManager {
         let config = self.config.read().await;
 
         // Sort rules by priority (descending — higher priority first)
-        let mut sorted: Vec<&AclRule> = rules.values()
-            .filter(|r| r.applies_to(direction))
-            .collect();
+        let mut sorted: Vec<&AclRule> =
+            rules.values().filter(|r| r.applies_to(direction)).collect();
         sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         // Evaluate first match
@@ -309,7 +312,9 @@ impl AclManager {
                         if config.log_allowed {
                             debug!("ACL: {} ALLOWED by rule '{}'", ip, rule.id);
                         }
-                        AclResult::Allowed { rule_id: Some(rule.id.clone()) }
+                        AclResult::Allowed {
+                            rule_id: Some(rule.id.clone()),
+                        }
                     }
                     AclAction::Deny => {
                         if config.log_denied {
@@ -317,13 +322,14 @@ impl AclManager {
                         }
                         AclResult::Denied {
                             rule_id: rule.id.clone(),
-                            reason: rule.comment.clone()
-                                .unwrap_or_else(|| rule.name.clone()),
+                            reason: rule.comment.clone().unwrap_or_else(|| rule.name.clone()),
                         }
                     }
                     AclAction::Log => {
                         warn!("ACL: {} matched LOG rule '{}' ({})", ip, rule.id, rule.name);
-                        AclResult::Logged { rule_id: rule.id.clone() }
+                        AclResult::Logged {
+                            rule_id: rule.id.clone(),
+                        }
                     }
                 };
 
@@ -334,8 +340,8 @@ impl AclManager {
                 stats.total_checked += 1;
                 match &result {
                     AclResult::Allowed { .. } => stats.allowed += 1,
-                    AclResult::Denied  { .. } => stats.denied  += 1,
-                    AclResult::Logged  { .. } => stats.logged  += 1,
+                    AclResult::Denied { .. } => stats.denied += 1,
+                    AclResult::Logged { .. } => stats.logged += 1,
                     _ => {}
                 }
                 return result;
@@ -353,7 +359,11 @@ impl AclManager {
         let mut stats = self.stats.write().await;
         stats.total_checked += 1;
         stats.default_applied += 1;
-        if allowed { stats.allowed += 1; } else { stats.denied += 1; }
+        if allowed {
+            stats.allowed += 1;
+        } else {
+            stats.denied += 1;
+        }
 
         AclResult::Default { allowed }
     }
@@ -398,7 +408,9 @@ impl AclManager {
         let mut count = 0u32;
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             let parts: Vec<&str> = line.splitn(5, '|').collect();
             if parts.len() < 5 {
                 warn!("ACL: skipping malformed rule: {}", line);
@@ -408,7 +420,9 @@ impl AclManager {
                 (parts[0], parts[1], parts[2], parts[3], parts[4]);
 
             let action = action_str.parse::<AclAction>()?;
-            let priority = prio_str.trim().parse::<i32>()
+            let priority = prio_str
+                .trim()
+                .parse::<i32>()
                 .map_err(|_| Error::Config(format!("invalid priority: {}", prio_str)))?;
 
             let rule = AclRule::new(id.trim(), name.trim(), cidr.trim(), action, priority)?;
@@ -424,9 +438,11 @@ impl AclManager {
         let rules = self.rules.read().await;
         let mut sorted: Vec<&AclRule> = rules.values().collect();
         sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
-        sorted.iter().map(|r| {
-            format!("{}|{}|{}|{}|{}", r.id, r.name, r.cidr, r.action, r.priority)
-        }).collect::<Vec<_>>().join("\n")
+        sorted
+            .iter()
+            .map(|r| format!("{}|{}|{}|{}|{}", r.id, r.name, r.cidr, r.action, r.priority))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Update the default action at runtime
@@ -439,7 +455,8 @@ impl AclManager {
     pub async fn block_ip(&self, ip: IpAddr, reason: &str) -> Result<()> {
         let cidr = format!("{}/128", ip);
         // Try /128 for IPv6, fall back to /32 for IPv4
-        let cidr = cidr.parse::<IpNetwork>()
+        let cidr = cidr
+            .parse::<IpNetwork>()
             .or_else(|_| format!("{}/32", ip).parse::<IpNetwork>())
             .map_err(|e| Error::Config(format!("invalid IP {}: {}", ip, e)))?;
 
@@ -472,7 +489,9 @@ mod tests {
         AclRule::new(id, id, cidr, AclAction::Deny, prio).unwrap()
     }
 
-    fn ip(s: &str) -> IpAddr { s.parse().unwrap() }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     // ── AclRule ───────────────────────────────────────────────────────────────
 
@@ -502,9 +521,9 @@ mod tests {
     #[test]
     fn test_action_from_str() {
         assert_eq!("allow".parse::<AclAction>().unwrap(), AclAction::Allow);
-        assert_eq!("deny".parse::<AclAction>().unwrap(),  AclAction::Deny);
+        assert_eq!("deny".parse::<AclAction>().unwrap(), AclAction::Deny);
         assert_eq!("block".parse::<AclAction>().unwrap(), AclAction::Deny);
-        assert_eq!("log".parse::<AclAction>().unwrap(),   AclAction::Log);
+        assert_eq!("log".parse::<AclAction>().unwrap(), AclAction::Log);
         assert!("invalid".parse::<AclAction>().is_err());
     }
 
@@ -535,7 +554,9 @@ mod tests {
     #[tokio::test]
     async fn test_allow_rule_matches() {
         let acl = AclManager::new_restrictive(); // default deny
-        acl.add_rule(allow_rule("trusted", "192.168.0.0/16", 100)).await.unwrap();
+        acl.add_rule(allow_rule("trusted", "192.168.0.0/16", 100))
+            .await
+            .unwrap();
 
         let r = acl.check(ip("192.168.5.10"), Direction::Inbound).await;
         assert!(r.is_allowed(), "should match allow rule");
@@ -545,7 +566,9 @@ mod tests {
     #[tokio::test]
     async fn test_deny_rule_matches() {
         let acl = AclManager::new_permissive(); // default allow
-        acl.add_rule(deny_rule("blocked", "10.10.0.0/16", 100)).await.unwrap();
+        acl.add_rule(deny_rule("blocked", "10.10.0.0/16", 100))
+            .await
+            .unwrap();
 
         let r = acl.check(ip("10.10.5.5"), Direction::Inbound).await;
         assert!(!r.is_allowed(), "should match deny rule");
@@ -558,9 +581,13 @@ mod tests {
     async fn test_higher_priority_wins() {
         let acl = AclManager::new_permissive();
         // Deny the whole /16 at low priority
-        acl.add_rule(deny_rule("deny-range", "10.0.0.0/16", 50)).await.unwrap();
+        acl.add_rule(deny_rule("deny-range", "10.0.0.0/16", 50))
+            .await
+            .unwrap();
         // Allow a specific /32 at higher priority
-        acl.add_rule(allow_rule("allow-host", "10.0.0.5/32", 200)).await.unwrap();
+        acl.add_rule(allow_rule("allow-host", "10.0.0.5/32", 200))
+            .await
+            .unwrap();
 
         // The specific host should be allowed despite the /16 deny
         let r = acl.check(ip("10.0.0.5"), Direction::Inbound).await;
@@ -568,7 +595,10 @@ mod tests {
 
         // Other IPs in the range should still be denied
         let r2 = acl.check(ip("10.0.0.10"), Direction::Inbound).await;
-        assert!(!r2.is_allowed(), "lower priority deny should apply to other IPs");
+        assert!(
+            !r2.is_allowed(),
+            "lower priority deny should apply to other IPs"
+        );
     }
 
     // ── Rule management ───────────────────────────────────────────────────────
@@ -576,7 +606,9 @@ mod tests {
     #[tokio::test]
     async fn test_remove_rule() {
         let acl = AclManager::new_permissive();
-        acl.add_rule(deny_rule("r1", "5.5.5.0/24", 100)).await.unwrap();
+        acl.add_rule(deny_rule("r1", "5.5.5.0/24", 100))
+            .await
+            .unwrap();
         assert_eq!(acl.rule_count().await, 1);
 
         acl.remove_rule("r1").await.unwrap();
@@ -596,7 +628,9 @@ mod tests {
     #[tokio::test]
     async fn test_disable_rule() {
         let acl = AclManager::new_permissive();
-        acl.add_rule(deny_rule("r1", "7.7.7.0/24", 100)).await.unwrap();
+        acl.add_rule(deny_rule("r1", "7.7.7.0/24", 100))
+            .await
+            .unwrap();
 
         // Rule active → denied
         let r = acl.check(ip("7.7.7.7"), Direction::Inbound).await;
@@ -643,8 +677,12 @@ r3|warn_zone|172.16.0.0/12|log|50\n";
     #[tokio::test]
     async fn test_export_to_text() {
         let acl = AclManager::new_permissive();
-        acl.add_rule(allow_rule("r1", "10.0.0.0/8", 100)).await.unwrap();
-        acl.add_rule(deny_rule("r2", "1.2.3.4/32", 200)).await.unwrap();
+        acl.add_rule(allow_rule("r1", "10.0.0.0/8", 100))
+            .await
+            .unwrap();
+        acl.add_rule(deny_rule("r2", "1.2.3.4/32", 200))
+            .await
+            .unwrap();
 
         let text = acl.export_to_text().await;
         assert!(text.contains("r1"), "export should contain r1");
@@ -670,7 +708,9 @@ r3|warn_zone|172.16.0.0/12|log|50\n";
     #[tokio::test]
     async fn test_stats_counting() {
         let acl = AclManager::new_permissive();
-        acl.add_rule(deny_rule("deny", "9.9.9.0/24", 100)).await.unwrap();
+        acl.add_rule(deny_rule("deny", "9.9.9.0/24", 100))
+            .await
+            .unwrap();
 
         acl.check(ip("1.1.1.1"), Direction::Inbound).await; // allowed (default)
         acl.check(ip("9.9.9.9"), Direction::Inbound).await; // denied (rule)
@@ -715,8 +755,17 @@ r3|warn_zone|172.16.0.0/12|log|50\n";
     async fn test_ipv6_rule() {
         let acl = AclManager::new_permissive();
         acl.add_rule(
-            AclRule::new("v6-block", "v6 block", "2001:db8::/32", AclAction::Deny, 100).unwrap()
-        ).await.unwrap();
+            AclRule::new(
+                "v6-block",
+                "v6 block",
+                "2001:db8::/32",
+                AclAction::Deny,
+                100,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
         let r = acl.check(ip("2001:db8::1"), Direction::Inbound).await;
         assert!(!r.is_allowed());

@@ -22,7 +22,6 @@ pub enum Error {
     //
     // #[error("sqlx error: {0}")]
     // Sqlx(#[from] sqlx::Error),
-
     #[error("{0}")]
     Other(String),
 }

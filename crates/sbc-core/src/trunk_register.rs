@@ -55,7 +55,10 @@ mod tests {
     fn test_parse_status() {
         assert_eq!(parse_status("SIP/2.0 200 OK\r\n"), 200);
         assert_eq!(parse_status("SIP/2.0 401 Unauthorized\r\n"), 401);
-        assert_eq!(parse_status("SIP/2.0 407 Proxy Authentication Required\r\n"), 407);
+        assert_eq!(
+            parse_status("SIP/2.0 407 Proxy Authentication Required\r\n"),
+            407
+        );
         assert_eq!(parse_status(""), 0);
     }
 

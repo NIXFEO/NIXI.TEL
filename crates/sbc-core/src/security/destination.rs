@@ -25,9 +25,15 @@ pub struct DestinationsConfig {
     pub seed_irsf_rules: bool,
 }
 
-fn default_enabled() -> bool { true }
-fn default_action() -> String { "allow".to_string() }
-fn default_cc() -> String { "33".to_string() }
+fn default_enabled() -> bool {
+    true
+}
+fn default_action() -> String {
+    "allow".to_string()
+}
+fn default_cc() -> String {
+    "33".to_string()
+}
 
 impl Default for DestinationsConfig {
     fn default() -> Self {
@@ -66,7 +72,10 @@ pub struct DestinationRule {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DestinationDecision {
     Allowed,
-    Blocked { rule_id: String, description: String },
+    Blocked {
+        rule_id: String,
+        description: String,
+    },
 }
 
 pub struct DestinationPolicy {
@@ -127,7 +136,10 @@ impl DestinationPolicy {
     /// "+…" passthrough; non-numeric strings returned as-is (matched
     /// literally, so rules like "08" still work on raw dial strings).
     pub fn canonicalize(&self, dialed: &str) -> String {
-        let digits: String = dialed.chars().filter(|c| !matches!(c, ' ' | '-' | '.')).collect();
+        let digits: String = dialed
+            .chars()
+            .filter(|c| !matches!(c, ' ' | '-' | '.'))
+            .collect();
         if digits.starts_with('+') {
             return digits;
         }
@@ -257,26 +269,44 @@ mod tests {
         let p = policy();
         // Global deny on +33899 premium, but allow a longer carve-out prefix
         p.add_rule(DestinationRule {
-            id: "deny899".into(), prefix: "+33899".into(), deny: true,
-            user: None, description: "premium".into(), enabled: true,
+            id: "deny899".into(),
+            prefix: "+33899".into(),
+            deny: true,
+            user: None,
+            description: "premium".into(),
+            enabled: true,
         });
         p.add_rule(DestinationRule {
-            id: "allow8991".into(), prefix: "+338991".into(), deny: false,
-            user: None, description: "carve-out".into(), enabled: true,
+            id: "allow8991".into(),
+            prefix: "+338991".into(),
+            deny: false,
+            user: None,
+            description: "carve-out".into(),
+            enabled: true,
         });
-        assert!(matches!(p.check("0899000000", None), DestinationDecision::Blocked { .. }));
+        assert!(matches!(
+            p.check("0899000000", None),
+            DestinationDecision::Blocked { .. }
+        ));
         assert_eq!(p.check("0899100000", None), DestinationDecision::Allowed);
 
         // Per-user deny beats global allow
         p.add_rule(DestinationRule {
-            id: "alice-no-intl".into(), prefix: "+1".into(), deny: true,
-            user: Some("alice".into()), description: "no US for alice".into(), enabled: true,
+            id: "alice-no-intl".into(),
+            prefix: "+1".into(),
+            deny: true,
+            user: Some("alice".into()),
+            description: "no US for alice".into(),
+            enabled: true,
         });
         assert!(matches!(
             p.check("+12125551234", Some("alice")),
             DestinationDecision::Blocked { .. }
         ));
-        assert_eq!(p.check("+12125551234", Some("bob")), DestinationDecision::Allowed);
+        assert_eq!(
+            p.check("+12125551234", Some("bob")),
+            DestinationDecision::Allowed
+        );
     }
 
     #[test]
@@ -284,19 +314,30 @@ mod tests {
         let p = policy();
         p.set_default_action(true);
         p.add_rule(DestinationRule {
-            id: "fr".into(), prefix: "+33".into(), deny: false,
-            user: None, description: "France ok".into(), enabled: true,
+            id: "fr".into(),
+            prefix: "+33".into(),
+            deny: false,
+            user: None,
+            description: "France ok".into(),
+            enabled: true,
         });
         assert_eq!(p.check("0612345678", None), DestinationDecision::Allowed);
-        assert!(matches!(p.check("+4912345", None), DestinationDecision::Blocked { .. }));
+        assert!(matches!(
+            p.check("+4912345", None),
+            DestinationDecision::Blocked { .. }
+        ));
     }
 
     #[test]
     fn disabled_rule_ignored() {
         let p = policy();
         p.add_rule(DestinationRule {
-            id: "off".into(), prefix: "+33".into(), deny: true,
-            user: None, description: "disabled".into(), enabled: false,
+            id: "off".into(),
+            prefix: "+33".into(),
+            deny: true,
+            user: None,
+            description: "disabled".into(),
+            enabled: false,
         });
         assert_eq!(p.check("0612345678", None), DestinationDecision::Allowed);
     }

@@ -13,9 +13,11 @@
 //!   - The 200 OK SDP sent to caller contains `ports_a.rtp` → caller sends to leg-A.
 //!   - The INVITE SDP sent to callee contains `ports_b.rtp` → callee sends to leg-B.
 
-use crate::media::PortPair;
 use crate::media::srtp::SrtpContext;
-use crate::media::stun::{classify_packet, build_binding_response_with_integrity, MultiplexedPacketType};
+use crate::media::stun::{
+    build_binding_response_with_integrity, classify_packet, MultiplexedPacketType,
+};
+use crate::media::PortPair;
 use crate::transcoding::Transcoder;
 use crate::{Error, Result};
 use std::net::SocketAddr;
@@ -154,7 +156,6 @@ pub struct RtpSession {
     ice_pwd_local: Option<String>,
 
     // ── Leg-B WebRTC support (PSTN → WebRTC callee) ──────────────────
-
     /// Channel to route DTLS packets from leg-B to the DTLS handshake task.
     dtls_packet_tx_b: Option<mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>>,
 
@@ -404,7 +405,9 @@ impl RtpSession {
     pub fn set_transcoder_a_to_b(&mut self, transcoder: Arc<Transcoder>) {
         info!(
             "Session {} transcoding A→B: {} → {}",
-            self.session_id, transcoder.src.name(), transcoder.dst.name()
+            self.session_id,
+            transcoder.src.name(),
+            transcoder.dst.name()
         );
         self.transcoder_a_to_b = Some(transcoder);
     }
@@ -425,7 +428,9 @@ impl RtpSession {
     pub fn set_transcoder_b_to_a(&mut self, transcoder: Arc<Transcoder>) {
         info!(
             "Session {} transcoding B→A: {} → {}",
-            self.session_id, transcoder.src.name(), transcoder.dst.name()
+            self.session_id,
+            transcoder.src.name(),
+            transcoder.dst.name()
         );
         self.transcoder_b_to_a = Some(transcoder);
     }
@@ -439,7 +444,11 @@ impl RtpSession {
     /// Used to decrypt SRTP from caller and encrypt RTP back to caller.
     /// Safe to call before or after start() — writes into shared Arc<Mutex<Option>>.
     pub fn set_srtp_context_a(&mut self, ctx: SrtpContext) {
-        info!("Session {} SRTP enabled on leg A ({})", self.session_id, ctx.crypto_suite());
+        info!(
+            "Session {} SRTP enabled on leg A ({})",
+            self.session_id,
+            ctx.crypto_suite()
+        );
         // For SDES-SRTP, same context handles both recv and send
         // We clone the context for the send direction
         let recv_shared = self.srtp_recv_ctx_a.clone();
@@ -456,7 +465,11 @@ impl RtpSession {
     /// Set SRTP context for leg B (callee side)
     /// Used to decrypt SRTP from callee and encrypt RTP back to callee.
     pub fn set_srtp_context_b(&self, ctx: SrtpContext) {
-        info!("Session {} SRTP enabled on leg B ({})", self.session_id, ctx.crypto_suite());
+        info!(
+            "Session {} SRTP enabled on leg B ({})",
+            self.session_id,
+            ctx.crypto_suite()
+        );
         let shared = self.srtp_context_b.clone();
         tokio::spawn(async move {
             *shared.lock().await = Some(ctx);
@@ -496,13 +509,23 @@ impl RtpSession {
     /// Enable WebRTC mode on leg A — activates STUN/DTLS/RTP demuxing.
     /// Returns a receiver for DTLS packets that will arrive on the RTP socket.
     /// `ice_pwd` is the SBC's local ICE password, used for STUN MESSAGE-INTEGRITY.
-    pub fn enable_webrtc_mode_a(&mut self, ice_pwd: Option<String>) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
+    pub fn enable_webrtc_mode_a(
+        &mut self,
+        ice_pwd: Option<String>,
+    ) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.dtls_packet_tx = Some(tx);
         self.webrtc_mode_a = true;
         self.ice_pwd_local = ice_pwd;
-        info!("Session {} WebRTC mode enabled on leg A (STUN/DTLS/RTP demux, ICE-pwd={})",
-            self.session_id, if self.ice_pwd_local.is_some() { "set" } else { "none" });
+        info!(
+            "Session {} WebRTC mode enabled on leg A (STUN/DTLS/RTP demux, ICE-pwd={})",
+            self.session_id,
+            if self.ice_pwd_local.is_some() {
+                "set"
+            } else {
+                "none"
+            }
+        );
         rx
     }
 
@@ -513,13 +536,23 @@ impl RtpSession {
 
     /// Enable WebRTC mode on leg B — activates STUN/DTLS/RTP demuxing on callee port.
     /// Returns a receiver for DTLS packets that will arrive on the leg-B RTP socket.
-    pub fn enable_webrtc_mode_b(&mut self, ice_pwd: Option<String>) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
+    pub fn enable_webrtc_mode_b(
+        &mut self,
+        ice_pwd: Option<String>,
+    ) -> mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.dtls_packet_tx_b = Some(tx);
         self.webrtc_mode_b = true;
         self.ice_pwd_local_b = ice_pwd;
-        info!("Session {} WebRTC mode enabled on leg B (STUN/DTLS/RTP demux, ICE-pwd={})",
-            self.session_id, if self.ice_pwd_local_b.is_some() { "set" } else { "none" });
+        info!(
+            "Session {} WebRTC mode enabled on leg B (STUN/DTLS/RTP demux, ICE-pwd={})",
+            self.session_id,
+            if self.ice_pwd_local_b.is_some() {
+                "set"
+            } else {
+                "none"
+            }
+        );
         rx
     }
 
@@ -618,8 +651,8 @@ impl RtpSession {
         }
 
         tokio::spawn(async move {
-            let mut buf_a    = vec![0u8; 4096];
-            let mut buf_b    = vec![0u8; 4096];
+            let mut buf_a = vec![0u8; 4096];
+            let mut buf_b = vec![0u8; 4096];
             let mut buf_rtcp_a = vec![0u8; 4096];
             let mut buf_rtcp_b = vec![0u8; 4096];
             let mut pkt_count: u64 = 0;
@@ -641,7 +674,8 @@ impl RtpSession {
 
             // RTP inactivity timeout: 90 seconds (covers DTLS handshake + ICE negotiation)
             let rtp_timeout_secs: u64 = 90;
-            let mut rtp_timeout_interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+            let mut rtp_timeout_interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(15));
             // Initialize last_activity to now
             stats.last_activity_secs.store(
                 std::time::SystemTime::now()
@@ -1397,7 +1431,10 @@ mod tests {
         assert_eq!(bytes[0], 0x80); // Version 2, no flags
         assert_eq!(bytes[1], 0x08); // PT=8
         assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 100);
-        assert_eq!(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 1000);
+        assert_eq!(
+            u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            1000
+        );
         assert_eq!(
             u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             0x12345678
@@ -1445,7 +1482,11 @@ mod tests {
         let ports_b = PortPair::new(10002).unwrap();
         let session = RtpSession::new_two_leg("test-session".to_string(), ports_a, ports_b).await;
 
-        assert!(session.is_ok(), "RtpSession creation failed: {:?}", session.err());
+        assert!(
+            session.is_ok(),
+            "RtpSession creation failed: {:?}",
+            session.err()
+        );
         let session = session.unwrap();
         assert_eq!(session.session_id, "test-session");
         assert_eq!(session.local_ports, ports_a);
@@ -1489,7 +1530,11 @@ mod tests {
         let ports_a = PortPair::new(10020).unwrap();
         let ports_b = PortPair::new(10022).unwrap();
         let session = RtpSession::new_two_leg("two-leg".to_string(), ports_a, ports_b).await;
-        assert!(session.is_ok(), "RtpSession two-leg creation failed: {:?}", session.err());
+        assert!(
+            session.is_ok(),
+            "RtpSession two-leg creation failed: {:?}",
+            session.err()
+        );
         let s = session.unwrap();
         assert_eq!(s.ports_a.rtp, 10020);
         assert_eq!(s.ports_b.rtp, 10022);

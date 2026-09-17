@@ -154,7 +154,10 @@ pub async fn apply_trunks_and_routes(
     // trunk name → extra prefixes from enabled routes
     let mut routes_by_trunk: HashMap<String, Vec<String>> = HashMap::new();
     for r in route_rows.into_iter().filter(|r| r.enabled) {
-        routes_by_trunk.entry(r.trunk_name).or_default().push(r.prefix);
+        routes_by_trunk
+            .entry(r.trunk_name)
+            .or_default()
+            .push(r.prefix);
     }
 
     let mut added = 0usize;
@@ -164,7 +167,10 @@ pub async fn apply_trunks_and_routes(
         trunk_rows.iter().map(|r| r.name.clone()).collect();
 
     for row in &trunk_rows {
-        let extra = routes_by_trunk.get(&row.name).map(|v| v.as_slice()).unwrap_or(&[]);
+        let extra = routes_by_trunk
+            .get(&row.name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let mut cfg = trunk_row_to_config(row, extra);
 
         if tm.find_by_name(&row.name).is_some() {
@@ -326,7 +332,10 @@ mod tests {
     async fn users_hydrate_excludes_disabled() {
         let store = ConfigStore::open_memory().await.unwrap();
         store.upsert_user(&user_row("alice", true)).await.unwrap();
-        store.upsert_user(&user_row("mallory", false)).await.unwrap();
+        store
+            .upsert_user(&user_row("mallory", false))
+            .await
+            .unwrap();
 
         let auth = DigestAuthenticator::new("sip.example.com", HashMap::new());
         let (_, _, total) = apply_users(&auth, &store).await.unwrap();
@@ -426,12 +435,18 @@ mod tests {
         assert_eq!(count, 1);
 
         let denied = acl
-            .check("198.51.100.7".parse().unwrap(), crate::acl::Direction::Inbound)
+            .check(
+                "198.51.100.7".parse().unwrap(),
+                crate::acl::Direction::Inbound,
+            )
             .await;
         assert!(!denied.is_allowed());
         // Default stays permissive for other IPs
         let allowed = acl
-            .check("203.0.113.1".parse().unwrap(), crate::acl::Direction::Inbound)
+            .check(
+                "203.0.113.1".parse().unwrap(),
+                crate::acl::Direction::Inbound,
+            )
             .await;
         assert!(allowed.is_allowed());
     }

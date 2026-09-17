@@ -55,10 +55,7 @@ impl UdpListener {
     }
 
     /// Start listening for SIP messages
-    pub async fn listen(
-        &self,
-        message_tx: mpsc::UnboundedSender<ReceivedMessage>,
-    ) -> Result<()> {
+    pub async fn listen(&self, message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<()> {
         info!("Starting UDP listener on {}", self.local_addr);
 
         let socket = self.socket.clone();
@@ -82,7 +79,10 @@ impl UdpListener {
             // Skip CRLF keep-alive pings (RFC 5626 §4.4.1)
             // Linphone and other SIP clients send periodic "\r\n\r\n" or
             // "\r\n" as connection keep-alive over UDP outbound flows.
-            let non_ws = data.iter().filter(|&&b| b != b'\r' && b != b'\n' && b != b' ').count();
+            let non_ws = data
+                .iter()
+                .filter(|&&b| b != b'\r' && b != b'\n' && b != b' ')
+                .count();
             if non_ws == 0 {
                 trace!("SIP keep-alive (CRLF) from {} ({} bytes)", peer_addr, len);
                 continue;
@@ -103,7 +103,10 @@ impl UdpListener {
                         .chars()
                         .take(300)
                         .collect::<String>();
-                    warn!("Failed to parse SIP message from {}: {} — raw: {}", peer_addr, e, snippet);
+                    warn!(
+                        "Failed to parse SIP message from {}: {} — raw: {}",
+                        peer_addr, e, snippet
+                    );
                     // Continue listening for other messages
                 }
             }
@@ -115,9 +118,8 @@ impl UdpListener {
     /// Parse SIP message from raw bytes
     fn parse_sip_message(data: &[u8], source: SocketAddr) -> Result<ReceivedMessage> {
         // Use rsip to parse the message
-        let message = SipMessage::try_from(data).map_err(|e| {
-            Error::Parse(format!("Failed to parse SIP message: {}", e))
-        })?;
+        let message = SipMessage::try_from(data)
+            .map_err(|e| Error::Parse(format!("Failed to parse SIP message: {}", e)))?;
 
         debug!(
             "Parsed SIP message: {} from {}",
@@ -189,10 +191,7 @@ mod tests {
                         Content-Length: 0\r\n\
                         \r\n";
 
-        let result = UdpListener::parse_sip_message(
-            sip_msg,
-            "192.168.1.1:5060".parse().unwrap(),
-        );
+        let result = UdpListener::parse_sip_message(sip_msg, "192.168.1.1:5060".parse().unwrap());
 
         assert!(result.is_ok());
         let received = result.unwrap();
@@ -209,10 +208,8 @@ mod tests {
     async fn test_parse_invalid_message() {
         let invalid_msg = b"This is not a SIP message";
 
-        let result = UdpListener::parse_sip_message(
-            invalid_msg,
-            "192.168.1.1:5060".parse().unwrap(),
-        );
+        let result =
+            UdpListener::parse_sip_message(invalid_msg, "192.168.1.1:5060".parse().unwrap());
 
         assert!(result.is_err());
     }

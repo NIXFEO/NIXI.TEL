@@ -40,8 +40,12 @@ pub struct BanBody {
     pub reason: String,
 }
 
-fn default_ban_secs() -> u64 { 3600 }
-fn default_reason() -> String { "manual".to_string() }
+fn default_ban_secs() -> u64 {
+    3600
+}
+fn default_reason() -> String {
+    "manual".to_string()
+}
 
 pub async fn create_ban(
     State(state): State<AppState>,
@@ -51,10 +55,11 @@ pub async fn create_ban(
         .ip
         .parse()
         .map_err(|_| ApiError::bad_request(format!("invalid IP: {}", body.ip)))?;
-    let entry = state
-        .security
-        .bans
-        .ban(ip, Duration::from_secs(body.duration_secs.max(1)), &body.reason);
+    let entry = state.security.bans.ban(
+        ip,
+        Duration::from_secs(body.duration_secs.max(1)),
+        &body.reason,
+    );
 
     // Persist so restarts keep the ban
     if let Some(store) = &state.store {
@@ -127,7 +132,10 @@ pub async fn create_destination_rule(
         enabled: true,
     };
     state.security.destinations.add_rule(rule.clone());
-    Ok((StatusCode::CREATED, Json(serde_json::to_value(&rule).unwrap_or_default())))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::to_value(&rule).unwrap_or_default()),
+    ))
 }
 
 pub async fn delete_destination_rule(
@@ -246,14 +254,39 @@ fn rfc3339(t: std::time::SystemTime) -> String {
     loop {
         let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
         let len = if leap { 366 } else { 365 };
-        if rem < len { break; }
+        if rem < len {
+            break;
+        }
         rem -= len;
         y += 1;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let month_len = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_len = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0;
-    while rem >= month_len[m] { rem -= month_len[m]; m += 1; }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m + 1, rem + 1, rem_secs / 3600, (rem_secs % 3600) / 60, rem_secs % 60)
+    while rem >= month_len[m] {
+        rem -= month_len[m];
+        m += 1;
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m + 1,
+        rem + 1,
+        rem_secs / 3600,
+        (rem_secs % 3600) / 60,
+        rem_secs % 60
+    )
 }

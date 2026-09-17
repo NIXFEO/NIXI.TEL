@@ -13,20 +13,20 @@ pub mod hydrate;
 pub mod import;
 
 use crate::acl::{AclManager, Direction};
-use crate::auth::{DigestAuthenticator, DigestChallenge, generate_digest_response};
+use crate::auth::{generate_digest_response, DigestAuthenticator, DigestChallenge};
 use crate::b2bua::B2buaManager;
 use crate::config::{DidMapping, NetworkConfig, SbcConfig};
 use crate::dos::{DosProtector, RateLimitConfig};
 use crate::maintenance::{MaintenanceConfig, MaintenanceHandle, MaintenanceTask};
-use crate::media::MediaManager;
 use crate::media::dtls::DtlsUdpBridge;
 use crate::media::sdp::transform_webrtc_to_trunk;
 use crate::media::webrtc_handler::WebRtcSession;
+use crate::media::MediaManager;
 use crate::metrics::SbcMetrics;
 use crate::register::{InMemoryRegistrar, RegisterHandler, RegisterResult};
 use crate::routing::router::Router;
 use crate::routing::trunk::NumberFormat;
-use crate::routing::{TrunkManager, TrunkConfig};
+use crate::routing::{TrunkConfig, TrunkManager};
 use crate::storage::CdrManager;
 use crate::topology::{apply_topology_hiding_outbound, SbcIdentity};
 use crate::transport::manager::TransportManager;
@@ -135,9 +135,12 @@ impl Sbc {
 
         // --- Media ---
         let port_range = config.media.rtp_port_range.0..config.media.rtp_port_range.1;
-        let public_ip = config.network.public_ipv4.map(|ip| std::net::IpAddr::V4(
-            match ip { std::net::IpAddr::V4(v4) => v4, std::net::IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED }
-        ));
+        let public_ip = config.network.public_ipv4.map(|ip| {
+            std::net::IpAddr::V4(match ip {
+                std::net::IpAddr::V4(v4) => v4,
+                std::net::IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED,
+            })
+        });
         let mut media_mgr = MediaManager::with_port_range(port_range, public_ip);
         media_mgr.set_global_rtp_counter(metrics.rtp_packets_total.clone());
         media_mgr.set_global_srtp_encrypt_counter(metrics.srtp_encrypted_total.clone());
@@ -162,13 +165,13 @@ impl Sbc {
                 "TCP" => crate::routing::TransportType::Tcp,
                 "TLS" => crate::routing::TransportType::Tls,
                 "WSS" => crate::routing::TransportType::Wss,
-                "WS"  => crate::routing::TransportType::Ws,
-                _     => crate::routing::TransportType::Udp,
+                "WS" => crate::routing::TransportType::Ws,
+                _ => crate::routing::TransportType::Udp,
             };
             let number_format = match tc.number_format.to_lowercase().as_str() {
                 "national" => NumberFormat::National,
-                "local"    => NumberFormat::Local,
-                _          => NumberFormat::E164,
+                "local" => NumberFormat::Local,
+                _ => NumberFormat::E164,
             };
             let mut trunk = TrunkConfig {
                 id: uuid::Uuid::new_v4(),
@@ -208,8 +211,14 @@ impl Sbc {
 
             // Resolve DNS for hostnames (e.g. trunk.example.com → IP)
             match trunk.resolve_destination().await {
-                Some(addr) => info!("Loaded trunk '{}' from config → resolved {}:{} → {}", trunk.name, trunk.host, trunk.port, addr),
-                None => warn!("Trunk '{}': DNS resolution failed for {}:{} — will retry", trunk.name, trunk.host, trunk.port),
+                Some(addr) => info!(
+                    "Loaded trunk '{}' from config → resolved {}:{} → {}",
+                    trunk.name, trunk.host, trunk.port, addr
+                ),
+                None => warn!(
+                    "Trunk '{}': DNS resolution failed for {}:{} — will retry",
+                    trunk.name, trunk.host, trunk.port
+                ),
             }
 
             let trunk_id = trunk_manager.add_trunk(trunk);
@@ -275,7 +284,10 @@ impl Sbc {
                     Arc::new(mgr)
                 }
                 Err(e) => {
-                    warn!("CDR file storage failed ({}), using memory: {}", cdr_file, e);
+                    warn!(
+                        "CDR file storage failed ({}), using memory: {}",
+                        cdr_file, e
+                    );
                     Arc::new(CdrManager::new_memory())
                 }
             }
@@ -292,7 +304,8 @@ impl Sbc {
         let did_mappings = Arc::new(tokio::sync::RwLock::new(config.dids.clone()));
 
         // --- SQLite config store (dynamic config source of truth) ---
-        let config_store = match sbc_storage::ConfigStore::open(&config.database.sqlite_path).await {
+        let config_store = match sbc_storage::ConfigStore::open(&config.database.sqlite_path).await
+        {
             Ok(store) => {
                 let store = Arc::new(store);
                 import::first_boot_import(&store, config).await;
@@ -306,7 +319,10 @@ impl Sbc {
                     acl: acl.clone(),
                 };
                 if let Err(e) = hydrate::hydrate_all(&handles, &store).await {
-                    warn!("Hydration from config store failed: {} — TOML values remain active", e);
+                    warn!(
+                        "Hydration from config store failed: {} — TOML values remain active",
+                        e
+                    );
                 }
 
                 // Restore persisted bans (restart must not amnesty offenders)
@@ -338,13 +354,18 @@ impl Sbc {
 
         // ── Collect trunk IPs for inbound INVITE whitelist ──
         // (after hydration, so API/store-defined trunks are included)
-        let trunk_ips_vec: Vec<String> = trunk_manager.list_trunks().iter()
+        let trunk_ips_vec: Vec<String> = trunk_manager
+            .list_trunks()
+            .iter()
             .filter_map(|t| t.resolved_addr.map(|a| a.ip().to_string()))
             .chain(trunk_manager.list_trunks().iter().map(|t| t.host.clone()))
             .chain(config.trunks.iter().map(|t| t.host.clone()))
             .collect();
         if !trunk_ips_vec.is_empty() {
-            info!("Trunk IPs whitelisted for inbound INVITE: {:?}", trunk_ips_vec);
+            info!(
+                "Trunk IPs whitelisted for inbound INVITE: {:?}",
+                trunk_ips_vec
+            );
         }
         let trunk_ips = Arc::new(tokio::sync::RwLock::new(trunk_ips_vec));
 
@@ -377,10 +398,12 @@ impl Sbc {
             events,
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
             security,
-            session_timer: config.security.session_timer_enabled.then(|| (
-                config.security.session_expires.max(config.security.min_se) as u32,
-                config.security.min_se as u32,
-            )),
+            session_timer: config.security.session_timer_enabled.then(|| {
+                (
+                    config.security.session_expires.max(config.security.min_se) as u32,
+                    config.security.min_se as u32,
+                )
+            }),
         })
     }
 
@@ -402,7 +425,9 @@ impl Sbc {
     /// Persist a ban to the config store (fire-and-forget) so restarts
     /// do not amnesty offenders.
     pub fn persist_ban(&self, entry: &crate::security::BanEntry) {
-        let Some(store) = self.config_store.clone() else { return };
+        let Some(store) = self.config_store.clone() else {
+            return;
+        };
         let row = sbc_storage::BanRow {
             ip: entry.ip.to_string(),
             reason: entry.reason.clone(),
@@ -443,7 +468,9 @@ impl Sbc {
     /// Currently reloads: SIP users (Digest auth), trunks.
     /// Preserves: transport listeners, active calls, registrations, nonces.
     pub async fn reload_config(&mut self) -> Result<()> {
-        let path = self.config_path.as_deref()
+        let path = self
+            .config_path
+            .as_deref()
             .ok_or_else(|| Error::Config("No config path set for reload".to_string()))?;
 
         info!("SIGHUP: reloading configuration from {}", path);
@@ -453,12 +480,17 @@ impl Sbc {
         // ── RFC 4028 session-timer offer: applied without a restart, so an
         // operator can raise session_expires to a trunk's floor (e.g. 14400
         // for Genesys) on the fly. Affects new calls only.
-        let session_timer = config.security.session_timer_enabled.then(|| (
-            config.security.session_expires.max(config.security.min_se) as u32,
-            config.security.min_se as u32,
-        ));
+        let session_timer = config.security.session_timer_enabled.then(|| {
+            (
+                config.security.session_expires.max(config.security.min_se) as u32,
+                config.security.min_se as u32,
+            )
+        });
         if session_timer != self.session_timer {
-            info!("Reload: session timers {:?} → {:?}", self.session_timer, session_timer);
+            info!(
+                "Reload: session timers {:?} → {:?}",
+                self.session_timer, session_timer
+            );
             self.session_timer = session_timer;
         }
 
@@ -500,10 +532,15 @@ impl Sbc {
         // We add new trunks and update existing ones by name.
         let mut trunks_added = 0u32;
         for tc in &config.trunks {
-            if !tc.enabled { continue; }
+            if !tc.enabled {
+                continue;
+            }
 
             // Check if trunk already exists (by name)
-            let existing = self.trunk_manager.list_trunks().iter()
+            let existing = self
+                .trunk_manager
+                .list_trunks()
+                .iter()
                 .find(|t| t.name == tc.name)
                 .map(|t| t.id);
 
@@ -512,13 +549,13 @@ impl Sbc {
                     "TCP" => crate::routing::TransportType::Tcp,
                     "TLS" => crate::routing::TransportType::Tls,
                     "WSS" => crate::routing::TransportType::Wss,
-                    "WS"  => crate::routing::TransportType::Ws,
-                    _     => crate::routing::TransportType::Udp,
+                    "WS" => crate::routing::TransportType::Ws,
+                    _ => crate::routing::TransportType::Udp,
                 };
                 let number_format = match tc.number_format.to_lowercase().as_str() {
                     "national" => NumberFormat::National,
-                    "local"    => NumberFormat::Local,
-                    _          => NumberFormat::E164,
+                    "local" => NumberFormat::Local,
+                    _ => NumberFormat::E164,
                 };
                 let mut trunk = TrunkConfig {
                     id: uuid::Uuid::new_v4(),
@@ -561,7 +598,10 @@ impl Sbc {
             }
         }
         let total_trunks = self.trunk_manager.list_trunks().len();
-        info!("SIGHUP: trunks reloaded — {} total ({} added)", total_trunks, trunks_added);
+        info!(
+            "SIGHUP: trunks reloaded — {} total ({} added)",
+            total_trunks, trunks_added
+        );
 
         // Reload DID mappings
         {
@@ -605,7 +645,10 @@ impl Sbc {
 
     /// Rebuild the inbound-INVITE trunk IP whitelist from the trunk manager.
     pub async fn refresh_trunk_ips(&self) {
-        let ips: Vec<String> = self.trunk_manager.list_trunks().iter()
+        let ips: Vec<String> = self
+            .trunk_manager
+            .list_trunks()
+            .iter()
             .flat_map(|t| {
                 t.resolved_addr
                     .map(|a| a.ip().to_string())
@@ -706,13 +749,19 @@ impl Sbc {
             info!("Trunk '{}': sending REGISTER", trunk_name);
             match Self::send_trunk_register(&trunk, &sock, &identity, &pending).await {
                 Ok(expires) => {
-                    info!("Trunk '{}': registered successfully (expires={}s)", trunk_name, expires);
+                    info!(
+                        "Trunk '{}': registered successfully (expires={}s)",
+                        trunk_name, expires
+                    );
                     let sleep_secs = ((expires as f64) * 0.8) as u64;
                     let sleep_secs = sleep_secs.max(30).min(interval);
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                 }
                 Err(reason) => {
-                    warn!("Trunk '{}': REGISTER failed: {}, retrying in 60s", trunk_name, reason);
+                    warn!(
+                        "Trunk '{}': REGISTER failed: {}, retrying in 60s",
+                        trunk_name, reason
+                    );
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 }
             }
@@ -728,11 +777,19 @@ impl Sbc {
         identity: &Option<SbcIdentity>,
         pending: &Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
     ) -> std::result::Result<u32, String> {
-        let dest = trunk.destination()
+        let dest = trunk
+            .destination()
             .ok_or_else(|| format!("No destination for trunk '{}'", trunk.name))?;
 
-        let call_id = format!("reg-{}-{}", trunk.name, &uuid::Uuid::new_v4().to_string()[..8]);
-        let branch = format!("z9hG4bK{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]);
+        let call_id = format!(
+            "reg-{}-{}",
+            trunk.name,
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let branch = format!(
+            "z9hG4bK{}",
+            &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
+        );
         let tag = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
         let (sbc_ip, _sbc_domain) = match identity {
@@ -768,20 +825,31 @@ impl Sbc {
         pending.insert(call_id.clone(), tx);
 
         // Send via the shared socket (port 5060)
-        sock.send_to(register_msg.as_bytes(), dest).await
-            .map_err(|e| { pending.remove(&call_id); format!("Send failed: {}", e) })?;
+        sock.send_to(register_msg.as_bytes(), dest)
+            .await
+            .map_err(|e| {
+                pending.remove(&call_id);
+                format!("Send failed: {}", e)
+            })?;
 
-        debug!("Trunk '{}': sent REGISTER to {} via port 5060 (Call-ID: {})", trunk.name, dest, call_id);
+        debug!(
+            "Trunk '{}': sent REGISTER to {} via port 5060 (Call-ID: {})",
+            trunk.name, dest, call_id
+        );
 
         // Wait for response via the oneshot channel (routed by handle_response)
-        let response_raw = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            rx,
-        ).await {
-            Ok(Ok(raw)) => raw,
-            Ok(Err(_)) => { pending.remove(&call_id); return Err("Response channel closed".to_string()); }
-            Err(_) => { pending.remove(&call_id); return Err("Timeout (10s)".to_string()); }
-        };
+        let response_raw =
+            match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(_)) => {
+                    pending.remove(&call_id);
+                    return Err("Response channel closed".to_string());
+                }
+                Err(_) => {
+                    pending.remove(&call_id);
+                    return Err("Timeout (10s)".to_string());
+                }
+            };
 
         let status = crate::trunk_register::parse_status(&response_raw);
         debug!("Trunk '{}': got {} for REGISTER", trunk.name, status);
@@ -793,19 +861,40 @@ impl Sbc {
             }
             401 | 407 => {
                 // Extract challenge and retry with auth
-                let header_name = if status == 401 { "www-authenticate" } else { "proxy-authenticate" };
-                let challenge_str = crate::trunk_register::extract_header(&response_raw, header_name)
-                    .ok_or_else(|| format!("No {} header in {}", header_name, status))?;
+                let header_name = if status == 401 {
+                    "www-authenticate"
+                } else {
+                    "proxy-authenticate"
+                };
+                let challenge_str =
+                    crate::trunk_register::extract_header(&response_raw, header_name)
+                        .ok_or_else(|| format!("No {} header in {}", header_name, status))?;
                 let challenge = DigestChallenge::from_header(&challenge_str)
                     .map_err(|e| format!("Bad challenge: {}", e))?;
 
                 let password = trunk.password.as_deref().unwrap_or("");
-                let auth_value = generate_digest_response(username, password, &challenge, "REGISTER", &request_uri);
+                let auth_value = generate_digest_response(
+                    username,
+                    password,
+                    &challenge,
+                    "REGISTER",
+                    &request_uri,
+                );
 
-                info!("Trunk '{}': {} challenge, retrying with auth (realm='{}')", trunk.name, status, challenge.realm);
+                info!(
+                    "Trunk '{}': {} challenge, retrying with auth (realm='{}')",
+                    trunk.name, status, challenge.realm
+                );
 
-                let auth_header_name = if status == 401 { "Authorization" } else { "Proxy-Authorization" };
-                let branch2 = format!("z9hG4bK{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]);
+                let auth_header_name = if status == 401 {
+                    "Authorization"
+                } else {
+                    "Proxy-Authorization"
+                };
+                let branch2 = format!(
+                    "z9hG4bK{}",
+                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
+                );
                 let via2 = format!("SIP/2.0/UDP {}:5060;branch={};rport", sbc_ip, branch2);
 
                 let register_auth = format!(
@@ -821,26 +910,41 @@ impl Sbc {
                      Expires: {}\r\n\
                      User-Agent: NIXI-SBC/1.0\r\n\
                      Content-Length: 0\r\n\r\n",
-                    request_uri, via2, from, to, call_id, contact,
-                    auth_header_name, auth_value, expires
+                    request_uri,
+                    via2,
+                    from,
+                    to,
+                    call_id,
+                    contact,
+                    auth_header_name,
+                    auth_value,
+                    expires
                 );
 
                 // Register a new oneshot for the auth response
                 let (tx2, rx2) = tokio::sync::oneshot::channel::<String>();
                 pending.insert(call_id.clone(), tx2);
 
-                sock.send_to(register_auth.as_bytes(), dest).await
-                    .map_err(|e| { pending.remove(&call_id); format!("Auth send failed: {}", e) })?;
+                sock.send_to(register_auth.as_bytes(), dest)
+                    .await
+                    .map_err(|e| {
+                        pending.remove(&call_id);
+                        format!("Auth send failed: {}", e)
+                    })?;
 
                 // Wait for auth response via oneshot channel
-                let response_raw2 = match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(10),
-                    rx2,
-                ).await {
-                    Ok(Ok(raw)) => raw,
-                    Ok(Err(_)) => { pending.remove(&call_id); return Err("Auth response channel closed".to_string()); }
-                    Err(_) => { pending.remove(&call_id); return Err("Auth response timeout".to_string()); }
-                };
+                let response_raw2 =
+                    match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx2).await {
+                        Ok(Ok(raw)) => raw,
+                        Ok(Err(_)) => {
+                            pending.remove(&call_id);
+                            return Err("Auth response channel closed".to_string());
+                        }
+                        Err(_) => {
+                            pending.remove(&call_id);
+                            return Err("Auth response timeout".to_string());
+                        }
+                    };
 
                 let status2 = crate::trunk_register::parse_status(&response_raw2);
                 if status2 == 200 {
@@ -872,15 +976,22 @@ impl Sbc {
         let pending = self.pending_register_responses.clone();
 
         for trunk in trunks {
-            if !trunk.enabled { continue; }
-            info!("Starting OPTIONS health check for trunk '{}' ({}:{})", trunk.name, trunk.host, trunk.port);
+            if !trunk.enabled {
+                continue;
+            }
+            info!(
+                "Starting OPTIONS health check for trunk '{}' ({}:{})",
+                trunk.name, trunk.host, trunk.port
+            );
             let identity = identity.clone();
             let sock = udp_socket.clone();
             let pending = pending.clone();
             let tm = trunk_manager.clone();
             let metrics = metrics.clone();
             let events = self.events.clone();
-            tokio::spawn(Self::trunk_health_check_task(trunk, identity, sock, pending, tm, metrics, events));
+            tokio::spawn(Self::trunk_health_check_task(
+                trunk, identity, sock, pending, tm, metrics, events,
+            ));
         }
     }
 
@@ -912,8 +1023,15 @@ impl Sbc {
                 }
             };
 
-            let call_id = format!("hc-{}-{}", trunk_name, &uuid::Uuid::new_v4().to_string()[..8]);
-            let branch = format!("z9hG4bK{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]);
+            let call_id = format!(
+                "hc-{}-{}",
+                trunk_name,
+                &uuid::Uuid::new_v4().to_string()[..8]
+            );
+            let branch = format!(
+                "z9hG4bK{}",
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
+            );
 
             let (sbc_ip, _) = match &identity {
                 Some(id) => (id.public_ip.clone(), id.sip_domain.clone()),
@@ -930,10 +1048,14 @@ impl Sbc {
                  CSeq: 1 OPTIONS\r\n\
                  User-Agent: NIXI-SBC/1.0\r\n\
                  Content-Length: 0\r\n\r\n",
-                trunk.host, trunk.port,
-                sbc_ip, branch,
-                sbc_ip, &uuid::Uuid::new_v4().to_string()[..8],
-                trunk.host, trunk.port,
+                trunk.host,
+                trunk.port,
+                sbc_ip,
+                branch,
+                sbc_ip,
+                &uuid::Uuid::new_v4().to_string()[..8],
+                trunk.host,
+                trunk.port,
                 call_id,
             );
 
@@ -942,18 +1064,16 @@ impl Sbc {
             pending.insert(call_id.clone(), tx);
 
             let is_up = match sock.send_to(options_msg.as_bytes(), dest).await {
-                Ok(_) => {
-                    match tokio::time::timeout(Duration::from_secs(5), rx).await {
-                        Ok(Ok(raw)) => {
-                            let status = crate::trunk_register::parse_status(&raw);
-                            (200..500).contains(&status)
-                        }
-                        _ => {
-                            pending.remove(&call_id);
-                            false
-                        }
+                Ok(_) => match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                    Ok(Ok(raw)) => {
+                        let status = crate::trunk_register::parse_status(&raw);
+                        (200..500).contains(&status)
                     }
-                }
+                    _ => {
+                        pending.remove(&call_id);
+                        false
+                    }
+                },
                 Err(_) => {
                     pending.remove(&call_id);
                     false
@@ -976,10 +1096,15 @@ impl Sbc {
             } else if ever_responded {
                 // Trunk previously responded to OPTIONS but stopped — real issue
                 if was_up {
-                    warn!("Trunk '{}' is DOWN — no response to OPTIONS (timeout 5s)", trunk_name);
+                    warn!(
+                        "Trunk '{}' is DOWN — no response to OPTIONS (timeout 5s)",
+                        trunk_name
+                    );
                     trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
-                    let failures = trunk_manager.get_state(&trunk_id)
-                        .map(|s| s.consecutive_failures).unwrap_or(1);
+                    let failures = trunk_manager
+                        .get_state(&trunk_id)
+                        .map(|s| s.consecutive_failures)
+                        .unwrap_or(1);
                     events.publish(crate::events::SbcEvent::TrunkHealth {
                         trunk: trunk_name.clone(),
                         status: "down".to_string(),
@@ -994,7 +1119,10 @@ impl Sbc {
                 // Trunk never responded to OPTIONS — probably doesn't support it
                 // Log once at info level, then go quiet
                 if was_up {
-                    info!("Trunk '{}' does not respond to OPTIONS — health check passive only", trunk_name);
+                    info!(
+                        "Trunk '{}' does not respond to OPTIONS — health check passive only",
+                        trunk_name
+                    );
                 }
             }
 
@@ -1145,9 +1273,9 @@ impl Sbc {
 
     /// Handle a single received message — full pipeline: ACL → DoS → dispatch
     async fn handle_message(&mut self, received: ReceivedMessage) -> Result<()> {
-        let source    = received.source;
+        let source = received.source;
         let transport = received.transport;
-        let reply_tx  = received.reply_tx;
+        let reply_tx = received.reply_tx;
 
         // 0. Ban check (fail2ban) — one DashMap read on the hot path
         if self.security.bans.is_banned(source.ip()) {
@@ -1155,7 +1283,14 @@ impl Sbc {
             if !self.security.bans.silent_drop() {
                 self.metrics.inc_sip_response(403);
                 let response_403 = build_plain_response(403, "Forbidden");
-                self.send_sip("403 (banned) → source", response_403.as_bytes(), source, transport, reply_tx.as_ref()).await;
+                self.send_sip(
+                    "403 (banned) → source",
+                    response_403.as_bytes(),
+                    source,
+                    transport,
+                    reply_tx.as_ref(),
+                )
+                .await;
             }
             return Ok(());
         }
@@ -1175,7 +1310,14 @@ impl Sbc {
             self.metrics.inc_dos_blocked();
             self.metrics.inc_sip_response(503);
             let response_503 = build_plain_response(503, "Service Unavailable");
-            self.send_sip("503 (rate-limited) → source", response_503.as_bytes(), source, transport, reply_tx.as_ref()).await;
+            self.send_sip(
+                "503 (rate-limited) → source",
+                response_503.as_bytes(),
+                source,
+                transport,
+                reply_tx.as_ref(),
+            )
+            .await;
             return Ok(());
         }
 
@@ -1184,10 +1326,12 @@ impl Sbc {
         // 3. Dispatch
         match received.message {
             SipMessage::Request(request) => {
-                self.handle_request(request, source, transport, reply_tx.as_ref()).await
+                self.handle_request(request, source, transport, reply_tx.as_ref())
+                    .await
             }
             SipMessage::Response(response) => {
-                self.handle_response(response, source, transport, reply_tx.as_ref()).await
+                self.handle_response(response, source, transport, reply_tx.as_ref())
+                    .await
             }
         }
     }
@@ -1206,19 +1350,41 @@ impl Sbc {
         self.metrics.inc_sip_request(&request.method.to_string());
 
         match &request.method {
-            Method::Options  => self.handle_options(&request, source, transport, reply_tx).await,
-            Method::Register => self.handle_register(&request, source, transport, reply_tx).await,
-            Method::Invite   => self.handle_invite(request, source, transport, reply_tx).await,
-            Method::Ack      => self.handle_ack(request, source, transport, reply_tx).await,
-            Method::Bye      => self.handle_bye(request, source, transport, reply_tx).await,
-            Method::Cancel   => self.handle_cancel(request, source, transport, reply_tx).await,
-            Method::Refer    => self.handle_refer(request, source, transport, reply_tx).await,
-            Method::Info     => self.handle_info(request, source, transport, reply_tx).await,
+            Method::Options => {
+                self.handle_options(&request, source, transport, reply_tx)
+                    .await
+            }
+            Method::Register => {
+                self.handle_register(&request, source, transport, reply_tx)
+                    .await
+            }
+            Method::Invite => {
+                self.handle_invite(request, source, transport, reply_tx)
+                    .await
+            }
+            Method::Ack => self.handle_ack(request, source, transport, reply_tx).await,
+            Method::Bye => self.handle_bye(request, source, transport, reply_tx).await,
+            Method::Cancel => {
+                self.handle_cancel(request, source, transport, reply_tx)
+                    .await
+            }
+            Method::Refer => {
+                self.handle_refer(request, source, transport, reply_tx)
+                    .await
+            }
+            Method::Info => self.handle_info(request, source, transport, reply_tx).await,
             method => {
                 warn!("Unhandled SIP method: {}", method);
                 self.metrics.inc_sip_response(501);
                 let response_501 = build_plain_response(501, "Not Implemented");
-                self.send_sip("501 → source", response_501.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip(
+                    "501 → source",
+                    response_501.as_bytes(),
+                    source,
+                    transport,
+                    reply_tx,
+                )
+                .await;
                 Ok(())
             }
         }
@@ -1240,7 +1406,9 @@ impl Sbc {
         self.metrics.inc_sip_response(200);
         let response = self.router.handle_local_request(request)?;
         let data = response.to_string().into_bytes();
-        self.transport.reply(&data, source, transport, reply_tx).await
+        self.transport
+            .reply(&data, source, transport, reply_tx)
+            .await
     }
 
     /// Handle REGISTER with optional Digest 401 challenge
@@ -1257,7 +1425,8 @@ impl Sbc {
         if self.enable_digest_auth {
             if let Some(auth) = &self.auth {
                 // Check for Authorization header
-                let auth_header: Option<String> = request.authorization_header()
+                let auth_header: Option<String> = request
+                    .authorization_header()
                     .map(|h| h.value().to_string());
 
                 match auth_header {
@@ -1268,7 +1437,10 @@ impl Sbc {
                         let challenge = auth.generate_challenge().await;
                         let response_401 = build_register_401(request, &challenge)?;
                         let data = response_401.to_string().into_bytes();
-                        return self.transport.reply(&data, source, transport, reply_tx).await;
+                        return self
+                            .transport
+                            .reply(&data, source, transport, reply_tx)
+                            .await;
                     }
                     Some(ref auth_value) => {
                         // Verify the credentials
@@ -1287,20 +1459,32 @@ impl Sbc {
                                 // are logged at warn for security monitoring.
                                 let err_str = e.to_string();
                                 if err_str.contains("nonce") || err_str.contains("Nonce") {
-                                    debug!("REGISTER auth: nonce issue from {}: {}", source.ip(), e);
+                                    debug!(
+                                        "REGISTER auth: nonce issue from {}: {}",
+                                        source.ip(),
+                                        e
+                                    );
                                 } else {
                                     warn!("REGISTER auth failed from {}: {}", source.ip(), e);
                                     // Real failure → fail2ban strike (stale-nonce
                                     // retries above must NOT count, or legitimate
                                     // clients get banned on re-REGISTER).
-                                    if let Some(entry) = self.security.record_auth_failure(source.ip(), None, "REGISTER") {
+                                    if let Some(entry) = self.security.record_auth_failure(
+                                        source.ip(),
+                                        None,
+                                        "REGISTER",
+                                    ) {
                                         self.metrics.inc_security_ban();
                                         self.persist_ban(&entry);
                                     }
                                 }
-                                let response_403 = build_plain_response_for_request(request, 403, "Forbidden")?;
+                                let response_403 =
+                                    build_plain_response_for_request(request, 403, "Forbidden")?;
                                 let data = response_403.to_string().into_bytes();
-                                return self.transport.reply(&data, source, transport, reply_tx).await;
+                                return self
+                                    .transport
+                                    .reply(&data, source, transport, reply_tx)
+                                    .await;
                             }
                         }
                     }
@@ -1311,13 +1495,15 @@ impl Sbc {
         // Extract registration fields
         // Normalize AOR: extract URI from angle brackets if present
         // e.g. "<sip:user@domain>" → "sip:user@domain"
-        let aor_raw = request.to_header()
+        let aor_raw = request
+            .to_header()
             .map_err(|e| Error::Other(format!("Missing To header: {}", e)))?
             .value()
             .to_string();
         let aor = normalize_aor(&aor_raw);
 
-        let contact = request.contact_header()
+        let contact = request
+            .contact_header()
             .map(|h| h.value().to_string())
             .unwrap_or_default();
 
@@ -1328,26 +1514,32 @@ impl Sbc {
             let raw = contact.to_lowercase();
             // Look for ";expires=NNN" in the contact string
             raw.split(';')
-               .skip(1) // skip the URI part
-               .find_map(|p| {
-                   let p = p.trim();
-                   if let Some(val) = p.strip_prefix("expires=") {
-                       val.trim_matches('>').parse::<u32>().ok()
-                   } else {
-                       None
-                   }
-               })
+                .skip(1) // skip the URI part
+                .find_map(|p| {
+                    let p = p.trim();
+                    if let Some(val) = p.strip_prefix("expires=") {
+                        val.trim_matches('>').parse::<u32>().ok()
+                    } else {
+                        None
+                    }
+                })
         };
         let expires: u32 = contact_expires
-            .or_else(|| request.expires_header().and_then(|h| h.value().parse().ok()))
+            .or_else(|| {
+                request
+                    .expires_header()
+                    .and_then(|h| h.value().parse().ok())
+            })
             .unwrap_or(3600);
 
-        let call_id = request.call_id_header()
+        let call_id = request
+            .call_id_header()
             .map_err(|e| Error::Other(format!("Missing Call-ID: {}", e)))?
             .value()
             .to_string();
 
-        let cseq: u32 = request.cseq_header()
+        let cseq: u32 = request
+            .cseq_header()
             .ok()
             .and_then(|h| h.typed().ok())
             .map(|c: rsip::typed::CSeq| c.seq)
@@ -1368,29 +1560,63 @@ impl Sbc {
         };
 
         // Process registration
-        match self.register_handler.handle_with_tx(&aor, &contact, expires, &call_id, cseq, source, &transport_str, ws_reply_tx).await {
-            Ok(RegisterResult::Ok { expires: exp, bindings }) => {
-                info!("Registered {} with {} binding(s), expires={}s", aor, bindings.len(), exp);
+        match self
+            .register_handler
+            .handle_with_tx(
+                &aor,
+                &contact,
+                expires,
+                &call_id,
+                cseq,
+                source,
+                &transport_str,
+                ws_reply_tx,
+            )
+            .await
+        {
+            Ok(RegisterResult::Ok {
+                expires: exp,
+                bindings,
+            }) => {
+                info!(
+                    "Registered {} with {} binding(s), expires={}s",
+                    aor,
+                    bindings.len(),
+                    exp
+                );
                 self.metrics.inc_registration();
-                self.metrics.set_active_registrations(self.register_handler.count().await);
+                self.metrics
+                    .set_active_registrations(self.register_handler.count().await);
                 self.metrics.inc_sip_response(200);
                 let response_200 = build_register_200(request, &bindings, &call_id, cseq)?;
                 let data = response_200.to_string().into_bytes();
-                self.transport.reply(&data, source, transport, reply_tx).await
+                self.transport
+                    .reply(&data, source, transport, reply_tx)
+                    .await
             }
             Ok(RegisterResult::Removed { count }) => {
                 info!("Unregistered {} contact(s) for {}", count, aor);
-                self.metrics.set_active_registrations(self.register_handler.count().await);
+                self.metrics
+                    .set_active_registrations(self.register_handler.count().await);
                 self.metrics.inc_sip_response(200);
                 let response_200 = build_plain_response_for_request(request, 200, "OK")?;
                 let data = response_200.to_string().into_bytes();
-                self.transport.reply(&data, source, transport, reply_tx).await
+                self.transport
+                    .reply(&data, source, transport, reply_tx)
+                    .await
             }
             Err(e) => {
                 warn!("Registration failed for {}: {}", aor, e);
                 self.metrics.inc_sip_response(500);
                 let response_500 = build_plain_response(500, "Server Internal Error");
-                self.send_sip("500 → REGISTER", response_500.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip(
+                    "500 → REGISTER",
+                    response_500.as_bytes(),
+                    source,
+                    transport,
+                    reply_tx,
+                )
+                .await;
                 Ok(())
             }
         }
@@ -1412,7 +1638,10 @@ impl Sbc {
         match self.transport.reply(data, dest, transport, reply_tx).await {
             Ok(()) => true,
             Err(e) => {
-                warn!("SIP send failed: {} → {} via {:?}: {}", what, dest, transport, e);
+                warn!(
+                    "SIP send failed: {} → {} via {:?}: {}",
+                    what, dest, transport, e
+                );
                 self.metrics.inc_sip_send_failure(transport);
                 false
             }
@@ -1423,18 +1652,42 @@ impl Sbc {
     // Accessors
     // =========================================================================
 
-    pub fn transport_mut(&mut self) -> &mut TransportManager { &mut self.transport }
-    pub fn media(&self) -> &Arc<MediaManager>              { &self.media }
-    pub fn b2bua(&self) -> &Arc<B2buaManager>              { &self.b2bua }
-    pub fn router(&self) -> &Arc<Router>                   { &self.router }
-    pub fn acl(&self) -> &Arc<AclManager>                  { &self.acl }
-    pub fn dos(&self) -> &Arc<DosProtector>                { &self.dos }
-    pub fn register_handler(&self) -> &Arc<RegisterHandler> { &self.register_handler }
-    pub fn cdr(&self) -> &Arc<CdrManager>                  { &self.cdr }
-    pub fn metrics(&self) -> &Arc<SbcMetrics>              { &self.metrics }
-    pub fn events(&self) -> crate::events::EventBus       { self.events.clone() }
-    pub fn security(&self) -> Arc<crate::security::SecurityManager> { self.security.clone() }
-    pub fn trunk_ips(&self) -> Arc<tokio::sync::RwLock<Vec<String>>> { self.trunk_ips.clone() }
+    pub fn transport_mut(&mut self) -> &mut TransportManager {
+        &mut self.transport
+    }
+    pub fn media(&self) -> &Arc<MediaManager> {
+        &self.media
+    }
+    pub fn b2bua(&self) -> &Arc<B2buaManager> {
+        &self.b2bua
+    }
+    pub fn router(&self) -> &Arc<Router> {
+        &self.router
+    }
+    pub fn acl(&self) -> &Arc<AclManager> {
+        &self.acl
+    }
+    pub fn dos(&self) -> &Arc<DosProtector> {
+        &self.dos
+    }
+    pub fn register_handler(&self) -> &Arc<RegisterHandler> {
+        &self.register_handler
+    }
+    pub fn cdr(&self) -> &Arc<CdrManager> {
+        &self.cdr
+    }
+    pub fn metrics(&self) -> &Arc<SbcMetrics> {
+        &self.metrics
+    }
+    pub fn events(&self) -> crate::events::EventBus {
+        self.events.clone()
+    }
+    pub fn security(&self) -> Arc<crate::security::SecurityManager> {
+        self.security.clone()
+    }
+    pub fn trunk_ips(&self) -> Arc<tokio::sync::RwLock<Vec<String>>> {
+        self.trunk_ips.clone()
+    }
 }
 
 impl Default for Sbc {
@@ -1454,7 +1707,7 @@ impl Default for Sbc {
 fn normalize_aor(raw: &str) -> String {
     let s = raw.trim();
     if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        s[start+1..end].trim().to_string()
+        s[start + 1..end].trim().to_string()
     } else {
         s.to_string()
     }
@@ -1470,7 +1723,9 @@ fn extract_callee_aor(request: &Request) -> Option<String> {
     // Use the Request-URI (first line of INVITE: "sip:user@domain")
     let uri_str = request.uri.to_string();
     // Also check To header as fallback
-    let to_str = request.to_header().ok()
+    let to_str = request
+        .to_header()
+        .ok()
         .map(|h| h.value().to_string())
         .unwrap_or_default();
 
@@ -1511,15 +1766,18 @@ fn build_bye_for_other_leg(original_bye: &Request, _dest: std::net::SocketAddr) 
     // that reuses From/To from the inbound request so the callee recognizes the dialog.
     // In a full B2BUA, we'd track the outbound dialog state and use its Call-ID/From/To.
     // For now, we generate a minimal BYE that will be recognized by the callee's dialog.
-    let call_id = original_bye.call_id_header()
+    let call_id = original_bye
+        .call_id_header()
         .map(|h| h.value().to_string())
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
-    let from_value = original_bye.from_header()
+    let from_value = original_bye
+        .from_header()
         .map(|h| h.value().to_string())
         .unwrap_or_else(|_| "<sip:sbc@localhost>".to_string());
 
-    let to_value = original_bye.to_header()
+    let to_value = original_bye
+        .to_header()
         .map(|h| h.value().to_string())
         .unwrap_or_else(|_| "<sip:callee@localhost>".to_string());
 
@@ -1529,9 +1787,13 @@ fn build_bye_for_other_leg(original_bye: &Request, _dest: std::net::SocketAddr) 
         let val = to_hdr.value().to_string();
         // Extract URI from angle brackets if present
         if let (Some(start), Some(end)) = (val.find('<'), val.rfind('>')) {
-            val[start+1..end].trim().to_string()
+            val[start + 1..end].trim().to_string()
         } else {
-            val.split(';').next().unwrap_or("sip:callee@localhost").trim().to_string()
+            val.split(';')
+                .next()
+                .unwrap_or("sip:callee@localhost")
+                .trim()
+                .to_string()
         }
     } else {
         "sip:callee@localhost".to_string()
@@ -1565,27 +1827,35 @@ fn build_cancel_for_callee(
     outbound_call_id: &str,
     _dest: std::net::SocketAddr,
 ) -> String {
-    let from_value = original_cancel.from_header()
+    let from_value = original_cancel
+        .from_header()
         .map(|h| h.value().to_string())
         .unwrap_or_else(|_| "<sip:sbc@localhost>".to_string());
 
-    let to_value = original_cancel.to_header()
+    let to_value = original_cancel
+        .to_header()
         .map(|h| h.value().to_string())
         .unwrap_or_else(|_| "<sip:callee@localhost>".to_string());
 
     // Request-URI = To URI (without tag or display name)
     let to_uri = {
-        let val = original_cancel.to_header()
+        let val = original_cancel
+            .to_header()
             .map(|h| h.value().to_string())
             .unwrap_or_default();
         if let (Some(start), Some(end)) = (val.find('<'), val.rfind('>')) {
-            val[start+1..end].trim().to_string()
+            val[start + 1..end].trim().to_string()
         } else {
-            val.split(';').next().unwrap_or("sip:callee@localhost").trim().to_string()
+            val.split(';')
+                .next()
+                .unwrap_or("sip:callee@localhost")
+                .trim()
+                .to_string()
         }
     };
 
-    let cseq_num = original_cancel.cseq_header()
+    let cseq_num = original_cancel
+        .cseq_header()
         .ok()
         .and_then(|h| h.typed().ok())
         .map(|cseq| cseq.seq.to_string())
@@ -1648,12 +1918,9 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             || octets[0] == 192 && octets[1] == 0 && octets[2] == 2       // 192.0.2.0/24 (TEST-NET-1)
             || octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)   // 198.18.0.0/15 (benchmark)
             || octets[0] == 198 && octets[1] == 51 && octets[2] == 100    // 198.51.100.0/24 (TEST-NET-2)
-            || octets[0] == 203 && octets[1] == 0 && octets[2] == 113     // 203.0.113.0/24 (TEST-NET-3)
+            || octets[0] == 203 && octets[1] == 0 && octets[2] == 113 // 203.0.113.0/24 (TEST-NET-3)
         }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-            || v6.is_unspecified()
-        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
     }
 }
 
@@ -1686,9 +1953,7 @@ fn extract_sdp_rtp_addr(sdp: &str) -> Option<std::net::SocketAddr> {
     }
 
     match (ip, port) {
-        (Some(ip), Some(port)) if port > 0 => {
-            Some(std::net::SocketAddr::new(ip, port))
-        }
+        (Some(ip), Some(port)) if port > 0 => Some(std::net::SocketAddr::new(ip, port)),
         _ => None,
     }
 }
@@ -1698,7 +1963,9 @@ fn extract_sdp_rtp_addr(sdp: &str) -> Option<std::net::SocketAddr> {
 /// (which relies on Content-Length) stays consistent.
 fn update_content_length_response(response: &mut rsip::Response) {
     let cl = rsip::headers::ContentLength::from(response.body.len() as u32);
-    response.headers.unique_push(rsip::Header::ContentLength(cl));
+    response
+        .headers
+        .unique_push(rsip::Header::ContentLength(cl));
 }
 
 fn update_content_length_request(request: &mut rsip::Request) {
@@ -1752,7 +2019,11 @@ fn rewrite_response_for_caller(
         let is_invite = msg
             .header_values("cseq")
             .first()
-            .map(|v| v.split_whitespace().nth(1).is_some_and(|m| m.eq_ignore_ascii_case("INVITE")))
+            .map(|v| {
+                v.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|m| m.eq_ignore_ascii_case("INVITE"))
+            })
             .unwrap_or(false);
         if is_invite {
             msg.set_header("CSeq", &format!("{} INVITE", n));
@@ -1781,14 +2052,15 @@ fn rewrite_response_for_caller(
 
 /// Build a minimal SIP response string (no request headers — last resort)
 fn build_plain_response(status: u16, reason: &str) -> String {
-    format!(
-        "SIP/2.0 {} {}\r\nContent-Length: 0\r\n\r\n",
-        status, reason
-    )
+    format!("SIP/2.0 {} {}\r\nContent-Length: 0\r\n\r\n", status, reason)
 }
 
 /// Build a proper SIP response echoing Via/From/To/Call-ID/CSeq from the request
-fn build_plain_response_for_request(request: &Request, status: u16, _reason: &str) -> Result<SipMessage> {
+fn build_plain_response_for_request(
+    request: &Request,
+    status: u16,
+    _reason: &str,
+) -> Result<SipMessage> {
     let mut headers: rsip::Headers = Default::default();
 
     // Copy ALL Via headers from the request (RFC 3261 §8.2.6.2)
@@ -1889,7 +2161,9 @@ fn build_register_200(
     // Echo back Contact bindings with expires
     for binding in bindings {
         let contact_value = format!("{};expires={}", binding.contact, binding.expires);
-        headers.push(rsip::Header::Contact(rsip::headers::Contact::new(&contact_value)));
+        headers.push(rsip::Header::Contact(rsip::headers::Contact::new(
+            &contact_value,
+        )));
     }
 
     // If no bindings, echo the request contact
@@ -1921,11 +2195,16 @@ fn build_register_200(
 #[allow(dead_code)]
 fn extract_uri_user(uri: &str) -> Option<String> {
     // Strip "sip:" or "sips:" prefix
-    let without_scheme = uri.strip_prefix("sip:")
+    let without_scheme = uri
+        .strip_prefix("sip:")
         .or_else(|| uri.strip_prefix("sips:"))?;
     // Take everything before '@'
     let user = without_scheme.split('@').next()?;
-    if user.is_empty() { None } else { Some(user.to_string()) }
+    if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    }
 }
 
 /// Extract the Request-URI from a raw SIP INVITE message.
@@ -1957,7 +2236,8 @@ fn inject_proxy_auth_into_invite(raw_invite: &str, auth_value: &str) -> String {
     lines.retain(|l| !l.to_lowercase().starts_with("proxy-authorization:"));
 
     // 4. Inject Proxy-Authorization after the request line and the top Via
-    let insert_pos = lines.iter()
+    let insert_pos = lines
+        .iter()
         .position(|l| {
             let lower = l.to_lowercase();
             !lower.starts_with("invite ") && !lower.starts_with("via:") && !lower.starts_with("v:")
@@ -1973,23 +2253,51 @@ fn inject_proxy_auth_into_invite(raw_invite: &str, auth_value: &str) -> String {
 
 /// RFC 3339 for a SystemTime (UTC).
 pub(crate) fn systemtime_rfc3339(t: std::time::SystemTime) -> String {
-    let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let days = secs / 86400;
     let rem_secs = secs % 86400;
     let (mut y, mut rem) = (1970u64, days);
     loop {
         let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
         let len = if leap { 366 } else { 365 };
-        if rem < len { break; }
+        if rem < len {
+            break;
+        }
         rem -= len;
         y += 1;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let month_len = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_len = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0;
-    while rem >= month_len[m] { rem -= month_len[m]; m += 1; }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, m + 1, rem + 1, rem_secs / 3600, (rem_secs % 3600) / 60, rem_secs % 60)
+    while rem >= month_len[m] {
+        rem -= month_len[m];
+        m += 1;
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m + 1,
+        rem + 1,
+        rem_secs / 3600,
+        (rem_secs % 3600) / 60,
+        rem_secs % 60
+    )
 }
 
 /// Convert a persisted ban row back to a live entry.
@@ -2012,10 +2320,27 @@ fn ban_row_to_entry(row: &sbc_storage::BanRow) -> Option<crate::security::BanEnt
         );
         let mut days = 0u64;
         for yy in 1970..y {
-            days += if (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0 { 366 } else { 365 };
+            days += if (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0 {
+                366
+            } else {
+                365
+            };
         }
         let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let month_len = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let month_len = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
         for len in month_len.iter().take(m.saturating_sub(1) as usize) {
             days += len;
         }
@@ -2079,7 +2404,10 @@ mod tests {
         let mut config = SbcConfig::default();
         config.security.enable_digest_auth = true;
         config.security.sip_realm = "test.sbc.local".to_string();
-        config.security.sip_users.insert("alice".to_string(), "password123".to_string());
+        config
+            .security
+            .sip_users
+            .insert("alice".to_string(), "password123".to_string());
 
         let sbc = Sbc::new_from_config(&config).await.unwrap();
         assert!(sbc.auth.is_some());
@@ -2096,12 +2424,24 @@ mod send_sip_tests {
         let sbc = Sbc::new();
         let dest: SocketAddr = "203.0.113.1:5061".parse().unwrap();
         // No WSS connection channel and no listener: the send cannot succeed.
-        let sent = sbc.send_sip("test BYE", b"BYE sip:x SIP/2.0\r\n\r\n", dest, rsip::Transport::Wss, None).await;
+        let sent = sbc
+            .send_sip(
+                "test BYE",
+                b"BYE sip:x SIP/2.0\r\n\r\n",
+                dest,
+                rsip::Transport::Wss,
+                None,
+            )
+            .await;
         assert!(!sent);
         let failures = sbc.metrics.sip_send_failures.lock().unwrap().clone();
         assert_eq!(failures.get("wss"), Some(&1));
         let output = sbc.metrics.render_prometheus();
-        assert!(output.contains("sbc_sip_send_failures_total{transport=\"wss\"} 1"), "{}", output);
+        assert!(
+            output.contains("sbc_sip_send_failures_total{transport=\"wss\"} 1"),
+            "{}",
+            output
+        );
     }
 }
 
@@ -2158,10 +2498,17 @@ mod cseq_mapping_tests {
         assert!(out.contains("CSeq: 4 INVITE\r\n"));
         assert!(!out.contains("z9hG4bKold"));
         assert!(out.contains("branch=z9hG4bK"));
-        assert!(out.ends_with("Content-Length: 5\r\n\r\nv=0\r\n"), "body and its CRLF preserved: {:?}", out);
+        assert!(
+            out.ends_with("Content-Length: 5\r\n\r\nv=0\r\n"),
+            "body and its CRLF preserved: {:?}",
+            out
+        );
         let lines: Vec<&str> = out.split("\r\n").collect();
         assert!(lines[1].starts_with("Via:"));
-        assert!(lines[2].starts_with("Proxy-Authorization:"), "inserted right after the top Via");
+        assert!(
+            lines[2].starts_with("Proxy-Authorization:"),
+            "inserted right after the top Via"
+        );
         rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
     }
 }

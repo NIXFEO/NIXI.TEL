@@ -2,10 +2,10 @@
 //!
 //! Central management for all media sessions
 
-use crate::media::{PortAllocator, PortPair, RtpSession, SessionDescription};
-use crate::media::srtp::{SrtpContext, CryptoSuite, parse_crypto_attribute};
+use crate::media::srtp::{parse_crypto_attribute, CryptoSuite, SrtpContext};
 use crate::media::webrtc_handler::WebRtcSdpInfo;
-use crate::transcoding::{Codec, Transcoder, sdp_primary_codec, needs_transcoding};
+use crate::media::{PortAllocator, PortPair, RtpSession, SessionDescription};
+use crate::transcoding::{needs_transcoding, sdp_primary_codec, Codec, Transcoder};
 use crate::{Error, Result};
 use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -143,10 +143,7 @@ impl MediaManager {
     }
 
     /// Create a new media manager with custom port range
-    pub fn with_port_range(
-        port_range: std::ops::Range<u16>,
-        public_ip: Option<IpAddr>,
-    ) -> Self {
+    pub fn with_port_range(port_range: std::ops::Range<u16>, public_ip: Option<IpAddr>) -> Self {
         Self {
             port_allocator: Arc::new(PortAllocator::with_range(port_range)),
             sessions: Arc::new(DashMap::new()),
@@ -210,7 +207,11 @@ impl MediaManager {
             }
         }
         // No crypto line found — plain RTP
-        debug!("Session {} no a=crypto: found in SDP (leg {})", session_id, if is_leg_a { "A" } else { "B" });
+        debug!(
+            "Session {} no a=crypto: found in SDP (leg {})",
+            session_id,
+            if is_leg_a { "A" } else { "B" }
+        );
         Ok(())
     }
 
@@ -293,14 +294,22 @@ impl MediaManager {
     pub fn set_callee_sdp(&self, session_id: &str, sdp: &str) {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             entry.sdp_callee = Some(sdp.to_string());
-            debug!("Stored callee SDP for session {} ({} bytes)", session_id, sdp.len());
+            debug!(
+                "Stored callee SDP for session {} ({} bytes)",
+                session_id,
+                sdp.len()
+            );
         }
     }
 
     /// Set the local ICE password for a WebRTC media session (used for STUN MESSAGE-INTEGRITY).
     pub fn set_ice_pwd_local(&self, session_id: &str, pwd: String) {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
-            info!("Set ICE pwd local for session {} (len={})", session_id, pwd.len());
+            info!(
+                "Set ICE pwd local for session {} (len={})",
+                session_id,
+                pwd.len()
+            );
             entry.ice_pwd_local = Some(pwd);
         }
     }
@@ -308,7 +317,11 @@ impl MediaManager {
     /// Set local ICE password for leg-B (callee is WebRTC)
     pub fn set_ice_pwd_local_b(&self, session_id: &str, pwd: String) {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
-            info!("Set ICE pwd local B for session {} (len={})", session_id, pwd.len());
+            info!(
+                "Set ICE pwd local B for session {} (len={})",
+                session_id,
+                pwd.len()
+            );
             entry.ice_pwd_local_b = Some(pwd);
         }
     }
@@ -361,7 +374,11 @@ impl MediaManager {
         sdp.replace_port(crate::media::MediaType::Audio, rtp_port);
 
         // Replace video port if present (RTP + 2 for separate stream)
-        if sdp.media.iter().any(|m| m.media_type == crate::media::MediaType::Video) {
+        if sdp
+            .media
+            .iter()
+            .any(|m| m.media_type == crate::media::MediaType::Video)
+        {
             sdp.replace_port(crate::media::MediaType::Video, rtp_port + 2);
         }
 
@@ -376,9 +393,22 @@ impl MediaManager {
     /// If the caller's SDP is WebRTC (Opus/SAVPF), WebRTC mode is automatically
     /// enabled on leg-A (STUN/DTLS/RTP demuxing). Returns `WebRtcRtpInfo` with
     /// the DTLS channel and socket needed for the DTLS handshake task.
-    pub async fn start_rtp_session(&self, session_id: &str) -> Result<(Option<WebRtcRtpInfo>, Option<WebRtcRtpInfoB>)> {
-        let (ports_a, ports_b, ep_a, ep_b, srtp_suite_a, srtp_kp_a, srtp_suite_b, srtp_kp_b,
-             sdp_caller_opt, sdp_callee_opt) = {
+    pub async fn start_rtp_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<WebRtcRtpInfo>, Option<WebRtcRtpInfoB>)> {
+        let (
+            ports_a,
+            ports_b,
+            ep_a,
+            ep_b,
+            srtp_suite_a,
+            srtp_kp_a,
+            srtp_suite_b,
+            srtp_kp_b,
+            sdp_caller_opt,
+            sdp_callee_opt,
+        ) = {
             let session = self
                 .sessions
                 .get(session_id)
@@ -386,19 +416,22 @@ impl MediaManager {
             let pa = session.ports;
             let pb = session.ports_b.unwrap_or(pa); // fallback: same port for both legs
             (
-                pa, pb, session.endpoint_a, session.endpoint_b,
-                session.srtp_suite_a, session.srtp_key_params_a.clone(),
-                session.srtp_suite_b, session.srtp_key_params_b.clone(),
-                session.sdp_caller.clone(), session.sdp_callee.clone(),
+                pa,
+                pb,
+                session.endpoint_a,
+                session.endpoint_b,
+                session.srtp_suite_a,
+                session.srtp_key_params_a.clone(),
+                session.srtp_suite_b,
+                session.srtp_key_params_b.clone(),
+                session.sdp_caller.clone(),
+                session.sdp_callee.clone(),
             )
         };
 
         // Create two-leg RTP proxy session (binds sockets)
-        let mut rtp_session = RtpSession::new_two_leg(
-            session_id.to_string(),
-            ports_a,
-            ports_b,
-        ).await?;
+        let mut rtp_session =
+            RtpSession::new_two_leg(session_id.to_string(), ports_a, ports_b).await?;
 
         // Pre-configure endpoints from SDP (relay task also does dynamic learning)
         if let Some(addr_a) = ep_a {
@@ -433,11 +466,18 @@ impl MediaManager {
         if let (Some(suite), Some(ref kp)) = (srtp_suite_a, &srtp_kp_a) {
             match SrtpContext::from_key_params(kp, suite) {
                 Ok(ctx) => {
-                    info!("Session {} SRTP leg-A: {} active", session_id, suite.to_sdp_name());
+                    info!(
+                        "Session {} SRTP leg-A: {} active",
+                        session_id,
+                        suite.to_sdp_name()
+                    );
                     rtp_session.set_srtp_context_a(ctx);
                 }
                 Err(e) => {
-                    warn!("Session {} SRTP leg-A init failed: {} (falling back to plain RTP)", session_id, e);
+                    warn!(
+                        "Session {} SRTP leg-A init failed: {} (falling back to plain RTP)",
+                        session_id, e
+                    );
                 }
             }
         }
@@ -445,11 +485,18 @@ impl MediaManager {
         if let (Some(suite), Some(ref kp)) = (srtp_suite_b, &srtp_kp_b) {
             match SrtpContext::from_key_params(kp, suite) {
                 Ok(ctx) => {
-                    info!("Session {} SRTP leg-B: {} active", session_id, suite.to_sdp_name());
+                    info!(
+                        "Session {} SRTP leg-B: {} active",
+                        session_id,
+                        suite.to_sdp_name()
+                    );
                     rtp_session.set_srtp_context_b(ctx);
                 }
                 Err(e) => {
-                    warn!("Session {} SRTP leg-B init failed: {} (falling back to plain RTP)", session_id, e);
+                    warn!(
+                        "Session {} SRTP leg-B init failed: {} (falling back to plain RTP)",
+                        session_id, e
+                    );
                 }
             }
         }
@@ -510,30 +557,51 @@ impl MediaManager {
                 info!(
                     "Session {} transcoding required: caller={} ({}) → callee={} ({}){}",
                     session_id,
-                    caller_codec.name(), caller_codec.pt(),
-                    callee_codec.name(), callee_codec.pt(),
+                    caller_codec.name(),
+                    caller_codec.pt(),
+                    callee_codec.name(),
+                    callee_codec.pt(),
                     webrtc_label
                 );
 
                 // A→B: caller sends in caller_codec, callee expects callee_codec
                 match Transcoder::new(caller_codec, callee_codec) {
                     Ok(tc) => {
-                        info!("Session {} transcoder A→B: {} → {}", session_id, caller_codec.name(), callee_codec.name());
+                        info!(
+                            "Session {} transcoder A→B: {} → {}",
+                            session_id,
+                            caller_codec.name(),
+                            callee_codec.name()
+                        );
                         rtp_session.set_transcoder_a_to_b(Arc::new(tc));
                     }
-                    Err(e) => warn!("Session {} failed to create A→B transcoder: {}", session_id, e),
+                    Err(e) => warn!(
+                        "Session {} failed to create A→B transcoder: {}",
+                        session_id, e
+                    ),
                 }
 
                 // B→A: callee sends in callee_codec, caller expects caller_codec
                 match Transcoder::new(callee_codec, caller_codec) {
                     Ok(tc) => {
-                        info!("Session {} transcoder B→A: {} → {}", session_id, callee_codec.name(), caller_codec.name());
+                        info!(
+                            "Session {} transcoder B→A: {} → {}",
+                            session_id,
+                            callee_codec.name(),
+                            caller_codec.name()
+                        );
                         rtp_session.set_transcoder_b_to_a(Arc::new(tc));
                     }
-                    Err(e) => warn!("Session {} failed to create B→A transcoder: {}", session_id, e),
+                    Err(e) => warn!(
+                        "Session {} failed to create B→A transcoder: {}",
+                        session_id, e
+                    ),
                 }
             } else {
-                debug!("Session {} no transcoding needed (common codec found)", session_id);
+                debug!(
+                    "Session {} no transcoding needed (common codec found)",
+                    session_id
+                );
             }
         }
 
@@ -554,23 +622,35 @@ impl MediaManager {
 
         // ── Enable WebRTC mode on leg-A if caller SDP is WebRTC ──────────
         // Get local ICE password (set by sbc.rs when creating WebRTC session)
-        let ice_pwd_local_opt = self.sessions.get(session_id)
+        let ice_pwd_local_opt = self
+            .sessions
+            .get(session_id)
             .and_then(|s| s.ice_pwd_local.clone());
 
         let webrtc_info = if let Some(ref caller_sdp) = sdp_caller_opt {
             let sdp_info = WebRtcSdpInfo::from_sdp(caller_sdp);
             if sdp_info.is_webrtc {
-                info!("Session {} enabling WebRTC mode on leg-A (STUN/DTLS/RTP demux, ice_pwd={})",
-                    session_id, if ice_pwd_local_opt.is_some() { "set" } else { "none" });
+                info!(
+                    "Session {} enabling WebRTC mode on leg-A (STUN/DTLS/RTP demux, ice_pwd={})",
+                    session_id,
+                    if ice_pwd_local_opt.is_some() {
+                        "set"
+                    } else {
+                        "none"
+                    }
+                );
                 let dtls_rx = rtp_session.enable_webrtc_mode_a(ice_pwd_local_opt);
                 let rtp_socket_a = rtp_session.rtp_socket_a();
                 let srtp_recv_ctx_a = rtp_session.srtp_recv_ctx_a_shared();
                 let srtp_send_ctx_a = rtp_session.srtp_send_ctx_a_shared();
-                let local_addr = SocketAddr::new(
-                    "0.0.0.0".parse().unwrap(),
-                    ports_a.rtp,
-                );
-                Some(WebRtcRtpInfo { dtls_rx, rtp_socket_a, local_addr, srtp_recv_ctx_a, srtp_send_ctx_a })
+                let local_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), ports_a.rtp);
+                Some(WebRtcRtpInfo {
+                    dtls_rx,
+                    rtp_socket_a,
+                    local_addr,
+                    srtp_recv_ctx_a,
+                    srtp_send_ctx_a,
+                })
             } else {
                 None
             }
@@ -579,22 +659,29 @@ impl MediaManager {
         };
 
         // ── Enable WebRTC mode on leg-B if callee is WebRTC ──────────
-        let ice_pwd_local_b_opt = self.sessions.get(session_id)
+        let ice_pwd_local_b_opt = self
+            .sessions
+            .get(session_id)
             .and_then(|s| s.ice_pwd_local_b.clone());
 
         let webrtc_info_b = if ice_pwd_local_b_opt.is_some() {
             // Callee is WebRTC: enable STUN/DTLS/RTP demux on leg-B
-            info!("Session {} enabling WebRTC mode on leg-B (STUN/DTLS/RTP demux)",
-                session_id);
+            info!(
+                "Session {} enabling WebRTC mode on leg-B (STUN/DTLS/RTP demux)",
+                session_id
+            );
             let dtls_rx = rtp_session.enable_webrtc_mode_b(ice_pwd_local_b_opt);
             let rtp_socket_b = rtp_session.rtp_socket_b();
             let srtp_recv_ctx_b = rtp_session.srtp_recv_ctx_b_shared();
             let srtp_send_ctx_b = rtp_session.srtp_send_ctx_b_shared();
-            let local_addr = SocketAddr::new(
-                "0.0.0.0".parse().unwrap(),
-                ports_b.rtp,
-            );
-            Some(WebRtcRtpInfoB { dtls_rx, rtp_socket_b, local_addr, srtp_recv_ctx_b, srtp_send_ctx_b })
+            let local_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), ports_b.rtp);
+            Some(WebRtcRtpInfoB {
+                dtls_rx,
+                rtp_socket_b,
+                local_addr,
+                srtp_recv_ctx_b,
+                srtp_send_ctx_b,
+            })
         } else {
             None
         };
@@ -702,7 +789,9 @@ fn rewrite_rtcp_attr(sdp: &str, new_rtcp_port: u16) -> String {
         if let Some(rest) = trimmed.strip_prefix("a=rtcp:") {
             // a=rtcp:<port>  or  a=rtcp:<port> IN IP4 ...
             // Find end of digits
-            let digit_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            let digit_end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
             if digit_end > 0 {
                 let suffix = &rest[digit_end..];
                 out.push_str(&format!("a=rtcp:{}{}", new_rtcp_port, suffix));
@@ -715,10 +804,9 @@ fn rewrite_rtcp_attr(sdp: &str, new_rtcp_port: u16) -> String {
         out.push_str("\r\n");
     }
     // Remove trailing extra \r\n if original didn't end with one
-    if !sdp.ends_with("\r\n") && !sdp.ends_with('\n')
-        && out.ends_with("\r\n") {
-            out.truncate(out.len() - 2);
-        }
+    if !sdp.ends_with("\r\n") && !sdp.ends_with('\n') && out.ends_with("\r\n") {
+        out.truncate(out.len() - 2);
+    }
     out
 }
 
@@ -800,12 +888,8 @@ a=rtpmap:8 PCMA/8000\r\n";
         let addr_a: SocketAddr = "192.168.1.1:5000".parse().unwrap();
         let addr_b: SocketAddr = "192.168.1.2:6000".parse().unwrap();
 
-        manager
-            .set_endpoint_a(&session.session_id, addr_a)
-            .unwrap();
-        manager
-            .set_endpoint_b(&session.session_id, addr_b)
-            .unwrap();
+        manager.set_endpoint_a(&session.session_id, addr_a).unwrap();
+        manager.set_endpoint_b(&session.session_id, addr_b).unwrap();
 
         let updated = manager.get_session(&session.session_id).unwrap();
         assert_eq!(updated.endpoint_a, Some(addr_a));

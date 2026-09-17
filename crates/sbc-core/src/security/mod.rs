@@ -16,7 +16,9 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 
 pub use ban::{BanConfig, BanEntry, BanManager};
-pub use destination::{DestinationDecision, DestinationPolicy, DestinationRule, DestinationsConfig};
+pub use destination::{
+    DestinationDecision, DestinationPolicy, DestinationRule, DestinationsConfig,
+};
 pub use user_limits::{LimitDecision, UserLimits, UserLimitsConfig, UserLimitsManager};
 
 /// TOML: `[security.ban]`, `[security.destinations]`, `[security.user_limits]`.
@@ -103,9 +105,12 @@ impl SecurityManager {
                     }
                     SecurityEvent::BanLifted { ip, .. } => ("ban_lifted", ip.clone()),
                     SecurityEvent::AuthFailure { ip, .. } => ("auth_failure", ip.clone()),
-                    SecurityEvent::DestinationBlocked { destination, rule, .. } => {
-                        ("destination_blocked", format!("{} (rule {})", destination, rule))
-                    }
+                    SecurityEvent::DestinationBlocked {
+                        destination, rule, ..
+                    } => (
+                        "destination_blocked",
+                        format!("{} (rule {})", destination, rule),
+                    ),
                     SecurityEvent::UserLimitHit { user, kind, .. } => {
                         ("user_limit", format!("{} ({})", user, kind))
                     }
@@ -140,7 +145,9 @@ impl SecurityManager {
             method: method.to_string(),
             ts: crate::events::event_ts(),
         });
-        let banned = self.bans.record_failure(ip, &format!("{} auth failures", method));
+        let banned = self
+            .bans
+            .record_failure(ip, &format!("{} auth failures", method));
         if let Some(entry) = &banned {
             self.emit(SecurityEvent::BanIssued {
                 ip: entry.ip.to_string(),

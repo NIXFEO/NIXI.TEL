@@ -199,24 +199,18 @@ impl ConfigStore {
     // ── trunks ───────────────────────────────────────────────────────────
 
     pub async fn list_trunks(&self) -> Result<Vec<TrunkRow>> {
-        sqlx::query_as::<_, TrunkRow>(&format!(
-            "SELECT {} FROM trunks ORDER BY name",
-            TRUNK_COLS
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)
+        sqlx::query_as::<_, TrunkRow>(&format!("SELECT {} FROM trunks ORDER BY name", TRUNK_COLS))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
     }
 
     pub async fn get_trunk(&self, name: &str) -> Result<Option<TrunkRow>> {
-        sqlx::query_as::<_, TrunkRow>(&format!(
-            "SELECT {} FROM trunks WHERE name = ?",
-            TRUNK_COLS
-        ))
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)
+        sqlx::query_as::<_, TrunkRow>(&format!("SELECT {} FROM trunks WHERE name = ?", TRUNK_COLS))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
     }
 
     pub async fn upsert_trunk(&self, row: &TrunkRow) -> Result<bool> {
@@ -455,12 +449,11 @@ impl ConfigStore {
     // ── settings / misc ──────────────────────────────────────────────────
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settings WHERE key = ?")
-                .bind(key)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(row.map(|(v,)| v))
     }
 
@@ -680,9 +673,15 @@ mod tests {
         };
         store.save_ban(&ban).await.unwrap();
 
-        let active = store.load_active_bans("2026-07-03T00:30:00Z").await.unwrap();
+        let active = store
+            .load_active_bans("2026-07-03T00:30:00Z")
+            .await
+            .unwrap();
         assert_eq!(active.len(), 1);
-        let expired = store.load_active_bans("2026-07-03T02:00:00Z").await.unwrap();
+        let expired = store
+            .load_active_bans("2026-07-03T02:00:00Z")
+            .await
+            .unwrap();
         assert!(expired.is_empty());
 
         assert!(store.delete_ban("198.51.100.7").await.unwrap());

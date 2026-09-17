@@ -2,8 +2,8 @@
 //!
 //! Handles SIP message reception and transmission over TLS (SIPS).
 
-use crate::{Error, Result};
 use crate::transport::udp::ReceivedMessage;
+use crate::{Error, Result};
 use rsip::SipMessage;
 use std::fs;
 use std::net::SocketAddr;
@@ -12,8 +12,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -29,11 +29,7 @@ pub struct TlsListenerServer {
 
 impl TlsListenerServer {
     /// Create a new TLS listener
-    pub async fn new(
-        bind_addr: SocketAddr,
-        cert_path: &Path,
-        key_path: &Path,
-    ) -> Result<Self> {
+    pub async fn new(bind_addr: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<Self> {
         // Load TLS certificates
         let certs = Self::load_certs(cert_path)?;
         let key = Self::load_private_key(key_path)?;
@@ -78,14 +74,15 @@ impl TlsListenerServer {
 
     /// Load private key from file
     fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let key_data = fs::read(path)
-            .map_err(|e| Error::Config(format!("Failed to read key file: {}", e)))?;
+        let key_data =
+            fs::read(path).map_err(|e| Error::Config(format!("Failed to read key file: {}", e)))?;
 
         // Try PKCS8 format first
         let mut key_slice = key_data.as_slice();
         let mut pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut key_slice);
         if let Some(key_result) = pkcs8_keys.next() {
-            let key = key_result.map_err(|e| Error::Config(format!("Failed to parse PKCS8 key: {}", e)))?;
+            let key = key_result
+                .map_err(|e| Error::Config(format!("Failed to parse PKCS8 key: {}", e)))?;
             return Ok(PrivateKeyDer::Pkcs8(key));
         }
 
@@ -93,11 +90,14 @@ impl TlsListenerServer {
         let mut key_slice = key_data.as_slice();
         let mut rsa_keys = rustls_pemfile::rsa_private_keys(&mut key_slice);
         if let Some(key_result) = rsa_keys.next() {
-            let key = key_result.map_err(|e| Error::Config(format!("Failed to parse RSA key: {}", e)))?;
+            let key =
+                key_result.map_err(|e| Error::Config(format!("Failed to parse RSA key: {}", e)))?;
             return Ok(PrivateKeyDer::Pkcs1(key));
         }
 
-        Err(Error::Config("No private keys found in key file".to_string()))
+        Err(Error::Config(
+            "No private keys found in key file".to_string(),
+        ))
     }
 
     /// Get the local address this listener is bound to
@@ -106,10 +106,7 @@ impl TlsListenerServer {
     }
 
     /// Start listening for incoming TLS connections
-    pub async fn listen(
-        self,
-        message_tx: mpsc::UnboundedSender<ReceivedMessage>,
-    ) -> Result<()> {
+    pub async fn listen(self, message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<()> {
         info!("Starting TLS listener on {}", self.local_addr);
 
         loop {
@@ -122,7 +119,10 @@ impl TlsListenerServer {
                 }
             };
 
-            debug!("Accepted TCP connection from {}, starting TLS handshake", peer_addr);
+            debug!(
+                "Accepted TCP connection from {}, starting TLS handshake",
+                peer_addr
+            );
 
             // Perform TLS handshake
             let acceptor = self.acceptor.clone();
@@ -200,7 +200,10 @@ impl TlsListenerServer {
             // Try to extract complete SIP messages
             while let Some((message, remaining)) = Self::extract_message(&buffer)? {
                 // Skip pure CRLF keepalives (RFC 5626 §4.4.1)
-                let trimmed = message.iter().filter(|&&b| b != b'\r' && b != b'\n').count();
+                let trimmed = message
+                    .iter()
+                    .filter(|&&b| b != b'\r' && b != b'\n')
+                    .count();
                 if trimmed == 0 {
                     buffer = remaining.to_vec();
                     continue;
@@ -248,9 +251,7 @@ impl TlsListenerServer {
         // Softphones send "\r\n\r\n" or "\r\n" as keepalive pings on TLS connections.
         let buffer = {
             let mut start = 0;
-            while start < buffer.len()
-                && (buffer[start] == b'\r' || buffer[start] == b'\n')
-            {
+            while start < buffer.len() && (buffer[start] == b'\r' || buffer[start] == b'\n') {
                 start += 1;
             }
             &buffer[start..]
@@ -309,9 +310,9 @@ impl TlsListenerServer {
                     .ok_or_else(|| Error::Parse("Invalid Content-Length header".to_string()))?
                     .trim();
 
-                return value.parse::<usize>().map_err(|e| {
-                    Error::Parse(format!("Failed to parse Content-Length: {}", e))
-                });
+                return value
+                    .parse::<usize>()
+                    .map_err(|e| Error::Parse(format!("Failed to parse Content-Length: {}", e)));
             }
         }
 
@@ -391,6 +392,9 @@ mod tests {
     #[test]
     fn test_parse_content_length() {
         let headers = b"Via: SIP/2.0/TLS example.com\r\nContent-Length: 142\r\n";
-        assert_eq!(TlsListenerServer::parse_content_length(headers).unwrap(), 142);
+        assert_eq!(
+            TlsListenerServer::parse_content_length(headers).unwrap(),
+            142
+        );
     }
 }

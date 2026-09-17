@@ -37,7 +37,10 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
         .route("/api/v1/calls", get(routes::calls::list_calls))
         .route("/api/v1/calls/:uuid", delete(routes::calls::kick_call))
         // Registrations
-        .route("/api/v1/registrations", get(routes::calls::list_registrations))
+        .route(
+            "/api/v1/registrations",
+            get(routes::calls::list_registrations),
+        )
         // CDRs
         .route("/api/v1/cdrs", get(routes::calls::list_cdrs))
         // Users / DIDs (SQLite-backed)
@@ -68,8 +71,14 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
                 .put(routes::trunks::update_trunk)
                 .delete(routes::trunks::delete_trunk),
         )
-        .route("/api/v1/trunks/:name/enable", post(routes::trunks::enable_trunk))
-        .route("/api/v1/trunks/:name/disable", post(routes::trunks::disable_trunk))
+        .route(
+            "/api/v1/trunks/:name/enable",
+            post(routes::trunks::enable_trunk),
+        )
+        .route(
+            "/api/v1/trunks/:name/disable",
+            post(routes::trunks::disable_trunk),
+        )
         // Routes (prefix → trunk)
         .route(
             "/api/v1/routes",
@@ -94,7 +103,10 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
             "/api/v1/security/bans",
             get(routes::security::list_bans).post(routes::security::create_ban),
         )
-        .route("/api/v1/security/bans/:ip", delete(routes::security::delete_ban))
+        .route(
+            "/api/v1/security/bans/:ip",
+            delete(routes::security::delete_ban),
+        )
         .route(
             "/api/v1/security/destination-rules",
             get(routes::security::list_destination_rules)
@@ -122,7 +134,10 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
         .route("/api/registrations", get(routes::calls::list_registrations))
         .route("/api/status", get(routes::system::stats))
         .route("/api/trunks", get(routes::trunks::list_trunks))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
         // Rate-limit is outermost so it runs first, before auth and handlers.
         .layer(middleware::from_fn_with_state(
@@ -179,10 +194,7 @@ fn build_cors(origins: &[String]) -> Option<CorsLayer> {
     let layer = if origins.iter().any(|o| o == "*") {
         layer.allow_origin(Any)
     } else {
-        let parsed: Vec<HeaderValue> = origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
+        let parsed: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
         layer.allow_origin(AllowOrigin::list(parsed))
     };
     Some(layer)
@@ -191,11 +203,7 @@ fn build_cors(origins: &[String]) -> Option<CorsLayer> {
 /// Constant-time bearer-token check. Accepts `Authorization: Bearer <t>`,
 /// `X-Api-Token: <t>`, or `?token=<t>` (for EventSource, which cannot set
 /// headers). `/health` and `/ready` stay public.
-async fn auth_middleware(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
     if path == "/health" || path == "/ready" {
         return next.run(request).await;
@@ -224,7 +232,10 @@ async fn auth_middleware(
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
         .map(str::to_string)
         .or_else(|| {
             request

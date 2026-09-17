@@ -14,18 +14,29 @@ impl Sbc {
         // ── In-dialog re-INVITE (RFC 4028 session refresh)? ─────────────
         // A To-tag + a known Call-ID means an existing dialog: answer with
         // unchanged SDP instead of treating it as a new call.
-        let to_has_tag = request.to_header().ok()
+        let to_has_tag = request
+            .to_header()
+            .ok()
             .and_then(|h| h.typed().ok())
             .map(|to: rsip::typed::To| to.params.iter().any(|p| matches!(p, rsip::Param::Tag(_))))
             .unwrap_or(false);
         if to_has_tag {
             if let Ok(cid_header) = request.call_id_header() {
                 let cid = cid_header.value().to_string();
-                if let Some((uuid, is_from_caller)) =
-                    self.b2bua.find_by_any_call_id_with_source(&cid, Some(source)).await
+                if let Some((uuid, is_from_caller)) = self
+                    .b2bua
+                    .find_by_any_call_id_with_source(&cid, Some(source))
+                    .await
                 {
                     return self
-                        .handle_reinvite(&uuid, is_from_caller, request, source, transport, reply_tx)
+                        .handle_reinvite(
+                            &uuid,
+                            is_from_caller,
+                            request,
+                            source,
+                            transport,
+                            reply_tx,
+                        )
                         .await;
                 }
             }
@@ -40,16 +51,27 @@ impl Sbc {
         //   (5) source IP is a known trunk IP (whitelisted)
         let source_ip = source.ip().to_string();
         let is_localhost = source_ip == "127.0.0.1" || source_ip == "::1";
-        let is_trunk_ip = self.trunk_ips.read().await.iter().any(|ip| ip == &source_ip);
+        let is_trunk_ip = self
+            .trunk_ips
+            .read()
+            .await
+            .iter()
+            .any(|ip| ip == &source_ip);
         if is_trunk_ip {
             info!("INVITE from trunk IP {} — whitelisted", source_ip);
         }
         if !is_localhost && !is_trunk_ip {
-            let all_regs = self.register_handler.all_registrations().await.unwrap_or_default();
+            let all_regs = self
+                .register_handler
+                .all_registrations()
+                .await
+                .unwrap_or_default();
             let ip_known = all_regs.iter().any(|r| r.received_ip == source_ip);
 
             // Also check From user against registered AORs
-            let from_user_known = request.from_header().ok()
+            let from_user_known = request
+                .from_header()
+                .ok()
                 .and_then(|h| h.typed().ok())
                 .map(|from: rsip::typed::From| {
                     let from_uri = from.uri.to_string();
@@ -58,7 +80,9 @@ impl Sbc {
                 .unwrap_or(false);
 
             // Also check if the To URI is one of our registered users (incoming call)
-            let to_user_known = request.to_header().ok()
+            let to_user_known = request
+                .to_header()
+                .ok()
                 .and_then(|h| h.typed().ok())
                 .map(|to: rsip::typed::To| {
                     let to_uri = to.uri.to_string();
@@ -67,17 +91,26 @@ impl Sbc {
                 .unwrap_or(false);
 
             if !ip_known && !from_user_known && !to_user_known {
-                warn!("INVITE rejected from unregistered source {} (IP/From/To all unknown)", source);
+                warn!(
+                    "INVITE rejected from unregistered source {} (IP/From/To all unknown)",
+                    source
+                );
                 self.metrics.inc_spam_blocked();
                 // Scanner INVITE floods count toward the fail2ban window
-                if let Some(entry) = self.security.record_auth_failure(source.ip(), None, "INVITE") {
+                if let Some(entry) = self
+                    .security
+                    .record_auth_failure(source.ip(), None, "INVITE")
+                {
                     self.metrics.inc_security_ban();
                     self.persist_ban(&entry);
                 }
                 self.metrics.inc_sip_response(403);
                 let response_403 = build_plain_response_for_request(&request, 403, "Forbidden")?;
                 let data = response_403.to_string().into_bytes();
-                return self.transport.reply(&data, source, transport, reply_tx).await;
+                return self
+                    .transport
+                    .reply(&data, source, transport, reply_tx)
+                    .await;
             }
         }
 
@@ -86,39 +119,68 @@ impl Sbc {
         // Trunk/localhost sources are exempt (inbound PSTN calls).
         if !is_localhost && !is_trunk_ip {
             let caller_user = {
-                let regs = self.register_handler.all_registrations().await.unwrap_or_default();
+                let regs = self
+                    .register_handler
+                    .all_registrations()
+                    .await
+                    .unwrap_or_default();
                 regs.iter()
                     .find(|r| r.received_ip == source_ip)
                     .and_then(|r| r.aor.strip_prefix("sip:").and_then(|a| a.split('@').next()))
                     .map(str::to_string)
                     .or_else(|| {
-                        request.from_header().ok()
+                        request
+                            .from_header()
+                            .ok()
                             .and_then(|h| h.typed().ok())
                             .and_then(|f: rsip::typed::From| f.uri.user().map(str::to_string))
                     })
             };
             if let Some(user) = caller_user {
                 let concurrent = self.b2bua.active_calls_for_user(&user).await;
-                match self.security.user_limits.check_and_record(&user, concurrent) {
+                match self
+                    .security
+                    .user_limits
+                    .check_and_record(&user, concurrent)
+                {
                     crate::security::LimitDecision::Allowed => {}
                     crate::security::LimitDecision::ConcurrentExceeded { current, limit } => {
                         warn!(target: "security", "User '{}' concurrent limit: {}/{}", user, current, limit);
-                        self.security.emit(crate::security::SecurityEvent::UserLimitHit {
-                            user: user.clone(), kind: "concurrent".into(), current, limit,
-                            ts: crate::events::event_ts(),
-                        });
+                        self.security
+                            .emit(crate::security::SecurityEvent::UserLimitHit {
+                                user: user.clone(),
+                                kind: "concurrent".into(),
+                                current,
+                                limit,
+                                ts: crate::events::event_ts(),
+                            });
                         self.metrics.inc_security_user_limit_rejection();
                         self.metrics.inc_sip_response(403);
-                        let r = build_plain_response_for_request(&request, 403, "Too Many Concurrent Calls")?;
+                        let r = build_plain_response_for_request(
+                            &request,
+                            403,
+                            "Too Many Concurrent Calls",
+                        )?;
                         let data = r.to_string().into_bytes();
-                        return self.transport.reply(&data, source, transport, reply_tx).await;
+                        return self
+                            .transport
+                            .reply(&data, source, transport, reply_tx)
+                            .await;
                     }
-                    crate::security::LimitDecision::RateExceeded { current, limit, retry_after_secs } => {
+                    crate::security::LimitDecision::RateExceeded {
+                        current,
+                        limit,
+                        retry_after_secs,
+                    } => {
                         warn!(target: "security", "User '{}' rate limit: {}/{} per min", user, current, limit);
-                        self.security.emit(crate::security::SecurityEvent::UserLimitHit {
-                            user: user.clone(), kind: "rate".into(), current, limit,
-                            ts: crate::events::event_ts(),
-                        });
+                        self.security
+                            .emit(crate::security::SecurityEvent::UserLimitHit {
+                                user: user.clone(),
+                                kind: "rate".into(),
+                                current,
+                                limit,
+                                ts: crate::events::event_ts(),
+                            });
                         self.metrics.inc_security_user_limit_rejection();
                         self.metrics.inc_sip_response(503);
                         // 503 + Retry-After (RFC 3261-conformant throttle)
@@ -126,13 +188,17 @@ impl Sbc {
                             "SIP/2.0 503 Service Unavailable\r\nRetry-After: {}\r\nContent-Length: 0\r\n\r\n",
                             retry_after_secs
                         );
-                        let r = build_plain_response_for_request(&request, 503, "Service Unavailable")?;
+                        let r =
+                            build_plain_response_for_request(&request, 503, "Service Unavailable")?;
                         let with_retry = r.to_string().replace(
                             "\r\nContent-Length:",
                             &format!("\r\nRetry-After: {}\r\nContent-Length:", retry_after_secs),
                         );
                         let _ = raw; // keep formatting simple: send the header-injected variant
-                        return self.transport.reply(with_retry.as_bytes(), source, transport, reply_tx).await;
+                        return self
+                            .transport
+                            .reply(with_retry.as_bytes(), source, transport, reply_tx)
+                            .await;
                     }
                 }
             }
@@ -143,35 +209,49 @@ impl Sbc {
         // relies on. (Formerly enforced as a side effect of the removed
         // transaction layer, which answered nothing at all.)
         if !request_has_rfc3261_branch(&request) {
-            warn!("INVITE from {} without an RFC 3261 Via branch — 400", source);
+            warn!(
+                "INVITE from {} without an RFC 3261 Via branch — 400",
+                source
+            );
             self.metrics.inc_sip_response(400);
             let r400 = build_plain_response_for_request(&request, 400, "Bad Request - Via branch")?;
             let data = r400.to_string().into_bytes();
-            return self.transport.reply(&data, source, transport, reply_tx).await;
+            return self
+                .transport
+                .reply(&data, source, transport, reply_tx)
+                .await;
         }
 
         // ── Metrics: call attempted ──
         self.metrics.inc_call_attempted();
 
         // Extract Call-ID and caller tag
-        let call_id = request.call_id_header()
+        let call_id = request
+            .call_id_header()
             .map_err(|e| Error::Other(format!("Missing Call-ID: {}", e)))?
             .value()
             .to_string();
 
-        let caller_tag = request.from_header()
+        let caller_tag = request
+            .from_header()
             .ok()
             .and_then(|h| h.typed().ok())
             .and_then(|from: rsip::typed::From| {
                 from.params.iter().find_map(|p| {
-                    if let rsip::Param::Tag(t) = p { Some(t.value().to_string()) } else { None }
+                    if let rsip::Param::Tag(t) = p {
+                        Some(t.value().to_string())
+                    } else {
+                        None
+                    }
                 })
             })
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
         // Extract SDP body
         let caller_sdp: Option<String> = if !request.body.is_empty() {
-            std::str::from_utf8(&request.body).ok().map(|s| s.to_string())
+            std::str::from_utf8(&request.body)
+                .ok()
+                .map(|s| s.to_string())
         } else {
             None
         };
@@ -180,26 +260,38 @@ impl Sbc {
         if let Ok(trying) = build_trying(&request) {
             self.metrics.inc_sip_response(100);
             let data = trying.to_string().into_bytes();
-            self.send_sip("100 Trying → caller", &data, source, transport, reply_tx).await;
+            self.send_sip("100 Trying → caller", &data, source, transport, reply_tx)
+                .await;
             debug!("Sent 100 Trying to {}", source);
         }
 
         // Create B2BUA call (allocates media ports, tracks call state)
         // Pass the reply_tx so later provisional/final responses can reach the caller
-        let uuid = match self.b2bua.create_call(
-            call_id.clone(),
-            caller_tag,
-            source,
-            caller_sdp.as_deref(),
-            reply_tx.cloned(),
-            transport,
-        ).await {
+        let uuid = match self
+            .b2bua
+            .create_call(
+                call_id.clone(),
+                caller_tag,
+                source,
+                caller_sdp.as_deref(),
+                reply_tx.cloned(),
+                transport,
+            )
+            .await
+        {
             Ok(uuid) => uuid,
             Err(e) => {
                 warn!("B2BUA create_call failed: {}", e);
                 self.metrics.inc_sip_response(500);
                 let response_500 = build_plain_response(500, "Server Internal Error");
-                self.send_sip("500 → caller", response_500.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip(
+                    "500 → caller",
+                    response_500.as_bytes(),
+                    source,
+                    transport,
+                    reply_tx,
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -235,7 +327,11 @@ impl Sbc {
                         // Extract local ICE credentials for STUN MESSAGE-INTEGRITY
                         let (_, ice_pwd) = session.ice_agent.credentials();
                         let ice_pwd_owned = ice_pwd.to_string();
-                        info!("WebRTC session created for call {} (ICE+DTLS+SRTP, ice_pwd_len={})", uuid, ice_pwd_owned.len());
+                        info!(
+                            "WebRTC session created for call {} (ICE+DTLS+SRTP, ice_pwd_len={})",
+                            uuid,
+                            ice_pwd_owned.len()
+                        );
 
                         // Store ice_pwd in B2BUA call for later use by MediaManager
                         self.b2bua.set_webrtc_ice_pwd(&uuid, ice_pwd_owned).await;
@@ -260,26 +356,39 @@ impl Sbc {
         let mut did_mapped = false;
         if let Some(ref aor) = callee_aor {
             // Extract just the user part from the AOR (e.g. "0123456789" from "sip:0123456789@sip.nixi.tel")
-            let callee_user = aor.strip_prefix("sip:")
+            let callee_user = aor
+                .strip_prefix("sip:")
                 .and_then(|s| s.split('@').next())
                 .unwrap_or(aor);
 
             // Check if this number matches a DID mapping
-            let did_match = self.did_mappings.read().await.iter().find(|did| {
-                // Match against the number as-is, or with/without leading 0, or E.164 format
-                let n = &did.number;
-                callee_user == n
-                    || callee_user == n.trim_start_matches('0')
-                    || callee_user == format!("+33{}", n.trim_start_matches('0'))
-                    || format!("+33{}", callee_user.trim_start_matches('0')) == format!("+33{}", n.trim_start_matches('0'))
-            }).cloned();
+            let did_match = self
+                .did_mappings
+                .read()
+                .await
+                .iter()
+                .find(|did| {
+                    // Match against the number as-is, or with/without leading 0, or E.164 format
+                    let n = &did.number;
+                    callee_user == n
+                        || callee_user == n.trim_start_matches('0')
+                        || callee_user == format!("+33{}", n.trim_start_matches('0'))
+                        || format!("+33{}", callee_user.trim_start_matches('0'))
+                            == format!("+33{}", n.trim_start_matches('0'))
+                })
+                .cloned();
 
             if let Some(did) = did_match {
-                let sip_realm = self.identity.as_ref()
+                let sip_realm = self
+                    .identity
+                    .as_ref()
                     .map(|id| id.sip_domain.clone())
                     .unwrap_or_else(|| "sip.nixi.tel".to_string());
                 let mapped_aor = format!("sip:{}@{}", did.user, sip_realm);
-                info!("DID mapping: {} → {} (user: {})", did.number, mapped_aor, did.user);
+                info!(
+                    "DID mapping: {} → {} (user: {})",
+                    did.number, mapped_aor, did.user
+                );
                 callee_aor = Some(mapped_aor);
                 did_mapped = true;
             }
@@ -291,7 +400,10 @@ impl Sbc {
                     // Pick the most recently registered contact
                     let contact = contacts.into_iter().max_by_key(|r| r.registered_at);
                     if let Some(ref c) = contact {
-                        info!("Registrar lookup: callee {} found at {} (transport={})", aor, c.contact, c.transport);
+                        info!(
+                            "Registrar lookup: callee {} found at {} (transport={})",
+                            aor, c.contact, c.transport
+                        );
                     }
                     contact
                 }
@@ -309,7 +421,8 @@ impl Sbc {
         };
 
         // ── Step 2: Determine destination, transport and outbound reply channel ─
-        let (dest, outbound_transport, outbound_reply_tx) = if let Some(ref reg) = registrar_contact {
+        let (dest, outbound_transport, outbound_reply_tx) = if let Some(ref reg) = registrar_contact
+        {
             // Route to registered contact (e.g., a WebRTC/WSS client)
             let addr: std::net::SocketAddr = format!("{}:{}", reg.received_ip, reg.received_port)
                 .parse()
@@ -317,13 +430,16 @@ impl Sbc {
 
             let reg_transport = match reg.transport.as_str() {
                 "WSS" => rsip::Transport::Wss,
-                "WS"  => rsip::Transport::Ws,
+                "WS" => rsip::Transport::Ws,
                 "TLS" => rsip::Transport::Tls,
                 "TCP" => rsip::Transport::Tcp,
-                _     => rsip::Transport::Udp,
+                _ => rsip::Transport::Udp,
             };
 
-            info!("Routing INVITE to registered contact {} via {}", addr, reg.transport);
+            info!(
+                "Routing INVITE to registered contact {} via {}",
+                addr, reg.transport
+            );
 
             // For connection-oriented transports (WS/WSS/TLS/TCP): reuse the stored
             // reply_tx (the inbound connection channel). This is critical for NAT
@@ -347,7 +463,14 @@ impl Sbc {
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(480);
                     let response_480 = build_plain_response(480, "Temporarily Unavailable");
-                    self.send_sip("480 → caller", response_480.as_bytes(), source, transport, reply_tx).await;
+                    self.send_sip(
+                        "480 → caller",
+                        response_480.as_bytes(),
+                        source,
+                        transport,
+                        reply_tx,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -362,7 +485,14 @@ impl Sbc {
             self.metrics.inc_call_failed();
             self.metrics.inc_sip_response(480);
             let response_480 = build_plain_response(480, "Temporarily Unavailable");
-            self.send_sip("480 → caller", response_480.as_bytes(), source, transport, reply_tx).await;
+            self.send_sip(
+                "480 → caller",
+                response_480.as_bytes(),
+                source,
+                transport,
+                reply_tx,
+            )
+            .await;
             return Ok(());
         } else {
             // No DID match and no registered user — fall back to trunk routing
@@ -370,26 +500,39 @@ impl Sbc {
             // the rest are armed for active failover (5s no-answer / 5xx).
             // ── Destination blocking (anti-IRSF) before trunk selection ──
             if let Some(dialed) = request.uri.user().map(|s| s.to_string()) {
-                let caller_user = request.from_header().ok()
+                let caller_user = request
+                    .from_header()
+                    .ok()
                     .and_then(|h| h.typed().ok())
                     .and_then(|f: rsip::typed::From| f.uri.user().map(str::to_string));
-                if let crate::security::DestinationDecision::Blocked { rule_id, description } =
-                    self.security.destinations.check(&dialed, caller_user.as_deref())
+                if let crate::security::DestinationDecision::Blocked {
+                    rule_id,
+                    description,
+                } = self
+                    .security
+                    .destinations
+                    .check(&dialed, caller_user.as_deref())
                 {
                     warn!(target: "security", "Destination blocked: {} (rule {}: {})", dialed, rule_id, description);
-                    self.security.emit(crate::security::SecurityEvent::DestinationBlocked {
-                        user: caller_user,
-                        destination: dialed,
-                        rule: rule_id,
-                        ts: crate::events::event_ts(),
-                    });
+                    self.security
+                        .emit(crate::security::SecurityEvent::DestinationBlocked {
+                            user: caller_user,
+                            destination: dialed,
+                            rule: rule_id,
+                            ts: crate::events::event_ts(),
+                        });
                     self.b2bua.terminate_call(&uuid).await;
                     self.metrics.inc_security_destination_blocked();
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(403);
-                    let r403 = build_plain_response_for_request(&request, 403, "Forbidden - Destination Blocked")?;
+                    let r403 = build_plain_response_for_request(
+                        &request,
+                        403,
+                        "Forbidden - Destination Blocked",
+                    )?;
                     let data = r403.to_string().into_bytes();
-                    self.send_sip("403 → caller", &data, source, transport, reply_tx).await;
+                    self.send_sip("403 → caller", &data, source, transport, reply_tx)
+                        .await;
                     return Ok(());
                 }
             }
@@ -401,25 +544,44 @@ impl Sbc {
                 self.metrics.inc_call_failed();
                 self.metrics.inc_sip_response(503);
                 let response_503 = build_plain_response(503, "Service Unavailable");
-                self.send_sip("503 → caller", response_503.as_bytes(), source, transport, reply_tx).await;
+                self.send_sip(
+                    "503 → caller",
+                    response_503.as_bytes(),
+                    source,
+                    transport,
+                    reply_tx,
+                )
+                .await;
                 return Ok(());
             }
             let trunk = candidates.remove(0);
             let backup_ids: Vec<crate::routing::TrunkId> =
                 candidates.iter().map(|t| t.id).collect();
-            self.b2bua.set_failover_candidates(&uuid, backup_ids.clone()).await;
+            self.b2bua
+                .set_failover_candidates(&uuid, backup_ids.clone())
+                .await;
             if !backup_ids.is_empty() {
-                info!("Failover armed: {} backup trunk(s) for call {}", backup_ids.len(), uuid);
+                info!(
+                    "Failover armed: {} backup trunk(s) for call {}",
+                    backup_ids.len(),
+                    uuid
+                );
             }
 
-            info!("Routing INVITE via trunk: {} ({}:{})", trunk.name, trunk.host, trunk.port);
+            info!(
+                "Routing INVITE via trunk: {} ({}:{})",
+                trunk.name, trunk.host, trunk.port
+            );
 
             // ── Number normalization for trunk ──────────────────────────────
             // Extract user part from Request-URI and normalize for this trunk's format
             if let Some(user_part) = request.uri.user().map(|s| s.to_string()) {
                 let normalized = trunk.normalize_number(&user_part);
                 if normalized != user_part {
-                    info!("Number normalized: {} → {} (trunk '{}' expects {:?})", user_part, normalized, trunk.name, trunk.number_format);
+                    info!(
+                        "Number normalized: {} → {} (trunk '{}' expects {:?})",
+                        user_part, normalized, trunk.name, trunk.number_format
+                    );
                     // Rewrite the Request-URI auth (user part) with the normalized number
                     if let Some(ref mut auth) = request.uri.auth {
                         auth.user = normalized;
@@ -429,7 +591,9 @@ impl Sbc {
 
             // ── Store trunk_id on the B2BUA call for 407 retry ──────────────
             // We need trunk_id to look up credentials when we get a 407 response
-            self.b2bua.store_outbound_invite(&uuid, String::new(), trunk.id).await;
+            self.b2bua
+                .store_outbound_invite(&uuid, String::new(), trunk.id)
+                .await;
             // Store trunk name for CDR enrichment
             {
                 let mut calls = self.b2bua.calls_locked().await;
@@ -447,7 +611,14 @@ impl Sbc {
                     self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(503);
                     let response_503 = build_plain_response(503, "Service Unavailable");
-                    self.send_sip("503 → caller", response_503.as_bytes(), source, transport, reply_tx).await;
+                    self.send_sip(
+                        "503 → caller",
+                        response_503.as_bytes(),
+                        source,
+                        transport,
+                        reply_tx,
+                    )
+                    .await;
                     return Ok(());
                 }
             };
@@ -457,10 +628,12 @@ impl Sbc {
 
         // ── CDR enrichment: store caller/callee numbers and trunk name ──────
         {
-            let caller_num = request.from_header().ok()
-                .and_then(|h| h.typed().ok())
-                .map(|from: rsip::typed::From| from.uri.user().unwrap_or("unknown").to_string());
-            let callee_num = callee_aor.as_deref()
+            let caller_num =
+                request.from_header().ok().and_then(|h| h.typed().ok()).map(
+                    |from: rsip::typed::From| from.uri.user().unwrap_or("unknown").to_string(),
+                );
+            let callee_num = callee_aor
+                .as_deref()
                 .and_then(|aor| aor.strip_prefix("sip:"))
                 .and_then(|s| s.split('@').next())
                 .map(|s| s.to_string());
@@ -482,10 +655,16 @@ impl Sbc {
         // If the callee is on WSS/WS transport, it's a WebRTC endpoint.
         // We need to generate a WebRTC SDP offer (Opus/SAVPF/ICE/DTLS) instead
         // of forwarding the trunk's PCMA/AVP SDP.
-        let callee_is_webrtc = matches!(outbound_transport, rsip::Transport::Wss | rsip::Transport::Ws);
+        let callee_is_webrtc = matches!(
+            outbound_transport,
+            rsip::Transport::Wss | rsip::Transport::Ws
+        );
         if callee_is_webrtc {
             self.b2bua.set_callee_is_webrtc(&uuid, true).await;
-            info!("Callee is WebRTC (transport={:?}) — will generate WebRTC SDP offer", outbound_transport);
+            info!(
+                "Callee is WebRTC (transport={:?}) — will generate WebRTC SDP offer",
+                outbound_transport
+            );
         }
 
         // ── Step 3: Rewrite SDP body for NAT traversal ───────────────────────
@@ -501,12 +680,15 @@ impl Sbc {
                 // When callee is WebRTC and caller is a trunk (plain RTP),
                 // completely replace the SDP with a WebRTC Opus/SAVPF offer.
                 let rewritten_sdp = if callee_is_webrtc {
-                    let sbc_ip = self.identity.as_ref()
+                    let sbc_ip = self
+                        .identity
+                        .as_ref()
                         .map(|id| id.public_ip.clone())
                         .unwrap_or_else(|| "127.0.0.1".to_string());
                     // Get the leg-B RTP port (callee/WebRTC side)
                     let leg_b_port = if let Some(ref media_id) = media_session_id {
-                        self.media.get_session(media_id)
+                        self.media
+                            .get_session(media_id)
                             .and_then(|s| s.ports_b.map(|pb| pb.rtp))
                             .unwrap_or(10000)
                     } else {
@@ -520,10 +702,14 @@ impl Sbc {
                                 let (_, ice_pwd) = session.ice_agent.credentials();
                                 ice_pwd.to_string()
                             };
-                            self.b2bua.set_webrtc_ice_pwd_b(&uuid, ice_pwd_owned.clone()).await;
+                            self.b2bua
+                                .set_webrtc_ice_pwd_b(&uuid, ice_pwd_owned.clone())
+                                .await;
 
                             let sdp_offer = session.generate_sdp_offer(leg_b_port, &sbc_ip);
-                            self.b2bua.set_webrtc_sdp_offer(&uuid, sdp_offer.clone()).await;
+                            self.b2bua
+                                .set_webrtc_sdp_offer(&uuid, sdp_offer.clone())
+                                .await;
                             self.b2bua.set_webrtc_session_b(&uuid, session).await;
 
                             // Set ICE pwd on MediaManager for leg-B STUN MESSAGE-INTEGRITY
@@ -541,15 +727,19 @@ impl Sbc {
                         }
                     }
                 } else if caller_is_webrtc {
-                    let sbc_ip = self.identity.as_ref()
+                    let sbc_ip = self
+                        .identity
+                        .as_ref()
                         .map(|id| id.public_ip.clone())
                         .unwrap_or_else(|| "127.0.0.1".to_string());
                     // Get the leg-B RTP port (callee/trunk side)
                     let trunk_rtp_port = if let Some(ref media_id) = media_session_id {
-                        self.media.get_session(media_id)
+                        self.media
+                            .get_session(media_id)
                             .and_then(|s| s.ports_b.map(|pb| pb.rtp))
                             .unwrap_or_else(|| {
-                                self.media.get_session(media_id)
+                                self.media
+                                    .get_session(media_id)
                                     .map(|s| s.ports.rtp)
                                     .unwrap_or(10000)
                             })
@@ -564,7 +754,8 @@ impl Sbc {
                     // Full proxy mode: replace IP and port with SBC proxy port.
                     // Use leg-B port: callee sends RTP to leg-B, leg-B relays to caller.
                     if let Some(session) = self.media.get_session(media_id) {
-                        let proxy_port = session.ports_b
+                        let proxy_port = session
+                            .ports_b
                             .map(|pb| pb.rtp)
                             .unwrap_or(session.ports.rtp);
                         self.media.rewrite_sdp_for_proxy(sdp_str, proxy_port)
@@ -603,7 +794,9 @@ impl Sbc {
         // its INVITE transaction (RFC 3261 §18.1.2). Topology hiding will strip
         // all Vias and insert the SBC's own Via for the outbound leg.
         {
-            let caller_vias: Vec<String> = request_with_sdp.headers.iter()
+            let caller_vias: Vec<String> = request_with_sdp
+                .headers
+                .iter()
                 .filter_map(|h| {
                     let s = h.to_string();
                     if s.to_lowercase().starts_with("via:") || s.to_lowercase().starts_with("v:") {
@@ -618,8 +811,14 @@ impl Sbc {
                 .ok()
                 .and_then(|h| h.typed().ok())
                 .map(|c: rsip::typed::CSeq| c.seq);
-            info!("Stored {} original Via header(s) for caller (CSeq {:?})", caller_vias.len(), caller_cseq);
-            self.b2bua.set_caller_vias(&uuid, caller_vias, caller_cseq).await;
+            info!(
+                "Stored {} original Via header(s) for caller (CSeq {:?})",
+                caller_vias.len(),
+                caller_cseq
+            );
+            self.b2bua
+                .set_caller_vias(&uuid, caller_vias, caller_cseq)
+                .await;
         }
 
         // ── Step 3b: Apply topology hiding on outbound message ────────────────
@@ -627,11 +826,11 @@ impl Sbc {
         // Use the OUTBOUND transport name (not the inbound one), so the Via header
         // reflects the correct transport the callee must use to reply.
         let outbound_transport_name = match outbound_transport {
-            rsip::Transport::Tls  => "TLS",
-            rsip::Transport::Tcp  => "TCP",
-            rsip::Transport::Wss  => "WSS",
-            rsip::Transport::Ws   => "WS",
-            _                     => "UDP",
+            rsip::Transport::Tls => "TLS",
+            rsip::Transport::Tcp => "TCP",
+            rsip::Transport::Wss => "WSS",
+            rsip::Transport::Ws => "WS",
+            _ => "UDP",
         };
         // Build an identity with the correct port for the outbound transport:
         // TLS/WSS → 5061, others → 5060
@@ -641,7 +840,10 @@ impl Sbc {
                 _ => 5060,
             };
             let outbound_identity = if out_port != base_identity.sip_port {
-                let tls_flag = matches!(outbound_transport, rsip::Transport::Tls | rsip::Transport::Wss);
+                let tls_flag = matches!(
+                    outbound_transport,
+                    rsip::Transport::Tls | rsip::Transport::Wss
+                );
                 crate::topology::SbcIdentity::new(
                     &base_identity.public_ip,
                     &base_identity.sip_domain,
@@ -651,8 +853,12 @@ impl Sbc {
             } else {
                 base_identity.clone()
             };
-            apply_topology_hiding_outbound(&raw_request, &outbound_identity, outbound_transport_name)
-                .unwrap_or(raw_request)
+            apply_topology_hiding_outbound(
+                &raw_request,
+                &outbound_identity,
+                outbound_transport_name,
+            )
+            .unwrap_or(raw_request)
         } else {
             raw_request
         };
@@ -662,9 +868,15 @@ impl Sbc {
         // For UDP/TCP, open a new connection.
         // Log the From/To in the outbound INVITE for dialog matching debug
         {
-            let from_line = outbound_raw.lines().find(|l| l.to_lowercase().starts_with("from:"));
-            let to_line = outbound_raw.lines().find(|l| l.to_lowercase().starts_with("to:"));
-            let callid_line = outbound_raw.lines().find(|l| l.to_lowercase().starts_with("call-id:"));
+            let from_line = outbound_raw
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("from:"));
+            let to_line = outbound_raw
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("to:"));
+            let callid_line = outbound_raw
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("call-id:"));
             info!("INVITE outbound {}", from_line.unwrap_or("(no From)"));
             info!("INVITE outbound {}", to_line.unwrap_or("(no To)"));
             info!("INVITE outbound {}", callid_line.unwrap_or("(no Call-ID)"));
@@ -679,17 +891,27 @@ impl Sbc {
         let outbound_raw = {
             let toward_trunk = {
                 let calls = self.b2bua.calls_locked().await;
-                calls.get(&uuid).map(|c| c.trunk_id.is_some()).unwrap_or(false)
+                calls
+                    .get(&uuid)
+                    .map(|c| c.trunk_id.is_some())
+                    .unwrap_or(false)
             };
             match (self.session_timer, toward_trunk) {
-                (Some((expires, min_se)), true) => set_session_timer_headers(
-                    &outbound_raw, expires, min_se,
-                ),
+                (Some((expires, min_se)), true) => {
+                    set_session_timer_headers(&outbound_raw, expires, min_se)
+                }
                 _ => outbound_raw,
             }
         };
 
-        self.transport.reply(outbound_raw.as_bytes(), dest, outbound_transport, outbound_reply_tx.as_ref()).await?;
+        self.transport
+            .reply(
+                outbound_raw.as_bytes(),
+                dest,
+                outbound_transport,
+                outbound_reply_tx.as_ref(),
+            )
+            .await?;
         info!("Forwarded INVITE to {} via {:?}", dest, outbound_transport);
 
         // ── Record the INVITE attempt ──────────────────────────────────
@@ -698,9 +920,19 @@ impl Sbc {
         // Via branch attributes the trunk's responses to this attempt.
         // (trunk_id was stored earlier for trunk-routed calls; None for
         // registrar-routed callees.)
-        let trunk_id = self.b2bua.get_auth_retry_info(&uuid).await.map(|(_, id, _)| id);
+        let trunk_id = self
+            .b2bua
+            .get_auth_retry_info(&uuid)
+            .await
+            .map(|(_, id, _)| id);
         self.b2bua
-            .push_invite_attempt(&uuid, outbound_raw.clone(), dest, outbound_transport, trunk_id)
+            .push_invite_attempt(
+                &uuid,
+                outbound_raw.clone(),
+                dest,
+                outbound_transport,
+                trunk_id,
+            )
             .await;
 
         // Attach outbound leg to B2BUA call (store callee reply_tx for BYE relay)
@@ -709,13 +941,22 @@ impl Sbc {
         // The callee will use this Call-ID in its BYE, so we must match on it.
         let outbound_call_id = call_id.clone();
         let local_tag = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let _ = self.b2bua.attach_outbound(
-            &uuid, outbound_call_id, local_tag, dest,
-            outbound_reply_tx.clone(), outbound_transport,
-        ).await;
+        let _ = self
+            .b2bua
+            .attach_outbound(
+                &uuid,
+                outbound_call_id,
+                local_tag,
+                dest,
+                outbound_reply_tx.clone(),
+                outbound_transport,
+            )
+            .await;
 
         // Store callee's Request-URI for ACK relay
-        self.b2bua.set_callee_request_uri(&uuid, callee_request_uri_str).await;
+        self.b2bua
+            .set_callee_request_uri(&uuid, callee_request_uri_str)
+            .await;
 
         Ok(())
     }
@@ -725,14 +966,19 @@ impl Sbc {
     /// trunk. With no remaining candidate the call is left to the normal
     /// call-setup timeout (a single slow trunk must not be aborted early).
     pub(crate) async fn check_invite_failover(&mut self) {
-        let timed_out = self.b2bua.invite_attempts_timed_out(self.invite_timeout).await;
+        let timed_out = self
+            .b2bua
+            .invite_attempts_timed_out(self.invite_timeout)
+            .await;
         for (uuid, attempt, has_remaining) in timed_out {
             if !has_remaining {
                 continue;
             }
             warn!(
                 "Failover: call {} attempt {} unanswered after {:?} — trying next trunk",
-                &uuid[..8.min(uuid.len())], attempt, self.invite_timeout
+                &uuid[..8.min(uuid.len())],
+                attempt,
+                self.invite_timeout
             );
             self.failover_to_next_trunk(&uuid).await;
         }
@@ -746,12 +992,18 @@ impl Sbc {
             return;
         };
         let Some(trunk) = self.trunk_manager.get_trunk(&next_id) else {
-            warn!("Failover: candidate trunk {} no longer exists — trying next", next_id);
+            warn!(
+                "Failover: candidate trunk {} no longer exists — trying next",
+                next_id
+            );
             // Recurse once per missing candidate (bounded by candidate list length)
             return Box::pin(self.failover_to_next_trunk(uuid)).await;
         };
         let Some(new_dest) = trunk.destination() else {
-            warn!("Failover: trunk '{}' has no destination — trying next", trunk.name);
+            warn!(
+                "Failover: trunk '{}' has no destination — trying next",
+                trunk.name
+            );
             return Box::pin(self.failover_to_next_trunk(uuid)).await;
         };
 
@@ -767,7 +1019,10 @@ impl Sbc {
             )
         };
         let Some(stored_invite) = stored_invite.filter(|s| !s.is_empty()) else {
-            warn!("Failover: no stored outbound INVITE for call {} — cannot fail over", uuid);
+            warn!(
+                "Failover: no stored outbound INVITE for call {} — cannot fail over",
+                uuid
+            );
             return;
         };
 
@@ -776,14 +1031,23 @@ impl Sbc {
             (crate::sip_builder::build_cancel(&stored_invite), prev_dest)
         {
             info!("Failover: CANCEL previous attempt → {}", dest);
-            let _ = self.transport
-                .reply(cancel.as_bytes(), dest, prev_transport, callee_reply_tx.as_ref())
+            let _ = self
+                .transport
+                .reply(
+                    cancel.as_bytes(),
+                    dest,
+                    prev_transport,
+                    callee_reply_tx.as_ref(),
+                )
                 .await;
         }
 
         // 2. Retarget the INVITE to the new trunk
         let Some(new_invite) = retarget_invite_for_trunk(&stored_invite, &trunk) else {
-            warn!("Failover: could not retarget INVITE for trunk '{}'", trunk.name);
+            warn!(
+                "Failover: could not retarget INVITE for trunk '{}'",
+                trunk.name
+            );
             return;
         };
         let new_transport = trunk.transport.to_rsip_transport();
@@ -792,7 +1056,8 @@ impl Sbc {
             "Failover: re-sending INVITE via trunk '{}' ({}:{})",
             trunk.name, trunk.host, trunk.port
         );
-        if let Err(e) = self.transport
+        if let Err(e) = self
+            .transport
             .reply(new_invite.as_bytes(), new_dest, new_transport, None)
             .await
         {
@@ -848,11 +1113,17 @@ impl Sbc {
             return Ok(false);
         };
         let Some(trunk_id) = attempt.trunk_id else {
-            info!("422 retry: callee of call {} is not a trunk — relaying", uuid);
+            info!(
+                "422 retry: callee of call {} is not a trunk — relaying",
+                uuid
+            );
             return Ok(false);
         };
         if self.b2bua.get_session_timer_retry_count(uuid).await >= 1 {
-            warn!("422 retry: already retried once for call {} — giving up", uuid);
+            warn!(
+                "422 retry: already retried once for call {} — giving up",
+                uuid
+            );
             return Ok(false);
         }
         let trunk_name = self
@@ -886,13 +1157,25 @@ impl Sbc {
         // 5. Rebuild + send (same destination and connection as the INVITE)
         let new_invite = build_session_interval_retry(&attempt.raw, new_se, new_min_se);
         let new_cseq = crate::b2bua::parse_cseq_number(&new_invite).unwrap_or(attempt.cseq + 1);
-        let dest = if attempt.dest.ip().is_unspecified() { trunk_source } else { attempt.dest };
+        let dest = if attempt.dest.ip().is_unspecified() {
+            trunk_source
+        } else {
+            attempt.dest
+        };
         if let Err(e) = self
             .transport
-            .reply(new_invite.as_bytes(), dest, attempt.transport, callee_reply_tx.as_ref())
+            .reply(
+                new_invite.as_bytes(),
+                dest,
+                attempt.transport,
+                callee_reply_tx.as_ref(),
+            )
             .await
         {
-            warn!("422 retry: send to {} failed for call {}: {}", dest, uuid, e);
+            warn!(
+                "422 retry: send to {} failed for call {}: {}",
+                dest, uuid, e
+            );
             return Ok(false);
         }
 
@@ -921,16 +1204,20 @@ impl Sbc {
         trunk_source: SocketAddr,
     ) -> Result<bool> {
         // 1. Check retry count — only allow one retry
-        let (original_invite, trunk_id, retry_count) = match self.b2bua.get_auth_retry_info(uuid).await {
-            Some(info) => info,
-            None => {
-                warn!("407 retry: no auth info stored for call {}", uuid);
-                return Ok(false);
-            }
-        };
+        let (original_invite, trunk_id, retry_count) =
+            match self.b2bua.get_auth_retry_info(uuid).await {
+                Some(info) => info,
+                None => {
+                    warn!("407 retry: no auth info stored for call {}", uuid);
+                    return Ok(false);
+                }
+            };
 
         if retry_count >= 1 {
-            warn!("407 retry: already retried once for call {} — giving up", uuid);
+            warn!(
+                "407 retry: already retried once for call {} — giving up",
+                uuid
+            );
             return Ok(false);
         }
 
@@ -949,28 +1236,38 @@ impl Sbc {
         };
 
         if !trunk.auth_required {
-            warn!("407 retry: trunk '{}' does not require auth but sent 407", trunk.name);
+            warn!(
+                "407 retry: trunk '{}' does not require auth but sent 407",
+                trunk.name
+            );
             return Ok(false);
         }
 
         let username = match &trunk.username {
             Some(u) => u.clone(),
             None => {
-                warn!("407 retry: no username configured for trunk '{}'", trunk.name);
+                warn!(
+                    "407 retry: no username configured for trunk '{}'",
+                    trunk.name
+                );
                 return Ok(false);
             }
         };
         let password = match &trunk.password {
             Some(p) => p.clone(),
             None => {
-                warn!("407 retry: no password configured for trunk '{}'", trunk.name);
+                warn!(
+                    "407 retry: no password configured for trunk '{}'",
+                    trunk.name
+                );
                 return Ok(false);
             }
         };
 
         // 3. Extract Proxy-Authenticate header from the 407 response
         let response_raw = rsip::SipMessage::Response(response.clone()).to_string();
-        let proxy_auth_header = response_raw.lines()
+        let proxy_auth_header = response_raw
+            .lines()
             .find(|line| line.to_lowercase().starts_with("proxy-authenticate:"))
             .map(|line| {
                 let colon_pos = line.find(':').unwrap_or(0);
@@ -999,15 +1296,13 @@ impl Sbc {
             .unwrap_or_else(|| "sip:unknown@unknown".to_string());
 
         // 6. Generate Proxy-Authorization header value
-        let auth_header_value = generate_digest_response(
-            &username,
-            &password,
-            &challenge,
-            "INVITE",
-            &digest_uri,
-        );
+        let auth_header_value =
+            generate_digest_response(&username, &password, &challenge, "INVITE", &digest_uri);
 
-        info!("407 retry: computed Proxy-Authorization for user '{}' realm '{}'", username, challenge.realm);
+        info!(
+            "407 retry: computed Proxy-Authorization for user '{}' realm '{}'",
+            username, challenge.realm
+        );
 
         // 7. Rebuild the INVITE: inject Proxy-Authorization, new Via branch, CSeq+1
         let new_invite = inject_proxy_auth_into_invite(&original_invite, &auth_header_value);
@@ -1022,15 +1317,22 @@ impl Sbc {
             calls.get(uuid).and_then(|c| c.callee_reply_tx.clone())
         };
 
-        if let Err(e) = self.transport.reply(
-            new_invite.as_bytes(),
-            dest,
-            outbound_transport,
-            callee_reply_tx.as_ref(),
-        ).await {
+        if let Err(e) = self
+            .transport
+            .reply(
+                new_invite.as_bytes(),
+                dest,
+                outbound_transport,
+                callee_reply_tx.as_ref(),
+            )
+            .await
+        {
             // A send failure must not escape handle_response and leave the
             // call half-alive: report "retry impossible" so the caller is answered.
-            warn!("407 retry: send to {} failed for call {}: {}", dest, uuid, e);
+            warn!(
+                "407 retry: send to {} failed for call {}: {}",
+                dest, uuid, e
+            );
             return Ok(false);
         }
 
@@ -1042,27 +1344,37 @@ impl Sbc {
             .push_invite_attempt(uuid, new_invite, dest, outbound_transport, Some(trunk_id))
             .await;
 
-        info!("407 retry: resent authenticated INVITE to {} for call {}", dest, uuid);
+        info!(
+            "407 retry: resent authenticated INVITE to {} for call {}",
+            dest, uuid
+        );
         Ok(true)
     }
 
     /// Apply topology hiding to an outbound SIP request (Via rewrite, Record-Route, Contact).
     /// Used for INVITE, ACK, BYE, CANCEL relayed to the other leg.
-    pub(crate) fn apply_outbound_topology(&self, raw_msg: &str, outbound_transport: rsip::Transport) -> String {
+    pub(crate) fn apply_outbound_topology(
+        &self,
+        raw_msg: &str,
+        outbound_transport: rsip::Transport,
+    ) -> String {
         if let Some(base_identity) = &self.identity {
             let outbound_transport_name = match outbound_transport {
-                rsip::Transport::Tls  => "TLS",
-                rsip::Transport::Tcp  => "TCP",
-                rsip::Transport::Wss  => "WSS",
-                rsip::Transport::Ws   => "WS",
-                _                     => "UDP",
+                rsip::Transport::Tls => "TLS",
+                rsip::Transport::Tcp => "TCP",
+                rsip::Transport::Wss => "WSS",
+                rsip::Transport::Ws => "WS",
+                _ => "UDP",
             };
             let out_port = match outbound_transport {
                 rsip::Transport::Tls | rsip::Transport::Wss => 5061,
                 _ => 5060,
             };
             let out_id = if out_port != base_identity.sip_port {
-                let tls_flag = matches!(outbound_transport, rsip::Transport::Tls | rsip::Transport::Wss);
+                let tls_flag = matches!(
+                    outbound_transport,
+                    rsip::Transport::Tls | rsip::Transport::Wss
+                );
                 crate::topology::SbcIdentity::new(
                     &base_identity.public_ip,
                     &base_identity.sip_domain,
@@ -1072,8 +1384,12 @@ impl Sbc {
             } else {
                 base_identity.clone()
             };
-            crate::topology::apply_topology_hiding_outbound(raw_msg, &out_id, outbound_transport_name)
-                .unwrap_or_else(|_| raw_msg.to_string())
+            crate::topology::apply_topology_hiding_outbound(
+                raw_msg,
+                &out_id,
+                outbound_transport_name,
+            )
+            .unwrap_or_else(|_| raw_msg.to_string())
         } else {
             raw_msg.to_string()
         }
@@ -1087,7 +1403,10 @@ fn request_has_rfc3261_branch(request: &Request) -> bool {
         .iter()
         .find(|h| matches!(h, rsip::Header::Via(_)))
         .map(|h| h.to_string())
-        .and_then(|via| via.find("branch=").map(|pos| via[pos + "branch=".len()..].starts_with("z9hG4bK")))
+        .and_then(|via| {
+            via.find("branch=")
+                .map(|pos| via[pos + "branch=".len()..].starts_with("z9hG4bK"))
+        })
         .unwrap_or(false)
 }
 
@@ -1132,7 +1451,10 @@ pub(crate) fn retarget_invite_for_trunk(
         .next()?
         .to_string();
     let normalized = trunk.normalize_number(&user);
-    lines[0] = format!("INVITE sip:{}@{}:{} {}", normalized, trunk.host, trunk.port, version);
+    lines[0] = format!(
+        "INVITE sip:{}@{}:{} {}",
+        normalized, trunk.host, trunk.port, version
+    );
 
     // Fresh branch on the top Via
     let fresh = crate::sip_builder::new_branch();
@@ -1141,7 +1463,9 @@ pub(crate) fn retarget_invite_for_trunk(
         if lower.starts_with("via:") || lower.starts_with("v:") {
             if let Some(pos) = line.find("branch=") {
                 let after = &line[pos + "branch=".len()..];
-                let end = after.find([';', ',']).map(|i| pos + "branch=".len() + i)
+                let end = after
+                    .find([';', ','])
+                    .map(|i| pos + "branch=".len() + i)
                     .unwrap_or(line.len());
                 line.replace_range(pos + "branch=".len()..end, &fresh);
             }
@@ -1154,7 +1478,6 @@ pub(crate) fn retarget_invite_for_trunk(
 
     Some(lines.join("\r\n"))
 }
-
 
 /// Make the SBC the sole RFC 4028 negotiator of a raw INVITE: drop every
 /// existing `Session-Expires` (long or compact `x:`) and `Min-SE`, add
@@ -1169,14 +1492,18 @@ pub(crate) fn set_session_timer_headers(raw: &str, expires: u32, min_se: u32) ->
     msg.to_string()
 }
 
-fn apply_session_timer_headers(msg: &mut crate::topology::RawSipMessage, expires: u32, min_se: u32) {
+fn apply_session_timer_headers(
+    msg: &mut crate::topology::RawSipMessage,
+    expires: u32,
+    min_se: u32,
+) {
     msg.remove_header("session-expires");
     msg.remove_header("x"); // compact form — no short-form mapping in RawSipMessage
     msg.remove_header("min-se");
-    let has_timer = msg
-        .header_values("supported")
-        .iter()
-        .any(|v| v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("timer")));
+    let has_timer = msg.header_values("supported").iter().any(|v| {
+        v.split(',')
+            .any(|tok| tok.trim().eq_ignore_ascii_case("timer"))
+    });
     let mut insert = Vec::with_capacity(3);
     if !has_timer {
         insert.push("Supported: timer".to_string());
@@ -1221,7 +1548,11 @@ pub(crate) fn session_interval_retry_values(
 /// timer values, a fresh transaction (new branch, CSeq+1) and no stale
 /// Proxy-Authorization (the new transaction gets a fresh challenge; a
 /// replayed digest is rejected by nonce-count enforcing servers).
-pub(crate) fn build_session_interval_retry(stored_invite: &str, expires: u32, min_se: u32) -> String {
+pub(crate) fn build_session_interval_retry(
+    stored_invite: &str,
+    expires: u32,
+    min_se: u32,
+) -> String {
     let stamped = match crate::topology::RawSipMessage::parse(stored_invite) {
         Ok(mut msg) => {
             msg.remove_header("proxy-authorization");
@@ -1232,7 +1563,6 @@ pub(crate) fn build_session_interval_retry(stored_invite: &str, expires: u32, mi
     };
     crate::sip_builder::renew_invite_transaction(&stamped)
 }
-
 
 #[cfg(test)]
 mod failover_tests {
@@ -1289,10 +1619,17 @@ Content-Length: 0\r\n\r\n";
     fn retarget_rewrites_uri_and_branch() {
         let t = trunk("203.0.113.9", 5080);
         let out = retarget_invite_for_trunk(INVITE, &t).expect("retarget");
-        assert!(out.starts_with("INVITE sip:+33612345678@203.0.113.9:5080 SIP/2.0\r\n"), "{}", out);
+        assert!(
+            out.starts_with("INVITE sip:+33612345678@203.0.113.9:5080 SIP/2.0\r\n"),
+            "{}",
+            out
+        );
         assert!(!out.contains("z9hG4bKoldbranch"), "branch must be fresh");
         assert!(out.contains("branch=z9hG4bK"));
-        assert!(out.contains("Call-ID: xyz@host\r\n"), "dialog identity preserved");
+        assert!(
+            out.contains("Call-ID: xyz@host\r\n"),
+            "dialog identity preserved"
+        );
         rsip::SipMessage::try_from(out.as_bytes().to_vec()).expect("retargeted INVITE parses");
     }
 
@@ -1306,7 +1643,13 @@ Content-Length: 0\r\n\r\n";
     fn set_session_timer_headers_before_content_length() {
         let raw = "INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nContent-Length: 0\r\n\r\n";
         let out = set_session_timer_headers(raw, 1800, 90);
-        assert!(out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nContent-Length: 0"), "{}", out);
+        assert!(
+            out.contains(
+                "Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nContent-Length: 0"
+            ),
+            "{}",
+            out
+        );
         rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
     }
 
@@ -1328,9 +1671,19 @@ Content-Length: 0\r\n\r\n";
         assert_eq!(out.matches("Session-Expires:").count(), 1, "{}", out);
         assert_eq!(out.matches("Min-SE:").count(), 1, "{}", out);
         assert!(!out.contains("\r\nx: "), "compact Session-Expires removed");
-        assert_eq!(out.matches("Supported:").count(), 1, "existing Supported with timer is kept as is");
+        assert_eq!(
+            out.matches("Supported:").count(),
+            1,
+            "existing Supported with timer is kept as is"
+        );
         assert!(out.contains("Supported: replaces, timer\r\n"));
-        assert!(out.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\nContent-Length: 5\r\n\r\nv=0\r\n"), "{}", out);
+        assert!(
+            out.contains(
+                "Session-Expires: 14400\r\nMin-SE: 14400\r\nContent-Length: 5\r\n\r\nv=0\r\n"
+            ),
+            "{}",
+            out
+        );
         rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
     }
 
@@ -1339,24 +1692,49 @@ Content-Length: 0\r\n\r\n";
         let raw = "INVITE sip:x@y SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nk: 100rel\r\nl: 0\r\n\r\n";
         let out = set_session_timer_headers(raw, 1800, 90);
         assert!(out.contains("k: 100rel\r\n"), "{}", out);
-        assert!(out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nl: 0\r\n"), "{}", out);
+        assert!(
+            out.contains("Supported: timer\r\nSession-Expires: 1800\r\nMin-SE: 90\r\nl: 0\r\n"),
+            "{}",
+            out
+        );
     }
 
     #[test]
     fn session_interval_retry_values_table() {
         // The incident: offered 1800/90, Genesys demands 14400
-        assert_eq!(session_interval_retry_values(Some(1800), 14400, (1800, 90)), Some((14400, 14400)));
+        assert_eq!(
+            session_interval_retry_values(Some(1800), 14400, (1800, 90)),
+            Some((14400, 14400))
+        );
         // Bogus 422: Min-SE not above what we offered → no point retrying
-        assert_eq!(session_interval_retry_values(Some(1800), 600, (1800, 90)), None);
-        assert_eq!(session_interval_retry_values(Some(14400), 14400, (1800, 90)), None);
+        assert_eq!(
+            session_interval_retry_values(Some(1800), 600, (1800, 90)),
+            None
+        );
+        assert_eq!(
+            session_interval_retry_values(Some(14400), 14400, (1800, 90)),
+            None
+        );
         // Configured Session-Expires above the demanded floor is kept
-        assert_eq!(session_interval_retry_values(Some(1800), 14400, (20000, 90)), Some((20000, 14400)));
+        assert_eq!(
+            session_interval_retry_values(Some(1800), 14400, (20000, 90)),
+            Some((20000, 14400))
+        );
         // Below the RFC 4028 §4 minimum → malformed
-        assert_eq!(session_interval_retry_values(Some(1800), 60, (1800, 90)), None);
+        assert_eq!(
+            session_interval_retry_values(Some(1800), 60, (1800, 90)),
+            None
+        );
         // Nothing parseable in the stored INVITE: retry from the 422 alone
-        assert_eq!(session_interval_retry_values(None, 14400, (1800, 90)), Some((14400, 14400)));
+        assert_eq!(
+            session_interval_retry_values(None, 14400, (1800, 90)),
+            Some((14400, 14400))
+        );
         // Configured Min-SE above the trunk's: keep ours
-        assert_eq!(session_interval_retry_values(Some(1800), 2000, (1800, 3000)), Some((3000, 3000)));
+        assert_eq!(
+            session_interval_retry_values(Some(1800), 2000, (1800, 3000)),
+            Some((3000, 3000))
+        );
     }
 
     #[test]
@@ -1380,13 +1758,24 @@ Content-Length: 0\r\n\r\n";
         assert!(out.starts_with("INVITE sip:+33612345678@203.0.113.9:5060 SIP/2.0\r\n"));
         assert!(out.contains("CSeq: 4 INVITE\r\n"), "{}", out);
         assert!(!out.contains("z9hG4bKold"));
-        assert!(!out.contains("Proxy-Authorization"), "a new transaction gets a fresh challenge");
+        assert!(
+            !out.contains("Proxy-Authorization"),
+            "a new transaction gets a fresh challenge"
+        );
         assert_eq!(out.matches("Session-Expires:").count(), 1);
-        assert!(out.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\n"), "{}", out);
+        assert!(
+            out.contains("Session-Expires: 14400\r\nMin-SE: 14400\r\n"),
+            "{}",
+            out
+        );
         assert_eq!(out.matches("Supported: timer").count(), 1);
         assert!(out.contains("Call-ID: xyz@host\r\n"));
         assert!(out.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
-        assert!(out.ends_with("Content-Length: 22\r\n\r\nv=0\r\nm=audio 1 RTP/AVP 0\r\n"), "body intact: {}", out);
+        assert!(
+            out.ends_with("Content-Length: 22\r\n\r\nv=0\r\nm=audio 1 RTP/AVP 0\r\n"),
+            "body intact: {}",
+            out
+        );
     }
 
     #[test]

@@ -104,11 +104,11 @@ impl Registration {
     pub fn refresh(&mut self, expires: u32, call_id: String, cseq: u32) {
         let now = unix_now();
         let expires = expires.clamp(MIN_EXPIRES, MAX_EXPIRES);
-        self.expires       = expires;
+        self.expires = expires;
         self.registered_at = now;
-        self.expires_at    = now + expires as u64;
-        self.call_id       = call_id;
-        self.cseq          = cseq;
+        self.expires_at = now + expires as u64;
+        self.call_id = call_id;
+        self.cseq = cseq;
         // reply_tx is preserved (updated separately via refresh_with_tx)
     }
 
@@ -157,7 +157,12 @@ pub trait Registrar: Send + Sync {
     /// Remove a registration only if it belongs to the given Call-ID.
     /// RFC 3261 §10.3: prevents a stale UNREGISTER (old Call-ID) from erasing
     /// a binding that was just refreshed by a newer REGISTER (different Call-ID).
-    async fn unregister_with_call_id(&self, aor: &str, contact: &str, call_id: Option<String>) -> Result<()>;
+    async fn unregister_with_call_id(
+        &self,
+        aor: &str,
+        contact: &str,
+        call_id: Option<String>,
+    ) -> Result<()>;
 
     /// Remove all registrations for an AOR (contact=*)
     async fn unregister_all(&self, aor: &str) -> Result<u32>;
@@ -189,12 +194,16 @@ pub struct InMemoryRegistrar {
 
 impl InMemoryRegistrar {
     pub fn new() -> Self {
-        Self { regs: Arc::new(RwLock::new(HashMap::new())) }
+        Self {
+            regs: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 }
 
 impl Default for InMemoryRegistrar {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
@@ -207,7 +216,10 @@ impl Registrar for InMemoryRegistrar {
         if let Some(existing) = map.get_mut(&key) {
             // Refresh, preserving/updating the reply_tx
             existing.refresh_with_tx(reg.expires, reg.call_id.clone(), reg.cseq, reg.reply_tx);
-            debug!("REGISTER: refreshed {} <-> {} ({}s)", existing.aor, existing.contact, expires);
+            debug!(
+                "REGISTER: refreshed {} <-> {} ({}s)",
+                existing.aor, existing.contact, expires
+            );
         } else {
             // Remove stale bindings from same AOR + same public IP
             // (Linphone opens a new TLS connection with a different port on each reconnect,
@@ -215,17 +227,22 @@ impl Registrar for InMemoryRegistrar {
             //  We keep only the latest binding per IP to avoid stale reply_tx channels.)
             let aor = reg.aor.clone();
             let source_ip = reg.received_ip.clone();
-            let stale_keys: Vec<RegKey> = map.iter()
-                .filter(|((a, _), r)| {
-                    *a == aor && r.received_ip == source_ip
-                })
+            let stale_keys: Vec<RegKey> = map
+                .iter()
+                .filter(|((a, _), r)| *a == aor && r.received_ip == source_ip)
                 .map(|(k, _)| k.clone())
                 .collect();
             for stale in &stale_keys {
-                debug!("REGISTER: removing stale binding for {} from {} (replaced by new contact)", aor, source_ip);
+                debug!(
+                    "REGISTER: removing stale binding for {} from {} (replaced by new contact)",
+                    aor, source_ip
+                );
                 map.remove(stale);
             }
-            info!("REGISTER: new {} <-> {} ({}s)", reg.aor, reg.contact, reg.expires);
+            info!(
+                "REGISTER: new {} <-> {} ({}s)",
+                reg.aor, reg.contact, reg.expires
+            );
             map.insert(key, reg);
         }
         Ok(expires)
@@ -235,7 +252,12 @@ impl Registrar for InMemoryRegistrar {
         self.unregister_with_call_id(aor, contact, None).await
     }
 
-    async fn unregister_with_call_id(&self, aor: &str, contact: &str, call_id: Option<String>) -> Result<()> {
+    async fn unregister_with_call_id(
+        &self,
+        aor: &str,
+        contact: &str,
+        call_id: Option<String>,
+    ) -> Result<()> {
         let key = (aor.to_string(), contact.to_string());
         let mut map = self.regs.write().await;
         if let Some(existing) = map.get(&key) {
@@ -278,7 +300,8 @@ impl Registrar for InMemoryRegistrar {
     async fn lookup(&self, aor: &str) -> Result<Vec<Registration>> {
         let map = self.regs.read().await;
         let now = unix_now();
-        let results: Vec<Registration> = map.iter()
+        let results: Vec<Registration> = map
+            .iter()
             .filter(|((a, _), r)| a == aor && r.expires_at > now)
             .map(|(_, r)| r.clone())
             .collect();
@@ -352,7 +375,10 @@ impl RegisterHandler {
         from_addr: SocketAddr,
         transport: &str,
     ) -> Result<RegisterResult> {
-        self.handle_with_tx(aor, contact, expires, call_id, cseq, from_addr, transport, None).await
+        self.handle_with_tx(
+            aor, contact, expires, call_id, cseq, from_addr, transport, None,
+        )
+        .await
     }
 
     /// Extended REGISTER handler that accepts a WebSocket reply channel.
@@ -380,7 +406,9 @@ impl RegisterHandler {
         // RFC 3261 §10.3: only remove if Call-ID matches the stored binding,
         // to prevent a late/stale UNREGISTER from erasing a fresher registration.
         if expires == 0 {
-            self.registrar.unregister_with_call_id(aor, contact, Some(call_id.to_string())).await?;
+            self.registrar
+                .unregister_with_call_id(aor, contact, Some(call_id.to_string()))
+                .await?;
             return Ok(RegisterResult::Removed { count: 1 });
         }
 
@@ -400,14 +428,18 @@ impl RegisterHandler {
 
         // Return all current bindings
         let bindings = self.registrar.lookup(aor).await?;
-        Ok(RegisterResult::Ok { expires: effective_expires, bindings })
+        Ok(RegisterResult::Ok {
+            expires: effective_expires,
+            bindings,
+        })
     }
 
     /// Build a SIP 200 OK response for a successful REGISTER.
     pub fn build_200_ok(bindings: &[Registration], call_id: &str, cseq: u32) -> String {
-        let contacts: Vec<String> = bindings.iter().map(|r| {
-            format!("<{}>;expires={}", r.contact, r.remaining_secs())
-        }).collect();
+        let contacts: Vec<String> = bindings
+            .iter()
+            .map(|r| format!("<{}>;expires={}", r.contact, r.remaining_secs()))
+            .collect();
         let contact_hdr = if contacts.is_empty() {
             String::new()
         } else {
@@ -420,9 +452,9 @@ Call-ID: {call_id}\r\n\
 CSeq: {cseq} REGISTER\r\n\
 {contact}Content-Length: 0\r\n\
 \r\n",
-            call_id  = call_id,
-            cseq     = cseq,
-            contact  = contact_hdr,
+            call_id = call_id,
+            cseq = cseq,
+            contact = contact_hdr,
         )
     }
 
@@ -436,8 +468,8 @@ Min-Expires: {min}\r\n\
 Content-Length: 0\r\n\
 \r\n",
             call_id = call_id,
-            cseq    = cseq,
-            min     = MIN_EXPIRES,
+            cseq = cseq,
+            min = MIN_EXPIRES,
         )
     }
 
@@ -454,7 +486,7 @@ Content-Length: 0\r\n\
         // Normalize: strip angle brackets and display name
         let s = aor.trim();
         let normalized = if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-            s[start+1..end].trim().to_string()
+            s[start + 1..end].trim().to_string()
         } else {
             s.to_string()
         };
@@ -488,8 +520,13 @@ Content-Length: 0\r\n\
 /// Result of processing a REGISTER request
 #[derive(Debug)]
 pub enum RegisterResult {
-    Ok { expires: u32, bindings: Vec<Registration> },
-    Removed { count: u32 },
+    Ok {
+        expires: u32,
+        bindings: Vec<Registration>,
+    },
+    Removed {
+        count: u32,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -500,9 +537,15 @@ pub enum RegisterResult {
 mod tests {
     use super::*;
 
-    fn addr() -> SocketAddr { "192.168.1.100:5060".parse().unwrap() }
-    fn aor() -> &'static str { "sip:alice@example.com" }
-    fn contact() -> &'static str { "sip:alice@192.168.1.100:5060" }
+    fn addr() -> SocketAddr {
+        "192.168.1.100:5060".parse().unwrap()
+    }
+    fn aor() -> &'static str {
+        "sip:alice@example.com"
+    }
+    fn contact() -> &'static str {
+        "sip:alice@192.168.1.100:5060"
+    }
 
     fn make_reg(expires: u32) -> Registration {
         Registration::new(
@@ -618,7 +661,10 @@ mod tests {
     #[tokio::test]
     async fn test_handler_register() {
         let h = RegisterHandler::new_inmemory();
-        let result = h.handle(aor(), contact(), 3600, "call-1", 1, addr(), "UDP").await.unwrap();
+        let result = h
+            .handle(aor(), contact(), 3600, "call-1", 1, addr(), "UDP")
+            .await
+            .unwrap();
         match result {
             RegisterResult::Ok { expires, bindings } => {
                 assert_eq!(expires, 3600);
@@ -631,9 +677,14 @@ mod tests {
     #[tokio::test]
     async fn test_handler_unregister_specific() {
         let h = RegisterHandler::new_inmemory();
-        h.handle(aor(), contact(), 3600, "call-1", 1, addr(), "UDP").await.unwrap();
+        h.handle(aor(), contact(), 3600, "call-1", 1, addr(), "UDP")
+            .await
+            .unwrap();
         // RFC 3261: UNREGISTER uses same Call-ID, higher CSeq
-        let result = h.handle(aor(), contact(), 0, "call-1", 2, addr(), "UDP").await.unwrap();
+        let result = h
+            .handle(aor(), contact(), 0, "call-1", 2, addr(), "UDP")
+            .await
+            .unwrap();
         match result {
             RegisterResult::Removed { count } => assert_eq!(count, 1),
             _ => panic!("expected Removed"),
@@ -645,11 +696,25 @@ mod tests {
     async fn test_handler_unregister_all() {
         let h = RegisterHandler::new_inmemory();
         // Register two contacts from different source IPs
-        h.handle(aor(), contact(), 3600, "call-1", 1, addr(), "UDP").await.unwrap();
-        h.handle(aor(), "sip:alice@10.0.0.2:5060", 3600, "call-2", 1,
-            "10.0.0.2:5060".parse().unwrap(), "UDP").await.unwrap();
+        h.handle(aor(), contact(), 3600, "call-1", 1, addr(), "UDP")
+            .await
+            .unwrap();
+        h.handle(
+            aor(),
+            "sip:alice@10.0.0.2:5060",
+            3600,
+            "call-2",
+            1,
+            "10.0.0.2:5060".parse().unwrap(),
+            "UDP",
+        )
+        .await
+        .unwrap();
         // contact="*", expires=0 → remove all (unregister_all bypasses call-id check)
-        let result = h.handle(aor(), "*", 0, "call-1", 2, addr(), "UDP").await.unwrap();
+        let result = h
+            .handle(aor(), "*", 0, "call-1", 2, addr(), "UDP")
+            .await
+            .unwrap();
         match result {
             RegisterResult::Removed { count } => assert_eq!(count, 2),
             _ => panic!("expected Removed"),

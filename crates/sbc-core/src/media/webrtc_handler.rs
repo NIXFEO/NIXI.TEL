@@ -8,14 +8,13 @@
 //! RFC 5764 - DTLS-SRTP
 //! RFC 3711 - SRTP
 
-use crate::{Error, Result};
+use crate::media::dtls::{CertificateFingerprint, DtlsContext, DtlsRole};
 use crate::media::ice::{IceAgent, IceCandidate, IceStats};
-use crate::media::dtls::{CertificateFingerprint, DtlsRole, DtlsContext};
-use crate::media::srtp::{CryptoSuite, SrtpContext, generate_key_material};
+use crate::media::srtp::{generate_key_material, CryptoSuite, SrtpContext};
+use crate::{Error, Result};
 
 /// Information extracted from a WebRTC SDP offer/answer
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct WebRtcSdpInfo {
     /// ICE username fragment from SDP (a=ice-ufrag)
     pub ice_ufrag: Option<String>,
@@ -64,7 +63,9 @@ impl WebRtcSdpInfo {
             let line = line.trim();
 
             // Detect WebRTC by RTP/SAVPF profile
-            if line.starts_with("m=") && (line.contains("RTP/SAVPF") || line.contains("UDP/TLS/RTP/SAVPF")) {
+            if line.starts_with("m=")
+                && (line.contains("RTP/SAVPF") || line.contains("UDP/TLS/RTP/SAVPF"))
+            {
                 info.is_webrtc = true;
                 // Extract port from m= line: "m=audio PORT ..."
                 let parts: Vec<&str> = line.splitn(4, ' ').collect();
@@ -160,7 +161,6 @@ impl WebRtcSdpInfo {
         }
     }
 }
-
 
 /// WebRTC session context managed by the SBC
 ///
@@ -295,7 +295,9 @@ impl WebRtcSession {
             self.srtp_recv = Some(srtp_recv);
             Ok(())
         } else {
-            Err(Error::Media("No SRTP crypto suite in remote SDP".to_string()))
+            Err(Error::Media(
+                "No SRTP crypto suite in remote SDP".to_string(),
+            ))
         }
     }
 
@@ -340,7 +342,8 @@ impl WebRtcSession {
         self.remote_info = WebRtcSdpInfo::from_sdp(remote_sdp);
         // Set remote ICE credentials for STUN validation
         if let (Some(ufrag), Some(pwd)) = (&self.remote_info.ice_ufrag, &self.remote_info.ice_pwd) {
-            self.ice_agent.set_remote_credentials(ufrag.clone(), pwd.clone());
+            self.ice_agent
+                .set_remote_credentials(ufrag.clone(), pwd.clone());
         }
         // Update DTLS role: if callee chose "active", SBC must be "passive"
         // If callee chose "passive", SBC must be "active"
@@ -481,7 +484,10 @@ a=rtpmap:0 PCMU/8000\r\n\
         assert_eq!(info.candidates.len(), 2);
         use crate::media::ice::CandidateType;
         assert_eq!(info.candidates[0].candidate_type, CandidateType::Host);
-        assert_eq!(info.candidates[1].candidate_type, CandidateType::ServerReflexive);
+        assert_eq!(
+            info.candidates[1].candidate_type,
+            CandidateType::ServerReflexive
+        );
     }
 
     #[tokio::test]

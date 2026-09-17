@@ -49,7 +49,8 @@ pub struct TransportManager {
     /// Outbound TLS: per-destination parameters + prebuilt client config
     /// (registered from trunk config) and established connections.
     tls_params: Arc<dashmap::DashMap<SocketAddr, TlsDestination>>,
-    tls_connections: Arc<dashmap::DashMap<SocketAddr, Arc<crate::transport::tls_connect::TlsClientConnection>>>,
+    tls_connections:
+        Arc<dashmap::DashMap<SocketAddr, Arc<crate::transport::tls_connect::TlsClientConnection>>>,
 }
 
 impl TransportManager {
@@ -143,12 +144,14 @@ impl TransportManager {
         let bind_addr = SocketAddr::new(config.bind_address, config.bind_port);
 
         let listener = if secure {
-            let cert_file = config.cert_file.as_ref().ok_or_else(|| {
-                Error::Config("WSS listener requires cert_file".to_string())
-            })?;
-            let key_file = config.key_file.as_ref().ok_or_else(|| {
-                Error::Config("WSS listener requires key_file".to_string())
-            })?;
+            let cert_file = config
+                .cert_file
+                .as_ref()
+                .ok_or_else(|| Error::Config("WSS listener requires cert_file".to_string()))?;
+            let key_file = config
+                .key_file
+                .as_ref()
+                .ok_or_else(|| Error::Config("WSS listener requires key_file".to_string()))?;
             WsListenerServer::new_wss(bind_addr, cert_file, key_file).await?
         } else {
             WsListenerServer::new_ws(bind_addr).await?
@@ -170,13 +173,15 @@ impl TransportManager {
 
     /// Start a TLS listener
     async fn start_tls_listener(&mut self, config: &ListenerConfig) -> Result<()> {
-        let cert_file = config.cert_file.as_ref().ok_or_else(|| {
-            Error::Config("TLS listener requires cert_file".to_string())
-        })?;
+        let cert_file = config
+            .cert_file
+            .as_ref()
+            .ok_or_else(|| Error::Config("TLS listener requires cert_file".to_string()))?;
 
-        let key_file = config.key_file.as_ref().ok_or_else(|| {
-            Error::Config("TLS listener requires key_file".to_string())
-        })?;
+        let key_file = config
+            .key_file
+            .as_ref()
+            .ok_or_else(|| Error::Config("TLS listener requires key_file".to_string()))?;
 
         let bind_addr = SocketAddr::new(config.bind_address, config.bind_port);
         let listener = TlsListenerServer::new(bind_addr, cert_file, key_file).await?;
@@ -230,7 +235,13 @@ impl TransportManager {
         params: crate::transport::tls_connect::TlsClientParams,
     ) -> Result<()> {
         let config = crate::transport::tls_connect::build_client_config(&params)?;
-        self.tls_params.insert(dest, TlsDestination { params, config: Arc::new(config) });
+        self.tls_params.insert(
+            dest,
+            TlsDestination {
+                params,
+                config: Arc::new(config),
+            },
+        );
         // A new config must not keep reusing a connection made with the old one
         self.tls_connections.remove(&dest);
         Ok(())
@@ -285,7 +296,11 @@ impl TransportManager {
 
         if let Err(e) = conn.send(data).await {
             self.tcp_connections.remove(&dest);
-            tracing::warn!("TCP send to {} failed, connection dropped from pool: {}", dest, e);
+            tracing::warn!(
+                "TCP send to {} failed, connection dropped from pool: {}",
+                dest,
+                e
+            );
             return Err(e);
         }
         Ok(())
@@ -327,12 +342,19 @@ impl TransportManager {
                     // Log first few lines of what we sent for diagnostics
                     if let Ok(text) = std::str::from_utf8(data) {
                         let preview: String = text.lines().take(6).collect::<Vec<_>>().join(" | ");
-                        tracing::info!("Transport reply via existing channel to {}: {}", dest, preview);
+                        tracing::info!(
+                            "Transport reply via existing channel to {}: {}",
+                            dest,
+                            preview
+                        );
                     }
                     return Ok(());
                 }
                 Err(_) => {
-                    tracing::warn!("Reply channel closed for {}, falling back to new connection", dest);
+                    tracing::warn!(
+                        "Reply channel closed for {}, falling back to new connection",
+                        dest
+                    );
                     // Fall through to open new connection
                 }
             }
@@ -422,7 +444,13 @@ mod outbound_pool_tests {
         let tm = TransportManager::new();
         let mut failed = false;
         for _ in 0..20 {
-            match tm.send_tcp(b"OPTIONS sip:probe SIP/2.0\r\nContent-Length: 0\r\n\r\n", dest).await {
+            match tm
+                .send_tcp(
+                    b"OPTIONS sip:probe SIP/2.0\r\nContent-Length: 0\r\n\r\n",
+                    dest,
+                )
+                .await
+            {
                 Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(30)).await,
                 Err(_) => {
                     failed = true;
@@ -431,7 +459,10 @@ mod outbound_pool_tests {
             }
         }
         assert!(failed, "writing to a peer that closed must eventually fail");
-        assert!(!tm.tcp_connections.contains_key(&dest), "the dead connection is evicted from the pool");
+        assert!(
+            !tm.tcp_connections.contains_key(&dest),
+            "the dead connection is evicted from the pool"
+        );
     }
 
     #[test]
@@ -445,12 +476,19 @@ mod outbound_pool_tests {
             client_cert: None,
             client_key: None,
         };
-        tm.register_tls_destination(ok_dest, params.clone()).expect("system roots load");
+        tm.register_tls_destination(ok_dest, params.clone())
+            .expect("system roots load");
         assert!(tm.tls_params.contains_key(&ok_dest));
 
         let bad_dest: SocketAddr = "203.0.113.10:5061".parse().unwrap();
-        let bad = TlsClientParams { ca_cert: Some("/nonexistent/ca.pem".to_string()), ..params };
+        let bad = TlsClientParams {
+            ca_cert: Some("/nonexistent/ca.pem".to_string()),
+            ..params
+        };
         assert!(tm.register_tls_destination(bad_dest, bad).is_err());
-        assert!(!tm.tls_params.contains_key(&bad_dest), "a destination whose config cannot be built is not registered");
+        assert!(
+            !tm.tls_params.contains_key(&bad_dest),
+            "a destination whose config cannot be built is not registered"
+        );
     }
 }

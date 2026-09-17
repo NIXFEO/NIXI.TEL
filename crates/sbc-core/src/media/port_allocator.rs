@@ -71,9 +71,7 @@ impl PortAllocator {
             }
         }
 
-        Err(Error::Transport(
-            "No available ports in range".to_string(),
-        ))
+        Err(Error::Transport("No available ports in range".to_string()))
     }
 
     /// Release a port pair
@@ -91,10 +89,7 @@ impl PortAllocator {
 
     /// Get number of allocated port pairs
     pub fn allocated_count(&self) -> usize {
-        self.allocated
-            .lock()
-            .map(|a| a.len() / 2)
-            .unwrap_or(0)
+        self.allocated.lock().map(|a| a.len() / 2).unwrap_or(0)
     }
 
     /// Get number of available port pairs
@@ -137,15 +132,10 @@ impl PortPair {
     /// RTP port must be even, RTCP will be RTP + 1
     pub fn new(rtp: u16) -> Result<Self> {
         if !rtp.is_multiple_of(2) {
-            return Err(Error::Transport(
-                "RTP port must be even".to_string(),
-            ));
+            return Err(Error::Transport("RTP port must be even".to_string()));
         }
 
-        Ok(Self {
-            rtp,
-            rtcp: rtp + 1,
-        })
+        Ok(Self { rtp, rtcp: rtp + 1 })
     }
 
     /// Check if this is a valid port pair

@@ -56,22 +56,35 @@ pub fn pcmu_encode_sample(pcm: i16) -> u8 {
 
     let mut sample = pcm as i32;
     // Sign: in µ-law, the MSB of the encoded byte = 1 if positive
-    let sign: u8 = if sample >= 0 { 0x80 } else {
+    let sign: u8 = if sample >= 0 {
+        0x80
+    } else {
         sample = -sample;
         0x00
     };
-    if sample > CLIP { sample = CLIP; }
+    if sample > CLIP {
+        sample = CLIP;
+    }
     sample += BIAS;
 
     // Find the segment (exponent)
-    let exp: u8 = if sample < 0x0100 { 0 }
-        else if sample < 0x0200 { 1 }
-        else if sample < 0x0400 { 2 }
-        else if sample < 0x0800 { 3 }
-        else if sample < 0x1000 { 4 }
-        else if sample < 0x2000 { 5 }
-        else if sample < 0x4000 { 6 }
-        else { 7 };
+    let exp: u8 = if sample < 0x0100 {
+        0
+    } else if sample < 0x0200 {
+        1
+    } else if sample < 0x0400 {
+        2
+    } else if sample < 0x0800 {
+        3
+    } else if sample < 0x1000 {
+        4
+    } else if sample < 0x2000 {
+        5
+    } else if sample < 0x4000 {
+        6
+    } else {
+        7
+    };
 
     let mantissa = ((sample >> (exp + 3)) & 0x0F) as u8;
     !(sign | (exp << 4) | mantissa)
@@ -81,13 +94,17 @@ pub fn pcmu_encode_sample(pcm: i16) -> u8 {
 #[inline]
 pub fn pcmu_decode_sample(ulaw: u8) -> i16 {
     let ulaw = !ulaw;
-    let sign  = ulaw & 0x80;
-    let exp   = ((ulaw >> 4) & 0x07) as i32;
-    let mant  = (ulaw & 0x0F) as i32;
+    let sign = ulaw & 0x80;
+    let exp = ((ulaw >> 4) & 0x07) as i32;
+    let mant = (ulaw & 0x0F) as i32;
     let t = ((mant << 3) | 0x84) << exp;
     let sample = t - 0x84;
     // sign bit 1 = positive
-    if sign != 0 { sample as i16 } else { -(sample as i16) }
+    if sign != 0 {
+        sample as i16
+    } else {
+        -(sample as i16)
+    }
 }
 
 /// Encode a buffer of linear PCM (i16 LE) samples to PCMU bytes.
@@ -120,7 +137,9 @@ pub fn pcma_encode_sample(pcm: i16) -> u8 {
         0x00
     };
     // Clip
-    if sample > 32767 { sample = 32767; }
+    if sample > 32767 {
+        sample = 32767;
+    }
 
     // Find segment (upper 13 bits, ignoring 3 LSBs)
     let s = sample >> 4;
@@ -153,9 +172,9 @@ pub fn pcma_encode_sample(pcm: i16) -> u8 {
 #[inline]
 pub fn pcma_decode_sample(alaw: u8) -> i16 {
     let alaw = (alaw as i32) ^ 0x55;
-    let sign  = alaw & 0x80;
-    let exp   = (alaw >> 4) & 0x07;
-    let mant  = alaw & 0x0F;
+    let sign = alaw & 0x80;
+    let exp = (alaw >> 4) & 0x07;
+    let mant = alaw & 0x0F;
 
     let sample = if exp == 0 {
         (mant << 1) | 1
@@ -164,7 +183,11 @@ pub fn pcma_decode_sample(alaw: u8) -> i16 {
     };
 
     // sign bit 1 = positive
-    if sign != 0 { sample as i16 } else { -(sample as i16) }
+    if sign != 0 {
+        sample as i16
+    } else {
+        -(sample as i16)
+    }
 }
 
 /// Encode a buffer of linear PCM (i16 LE) samples to PCMA bytes.
@@ -189,9 +212,8 @@ pub fn downsample_48k_to_8k(samples: &[i16]) -> Vec<i16> {
     // FIR low-pass filter + decimate by 6 (48kHz → 8kHz)
     // 15-tap symmetric FIR, cutoff ~3.4kHz (voice band), windowed sinc
     const LP: [f32; 15] = [
-        0.0025, 0.0085, 0.0230, 0.0480, 0.0810,
-        0.1130, 0.1350, 0.1400, 0.1350, 0.1130,
-        0.0810, 0.0480, 0.0230, 0.0085, 0.0025,
+        0.0025, 0.0085, 0.0230, 0.0480, 0.0810, 0.1130, 0.1350, 0.1400, 0.1350, 0.1130, 0.0810,
+        0.0480, 0.0230, 0.0085, 0.0025,
     ];
     const HALF: isize = 7; // LP.len() / 2
 
@@ -224,7 +246,11 @@ pub fn upsample_8k_to_48k(samples: &[i16]) -> Vec<i16> {
     let mut out = Vec::with_capacity(samples.len() * 6);
     for i in 0..samples.len() {
         let s0 = samples[i] as i32;
-        let s1 = if i + 1 < samples.len() { samples[i + 1] as i32 } else { s0 };
+        let s1 = if i + 1 < samples.len() {
+            samples[i + 1] as i32
+        } else {
+            s0
+        };
         for k in 0..6 {
             let interp = s0 + (s1 - s0) * k / 6;
             out.push(interp as i16);
@@ -245,11 +271,8 @@ pub struct OpusEncoder {
 impl OpusEncoder {
     /// Create a new Opus encoder for VoIP (mono, 48 kHz)
     pub fn new() -> Result<Self> {
-        let encoder = opus::Encoder::new(
-            OPUS_RATE,
-            opus::Channels::Mono,
-            opus::Application::Voip,
-        ).map_err(|e| Error::Other(format!("Opus encoder init: {}", e)))?;
+        let encoder = opus::Encoder::new(OPUS_RATE, opus::Channels::Mono, opus::Application::Voip)
+            .map_err(|e| Error::Other(format!("Opus encoder init: {}", e)))?;
 
         Ok(Self {
             inner: std::sync::Mutex::new(encoder),
@@ -258,13 +281,12 @@ impl OpusEncoder {
 
     /// Create an Opus encoder with specific settings
     pub fn with_bitrate(bitrate: i32) -> Result<Self> {
-        let mut encoder = opus::Encoder::new(
-            OPUS_RATE,
-            opus::Channels::Mono,
-            opus::Application::Voip,
-        ).map_err(|e| Error::Other(format!("Opus encoder init: {}", e)))?;
+        let mut encoder =
+            opus::Encoder::new(OPUS_RATE, opus::Channels::Mono, opus::Application::Voip)
+                .map_err(|e| Error::Other(format!("Opus encoder init: {}", e)))?;
 
-        encoder.set_bitrate(opus::Bitrate::Bits(bitrate))
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(bitrate))
             .map_err(|e| Error::Other(format!("Opus set bitrate: {}", e)))?;
 
         Ok(Self {
@@ -277,10 +299,13 @@ impl OpusEncoder {
     /// `pcm` must contain exactly `OPUS_FRAME_SAMPLES` (960) samples for 20ms frame.
     pub fn encode(&self, pcm: &[i16]) -> Result<Vec<u8>> {
         let mut output = vec![0u8; OPUS_MAX_FRAME_SIZE];
-        let mut enc = self.inner.lock()
+        let mut enc = self
+            .inner
+            .lock()
             .map_err(|e| Error::Other(format!("Opus encoder lock: {}", e)))?;
 
-        let len = enc.encode(pcm, &mut output)
+        let len = enc
+            .encode(pcm, &mut output)
             .map_err(|e| Error::Other(format!("Opus encode: {}", e)))?;
 
         output.truncate(len);
@@ -296,10 +321,8 @@ pub struct OpusDecoder {
 impl OpusDecoder {
     /// Create a new Opus decoder (mono, 48 kHz)
     pub fn new() -> Result<Self> {
-        let decoder = opus::Decoder::new(
-            OPUS_RATE,
-            opus::Channels::Mono,
-        ).map_err(|e| Error::Other(format!("Opus decoder init: {}", e)))?;
+        let decoder = opus::Decoder::new(OPUS_RATE, opus::Channels::Mono)
+            .map_err(|e| Error::Other(format!("Opus decoder init: {}", e)))?;
 
         Ok(Self {
             inner: std::sync::Mutex::new(decoder),
@@ -311,10 +334,13 @@ impl OpusDecoder {
     /// Returns up to `OPUS_FRAME_SAMPLES` (960) samples for a 20ms frame.
     pub fn decode(&self, opus_data: &[u8]) -> Result<Vec<i16>> {
         let mut output = vec![0i16; OPUS_FRAME_SAMPLES];
-        let mut dec = self.inner.lock()
+        let mut dec = self
+            .inner
+            .lock()
             .map_err(|e| Error::Other(format!("Opus decoder lock: {}", e)))?;
 
-        let len = dec.decode(opus_data, &mut output, false)
+        let len = dec
+            .decode(opus_data, &mut output, false)
             .map_err(|e| Error::Other(format!("Opus decode: {}", e)))?;
 
         output.truncate(len);
@@ -324,10 +350,13 @@ impl OpusDecoder {
     /// Decode with Forward Error Correction (packet loss concealment)
     pub fn decode_fec(&self, opus_data: &[u8]) -> Result<Vec<i16>> {
         let mut output = vec![0i16; OPUS_FRAME_SAMPLES];
-        let mut dec = self.inner.lock()
+        let mut dec = self
+            .inner
+            .lock()
             .map_err(|e| Error::Other(format!("Opus decoder lock: {}", e)))?;
 
-        let len = dec.decode(opus_data, &mut output, true)
+        let len = dec
+            .decode(opus_data, &mut output, true)
             .map_err(|e| Error::Other(format!("Opus decode FEC: {}", e)))?;
 
         output.truncate(len);
@@ -359,16 +388,16 @@ impl Codec {
             PT_PCMU => Self::Pcmu,
             PT_PCMA => Self::Pcma,
             PT_OPUS => Self::Opus,
-            other   => Self::Unknown(other),
+            other => Self::Unknown(other),
         }
     }
 
     /// RTP payload type for this codec
     pub fn pt(&self) -> u8 {
         match self {
-            Self::Pcmu       => PT_PCMU,
-            Self::Pcma       => PT_PCMA,
-            Self::Opus       => PT_OPUS,
+            Self::Pcmu => PT_PCMU,
+            Self::Pcma => PT_PCMA,
+            Self::Opus => PT_OPUS,
             Self::Unknown(p) => *p,
         }
     }
@@ -377,16 +406,16 @@ impl Codec {
     pub fn sample_rate(&self) -> u32 {
         match self {
             Self::Pcmu | Self::Pcma => G711_RATE,
-            Self::Opus              => OPUS_RATE,
-            Self::Unknown(_)        => G711_RATE,
+            Self::Opus => OPUS_RATE,
+            Self::Unknown(_) => G711_RATE,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Pcmu       => "PCMU",
-            Self::Pcma       => "PCMA",
-            Self::Opus       => "opus",
+            Self::Pcmu => "PCMU",
+            Self::Pcma => "PCMA",
+            Self::Opus => "opus",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -394,9 +423,9 @@ impl Codec {
     /// RTP clock rate in Hz for this codec
     pub fn clock_rate(&self) -> u32 {
         match self {
-            Self::Pcmu       => 8000,
-            Self::Pcma       => 8000,
-            Self::Opus       => 48000,
+            Self::Pcmu => 8000,
+            Self::Pcma => 8000,
+            Self::Opus => 48000,
             Self::Unknown(_) => 8000, // default guess
         }
     }
@@ -432,7 +461,12 @@ impl Transcoder {
             None
         };
 
-        Ok(Self { src, dst, opus_encoder, opus_decoder })
+        Ok(Self {
+            src,
+            dst,
+            opus_encoder,
+            opus_decoder,
+        })
     }
 
     /// Create a passthrough transcoder (no conversion)
@@ -518,7 +552,9 @@ impl Transcoder {
 
     /// Check if this transcoder performs a real conversion
     pub fn is_passthrough(&self) -> bool {
-        self.src == self.dst || matches!(self.src, Codec::Unknown(_)) || matches!(self.dst, Codec::Unknown(_))
+        self.src == self.dst
+            || matches!(self.src, Codec::Unknown(_))
+            || matches!(self.dst, Codec::Unknown(_))
     }
 }
 
@@ -574,11 +610,13 @@ impl TranscodingPool {
             let _ = tx.send(result);
         });
 
-        let result = rx.await
+        let result = rx
+            .await
             .map_err(|_| Error::Other("Transcoding pool channel closed".to_string()))?;
 
         if result.is_ok() {
-            self.transcoded_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.transcoded_packets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         result
@@ -586,7 +624,8 @@ impl TranscodingPool {
 
     /// Get the total number of transcoded packets
     pub fn transcoded_count(&self) -> u64 {
-        self.transcoded_packets.load(std::sync::atomic::Ordering::Relaxed)
+        self.transcoded_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -605,7 +644,8 @@ fn pcm_to_bytes(pcm: &[i16]) -> Vec<u8> {
 
 // Helper: raw bytes → i16 slice (little-endian)
 fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
-    bytes.chunks_exact(2)
+    bytes
+        .chunks_exact(2)
         .map(|b| i16::from_le_bytes([b[0], b[1]]))
         .collect()
 }
@@ -622,31 +662,34 @@ fn bytes_to_pcm(bytes: &[u8]) -> Vec<i16> {
 /// Returns the rewritten SDP string.
 pub fn sdp_prefer_codec(sdp: &str, preferred_pt: u8) -> String {
     let preferred_str = preferred_pt.to_string();
-    sdp.lines().map(|line| {
-        if line.starts_with("m=audio") {
-            // Parse: "m=audio PORT PROTO PT1 PT2 ..."
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 3 {
-                let pts = &parts[3..];
-                let mut ordered = vec![];
-                // Put preferred first
-                if pts.contains(&preferred_str.as_str()) {
-                    ordered.push(preferred_str.clone());
-                }
-                for &pt in pts {
-                    if pt != preferred_str.as_str() {
-                        ordered.push(pt.to_string());
+    sdp.lines()
+        .map(|line| {
+            if line.starts_with("m=audio") {
+                // Parse: "m=audio PORT PROTO PT1 PT2 ..."
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 3 {
+                    let pts = &parts[3..];
+                    let mut ordered = vec![];
+                    // Put preferred first
+                    if pts.contains(&preferred_str.as_str()) {
+                        ordered.push(preferred_str.clone());
                     }
+                    for &pt in pts {
+                        if pt != preferred_str.as_str() {
+                            ordered.push(pt.to_string());
+                        }
+                    }
+                    let pts_str = ordered.join(" ");
+                    format!("{} {} {} {}", parts[0], parts[1], parts[2], pts_str)
+                } else {
+                    line.to_string()
                 }
-                let pts_str = ordered.join(" ");
-                format!("{} {} {} {}", parts[0], parts[1], parts[2], pts_str)
             } else {
                 line.to_string()
             }
-        } else {
-            line.to_string()
-        }
-    }).collect::<Vec<_>>().join("\r\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 /// Extract the list of audio payload types from an SDP body.
@@ -655,7 +698,8 @@ pub fn sdp_audio_pts(sdp: &str) -> Vec<u8> {
         if line.starts_with("m=audio") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() > 3 {
-                return parts[3..].iter()
+                return parts[3..]
+                    .iter()
                     .filter_map(|s| s.parse::<u8>().ok())
                     .collect();
             }
@@ -678,7 +722,9 @@ pub fn sdp_has_pcmu(sdp: &str) -> bool {
 /// Determine the primary codec from SDP (first in m= line)
 pub fn sdp_primary_codec(sdp: &str) -> Codec {
     let pts = sdp_audio_pts(sdp);
-    pts.first().map(|&pt| Codec::from_pt(pt)).unwrap_or(Codec::Unknown(0))
+    pts.first()
+        .map(|&pt| Codec::from_pt(pt))
+        .unwrap_or(Codec::Unknown(0))
 }
 
 /// Check if transcoding is needed between two SDPs
@@ -742,7 +788,11 @@ mod tests {
         // All decoded samples should be positive and in the same ballpark
         for s in &decoded {
             assert!(*s > 0, "decoded should be positive, got {}", s);
-            assert!((*s as i32 - 1000).abs() < 2000, "round-trip error too large: {}", s);
+            assert!(
+                (*s as i32 - 1000).abs() < 2000,
+                "round-trip error too large: {}",
+                s
+            );
         }
     }
 
@@ -753,7 +803,11 @@ mod tests {
         let decoded = pcmu_decode(&encoded);
         for s in &decoded {
             assert!(*s < 0, "decoded should be negative, got {}", s);
-            assert!((*s as i32 + 1000).abs() < 2000, "round-trip error too large: {}", s);
+            assert!(
+                (*s as i32 + 1000).abs() < 2000,
+                "round-trip error too large: {}",
+                s
+            );
         }
     }
 
@@ -803,7 +857,7 @@ mod tests {
 
         // Decode both and compare: same sign, same order of magnitude
         let pcm_from_mu = pcmu_decode(&pcmu);
-        let pcm_from_a  = pcma_decode(&pcma);
+        let pcm_from_a = pcma_decode(&pcma);
         for (a, b) in pcm_from_mu.iter().zip(pcm_from_a.iter()) {
             assert!(*a > 0, "µ-law decoded should be positive: {}", a);
             assert!(*b > 0, "A-law decoded should be positive: {}", b);
@@ -847,17 +901,32 @@ mod tests {
         // Encode
         let opus_frame = encoder.encode(&pcm_48k).unwrap();
         assert!(!opus_frame.is_empty(), "Opus frame should not be empty");
-        assert!(opus_frame.len() < OPUS_MAX_FRAME_SIZE, "Opus frame too large");
-        debug!("Opus encoded: {} samples → {} bytes", pcm_48k.len(), opus_frame.len());
+        assert!(
+            opus_frame.len() < OPUS_MAX_FRAME_SIZE,
+            "Opus frame too large"
+        );
+        debug!(
+            "Opus encoded: {} samples → {} bytes",
+            pcm_48k.len(),
+            opus_frame.len()
+        );
 
         // Decode
         let decoded = decoder.decode(&opus_frame).unwrap();
-        assert_eq!(decoded.len(), OPUS_FRAME_SAMPLES, "Decoded frame should be 960 samples");
+        assert_eq!(
+            decoded.len(),
+            OPUS_FRAME_SAMPLES,
+            "Decoded frame should be 960 samples"
+        );
 
         // Verify audio similarity (Opus is lossy — especially on the first frame
         // before the encoder settles; VoIP mode also trades quality for latency)
         let correlation = pcm_correlation(&pcm_48k, &decoded);
-        assert!(correlation > 0.2, "Opus round-trip correlation too low: {}", correlation);
+        assert!(
+            correlation > 0.2,
+            "Opus round-trip correlation too low: {}",
+            correlation
+        );
     }
 
     #[test]
@@ -876,8 +945,11 @@ mod tests {
 
         // Transcode PCMU → Opus
         let opus_frame = t.transcode(&pcmu).unwrap();
-        assert!(!opus_frame.is_empty() && opus_frame.len() < 200,
-            "Opus frame should be compact, got {} bytes", opus_frame.len());
+        assert!(
+            !opus_frame.is_empty() && opus_frame.len() < 200,
+            "Opus frame should be compact, got {} bytes",
+            opus_frame.len()
+        );
     }
 
     #[test]
@@ -895,15 +967,23 @@ mod tests {
         // Now transcode Opus → PCMU
         let t = Transcoder::new(Codec::Opus, Codec::Pcmu).unwrap();
         let pcmu = t.transcode(&opus_frame).unwrap();
-        assert_eq!(pcmu.len(), G711_FRAME_SAMPLES,
-            "PCMU should be 160 bytes, got {}", pcmu.len());
+        assert_eq!(
+            pcmu.len(),
+            G711_FRAME_SAMPLES,
+            "PCMU should be 160 bytes, got {}",
+            pcmu.len()
+        );
 
         // Verify the PCMU can be decoded back to audio
         let pcm = pcmu_decode(&pcmu);
         assert_eq!(pcm.len(), G711_FRAME_SAMPLES);
         // Audio should not be all zeros
         let max_sample = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
-        assert!(max_sample > 100, "Transcoded audio should not be silent, max={}", max_sample);
+        assert!(
+            max_sample > 100,
+            "Transcoded audio should not be silent, max={}",
+            max_sample
+        );
     }
 
     #[test]
@@ -930,7 +1010,10 @@ mod tests {
         let transcoder = Arc::new(Transcoder::new(Codec::Pcmu, Codec::Pcma).unwrap());
 
         let pcmu = pcmu_encode(&[500i16; 160]);
-        let result = pool.transcode_async(transcoder, pcmu.clone()).await.unwrap();
+        let result = pool
+            .transcode_async(transcoder, pcmu.clone())
+            .await
+            .unwrap();
         assert_eq!(result.len(), 160);
         assert_eq!(pool.transcoded_count(), 1);
     }
@@ -957,17 +1040,21 @@ mod tests {
         let samples: Vec<i16> = vec![1000i16; 480]; // 10ms at 48kHz
         let down = downsample_48k_to_8k(&samples);
         assert_eq!(down.len(), 80); // 10ms at 8kHz
-        // FIR filter coefficients sum to ~0.962, and edge samples are further
-        // attenuated by zero-padding. Interior samples should be close to 962.
+                                    // FIR filter coefficients sum to ~0.962, and edge samples are further
+                                    // attenuated by zero-padding. Interior samples should be close to 962.
         let interior = &down[3..77]; // skip edge samples affected by zero-padding
         for &s in interior {
-            assert!((s - 962).abs() < 10, "interior sample {} too far from expected 962", s);
+            assert!(
+                (s - 962).abs() < 10,
+                "interior sample {} too far from expected 962",
+                s
+            );
         }
     }
 
     #[test]
     fn test_upsample_8k_to_48k() {
-        let samples: Vec<i16> = vec![500i16; 80];  // 10ms at 8kHz
+        let samples: Vec<i16> = vec![500i16; 80]; // 10ms at 8kHz
         let up = upsample_8k_to_48k(&samples);
         assert_eq!(up.len(), 480); // 10ms at 48kHz
     }
@@ -976,8 +1063,8 @@ mod tests {
 
     #[test]
     fn test_codec_from_pt() {
-        assert_eq!(Codec::from_pt(0),   Codec::Pcmu);
-        assert_eq!(Codec::from_pt(8),   Codec::Pcma);
+        assert_eq!(Codec::from_pt(0), Codec::Pcmu);
+        assert_eq!(Codec::from_pt(8), Codec::Pcma);
         assert_eq!(Codec::from_pt(111), Codec::Opus);
         assert!(matches!(Codec::from_pt(100), Codec::Unknown(100)));
     }
@@ -995,9 +1082,16 @@ mod tests {
     fn test_sdp_prefer_codec_pcmu() {
         let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 5004 RTP/AVP 111 0 8\r\na=rtpmap:111 opus/48000/2\r\n";
         let rewritten = sdp_prefer_codec(sdp, PT_PCMU);
-        let m_line = rewritten.lines().find(|l| l.starts_with("m=audio")).unwrap();
+        let m_line = rewritten
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .unwrap();
         // PCMU (0) should be first PT
-        assert!(m_line.contains("RTP/AVP 0 "), "PCMU should be first: {}", m_line);
+        assert!(
+            m_line.contains("RTP/AVP 0 "),
+            "PCMU should be first: {}",
+            m_line
+        );
     }
 
     #[test]
@@ -1034,18 +1128,30 @@ mod tests {
     fn test_needs_transcoding() {
         let opus_sdp = "m=audio 5004 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n";
         let g711_sdp = "m=audio 5004 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\n";
-        let both_sdp = "m=audio 5004 RTP/AVP 111 0 8\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\n";
+        let both_sdp =
+            "m=audio 5004 RTP/AVP 111 0 8\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:0 PCMU/8000\r\n";
 
-        assert!(needs_transcoding(opus_sdp, g711_sdp), "Opus-only vs G.711-only needs transcoding");
-        assert!(!needs_transcoding(both_sdp, g711_sdp), "Both has common codec with G.711");
-        assert!(!needs_transcoding(opus_sdp, both_sdp), "Opus has common codec with Both");
+        assert!(
+            needs_transcoding(opus_sdp, g711_sdp),
+            "Opus-only vs G.711-only needs transcoding"
+        );
+        assert!(
+            !needs_transcoding(both_sdp, g711_sdp),
+            "Both has common codec with G.711"
+        );
+        assert!(
+            !needs_transcoding(opus_sdp, both_sdp),
+            "Opus has common codec with Both"
+        );
     }
 
     // ── Helper: PCM correlation ──────────────────────────────────────────────
 
     fn pcm_correlation(a: &[i16], b: &[i16]) -> f64 {
         let n = a.len().min(b.len());
-        if n == 0 { return 0.0; }
+        if n == 0 {
+            return 0.0;
+        }
         let mut sum_ab = 0.0f64;
         let mut sum_aa = 0.0f64;
         let mut sum_bb = 0.0f64;
@@ -1056,7 +1162,9 @@ mod tests {
             sum_aa += fa * fa;
             sum_bb += fb * fb;
         }
-        if sum_aa == 0.0 || sum_bb == 0.0 { return 0.0; }
+        if sum_aa == 0.0 || sum_bb == 0.0 {
+            return 0.0;
+        }
         sum_ab / (sum_aa.sqrt() * sum_bb.sqrt())
     }
 }

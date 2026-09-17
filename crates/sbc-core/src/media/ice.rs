@@ -103,8 +103,7 @@ impl IceCandidate {
         component: u16,
         related_address: SocketAddr,
     ) -> Self {
-        let priority =
-            Self::compute_priority(CandidateType::ServerReflexive, 65535, component);
+        let priority = Self::compute_priority(CandidateType::ServerReflexive, 65535, component);
 
         Self {
             foundation: format!("srflx-{}", component),
@@ -273,11 +272,7 @@ pub enum PairState {
 impl CandidatePair {
     /// Create new candidate pair
     pub fn new(local: IceCandidate, remote: IceCandidate, is_controlling: bool) -> Self {
-        let priority = Self::compute_pair_priority(
-            local.priority,
-            remote.priority,
-            is_controlling,
-        );
+        let priority = Self::compute_pair_priority(local.priority, remote.priority, is_controlling);
 
         Self {
             local,
@@ -393,11 +388,7 @@ impl IceAgent {
         for local in &self.local_candidates {
             // Only pair candidates with same component
             if local.component == remote.component {
-                let pair = CandidatePair::new(
-                    local.clone(),
-                    remote.clone(),
-                    self.is_controlling,
-                );
+                let pair = CandidatePair::new(local.clone(), remote.clone(), self.is_controlling);
 
                 debug!(
                     "Formed pair: {}:{} <-> {}:{}",
@@ -454,7 +445,10 @@ impl IceAgent {
             self.pairs.lock().await[i].state = PairState::InProgress;
 
             // Perform real STUN Binding request
-            match self.send_stun_binding_request(local_addr, remote_addr).await {
+            match self
+                .send_stun_binding_request(local_addr, remote_addr)
+                .await
+            {
                 Ok(mapped_addr) => {
                     debug!(
                         "Connectivity check OK: {} <-> {} (mapped: {})",
@@ -491,9 +485,9 @@ impl IceAgent {
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     ) -> Result<SocketAddr> {
+        use rand::Rng;
         use tokio::net::UdpSocket;
         use tokio::time::{timeout, Duration};
-        use rand::Rng;
 
         // Bind a UDP socket on the local candidate address (or 0.0.0.0 for loopback tests)
         let bind_addr = if local_addr.ip().is_loopback() || local_addr.ip().is_unspecified() {
@@ -502,9 +496,9 @@ impl IceAgent {
             SocketAddr::new(local_addr.ip(), 0)
         };
 
-        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-            Error::Media(format!("ICE check bind failed for {}: {}", bind_addr, e))
-        })?;
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| Error::Media(format!("ICE check bind failed for {}: {}", bind_addr, e)))?;
 
         // Build STUN Binding Request (RFC 5389 Section 6)
         let mut transaction_id = [0u8; 12];
@@ -556,10 +550,12 @@ impl IceAgent {
         let (n, from) = match result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(Error::Media(format!("ICE check recv error: {}", e))),
-            Err(_) => return Err(Error::Media(format!(
-                "ICE check timeout to {}",
-                remote_addr
-            ))),
+            Err(_) => {
+                return Err(Error::Media(format!(
+                    "ICE check timeout to {}",
+                    remote_addr
+                )))
+            }
         };
 
         let response = &buf[..n];
@@ -571,7 +567,9 @@ impl IceAgent {
 
         // Check Magic Cookie
         if response[4..8] != 0x2112A442u32.to_be_bytes() {
-            return Err(Error::Media("ICE: invalid magic cookie in response".to_string()));
+            return Err(Error::Media(
+                "ICE: invalid magic cookie in response".to_string(),
+            ));
         }
 
         // Check transaction ID matches
@@ -583,7 +581,9 @@ impl IceAgent {
         let msg_type = u16::from_be_bytes([response[0], response[1]]);
         if msg_type == 0x0111 {
             // Binding Error Response
-            return Err(Error::Media("ICE: received Binding Error Response".to_string()));
+            return Err(Error::Media(
+                "ICE: received Binding Error Response".to_string(),
+            ));
         }
         if msg_type != 0x0101 {
             return Err(Error::Media(format!(
@@ -598,7 +598,8 @@ impl IceAgent {
 
         while offset + 4 <= 20 + msg_len && offset + 4 <= response.len() {
             let attr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-            let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
+            let attr_len =
+                u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
             offset += 4;
 
             if attr_type == 0x0020 && attr_len >= 8 {
@@ -646,8 +647,14 @@ impl IceAgent {
             local_candidates: self.local_candidates.len(),
             remote_candidates: self.remote_candidates.len(),
             total_pairs: pairs.len(),
-            succeeded_pairs: pairs.iter().filter(|p| p.state == PairState::Succeeded).count(),
-            failed_pairs: pairs.iter().filter(|p| p.state == PairState::Failed).count(),
+            succeeded_pairs: pairs
+                .iter()
+                .filter(|p| p.state == PairState::Succeeded)
+                .count(),
+            failed_pairs: pairs
+                .iter()
+                .filter(|p| p.state == PairState::Failed)
+                .count(),
             has_selected_pair: self.selected_pair.lock().await.is_some(),
         }
     }
@@ -749,17 +756,9 @@ mod tests {
         let local_prio = 2130706431u32;
         let remote_prio = 2130706431u32;
 
-        let prio_controlling = CandidatePair::compute_pair_priority(
-            local_prio,
-            remote_prio,
-            true,
-        );
+        let prio_controlling = CandidatePair::compute_pair_priority(local_prio, remote_prio, true);
 
-        let prio_controlled = CandidatePair::compute_pair_priority(
-            local_prio,
-            remote_prio,
-            false,
-        );
+        let prio_controlled = CandidatePair::compute_pair_priority(local_prio, remote_prio, false);
 
         assert_eq!(prio_controlling, prio_controlled);
     }
@@ -795,7 +794,9 @@ mod tests {
         let remote_addr: SocketAddr = "192.168.1.200:6000".parse().unwrap();
 
         agent.add_local_candidate(IceCandidate::host(local_addr, 1));
-        agent.add_remote_candidate(IceCandidate::host(remote_addr, 1)).await;
+        agent
+            .add_remote_candidate(IceCandidate::host(remote_addr, 1))
+            .await;
 
         let stats = agent.stats().await;
         assert_eq!(stats.local_candidates, 1);
@@ -817,7 +818,9 @@ mod tests {
         let remote_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
         agent.add_local_candidate(IceCandidate::host(bound_local, 1));
-        agent.add_remote_candidate(IceCandidate::host(remote_addr, 1)).await;
+        agent
+            .add_remote_candidate(IceCandidate::host(remote_addr, 1))
+            .await;
 
         // Check will timeout (port 1 has no listener)
         agent.perform_checks().await.unwrap();
@@ -859,7 +862,7 @@ mod tests {
                     resp.extend_from_slice(&8u16.to_be_bytes());
                     resp.push(0x00); // reserved
                     resp.push(0x01); // IPv4
-                    // XOR-Port
+                                     // XOR-Port
                     let xport = from.port() ^ 0x2112u16;
                     resp.extend_from_slice(&xport.to_be_bytes());
                     // XOR-Address
@@ -882,7 +885,9 @@ mod tests {
 
         let mut agent = IceAgent::new(true);
         agent.add_local_candidate(IceCandidate::host(client_addr, 1));
-        agent.add_remote_candidate(IceCandidate::host(responder_addr, 1)).await;
+        agent
+            .add_remote_candidate(IceCandidate::host(responder_addr, 1))
+            .await;
 
         agent.perform_checks().await.unwrap();
 
@@ -902,7 +907,9 @@ mod tests {
 
         agent.add_local_candidate(IceCandidate::host(la1, 1));
         agent.add_local_candidate(IceCandidate::host(la2, 1));
-        agent.add_remote_candidate(IceCandidate::host(remote, 1)).await;
+        agent
+            .add_remote_candidate(IceCandidate::host(remote, 1))
+            .await;
 
         let stats = agent.stats().await;
         assert_eq!(stats.total_pairs, 2);

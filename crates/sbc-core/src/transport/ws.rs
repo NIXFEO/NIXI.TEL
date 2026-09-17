@@ -8,7 +8,7 @@
 
 use crate::transport::udp::ReceivedMessage;
 use crate::{Error, Result};
-use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
+use futures_util::{stream::SplitSink, stream::SplitStream, SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,9 +17,9 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::accept_hdr_async;
 use tracing::{debug, error, info, warn};
 
 /// WebSocket listener for SIP over WebSocket (RFC 7118)
@@ -50,11 +50,7 @@ impl WsListenerServer {
     }
 
     /// Create a secure WebSocket (WSS) listener with TLS
-    pub async fn new_wss(
-        bind_addr: SocketAddr,
-        cert_path: &Path,
-        key_path: &Path,
-    ) -> Result<Self> {
+    pub async fn new_wss(bind_addr: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<Self> {
         let certs = Self::load_certs(cert_path)?;
         let key = Self::load_private_key(key_path)?;
 
@@ -101,8 +97,8 @@ impl WsListenerServer {
 
     /// Load private key from PEM file
     fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let data = std::fs::read(path)
-            .map_err(|e| Error::Config(format!("Failed to read key: {}", e)))?;
+        let data =
+            std::fs::read(path).map_err(|e| Error::Config(format!("Failed to read key: {}", e)))?;
         let mut cursor = std::io::Cursor::new(data);
         rustls_pemfile::private_key(&mut cursor)
             .map_err(|e| Error::Config(format!("Failed to parse key: {}", e)))?
@@ -115,7 +111,11 @@ impl WsListenerServer {
         message_tx: mpsc::UnboundedSender<ReceivedMessage>,
         event_tx: mpsc::UnboundedSender<crate::transport::manager::TransportEvent>,
     ) -> Result<()> {
-        let proto = if self.tls_acceptor.is_some() { "WSS" } else { "WS" };
+        let proto = if self.tls_acceptor.is_some() {
+            "WSS"
+        } else {
+            "WS"
+        };
         info!("Starting {} listener on {}", proto, self.local_addr);
 
         loop {
@@ -135,14 +135,21 @@ impl WsListenerServer {
             let is_wss = acceptor.is_some();
 
             tokio::spawn(async move {
-                let transport = if is_wss { rsip::Transport::Wss } else { rsip::Transport::Ws };
-                let result = handle_ws_connection(tcp_stream, peer_addr, tx, acceptor, is_wss).await;
+                let transport = if is_wss {
+                    rsip::Transport::Wss
+                } else {
+                    rsip::Transport::Ws
+                };
+                let result =
+                    handle_ws_connection(tcp_stream, peer_addr, tx, acceptor, is_wss).await;
                 // Reader loop exited (clean close or error): notify the SBC
                 // so registrations/calls bound to this connection are cleaned up.
-                let _ = ev_tx.send(crate::transport::manager::TransportEvent::ConnectionClosed {
-                    peer: peer_addr,
-                    transport,
-                });
+                let _ = ev_tx.send(
+                    crate::transport::manager::TransportEvent::ConnectionClosed {
+                        peer: peer_addr,
+                        transport,
+                    },
+                );
                 if let Err(e) = result {
                     // WSS connection errors are mostly scanners/bots sending
                     // invalid HTTP to the WebSocket port — log at debug.
@@ -172,10 +179,8 @@ async fn handle_ws_connection(
             .unwrap_or("");
 
         if proto.contains("sip") {
-            resp.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                "sip".parse().unwrap(),
-            );
+            resp.headers_mut()
+                .insert("Sec-WebSocket-Protocol", "sip".parse().unwrap());
         }
         Ok(resp)
     };
@@ -216,30 +221,51 @@ async fn handle_ws_connection(
 #[allow(clippy::large_enum_variant)] // one stream per connection; the TLS variant is the common case
 enum WsStream {
     Plain(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>),
-    Secure(tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+    Secure(
+        tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    ),
 }
 
 /// Sink half of a split WebSocket (for writing replies)
 enum WsSink {
     Plain(SplitSink<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, Message>),
-    Secure(SplitSink<tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>, Message>),
+    Secure(
+        SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
+    ),
 }
 
 /// Stream half of a split WebSocket (for reading messages)
 enum WsReader {
     Plain(SplitStream<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>),
-    Secure(SplitStream<tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>),
+    Secure(
+        SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+    ),
 }
 
 impl WsSink {
-    async fn send_text(&mut self, text: String) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
+    async fn send_text(
+        &mut self,
+        text: String,
+    ) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
         match self {
             WsSink::Plain(s) => s.send(Message::Text(text)).await,
             WsSink::Secure(s) => s.send(Message::Text(text)).await,
         }
     }
 
-    async fn send_pong(&mut self, data: Vec<u8>) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
+    async fn send_pong(
+        &mut self,
+        data: Vec<u8>,
+    ) -> std::result::Result<(), tokio_tungstenite::tungstenite::Error> {
         match self {
             WsSink::Plain(s) => s.send(Message::Pong(data)).await,
             WsSink::Secure(s) => s.send(Message::Pong(data)).await,
@@ -248,7 +274,9 @@ impl WsSink {
 }
 
 impl WsReader {
-    async fn next_msg(&mut self) -> Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
+    async fn next_msg(
+        &mut self,
+    ) -> Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>> {
         match self {
             WsReader::Plain(s) => s.next().await,
             WsReader::Secure(s) => s.next().await,
@@ -315,16 +343,18 @@ async fn process_ws_messages(
             Some(Ok(Message::Text(text))) => {
                 // SIP message as text (RFC 7118 §7.2)
                 debug!("WS SIP message from {}: {} bytes", peer_addr, text.len());
-                match parse_and_forward(&text, peer_addr, transport, &message_tx, reply_tx.clone()) {
-                    Ok(_) => {},
+                match parse_and_forward(&text, peer_addr, transport, &message_tx, reply_tx.clone())
+                {
+                    Ok(_) => {}
                     Err(e) => warn!("Failed to parse WS SIP message: {}", e),
                 }
             }
             Some(Ok(Message::Binary(data))) => {
                 // SIP message as binary (uncommon but valid per RFC 7118)
                 let text = String::from_utf8_lossy(&data);
-                match parse_and_forward(&text, peer_addr, transport, &message_tx, reply_tx.clone()) {
-                    Ok(_) => {},
+                match parse_and_forward(&text, peer_addr, transport, &message_tx, reply_tx.clone())
+                {
+                    Ok(_) => {}
                     Err(e) => warn!("Failed to parse WS binary SIP message: {}", e),
                 }
             }
@@ -431,7 +461,8 @@ mod tests {
             addr,
             Path::new("/nonexistent/cert.pem"),
             Path::new("/nonexistent/key.pem"),
-        ).await;
+        )
+        .await;
         assert!(result.is_err());
     }
 }

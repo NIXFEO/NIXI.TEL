@@ -4,11 +4,11 @@
 //! All message handling is delegated to sbc_core::Sbc.
 
 use anyhow::Result;
+use clap::Parser;
 use sbc_core::config::SbcConfig;
 use sbc_core::Sbc;
 use sbc_management::state::AppState;
 use std::path::PathBuf;
-use clap::Parser;
 use tracing::{info, warn};
 
 /// Build identity: crate version + git commit (see build.rs).
@@ -109,7 +109,11 @@ async fn main() -> Result<()> {
     info!("Instance ID: {}", config.general.instance_id);
     info!(
         "Digest auth: {}",
-        if config.security.enable_digest_auth { "enabled" } else { "disabled" }
+        if config.security.enable_digest_auth {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     // Run main event loop — blocks until shutdown

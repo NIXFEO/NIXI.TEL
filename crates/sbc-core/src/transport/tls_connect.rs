@@ -71,11 +71,21 @@ impl TlsClientConnection {
 
         let tcp = tokio::time::timeout(timeout, TcpStream::connect(dest))
             .await
-            .map_err(|_| Error::Transport(format!("TLS connect to {} timed out after {:?}", dest, timeout)))?
+            .map_err(|_| {
+                Error::Transport(format!(
+                    "TLS connect to {} timed out after {:?}",
+                    dest, timeout
+                ))
+            })?
             .map_err(|e| Error::Transport(format!("TLS connect {}: {}", dest, e)))?;
         let stream = tokio::time::timeout(timeout, connector.connect(server_name, tcp))
             .await
-            .map_err(|_| Error::Transport(format!("TLS handshake with {} timed out after {:?}", dest, timeout)))?
+            .map_err(|_| {
+                Error::Transport(format!(
+                    "TLS handshake with {} timed out after {:?}",
+                    dest, timeout
+                ))
+            })?
             .map_err(|e| Error::Transport(format!("TLS handshake with {} failed: {}", dest, e)))?;
 
         info!(
@@ -141,7 +151,10 @@ impl TlsClientConnection {
             }
         });
 
-        Ok(Arc::new(Self { write_tx, peer: dest }))
+        Ok(Arc::new(Self {
+            write_tx,
+            peer: dest,
+        }))
     }
 
     pub fn send(&self, data: &[u8]) -> Result<()> {
@@ -314,7 +327,9 @@ mod tests {
         // Two pipelined messages: first is framed, remainder untouched
         let two = b"OPTIONS sip:x SIP/2.0\r\nContent-Length: 0\r\n\r\nBYE sip:y SIP/2.0\r\n";
         let (end, _) = frame_sip_message(two).unwrap();
-        assert!(std::str::from_utf8(&two[..end]).unwrap().starts_with("OPTIONS"));
+        assert!(std::str::from_utf8(&two[..end])
+            .unwrap()
+            .starts_with("OPTIONS"));
     }
 }
 
@@ -342,12 +357,19 @@ mod connect_timeout_tests {
         let result = TlsClientConnection::connect(dest, &params(), config, tx).await;
         assert!(result.is_err());
         let budget = crate::transport::OUTBOUND_CONNECT_TIMEOUT + Duration::from_secs(1);
-        assert!(started.elapsed() <= budget, "connect took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() <= budget,
+            "connect took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn build_client_config_fails_closed_on_a_missing_ca_bundle() {
-        let bad = TlsClientParams { ca_cert: Some("/nonexistent/ca.pem".to_string()), ..params() };
+        let bad = TlsClientParams {
+            ca_cert: Some("/nonexistent/ca.pem".to_string()),
+            ..params()
+        };
         assert!(build_client_config(&bad).is_err());
     }
 }

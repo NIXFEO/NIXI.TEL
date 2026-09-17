@@ -56,7 +56,10 @@ fn req(method: &str, path: &str, body: Option<&str>, with_token: bool) -> Reques
         builder = builder.header("content-type", "application/json");
     }
     builder
-        .body(body.map(|b| Body::from(b.to_string())).unwrap_or_else(Body::empty))
+        .body(
+            body.map(|b| Body::from(b.to_string()))
+                .unwrap_or_else(Body::empty),
+        )
         .unwrap()
 }
 
@@ -193,7 +196,10 @@ async fn user_crud_roundtrip_applies_to_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    assert!(auth.user_exists("alice").await, "runtime must see the user immediately");
+    assert!(
+        auth.user_exists("alice").await,
+        "runtime must see the user immediately"
+    );
 
     // Response must never leak ha1
     let resp = app
@@ -396,7 +402,12 @@ async fn acl_rules_apply_immediately() {
 
     let resp = app
         .clone()
-        .oneshot(req("DELETE", &format!("/api/v1/acl/rules/{}", id), None, true))
+        .oneshot(req(
+            "DELETE",
+            &format!("/api/v1/acl/rules/{}", id),
+            None,
+            true,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -413,8 +424,17 @@ async fn acl_rules_apply_immediately() {
 #[tokio::test]
 async fn legacy_aliases_work() {
     let app = build_router(make_state().await, &[]);
-    for path in ["/api/calls", "/api/registrations", "/api/status", "/api/trunks"] {
-        let resp = app.clone().oneshot(req("GET", path, None, true)).await.unwrap();
+    for path in [
+        "/api/calls",
+        "/api/registrations",
+        "/api/status",
+        "/api/trunks",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", path, None, true))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "legacy alias {}", path);
     }
 }
@@ -463,19 +483,27 @@ async fn events_endpoint_is_sse() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.starts_with("text/event-stream"), "content-type: {}", ct);
 
     // Read the first frame from the stream
     let mut body = resp.into_body().into_data_stream();
     let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        
         futures_util_next(&mut body).await
     })
     .await
     .expect("first SSE frame within 2s");
     let text = String::from_utf8_lossy(&frame).to_string();
-    assert!(text.contains("call_answered") || text.contains("keep-alive"), "frame: {}", text);
+    assert!(
+        text.contains("call_answered") || text.contains("keep-alive"),
+        "frame: {}",
+        text
+    );
     handle.await.unwrap();
 }
 

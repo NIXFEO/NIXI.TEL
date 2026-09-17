@@ -218,7 +218,8 @@ impl StunAttribute {
         match self {
             StunAttribute::XorMappedAddress(addr) => {
                 // Type (2 bytes)
-                bytes.extend_from_slice(&StunAttributeType::XorMappedAddress.to_u16().to_be_bytes());
+                bytes
+                    .extend_from_slice(&StunAttributeType::XorMappedAddress.to_u16().to_be_bytes());
 
                 // Value
                 let value = encode_xor_address(*addr);
@@ -504,9 +505,7 @@ pub fn build_binding_response_with_integrity(
     let response = StunMessage {
         message_type: StunMessageType::BindingResponse,
         transaction_id: request.transaction_id, // Echo back same transaction ID
-        attributes: vec![
-            StunAttribute::XorMappedAddress(source),
-        ],
+        attributes: vec![StunAttribute::XorMappedAddress(source)],
     };
 
     let mut bytes = response.to_bytes();

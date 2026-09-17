@@ -40,10 +40,7 @@ impl Router {
         // Check if trunk can handle the call
         if !trunk.enabled {
             warn!("Selected trunk {} is disabled", trunk.name);
-            return Err(Error::Routing(format!(
-                "Trunk {} is disabled",
-                trunk.name
-            )));
+            return Err(Error::Routing(format!("Trunk {} is disabled", trunk.name)));
         }
 
         // Check concurrent call limit
@@ -53,10 +50,7 @@ impl Router {
                     "Trunk {} has reached max concurrent calls limit",
                     trunk.name
                 );
-                return Err(Error::Routing(format!(
-                    "Trunk {} at capacity",
-                    trunk.name
-                )));
+                return Err(Error::Routing(format!("Trunk {} at capacity", trunk.name)));
             }
         }
 
@@ -97,11 +91,13 @@ impl Router {
         }
 
         // Step 2: LCR — filter enabled + prefix match + capacity, sort by priority/cost
-        let mut candidates: Vec<&TrunkConfig> = trunks.iter()
+        let mut candidates: Vec<&TrunkConfig> = trunks
+            .iter()
             .filter(|t| t.enabled)
             .filter(|t| t.matches_prefix(&user))
             .filter(|t| {
-                self.trunk_manager.get_state(&t.id)
+                self.trunk_manager
+                    .get_state(&t.id)
                     .is_none_or(|s| s.can_accept_call(t))
             })
             .collect();
@@ -120,7 +116,6 @@ impl Router {
         self.get_default_trunk()
             .ok_or_else(|| Error::Routing("No trunk available for route".to_string()))
     }
-
 
     /// Route an incoming SIP request — return ALL candidate trunks (ordered by priority/cost)
     /// for failover. The caller should try each trunk in order.
@@ -153,12 +148,14 @@ impl Router {
         }
 
         // Step 2: LCR prefix-match candidates
-        let mut lcr_candidates: Vec<TrunkConfig> = trunks.iter()
+        let mut lcr_candidates: Vec<TrunkConfig> = trunks
+            .iter()
             .filter(|t| t.enabled)
             .filter(|t| t.host != domain) // already added domain matches
             .filter(|t| t.matches_prefix(&user))
             .filter(|t| {
-                self.trunk_manager.get_state(&t.id)
+                self.trunk_manager
+                    .get_state(&t.id)
                     .is_none_or(|s| s.can_accept_call(t))
             })
             .cloned()
@@ -168,10 +165,12 @@ impl Router {
 
         // Step 3: if nothing matched, add default trunks as last resort
         if candidates.is_empty() {
-            let mut defaults: Vec<TrunkConfig> = trunks.iter()
+            let mut defaults: Vec<TrunkConfig> = trunks
+                .iter()
                 .filter(|t| t.enabled)
                 .filter(|t| {
-                    self.trunk_manager.get_state(&t.id)
+                    self.trunk_manager
+                        .get_state(&t.id)
                         .is_none_or(|s| s.can_accept_call(t))
                 })
                 .cloned()
@@ -180,9 +179,19 @@ impl Router {
             candidates = defaults;
         }
 
-        info!("LCR failover: {} candidate trunk(s) for user='{}'", candidates.len(), user);
+        info!(
+            "LCR failover: {} candidate trunk(s) for user='{}'",
+            candidates.len(),
+            user
+        );
         for (i, t) in candidates.iter().enumerate() {
-            debug!("  #{}: {} (priority={}, cost={})", i+1, t.name, t.priority, t.cost_per_minute);
+            debug!(
+                "  #{}: {} (priority={}, cost={})",
+                i + 1,
+                t.name,
+                t.priority,
+                t.cost_per_minute
+            );
         }
 
         candidates
@@ -190,7 +199,8 @@ impl Router {
 
     /// Get the default trunk (first enabled trunk, lowest priority)
     fn get_default_trunk(&self) -> Option<TrunkConfig> {
-        let mut trunks: Vec<TrunkConfig> = self.trunk_manager
+        let mut trunks: Vec<TrunkConfig> = self
+            .trunk_manager
             .list_trunks()
             .into_iter()
             .filter(|t| t.enabled)

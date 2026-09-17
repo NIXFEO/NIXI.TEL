@@ -85,7 +85,10 @@ pub fn build_bye(d: &DialogInfo, reason: Option<&str>) -> String {
 /// ACK for a 2xx response (its own transaction: fresh branch, CSeq number of
 /// the INVITE it acknowledges).
 pub fn build_ack_for_2xx(d: &DialogInfo, invite_cseq: u32) -> String {
-    let d2 = DialogInfo { cseq: invite_cseq, ..d.clone() };
+    let d2 = DialogInfo {
+        cseq: invite_cseq,
+        ..d.clone()
+    };
     build_request("ACK", &d2, "ACK", &[], None)
 }
 
@@ -102,10 +105,7 @@ pub fn build_reinvite(
 ) -> String {
     let se_value;
     let min_se_value;
-    let mut extras: Vec<(&str, &str)> = vec![
-        ("Contact", contact_uri),
-        ("Supported", "timer"),
-    ];
+    let mut extras: Vec<(&str, &str)> = vec![("Contact", contact_uri), ("Supported", "timer")];
     if let Some((interval, refresher)) = session_expires {
         se_value = format!("{};refresher={}", interval, refresher);
         extras.push(("Session-Expires", &se_value));
@@ -157,7 +157,9 @@ pub fn parse_invite_identity(raw_invite: &str) -> Option<InviteIdentity> {
         if line.is_empty() {
             break; // end of headers
         }
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         let value = value.trim();
         match name.trim().to_lowercase().as_str() {
             "via" | "v" if top_via.is_none() => top_via = Some(value.to_string()),
@@ -190,7 +192,9 @@ pub fn top_via_branch(raw: &str) -> Option<String> {
         if line.is_empty() {
             return None;
         }
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         let name = name.trim().to_lowercase();
         if name != "via" && name != "v" {
             continue;
@@ -335,7 +339,11 @@ mod tests {
     #[test]
     fn header_order_via_first_content_length_last() {
         let raw = build_bye(&dialog(), None);
-        let headers: Vec<&str> = raw.split("\r\n").skip(1).take_while(|l| !l.is_empty()).collect();
+        let headers: Vec<&str> = raw
+            .split("\r\n")
+            .skip(1)
+            .take_while(|l| !l.is_empty())
+            .collect();
         assert!(headers[0].starts_with("Via:"));
         assert!(headers[1].starts_with("Max-Forwards:"));
         assert!(headers[2].starts_with("From:"));
@@ -376,7 +384,13 @@ mod tests {
 
     #[test]
     fn reinvite_without_min_se_omits_header() {
-        let raw = build_reinvite(&dialog(), "v=0\r\n", "<sip:sbc@1.2.3.4>", Some((1800, "uac")), None);
+        let raw = build_reinvite(
+            &dialog(),
+            "v=0\r\n",
+            "<sip:sbc@1.2.3.4>",
+            Some((1800, "uac")),
+            None,
+        );
         parse(&raw);
         assert!(!raw.contains("Min-SE:"));
     }
@@ -400,8 +414,11 @@ mod tests {
             .expect("ack built");
         parse(&raw);
         assert!(raw.starts_with("ACK sip:bob@203.0.113.9:5060 SIP/2.0\r\n"));
-        assert!(raw.contains("Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bKdeadbeef;rport\r\n"),
-            "ACK must reuse the INVITE's top Via verbatim: {}", raw);
+        assert!(
+            raw.contains("Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bKdeadbeef;rport\r\n"),
+            "ACK must reuse the INVITE's top Via verbatim: {}",
+            raw
+        );
         assert!(raw.contains("Route: <sip:proxy.example.com;lr>\r\n"));
         assert!(raw.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
         assert!(raw.contains("To: <sip:bob@b.example.com>;tag=gen-42\r\n"));
@@ -412,12 +429,17 @@ mod tests {
 
     #[test]
     fn ack_for_non_2xx_rejects_non_invite() {
-        assert!(build_ack_for_non_2xx("BYE sip:x SIP/2.0\r\nCall-ID: 1\r\n\r\n", "<sip:x>").is_none());
+        assert!(
+            build_ack_for_non_2xx("BYE sip:x SIP/2.0\r\nCall-ID: 1\r\n\r\n", "<sip:x>").is_none()
+        );
     }
 
     #[test]
     fn top_via_branch_variants() {
-        assert_eq!(top_via_branch(INVITE_WITH_BODY).as_deref(), Some("z9hG4bKdeadbeef"));
+        assert_eq!(
+            top_via_branch(INVITE_WITH_BODY).as_deref(),
+            Some("z9hG4bKdeadbeef")
+        );
         let resp = "SIP/2.0 422 Session Interval Too Small\r\n\
                     v: SIP/2.0/UDP 198.51.100.1:5060;rport=5060;received=1.2.3.4;branch=z9hG4bKabc\r\n\
                     Via: SIP/2.0/UDP other;branch=z9hG4bKnot-top\r\n\r\n";
@@ -434,11 +456,23 @@ mod tests {
         assert!(out.contains("CSeq: 4 INVITE\r\n"), "{}", out);
         assert!(!out.contains("z9hG4bKdeadbeef"), "branch must be fresh");
         assert!(out.contains("branch=z9hG4bK"));
-        assert!(out.contains(";rport\r\n"), "Via params after the branch survive");
-        assert!(out.ends_with("Content-Length: 22\r\n\r\nv=0\r\nm=audio 1 RTP/AVP 0\r\n"),
-            "body must be byte-identical: {}", out);
-        assert!(out.contains("Proxy-Authorization: Digest"), "other headers untouched");
-        assert_eq!(out.len(), INVITE_WITH_BODY.len() + (new_branch().len() - "z9hG4bKdeadbeef".len()));
+        assert!(
+            out.contains(";rport\r\n"),
+            "Via params after the branch survive"
+        );
+        assert!(
+            out.ends_with("Content-Length: 22\r\n\r\nv=0\r\nm=audio 1 RTP/AVP 0\r\n"),
+            "body must be byte-identical: {}",
+            out
+        );
+        assert!(
+            out.contains("Proxy-Authorization: Digest"),
+            "other headers untouched"
+        );
+        assert_eq!(
+            out.len(),
+            INVITE_WITH_BODY.len() + (new_branch().len() - "z9hG4bKdeadbeef".len())
+        );
     }
 
     #[test]
@@ -458,7 +492,10 @@ mod tests {
         assert_eq!(id.top_via, "SIP/2.0/UDP h;branch=z9hG4bK1");
         assert_eq!(id.cseq, 12);
         assert_eq!(id.routes, vec!["<sip:r1;lr>", "<sip:r2;lr>"]);
-        assert!(parse_invite_identity("INVITE sip:x SIP/2.0\r\nVia: x\r\n\r\n").is_none(), "missing From/To/Call-ID");
+        assert!(
+            parse_invite_identity("INVITE sip:x SIP/2.0\r\nVia: x\r\n\r\n").is_none(),
+            "missing From/To/Call-ID"
+        );
     }
 
     #[test]
@@ -475,7 +512,10 @@ mod tests {
         let raw = build_cancel(invite).expect("cancel built");
         parse(&raw);
         assert!(raw.starts_with("CANCEL sip:bob@203.0.113.9:5060 SIP/2.0\r\n"));
-        assert!(raw.contains("branch=z9hG4bKdeadbeef"), "CANCEL must reuse the INVITE branch");
+        assert!(
+            raw.contains("branch=z9hG4bKdeadbeef"),
+            "CANCEL must reuse the INVITE branch"
+        );
         assert!(raw.contains("CSeq: 3 CANCEL\r\n"));
         assert!(raw.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
         assert!(raw.contains("To: <sip:bob@b.example.com>\r\n"));

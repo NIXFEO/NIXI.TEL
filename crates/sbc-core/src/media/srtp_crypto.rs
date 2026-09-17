@@ -95,12 +95,8 @@ impl SrtpCrypto {
         let payload = &rtp_packet[header_len..];
 
         // Extract SSRC and sequence number for IV derivation
-        let ssrc = u32::from_be_bytes([
-            rtp_packet[8],
-            rtp_packet[9],
-            rtp_packet[10],
-            rtp_packet[11],
-        ]);
+        let ssrc =
+            u32::from_be_bytes([rtp_packet[8], rtp_packet[9], rtp_packet[10], rtp_packet[11]]);
         let seq = u16::from_be_bytes([rtp_packet[2], rtp_packet[3]]);
 
         // Derive IV for this packet
@@ -191,8 +187,8 @@ impl SrtpCrypto {
         iv[4..8].copy_from_slice(&ssrc.to_be_bytes());
 
         // Packet index at bytes [8-13] (48 bits)
-        iv[8]  = ((packet_index >> 40) & 0xFF) as u8;
-        iv[9]  = ((packet_index >> 32) & 0xFF) as u8;
+        iv[8] = ((packet_index >> 40) & 0xFF) as u8;
+        iv[9] = ((packet_index >> 32) & 0xFF) as u8;
         iv[10] = ((packet_index >> 24) & 0xFF) as u8;
         iv[11] = ((packet_index >> 16) & 0xFF) as u8;
         iv[12] = ((packet_index >> 8) & 0xFF) as u8;
@@ -241,10 +237,8 @@ impl SrtpCrypto {
             }
 
             // Extension length is in 32-bit words (bytes header_len+2 and header_len+3)
-            let ext_len = u16::from_be_bytes([
-                packet[header_len + 2],
-                packet[header_len + 3],
-            ]) as usize;
+            let ext_len =
+                u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]) as usize;
 
             header_len += 4 + (ext_len * 4);
         }
@@ -393,7 +387,9 @@ impl SrtcpCrypto {
     ///   [RTCP header][encrypted payload][E-bit + SRTCP index 4 bytes][auth tag]
     pub fn encrypt_rtcp(&mut self, rtcp_packet: &[u8]) -> Result<Vec<u8>> {
         if rtcp_packet.len() < 8 {
-            return Err(Error::Media("RTCP packet too short (min 8 bytes)".to_string()));
+            return Err(Error::Media(
+                "RTCP packet too short (min 8 bytes)".to_string(),
+            ));
         }
 
         // Extract SSRC from RTCP header (bytes 4-7)
@@ -513,8 +509,8 @@ impl SrtcpCrypto {
         iv[7] = ssrc as u8;
 
         // SRTCP index occupies bits [31:0]
-        iv[8]  = (srtcp_index >> 24) as u8;
-        iv[9]  = (srtcp_index >> 16) as u8;
+        iv[8] = (srtcp_index >> 24) as u8;
+        iv[9] = (srtcp_index >> 16) as u8;
         iv[10] = (srtcp_index >> 8) as u8;
         iv[11] = srtcp_index as u8;
 
@@ -570,8 +566,8 @@ pub fn derive_srtcp_keys(
 
     // RFC 3711 Table 1: SRTCP labels are 0x03, 0x04, 0x05
     let cipher_key = kdf_prf(master_key, master_salt, 0x03, master_key.len())?;
-    let auth_key   = kdf_prf(master_key, master_salt, 0x04, 20)?;
-    let salt_key   = kdf_prf(master_key, master_salt, 0x05, 14)?;
+    let auth_key = kdf_prf(master_key, master_salt, 0x04, 20)?;
+    let salt_key = kdf_prf(master_key, master_salt, 0x05, 14)?;
 
     Ok((cipher_key, auth_key, salt_key))
 }
@@ -630,7 +626,8 @@ mod tests {
         let master_key = vec![0xABu8; 16];
         let master_salt = vec![0xCDu8; 14];
 
-        let (cipher_key, auth_key, salt_key) = derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
+        let (cipher_key, auth_key, salt_key) =
+            derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
         let mut crypto = SrtpCrypto::new(cipher_key, auth_key, salt_key, 10).unwrap();
 
         // Create simple RTP packet
@@ -665,13 +662,14 @@ mod tests {
         let master_key = vec![0xABu8; 16];
         let master_salt = vec![0xCDu8; 14];
 
-        let (cipher_key, auth_key, salt_key) = derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
+        let (cipher_key, auth_key, salt_key) =
+            derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
         let mut crypto = SrtpCrypto::new(cipher_key, auth_key, salt_key, 10).unwrap();
 
         // Create RTP packet
         let rtp_packet = vec![
-            0x80, 0x00, 0x00, 0x64, 0x00, 0x00, 0x03, 0xE8, 0x12, 0x34, 0x56, 0x78,
-            0x48, 0x65, 0x6C, 0x6C, 0x6F, // "Hello"
+            0x80, 0x00, 0x00, 0x64, 0x00, 0x00, 0x03, 0xE8, 0x12, 0x34, 0x56, 0x78, 0x48, 0x65,
+            0x6C, 0x6C, 0x6F, // "Hello"
         ];
 
         // Encrypt
@@ -684,7 +682,10 @@ mod tests {
         // Decrypt should fail
         let result = crypto.decrypt_srtp(&srtp_packet);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("authentication failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("authentication failed"));
     }
 
     // --- SRTCP Tests ---
@@ -711,11 +712,8 @@ mod tests {
             0x80, 0xC8, 0x00, 0x06, // V=2, PT=200 (SR), length=6
             0x12, 0x34, 0x56, 0x78, // SSRC
             // Sender info (20 bytes)
-            0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x02,
-            0x00, 0x00, 0x00, 0x03,
-            0x00, 0x00, 0x00, 0x04,
-            0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x05,
         ];
 
         let srtcp = ctx.encrypt_rtcp(&rtcp).unwrap();
@@ -735,9 +733,7 @@ mod tests {
         let mut ctx = SrtcpCrypto::new(ck, ak, sk, 10).unwrap();
 
         let rtcp: Vec<u8> = vec![
-            0x80, 0xC8, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00,
+            0x80, 0xC8, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let mut srtcp = ctx.encrypt_rtcp(&rtcp).unwrap();
@@ -747,7 +743,10 @@ mod tests {
 
         let result = ctx.decrypt_srtcp(&srtcp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("authentication failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("authentication failed"));
     }
 
     #[test]
@@ -756,9 +755,7 @@ mod tests {
         let mut ctx = SrtcpCrypto::new(ck, ak, sk, 10).unwrap();
 
         let rtcp: Vec<u8> = vec![
-            0x80, 0xC8, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00,
+            0x80, 0xC8, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
         ];
 
         assert_eq!(ctx.get_srtcp_index(), 0);
@@ -812,14 +809,18 @@ mod tests {
         let master_key = vec![0x0bu8; 16];
         let master_salt = vec![0x0cu8; 14];
 
-        let (cipher_key, auth_key, salt_key) = derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
+        let (cipher_key, auth_key, salt_key) =
+            derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
 
         // Python outputs:
         //   cipher_key: 3af8651805fbf61aadd0f54da13d327a
         //   auth_key:   201adad6e49f7d617c6a00624b8ef9ba68783879
         //   salt_key:   5dd0c0f7bb624cc0ff759df2b55e
         assert_eq!(to_hex(&cipher_key), "3af8651805fbf61aadd0f54da13d327a");
-        assert_eq!(to_hex(&auth_key), "201adad6e49f7d617c6a00624b8ef9ba68783879");
+        assert_eq!(
+            to_hex(&auth_key),
+            "201adad6e49f7d617c6a00624b8ef9ba68783879"
+        );
         assert_eq!(to_hex(&salt_key), "5dd0c0f7bb624cc0ff759df2b55e");
     }
 
@@ -831,8 +832,10 @@ mod tests {
         let master_key = vec![0x0bu8; 16];
         let master_salt = vec![0x0cu8; 14];
 
-        let (cipher_key, auth_key, salt_key) = derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
-        let (cipher_key2, auth_key2, salt_key2) = derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
+        let (cipher_key, auth_key, salt_key) =
+            derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
+        let (cipher_key2, auth_key2, salt_key2) =
+            derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
 
         let mut encryptor = SrtpCrypto::new(cipher_key, auth_key, salt_key, 10).unwrap();
         let mut decryptor = SrtpCrypto::new(cipher_key2, auth_key2, salt_key2, 10).unwrap();
@@ -850,7 +853,7 @@ mod tests {
         // Verify header is preserved in cleartext
         assert_eq!(&srtp[..12], &rtp[..12]);
         // Payload must be encrypted (different from plaintext)
-        assert_ne!(&srtp[12..srtp.len()-10], &rtp[12..]);
+        assert_ne!(&srtp[12..srtp.len() - 10], &rtp[12..]);
         // Auth tag appended (10 bytes)
         assert_eq!(srtp.len(), rtp.len() + 10);
 

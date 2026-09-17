@@ -3,8 +3,8 @@
 //! Handles SIP message reception and transmission over TCP.
 //! Supports connection pooling and proper stream parsing.
 
-use crate::{Error, Result};
 use crate::transport::udp::ReceivedMessage;
+use crate::{Error, Result};
 use rsip::SipMessage;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,10 +47,7 @@ impl TcpListenerServer {
     }
 
     /// Start listening for incoming TCP connections
-    pub async fn listen(
-        self,
-        message_tx: mpsc::UnboundedSender<ReceivedMessage>,
-    ) -> Result<()> {
+    pub async fn listen(self, message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<()> {
         info!("Starting TCP listener on {}", self.local_addr);
 
         loop {
@@ -127,7 +124,10 @@ impl TcpListenerServer {
             // Try to extract complete SIP messages
             while let Some((message, remaining)) = Self::extract_message(&buffer)? {
                 // Skip pure CRLF keepalives (RFC 5626 §4.4.1)
-                let trimmed = message.iter().filter(|&&b| b != b'\r' && b != b'\n').count();
+                let trimmed = message
+                    .iter()
+                    .filter(|&&b| b != b'\r' && b != b'\n')
+                    .count();
                 if trimmed == 0 {
                     buffer = remaining.to_vec();
                     continue;
@@ -210,8 +210,8 @@ impl TcpListenerServer {
         // Look for Content-Length header (case-insensitive)
         for line in headers_str.lines() {
             let line_lower = line.to_lowercase();
-            if line_lower.starts_with("content-length:")
-                || line_lower.starts_with("l:") // Compact form
+            if line_lower.starts_with("content-length:") || line_lower.starts_with("l:")
+            // Compact form
             {
                 let value = line
                     .split(':')
@@ -219,9 +219,9 @@ impl TcpListenerServer {
                     .ok_or_else(|| Error::Parse("Invalid Content-Length header".to_string()))?
                     .trim();
 
-                return value.parse::<usize>().map_err(|e| {
-                    Error::Parse(format!("Failed to parse Content-Length: {}", e))
-                });
+                return value
+                    .parse::<usize>()
+                    .map_err(|e| Error::Parse(format!("Failed to parse Content-Length: {}", e)));
             }
         }
 
@@ -298,7 +298,12 @@ impl TcpConnection {
         let timeout = crate::transport::OUTBOUND_CONNECT_TIMEOUT;
         let stream = tokio::time::timeout(timeout, TcpStream::connect(dest))
             .await
-            .map_err(|_| Error::Transport(format!("TCP connect to {} timed out after {:?}", dest, timeout)))?
+            .map_err(|_| {
+                Error::Transport(format!(
+                    "TCP connect to {} timed out after {:?}",
+                    dest, timeout
+                ))
+            })?
             .map_err(|e| Error::Transport(format!("Failed to connect to {}: {}", dest, e)))?;
 
         debug!("Established TCP connection to {}", dest);
@@ -311,11 +316,7 @@ impl TcpConnection {
 
     /// Send SIP message over this connection
     pub async fn send(&self, data: &[u8]) -> Result<()> {
-        debug!(
-            "Sending {} bytes to {} via TCP",
-            data.len(),
-            self.peer_addr
-        );
+        debug!("Sending {} bytes to {} via TCP", data.len(), self.peer_addr);
 
         let mut stream = self.stream.lock().await;
         stream
@@ -349,13 +350,19 @@ mod tests {
     #[test]
     fn test_parse_content_length() {
         let headers = b"Via: SIP/2.0/TCP example.com\r\nContent-Length: 142\r\n";
-        assert_eq!(TcpListenerServer::parse_content_length(headers).unwrap(), 142);
+        assert_eq!(
+            TcpListenerServer::parse_content_length(headers).unwrap(),
+            142
+        );
     }
 
     #[test]
     fn test_parse_content_length_compact() {
         let headers = b"Via: SIP/2.0/TCP example.com\r\nl: 50\r\n";
-        assert_eq!(TcpListenerServer::parse_content_length(headers).unwrap(), 50);
+        assert_eq!(
+            TcpListenerServer::parse_content_length(headers).unwrap(),
+            50
+        );
     }
 
     #[test]
@@ -407,6 +414,10 @@ mod connect_timeout_tests {
         let result = TcpConnection::connect(dest).await;
         assert!(result.is_err());
         let budget = crate::transport::OUTBOUND_CONNECT_TIMEOUT + Duration::from_secs(1);
-        assert!(started.elapsed() <= budget, "connect took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() <= budget,
+            "connect took {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -95,15 +95,33 @@ pub struct TrunkConfigToml {
     pub max_concurrent_calls: u32,
 }
 
-fn default_true() -> bool { true }
-fn default_sip_port() -> u16 { 5060 }
-fn default_udp() -> String { "UDP".to_string() }
-fn default_reg_interval() -> u64 { 300 }
-fn default_priority() -> u32 { 100 }
-fn default_weight() -> u32 { 100 }
-fn default_number_format() -> String { "e164".to_string() }
-fn default_codecs() -> Vec<String> { vec!["PCMU".to_string(), "PCMA".to_string()] }
-fn default_max_calls() -> u32 { 100 }
+fn default_true() -> bool {
+    true
+}
+fn default_sip_port() -> u16 {
+    5060
+}
+fn default_udp() -> String {
+    "UDP".to_string()
+}
+fn default_reg_interval() -> u64 {
+    300
+}
+fn default_priority() -> u32 {
+    100
+}
+fn default_weight() -> u32 {
+    100
+}
+fn default_number_format() -> String {
+    "e164".to_string()
+}
+fn default_codecs() -> Vec<String> {
+    vec!["PCMU".to_string(), "PCMA".to_string()]
+}
+fn default_max_calls() -> u32 {
+    100
+}
 
 /// General SBC settings
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -195,7 +213,9 @@ impl Default for DatabaseConfig {
     }
 }
 
-fn default_sqlite_path() -> String { "data/sbc.db".to_string() }
+fn default_sqlite_path() -> String {
+    "data/sbc.db".to_string()
+}
 
 /// Security configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -249,12 +269,24 @@ pub struct SecurityConfig {
     pub features: crate::security::SecurityFeaturesConfig,
 }
 
-fn default_max_call_duration() -> u64 { 14400 }
-fn default_call_setup_timeout() -> u64 { 60 }
-fn default_rtp_timeout() -> u64 { 90 }
-fn default_invite_timeout() -> u64 { 5 }
-fn default_session_expires() -> u64 { 1800 }
-fn default_min_se() -> u64 { 90 }
+fn default_max_call_duration() -> u64 {
+    14400
+}
+fn default_call_setup_timeout() -> u64 {
+    60
+}
+fn default_rtp_timeout() -> u64 {
+    90
+}
+fn default_invite_timeout() -> u64 {
+    5
+}
+fn default_session_expires() -> u64 {
+    1800
+}
+fn default_min_se() -> u64 {
+    90
+}
 
 fn default_sip_realm() -> String {
     "sbc.local".to_string()
@@ -301,7 +333,11 @@ pub fn resolve_api_token(toml_val: &Option<String>) -> Option<String> {
 fn resolve_api_token_from(env_val: Option<String>, toml_val: &Option<String>) -> Option<String> {
     let non_empty = |s: &str| {
         let t = s.trim();
-        if t.is_empty() { None } else { Some(t.to_string()) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
     };
     env_val
         .as_deref()
@@ -335,20 +371,19 @@ impl SbcConfig {
     fn validate(&self) -> crate::Result<()> {
         // Validate port ranges
         if self.media.rtp_port_range.0 >= self.media.rtp_port_range.1 {
-            return Err(crate::Error::Config(
-                "Invalid RTP port range".to_string(),
-            ));
+            return Err(crate::Error::Config("Invalid RTP port range".to_string()));
         }
 
         // Validate listeners have TLS config when needed
         for listener in &self.network.listeners {
             if listener.transport.is_secure()
-                && (listener.cert_file.is_none() || listener.key_file.is_none()) {
-                    return Err(crate::Error::Config(format!(
-                        "TLS listener on port {} requires cert_file and key_file",
-                        listener.bind_port
-                    )));
-                }
+                && (listener.cert_file.is_none() || listener.key_file.is_none())
+            {
+                return Err(crate::Error::Config(format!(
+                    "TLS listener on port {} requires cert_file and key_file",
+                    listener.bind_port
+                )));
+            }
         }
 
         // Fail closed: never expose the management API on a non-loopback
