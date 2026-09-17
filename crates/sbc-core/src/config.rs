@@ -233,6 +233,23 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub enable_digest_auth: bool,
 
+    /// REGISTER authorization (RFC 3261 §10.3 step 5): the authenticated
+    /// user may only bind its own AOR on a served domain. `enforce` answers
+    /// 403 on a mismatch, `log` only reports it (upgrade fallback).
+    #[serde(default = "default_register_aor_check")]
+    pub register_aor_check: String,
+
+    /// Extra hosts accepted as the domain of an AOR or a local From, besides
+    /// `sip_realm`, the SBC domain, its public IP and loopback.
+    #[serde(default)]
+    pub served_domains: Vec<String>,
+
+    /// An INVITE from a trunk whose From claims a local user: `allow`
+    /// relays it (flagged, never attributed to that user), `reject` answers
+    /// 403.
+    #[serde(default = "default_trunk_local_from")]
+    pub trunk_local_from: String,
+
     /// Maximum call duration in seconds (0 = unlimited, default 14400 = 4 hours)
     #[serde(default = "default_max_call_duration")]
     pub max_call_duration: u64,
@@ -274,6 +291,12 @@ pub struct SecurityConfig {
 
 fn default_max_call_duration() -> u64 {
     14400
+}
+fn default_register_aor_check() -> String {
+    "enforce".to_string()
+}
+fn default_trunk_local_from() -> String {
+    "allow".to_string()
 }
 fn default_call_setup_timeout() -> u64 {
     60
@@ -453,6 +476,9 @@ impl Default for SbcConfig {
                 sip_realm: "sbc.local".to_string(),
                 sip_users: HashMap::new(),
                 enable_digest_auth: false,
+                register_aor_check: "enforce".to_string(),
+                served_domains: Vec::new(),
+                trunk_local_from: "allow".to_string(),
                 max_call_duration: 14400,
                 call_setup_timeout: 60,
                 rtp_timeout: 90,

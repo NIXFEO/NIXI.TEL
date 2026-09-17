@@ -1391,3 +1391,469 @@ async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
     );
     assert_eq!(auth_events(&sbc), 2);
 }
+
+fn identity_events(sbc: &Sbc) -> Vec<(String, String, String)> {
+    sbc.security
+        .recent_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::security::SecurityEvent::IdentityMismatch {
+                user,
+                claimed,
+                method,
+                ..
+            } => Some((user, claimed, method)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn strike_count(sbc: &Sbc) -> usize {
+    sbc.security
+        .recent_events()
+        .iter()
+        .filter(|e| matches!(e, crate::security::SecurityEvent::AuthFailure { .. }))
+        .count()
+}
+
+/// Register `user` from `source` on an SBC with Digest on (401 → 200).
+async fn register(sbc: &mut Sbc, user: &str, password: &str, realm: &str, source: SocketAddr) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_request(
+        register_request(user, realm, 1, ""),
+        source,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 401 "), "{}", out[0]);
+    let nonce = nonce_of(&out[0]);
+    sbc.handle_request(
+        register_request(
+            user,
+            realm,
+            2,
+            &authorization_line(user, realm, password, &nonce, "00000001"),
+        ),
+        source,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 200 OK"), "{}", out[0]);
+}
+
+/// RFC 3261 §10.3 step 5: alice's password binds alice's AOR, nobody else's.
+#[tokio::test]
+async fn register_for_another_users_aor_is_forbidden() {
+    const REALM: &str = "sip.example.com";
+    let mut sbc = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret"), ("bob", "b0b")])
+        .build();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Challenge, then alice authenticates for bob's AOR
+    sbc.handle_request(
+        register_request_for("alice", "sip:bob@sip.example.com", REALM, 1, ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let nonce = nonce_of(&drain(&mut rx)[0]);
+    sbc.handle_request(
+        register_request_for(
+            "alice",
+            "sip:bob@sip.example.com",
+            REALM,
+            2,
+            &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(sbc
+        .register_handler
+        .lookup("sip:bob@sip.example.com")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        identity_events(&sbc),
+        vec![(
+            "alice".to_string(),
+            "sip:bob@sip.example.com".to_string(),
+            "REGISTER".to_string()
+        )]
+    );
+    assert_eq!(strike_count(&sbc), 0, "a valid credential is never banned");
+
+    // Own user on a foreign domain: refused too
+    sbc.handle_request(
+        register_request_for("alice", "sip:alice@evil.example", REALM, 3, ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let nonce = nonce_of(&drain(&mut rx)[0]);
+    sbc.handle_request(
+        register_request_for(
+            "alice",
+            "sip:alice@evil.example",
+            REALM,
+            4,
+            &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut rx)[0].starts_with("SIP/2.0 403 "));
+
+    // Own user at the SBC's loopback address (Linphone-style IP AOR): fine
+    sbc.handle_request(
+        register_request_for("alice", "sip:alice@127.0.0.1", REALM, 5, ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let nonce = nonce_of(&drain(&mut rx)[0]);
+    sbc.handle_request(
+        register_request_for(
+            "alice",
+            "sip:alice@127.0.0.1",
+            REALM,
+            6,
+            &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut rx)[0].starts_with("SIP/2.0 200 OK"));
+
+    // register_aor_check = log: reported, allowed
+    let mut lenient = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .identity_policy(IdentityPolicy {
+            enforce_register_aor: false,
+            ..IdentityPolicy::default()
+        })
+        .build();
+    lenient
+        .handle_request(
+            register_request_for("alice", "sip:bob@sip.example.com", REALM, 1, ""),
+            local_addr(),
+            rsip::Transport::Udp,
+            Some(&tx),
+        )
+        .await
+        .unwrap();
+    let nonce = nonce_of(&drain(&mut rx)[0]);
+    lenient
+        .handle_request(
+            register_request_for(
+                "alice",
+                "sip:bob@sip.example.com",
+                REALM,
+                2,
+                &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+            ),
+            local_addr(),
+            rsip::Transport::Udp,
+            Some(&tx),
+        )
+        .await
+        .unwrap();
+    assert!(drain(&mut rx)[0].starts_with("SIP/2.0 200 OK"));
+    assert_eq!(identity_events(&lenient).len(), 1, "still reported");
+}
+
+/// A registered source presents its own From, or nothing.
+#[tokio::test]
+async fn invite_from_a_registered_source_must_carry_its_own_from() {
+    const REALM: &str = "sip.example.com";
+    let phone: SocketAddr = "10.0.0.9:5080".parse().unwrap();
+    let mut sbc = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret"), ("bob", "b0b")])
+        .build();
+    register(&mut sbc, "alice", "s3cret", REALM, phone).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // From bob, from alice's phone: refused, flagged, not a scanner strike
+    sbc.handle_invite(
+        invite_from_user("bob", REALM, "+33612345678", ""),
+        phone,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "403 only: {:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(sbc.b2bua.calls_locked().await.is_empty());
+    assert_eq!(sbc.media.stats().allocated_ports, 0);
+    assert_eq!(
+        identity_events(&sbc),
+        vec![("alice".to_string(), "bob".to_string(), "INVITE".to_string())]
+    );
+    assert_eq!(strike_count(&sbc), 0);
+
+    // From alice: admitted (100 Trying; the forward fails in the harness → 503)
+    sbc.handle_invite(
+        invite_from_user("alice", REALM, "+33612345678", ""),
+        phone,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 100 Trying\r\n"), "{:?}", out);
+    let cdrs = sbc.cdr.get_recent(10).await.unwrap();
+    assert_eq!(cdrs.len(), 1);
+    assert_eq!(
+        cdrs[0].caller, "alice",
+        "attributed to the verified identity"
+    );
+}
+
+/// An unregistered source claiming a local user must prove it (407), as
+/// a REGISTER would; then it is that user.
+#[tokio::test]
+async fn unregistered_source_claiming_a_local_user_is_challenged_407() {
+    const REALM: &str = "sip.example.com";
+    let stranger: SocketAddr = "198.51.100.7:5060".parse().unwrap();
+    let mut sbc = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .build();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_user("alice", REALM, "+33612345678", ""),
+        stranger,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 407 Proxy Authentication Required\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("Proxy-Authenticate: Digest realm=\"sip.example.com\", nonce=\""));
+    assert!(out[0].contains("CSeq: 1 INVITE\r\n"));
+    assert_eq!(strike_count(&sbc), 0, "a challenge is not a strike");
+    assert!(
+        sbc.b2bua.calls_locked().await.is_empty(),
+        "no state before proof"
+    );
+    let nonce = nonce_of(&out[0]);
+    let uri = format!("sip:+33612345678@{}", REALM);
+
+    // Wrong password: 403 + strike
+    sbc.handle_invite(
+        invite_from_user_tx(
+            "alice",
+            REALM,
+            "+33612345678",
+            &proxy_authorization_line("alice", REALM, "wrong", &nonce, &uri, "00000001"),
+            2,
+        ),
+        stranger,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        "{}",
+        out[0]
+    );
+    assert_eq!(strike_count(&sbc), 1);
+
+    // Right password: admitted as alice
+    sbc.handle_invite(
+        invite_from_user_tx(
+            "alice",
+            REALM,
+            "+33612345678",
+            &proxy_authorization_line("alice", REALM, "s3cret", &nonce, &uri, "00000002"),
+            3,
+        ),
+        stranger,
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 100 Trying\r\n"), "{:?}", out);
+    let cdrs = sbc.cdr.get_recent(10).await.unwrap();
+    assert_eq!(cdrs.len(), 1);
+    assert_eq!(cdrs[0].caller, "alice");
+    assert_eq!(cdrs[0].source_ip, "198.51.100.7");
+
+    // Proving to be alice while presenting bob: refused, flagged
+    let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_invite(
+        invite_from_user_tx("bob", REALM, "+33612345678", "", 4),
+        stranger,
+        rsip::Transport::Udp,
+        Some(&tx2),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx2);
+    assert!(
+        out[0].starts_with("SIP/2.0 403 "),
+        "bob is nobody here → scanner: {}",
+        out[0]
+    );
+}
+
+/// Nobody but a trunk (or a host of its /24) calls our registered users.
+#[tokio::test]
+async fn unknown_source_reaches_a_registered_user_only_from_a_trunk_subnet() {
+    const REALM: &str = "sip.example.com";
+    let phone: SocketAddr = "10.0.0.9:5080".parse().unwrap();
+    let mut sbc = SbcBuilder::new()
+        .digest_users(REALM, &[("bob", "b0b")])
+        .build();
+    register(&mut sbc, "bob", "b0b", REALM, phone).await;
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let call_bob = |tx| invite_from_trunk_tx("sip:+33699000000@example.net", "bob", 70, tx);
+
+    // Random Internet host: 403 + strike
+    sbc.handle_invite(
+        call_bob(1),
+        "198.51.100.7:5060".parse().unwrap(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 403 "), "{}", out[0]);
+    assert_eq!(strike_count(&sbc), 1);
+
+    // Sibling host of the trunk's /24: a trunk
+    sbc.handle_invite(
+        call_bob(2),
+        "203.0.113.42:5060".parse().unwrap(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(out[0].starts_with("SIP/2.0 100 Trying\r\n"), "{:?}", out);
+    assert_eq!(strike_count(&sbc), 1);
+}
+
+/// A trunk that presents one of our users is flagged (and refused when
+/// `trunk_local_from = reject`); the call is never attributed to the user.
+#[tokio::test]
+async fn trunk_invite_presenting_a_local_user_is_flagged() {
+    const REALM: &str = "sip.example.com";
+    let mut sbc = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_trunk_as("sip:alice@sip.example.com", "+33999000111", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert!(
+        out[0].starts_with("SIP/2.0 100 Trying\r\n"),
+        "relayed: {:?}",
+        out
+    );
+    assert_eq!(
+        identity_events(&sbc),
+        vec![(
+            "trunk".to_string(),
+            "sip:alice@sip.example.com".to_string(),
+            "INVITE".to_string()
+        )]
+    );
+    assert_eq!(
+        sbc.b2bua.active_calls_for_user("alice").await,
+        0,
+        "never counted against alice"
+    );
+
+    let mut strict = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .identity_policy(IdentityPolicy {
+            reject_trunk_local_from: true,
+            ..IdentityPolicy::default()
+        })
+        .build();
+    register_trunk_ip(&strict).await;
+    strict
+        .handle_invite(
+            invite_from_trunk_as("sip:alice@sip.example.com", "+33999000111", 70),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            Some(&tx),
+        )
+        .await
+        .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].starts_with("SIP/2.0 403 "), "{}", out[0]);
+    assert_eq!(strike_count(&strict), 0, "a trunk is never banned for it");
+
+    // A PSTN caller whose number is not a local user: nothing flagged
+    sbc.handle_invite(
+        invite_from_trunk_tx("sip:+33612345678@203.0.113.9", "+33999000111", 70, 2),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let _ = drain(&mut rx);
+    assert_eq!(identity_events(&sbc).len(), 1);
+}

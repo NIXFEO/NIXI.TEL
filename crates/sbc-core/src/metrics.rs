@@ -84,6 +84,8 @@ pub struct SbcMetrics {
 
     /// Total calls rejected by per-user limits (concurrent + rate)
     pub security_user_limit_rejections_total: Arc<AtomicU64>,
+    /// REGISTER/INVITE identities that did not match the authenticated source
+    pub security_identity_mismatches_total: Arc<AtomicU64>,
 
     /// Total calls torn down by the RTP inactivity timeout (media stopped
     /// without a BYE — e.g. Jambonz-style callees). A rising rate signals
@@ -158,6 +160,7 @@ impl SbcMetrics {
             security_ban_drops_total: Arc::new(AtomicU64::new(0)),
             security_destination_blocked_total: Arc::new(AtomicU64::new(0)),
             security_user_limit_rejections_total: Arc::new(AtomicU64::new(0)),
+            security_identity_mismatches_total: Arc::new(AtomicU64::new(0)),
             rtp_timeouts_total: Arc::new(AtomicU64::new(0)),
             session_timer_422_retries_total: Arc::new(AtomicU64::new(0)),
             sip_responses_by_code: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -303,6 +306,11 @@ impl SbcMetrics {
     }
 
     /// Count a call rejected by per-user limits.
+    pub fn inc_security_identity_mismatch(&self) {
+        self.security_identity_mismatches_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inc_security_user_limit_rejection(&self) {
         self.security_user_limit_rejections_total
             .fetch_add(1, Ordering::Relaxed);
@@ -593,6 +601,13 @@ impl SbcMetrics {
             "sbc_security_user_limit_rejections",
             "Total calls rejected by per-user limits (concurrent + rate)",
             self.security_user_limit_rejections_total
+                .load(Ordering::Relaxed)
+        );
+
+        counter!(
+            "sbc_security_identity_mismatches",
+            "Identities claimed by a source that is not entitled to them (REGISTER/INVITE)",
+            self.security_identity_mismatches_total
                 .load(Ordering::Relaxed)
         );
 

@@ -1442,6 +1442,9 @@ impl B2buaManager {
         calls
             .values()
             .filter(|c| !matches!(c.state, CallState::Terminated | CallState::Terminating))
+            // A PSTN caller whose number happens to match a local username
+            // is not that user: inbound trunk calls never count.
+            .filter(|c| c.direction() != "inbound")
             .filter(|c| c.caller_number.as_deref() == Some(user))
             .count() as u32
     }

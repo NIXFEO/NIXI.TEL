@@ -110,6 +110,18 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Authorization is refused), byte-identical UDP retransmissions are
   accepted, a non-Digest header gets 400. New counter
   `sbc_auth_stale_challenges_total`.
+- Identity binding (RFC 3261 §10.3 step 5, §22.3). A REGISTER authenticated
+  as alice could bind, or wipe (`Contact: *`), any AOR; an INVITE's From was
+  trusted whatever the source. Now: the authenticated user may only bind its
+  own AOR on a served domain (`register_aor_check`, `served_domains`); an
+  INVITE from a registered phone must carry one of that phone's identities;
+  an unregistered source claiming a local user is challenged with 407 and
+  admitted only with the right password; a source that is none of trunk,
+  registered or provable is 403 + fail2ban; a trunk presenting a local user
+  is flagged (`trunk_local_from`) and its calls never count against that
+  user. Every mismatch is a `identity_mismatch` security event and counts
+  in `sbc_security_identity_mismatches_total`; CDR `caller` is the verified
+  identity. `Registered` / `Unregistered` SSE events are published.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

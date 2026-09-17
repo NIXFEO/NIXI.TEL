@@ -73,13 +73,11 @@ impl Sbc {
             }
         }
 
-        // ── Anti-spam: reject INVITE from unregistered/unknown sources ──
-        // Allow if any of:
-        //   (1) source IP matches a registered user's received_ip
-        //   (2) source is localhost (trunk)
-        //   (3) From URI user matches a registered AOR (user calling from proxy/TLS)
-        //   (4) callee is registered (incoming call from trunk for our user)
-        //   (5) source IP is a known trunk IP (whitelisted)
+        // ── Who is calling? ────────────────────────────────────────────
+        // Trunk and loopback sources are trusted for what they are; a
+        // registered source may only present its own identity; an unknown
+        // source claiming a local user must prove it (407); anything else
+        // is a scanner (403 + strike). Decided before any state exists.
         let source_ip = source.ip().to_string();
         let is_localhost = source_ip == "127.0.0.1" || source_ip == "::1";
         let is_trunk_ip = self
@@ -88,86 +86,38 @@ impl Sbc {
             .await
             .iter()
             .any(|ip| ip == &source_ip);
+        let from_user = request
+            .from_header()
+            .ok()
+            .and_then(|h| h.typed().ok())
+            .and_then(|f: rsip::typed::From| f.uri.user().map(str::to_string));
+        let caller = match self
+            .classify_caller(
+                &request,
+                source,
+                is_localhost,
+                is_trunk_ip,
+                from_user.as_deref(),
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(verdict) => {
+                return self
+                    .answer_identity_verdict(&request, source, transport, reply_tx, verdict)
+                    .await;
+            }
+        };
         if is_trunk_ip {
             info!("INVITE from trunk IP {} — whitelisted", source_ip);
         }
-        if !is_localhost && !is_trunk_ip {
-            let all_regs = self
-                .register_handler
-                .all_registrations()
-                .await
-                .unwrap_or_default();
-            let ip_known = all_regs.iter().any(|r| r.received_ip == source_ip);
-
-            // Also check From user against registered AORs
-            let from_user_known = request
-                .from_header()
-                .ok()
-                .and_then(|h| h.typed().ok())
-                .map(|from: rsip::typed::From| {
-                    let from_uri = from.uri.to_string();
-                    all_regs.iter().any(|r| r.aor == from_uri)
-                })
-                .unwrap_or(false);
-
-            // Also check if the To URI is one of our registered users (incoming call)
-            let to_user_known = request
-                .to_header()
-                .ok()
-                .and_then(|h| h.typed().ok())
-                .map(|to: rsip::typed::To| {
-                    let to_uri = to.uri.to_string();
-                    all_regs.iter().any(|r| r.aor == to_uri)
-                })
-                .unwrap_or(false);
-
-            if !ip_known && !from_user_known && !to_user_known {
-                warn!(
-                    "INVITE rejected from unregistered source {} (IP/From/To all unknown)",
-                    source
-                );
-                self.metrics.inc_spam_blocked();
-                // Scanner INVITE floods count toward the fail2ban window
-                if let Some(entry) = self
-                    .security
-                    .record_auth_failure(source.ip(), None, "INVITE")
-                {
-                    self.metrics.inc_security_ban();
-                    self.persist_ban(&entry);
-                }
-                self.metrics.inc_sip_response(403);
-                let response_403 = build_plain_response_for_request(&request, 403, "Forbidden")?;
-                let data = response_403.to_string().into_bytes();
-                return self
-                    .transport
-                    .reply(&data, source, transport, reply_tx)
-                    .await;
-            }
-        }
 
         // ── Per-user call limits (concurrent + setup rate) ──────────────
-        // Identity: registration matched by source IP, else From user.
-        // Trunk/localhost sources are exempt (inbound PSTN calls).
-        if !is_localhost && !is_trunk_ip {
-            let caller_user = {
-                let regs = self
-                    .register_handler
-                    .all_registrations()
-                    .await
-                    .unwrap_or_default();
-                regs.iter()
-                    .find(|r| r.received_ip == source_ip)
-                    .and_then(|r| r.aor.strip_prefix("sip:").and_then(|a| a.split('@').next()))
-                    .map(str::to_string)
-                    .or_else(|| {
-                        request
-                            .from_header()
-                            .ok()
-                            .and_then(|h| h.typed().ok())
-                            .and_then(|f: rsip::typed::From| f.uri.user().map(str::to_string))
-                    })
-            };
-            if let Some(user) = caller_user {
+        // Identity: the verified local user. Trunk/localhost sources are
+        // exempt (inbound PSTN calls, co-located PBX).
+        if let CallerIdentity::Local(ref user) = caller {
+            let user = user.clone();
+            {
                 let concurrent = self.b2bua.active_calls_for_user(&user).await;
                 match self
                     .security
@@ -379,10 +329,10 @@ impl Sbc {
         // numbers and, for a trunk-originated call, the trunk name from the
         // source IP — so a call rejected before routing is billed right.
         {
-            let caller_num =
-                request.from_header().ok().and_then(|h| h.typed().ok()).map(
-                    |from: rsip::typed::From| from.uri.user().unwrap_or("unknown").to_string(),
-                );
+            let caller_num = match &caller {
+                CallerIdentity::Local(user) => Some(user.clone()),
+                _ => from_user.clone().or_else(|| Some("unknown".to_string())),
+            };
             let callee_num = request.uri.user().map(str::to_string);
             let inbound_trunk = self.trunk_manager.name_for_ip(&source_ip);
             let mut calls = self.b2bua.calls_locked().await;
@@ -1568,6 +1518,270 @@ fn request_has_rfc3261_branch(request: &Request) -> bool {
 
 /// Extract the URI from a Contact header value: `"Bob" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60`
 /// → `sip:b@1.2.3.4:5060;transport=tcp`. Falls back to the trimmed value.
+/// Who an INVITE comes from, as far as the SBC can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallerIdentity {
+    /// A configured trunk (or a sibling host of one).
+    Trunk,
+    /// Loopback: a co-located PBX/application, trusted.
+    Localhost,
+    /// A local user, registered from that source or proven by Digest.
+    Local(String),
+}
+
+/// How an INVITE is refused or challenged before any state exists.
+#[derive(Debug)]
+pub(crate) enum IdentityVerdict {
+    /// 403; `strike` counts toward fail2ban.
+    Forbidden { strike: bool, why: String },
+    /// 407 Proxy Authentication Required (`stale` on an old nonce).
+    Challenge { stale: bool },
+    /// 400: the Proxy-Authorization header is not a Digest.
+    BadRequest,
+}
+
+impl Sbc {
+    /// Users registered from `source_ip` and users registered anywhere
+    /// (user part of the AORs).
+    async fn users_registered_from(&self, source_ip: &str) -> (Vec<String>, Vec<String>) {
+        let regs = self
+            .register_handler
+            .all_registrations()
+            .await
+            .unwrap_or_default();
+        let here = regs
+            .iter()
+            .filter(|r| r.received_ip == source_ip)
+            .filter_map(|r| super::uri_user(&r.aor))
+            .collect();
+        let anywhere = regs
+            .iter()
+            .filter_map(|r| super::uri_user(&r.aor))
+            .collect();
+        (here, anywhere)
+    }
+
+    /// Whether `user` is a local identity: provisioned for Digest, or
+    /// registered right now.
+    async fn is_local_user(&self, user: &str, registered: &[String]) -> bool {
+        if registered.iter().any(|u| u == user) {
+            return true;
+        }
+        match &self.auth {
+            Some(auth) => auth.user_exists(user).await,
+            None => false,
+        }
+    }
+
+    fn flag_identity_mismatch(&self, source: SocketAddr, who: &str, claimed: &str) {
+        self.metrics.inc_security_identity_mismatch();
+        self.security
+            .emit(crate::security::SecurityEvent::IdentityMismatch {
+                ip: source.ip().to_string(),
+                user: who.to_string(),
+                claimed: claimed.to_string(),
+                method: "INVITE".to_string(),
+                ts: crate::events::event_ts(),
+            });
+    }
+
+    /// Resolve the caller's identity for a new INVITE.
+    pub(crate) async fn classify_caller(
+        &self,
+        request: &Request,
+        source: SocketAddr,
+        is_localhost: bool,
+        is_trunk_ip: bool,
+        from_user: Option<&str>,
+    ) -> std::result::Result<CallerIdentity, IdentityVerdict> {
+        if is_localhost {
+            return Ok(CallerIdentity::Localhost);
+        }
+        let source_ip = source.ip().to_string();
+        let (here, anywhere) = self.users_registered_from(&source_ip).await;
+
+        // A trunk presenting one of OUR users as From: flagged; relayed
+        // (never attributed to the user) or refused per policy.
+        if is_trunk_ip {
+            if let Some(user) = from_user {
+                let from_raw = request
+                    .from_header()
+                    .ok()
+                    .map(|h| h.value().to_string())
+                    .unwrap_or_default();
+                let served_host = super::uri_host(&from_raw)
+                    .map(|h| self.served_domains().contains(&h))
+                    .unwrap_or(false);
+                if served_host && self.is_local_user(user, &anywhere).await {
+                    self.flag_identity_mismatch(source, "trunk", &super::normalize_aor(&from_raw));
+                    if self.identity_policy.reject_trunk_local_from {
+                        return Err(IdentityVerdict::Forbidden {
+                            strike: false,
+                            why: format!("trunk {} presented local user '{}'", source_ip, user),
+                        });
+                    }
+                    warn!(
+                        "INVITE from trunk {} presents local user '{}' — relayed, not attributed (trunk_local_from = allow)",
+                        source_ip, user
+                    );
+                }
+            }
+            return Ok(CallerIdentity::Trunk);
+        }
+
+        // Registered source: From must be one of the users bound from it.
+        if !here.is_empty() {
+            return match from_user {
+                Some(u) if here.iter().any(|h| h == u) => Ok(CallerIdentity::Local(u.to_string())),
+                _ => {
+                    let claimed = from_user.unwrap_or("?");
+                    self.flag_identity_mismatch(source, &here.join(","), claimed);
+                    Err(IdentityVerdict::Forbidden {
+                        strike: false,
+                        why: format!(
+                            "registered source {} ({}) presented From '{}'",
+                            source_ip,
+                            here.join(","),
+                            claimed
+                        ),
+                    })
+                }
+            };
+        }
+
+        // Unregistered source claiming a local user: Digest proof (407),
+        // like a REGISTER would. Without Digest configured, the legacy
+        // rule admits a From that matches a registered AOR.
+        if let Some(user) = from_user {
+            if self.is_local_user(user, &anywhere).await {
+                let Some(auth) = (self.enable_digest_auth)
+                    .then_some(self.auth.as_ref())
+                    .flatten()
+                else {
+                    warn!(
+                        "INVITE from unregistered {} as '{}' admitted without Digest (enable_digest_auth is off)",
+                        source_ip, user
+                    );
+                    return Ok(CallerIdentity::Local(user.to_string()));
+                };
+                let Some(value) = super::cdr::header_value(request, "proxy-authorization") else {
+                    return Err(IdentityVerdict::Challenge { stale: false });
+                };
+                let fingerprint = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    value.hash(&mut h);
+                    source.hash(&mut h);
+                    h.finish()
+                };
+                return match auth.verify_with(&value, "INVITE", Some(fingerprint)).await {
+                    Ok(proved) if proved == user => Ok(CallerIdentity::Local(proved)),
+                    Ok(proved) => {
+                        self.flag_identity_mismatch(source, &proved, user);
+                        Err(IdentityVerdict::Forbidden {
+                            strike: false,
+                            why: format!(
+                                "'{}' authenticated but presented From '{}'",
+                                proved, user
+                            ),
+                        })
+                    }
+                    Err(f) if f.is_stale() => Err(IdentityVerdict::Challenge { stale: true }),
+                    Err(crate::auth::AuthFailure::Malformed) => Err(IdentityVerdict::BadRequest),
+                    Err(f) => Err(IdentityVerdict::Forbidden {
+                        strike: true,
+                        why: format!("Digest failed: {}", f),
+                    }),
+                };
+            }
+        }
+
+        // Calling one of our registered users from a sibling host of a
+        // trunk cluster: a trunk.
+        let to_user = request
+            .to_header()
+            .ok()
+            .and_then(|h| super::uri_user(h.value()));
+        let callee_registered = to_user
+            .as_deref()
+            .map(|u| anywhere.iter().any(|a| a == u))
+            .unwrap_or(false);
+        if callee_registered && self.source_is_trunk_related(source).await {
+            return Ok(CallerIdentity::Trunk);
+        }
+
+        Err(IdentityVerdict::Forbidden {
+            strike: true,
+            why: format!("unregistered source {} (IP/From/To all unknown)", source),
+        })
+    }
+
+    /// Send the refusal or challenge decided by `classify_caller`.
+    async fn answer_identity_verdict(
+        &self,
+        request: &Request,
+        source: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+        verdict: IdentityVerdict,
+    ) -> Result<()> {
+        match verdict {
+            IdentityVerdict::Forbidden { strike, why } => {
+                warn!("INVITE rejected: {} — 403", why);
+                if strike {
+                    self.metrics.inc_spam_blocked();
+                    // Scanner INVITE floods count toward the fail2ban window
+                    if let Some(entry) =
+                        self.security
+                            .record_auth_failure(source.ip(), None, "INVITE")
+                    {
+                        self.metrics.inc_security_ban();
+                        self.persist_ban(&entry);
+                    }
+                }
+                self.metrics.inc_sip_response(403);
+                let r = response_for_request(request, 403, "Forbidden");
+                self.send_sip("403 → caller", r.as_bytes(), source, transport, reply_tx)
+                    .await;
+            }
+            IdentityVerdict::Challenge { stale } => {
+                let Some(auth) = self.auth.as_ref() else {
+                    return Ok(());
+                };
+                debug!(
+                    "INVITE from unregistered {} claims a local user — 407{}",
+                    source,
+                    if stale { " (stale)" } else { "" }
+                );
+                self.metrics.inc_auth_challenge();
+                if stale {
+                    self.metrics.inc_auth_stale_challenge();
+                }
+                self.metrics.inc_sip_response(407);
+                let challenge = auth.generate_challenge_with(stale).await;
+                let mut r = response_for_request(request, 407, "Proxy Authentication Required");
+                if let Ok(mut m) = crate::topology::RawSipMessage::parse(&r) {
+                    m.set_header("Proxy-Authenticate", &challenge);
+                    r = m.to_string();
+                }
+                self.send_sip("407 → caller", r.as_bytes(), source, transport, reply_tx)
+                    .await;
+            }
+            IdentityVerdict::BadRequest => {
+                warn!(
+                    "INVITE from {}: Proxy-Authorization is not a Digest — 400",
+                    source
+                );
+                self.metrics.inc_sip_response(400);
+                let r = response_for_request(request, 400, "Bad Request");
+                self.send_sip("400 → caller", r.as_bytes(), source, transport, reply_tx)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Extensions the request `Require`s (or `Proxy-Require`s) that the SBC
 /// does not implement (RFC 3261 §8.2.2.3), lowercase, deduplicated.
 pub(crate) fn unsupported_required_extensions(request: &Request) -> Vec<String> {

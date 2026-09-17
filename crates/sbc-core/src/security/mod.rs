@@ -69,6 +69,18 @@ pub enum SecurityEvent {
         limit: u32,
         ts: u64,
     },
+    /// An authenticated or trusted source claimed an identity that is not
+    /// its own (REGISTER for another AOR, INVITE From another user, a trunk
+    /// presenting a local user).
+    IdentityMismatch {
+        ip: String,
+        /// Who the source is (authenticated user, or "trunk").
+        user: String,
+        /// The AOR / From it claimed.
+        claimed: String,
+        method: String,
+        ts: u64,
+    },
 }
 
 pub struct SecurityManager {
@@ -114,6 +126,15 @@ impl SecurityManager {
                     SecurityEvent::UserLimitHit { user, kind, .. } => {
                         ("user_limit", format!("{} ({})", user, kind))
                     }
+                    SecurityEvent::IdentityMismatch {
+                        user,
+                        claimed,
+                        method,
+                        ..
+                    } => (
+                        "identity_mismatch",
+                        format!("{} claimed {} on {}", user, claimed, method),
+                    ),
                 };
                 bus.publish(crate::events::SbcEvent::Alert {
                     level: "warning".to_string(),

@@ -49,6 +49,118 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
 /// Integrated SBC combining all layers
+/// How claimed identities are policed (`[security]`).
+#[derive(Debug, Clone)]
+pub struct IdentityPolicy {
+    /// 403 (true) or log-only on a REGISTER for someone else's AOR.
+    pub enforce_register_aor: bool,
+    /// Hosts accepted as the domain of an AOR / local From, besides the
+    /// realm, the SBC domain, its public IP and loopback.
+    pub served_domains: Vec<String>,
+    /// 403 (true) or flag-and-relay an INVITE from a trunk whose From
+    /// claims a local user.
+    pub reject_trunk_local_from: bool,
+}
+
+impl Default for IdentityPolicy {
+    fn default() -> Self {
+        Self {
+            enforce_register_aor: true,
+            served_domains: Vec::new(),
+            reject_trunk_local_from: false,
+        }
+    }
+}
+
+impl IdentityPolicy {
+    pub fn from_config(sec: &crate::config::SecurityConfig) -> Self {
+        Self {
+            enforce_register_aor: !sec.register_aor_check.eq_ignore_ascii_case("log"),
+            served_domains: sec
+                .served_domains
+                .iter()
+                .map(|d| d.trim().to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect(),
+            reject_trunk_local_from: sec.trunk_local_from.eq_ignore_ascii_case("reject"),
+        }
+    }
+}
+
+/// Why an authenticated user may not act for an AOR (RFC 3261 §10.3 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AorRejection {
+    /// The AOR's user part is not the authenticated user.
+    User(String),
+    /// The AOR's host is not a domain this SBC serves.
+    Domain(String),
+}
+
+impl std::fmt::Display for AorRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(u) => write!(f, "AOR belongs to '{}'", u),
+            Self::Domain(d) => write!(f, "domain '{}' is not served here", d),
+        }
+    }
+}
+
+/// User part of a SIP URI ("sip:alice@h;p" → "alice"), None without one.
+pub(crate) fn uri_user(uri: &str) -> Option<String> {
+    let s = uri.trim().trim_start_matches('<');
+    let s = s
+        .strip_prefix("sips:")
+        .or_else(|| s.strip_prefix("sip:"))
+        .unwrap_or(s);
+    let (user, _) = s.split_once('@')?;
+    let user = user.split(';').next().unwrap_or(user).trim();
+    (!user.is_empty()).then(|| user.to_string())
+}
+
+/// Host of a SIP URI, lowercased, without port, params or brackets.
+pub(crate) fn uri_host(uri: &str) -> Option<String> {
+    let s = uri.trim().trim_start_matches('<');
+    let s = s
+        .strip_prefix("sips:")
+        .or_else(|| s.strip_prefix("sip:"))
+        .unwrap_or(s);
+    let host_port = s.split_once('@').map(|(_, h)| h).unwrap_or(s);
+    let host_port = host_port
+        .split([';', '>', '?'])
+        .next()
+        .unwrap_or(host_port)
+        .trim();
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// May `auth_user` bind `aor`? User part must be its own; host must be
+/// served (skipped when no served domain is known at all).
+pub(crate) fn authorize_aor(
+    auth_user: &str,
+    aor: &str,
+    served: &[String],
+) -> std::result::Result<(), AorRejection> {
+    let user = uri_user(aor).unwrap_or_default();
+    if user != auth_user {
+        return Err(AorRejection::User(user));
+    }
+    if !served.is_empty() {
+        let host = uri_host(aor).unwrap_or_default();
+        if !served.iter().any(|d| d.eq_ignore_ascii_case(&host)) {
+            return Err(AorRejection::Domain(host));
+        }
+    }
+    Ok(())
+}
+
 /// Administrative teardown requests (`DELETE /api/v1/calls/{uuid}`). The
 /// API has no SIP transport: it queues the uuid here and the event loop
 /// ends the call properly (BYE/CANCEL on both legs, CDR "admin-kick").
@@ -169,6 +281,9 @@ pub struct Sbc {
 
     /// Teardown requests from the management API.
     admin_kicks: Arc<AdminKicks>,
+
+    /// REGISTER / INVITE identity rules (`[security]`).
+    identity_policy: IdentityPolicy,
 
     /// INVITE server transactions in flight or just completed: a
     /// retransmission replays the last response (RFC 3261 §17.2.1).
@@ -466,6 +581,7 @@ impl Sbc {
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
             call_setup_timeout: Duration::from_secs(config.security.call_setup_timeout.max(10)),
             admin_kicks: Arc::new(AdminKicks::new()),
+            identity_policy: IdentityPolicy::from_config(&config.security),
             invite_tx: invite_tx::InviteTxCache::new(),
             max_call_duration: Duration::from_secs(config.security.max_call_duration.max(60)),
             security,
@@ -573,6 +689,7 @@ impl Sbc {
             );
             self.max_call_duration = max_call_duration;
         }
+        self.identity_policy = IdentityPolicy::from_config(&config.security);
         let setup_timeout = Duration::from_secs(config.security.call_setup_timeout.max(10));
         if setup_timeout != self.call_setup_timeout {
             info!(
@@ -783,6 +900,7 @@ impl Sbc {
             invite_timeout: Duration::from_secs(5),
             call_setup_timeout: Duration::from_secs(60),
             admin_kicks: Arc::new(AdminKicks::new()),
+            identity_policy: IdentityPolicy::default(),
             invite_tx: invite_tx::InviteTxCache::new(),
             max_call_duration: Duration::from_secs(14400),
             session_timer: None,
@@ -1529,6 +1647,7 @@ impl Sbc {
         info!("Handling local request: REGISTER");
 
         // If Digest auth is enabled, challenge first
+        let mut authenticated: Option<String> = None;
         if self.enable_digest_auth {
             if let Some(auth) = &self.auth {
                 // Check for Authorization header
@@ -1572,7 +1691,7 @@ impl Sbc {
                         {
                             Ok(username) => {
                                 info!("REGISTER authenticated for user: {}", username);
-                                // Fall through to registration
+                                authenticated = Some(username);
                             }
                             Err(failure) => {
                                 return self
@@ -1596,6 +1715,50 @@ impl Sbc {
             .value()
             .to_string();
         let aor = normalize_aor(&aor_raw);
+
+        // RFC 3261 §10.3 step 5: an authenticated user binds (or unbinds,
+        // Expires: 0 / Contact: *) only its own AOR, on a domain we serve —
+        // alice's password must not register or wipe bob's phone.
+        if let Some(user) = authenticated.as_deref() {
+            if let Err(why) = authorize_aor(user, &aor, &self.served_domains()) {
+                self.metrics.inc_security_identity_mismatch();
+                self.security
+                    .emit(crate::security::SecurityEvent::IdentityMismatch {
+                        ip: source.ip().to_string(),
+                        user: user.to_string(),
+                        claimed: aor.clone(),
+                        method: "REGISTER".to_string(),
+                        ts: crate::events::event_ts(),
+                    });
+                if self.identity_policy.enforce_register_aor {
+                    warn!(
+                        "REGISTER from {} authenticated as '{}' for {} refused: {}",
+                        source.ip(),
+                        user,
+                        aor,
+                        why
+                    );
+                    self.metrics.inc_sip_response(403);
+                    let r = response_for_request(request, 403, "Forbidden");
+                    self.send_sip(
+                        "403 (AOR) → REGISTER",
+                        r.as_bytes(),
+                        source,
+                        transport,
+                        reply_tx,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                warn!(
+                    "REGISTER from {} authenticated as '{}' for {}: {} (register_aor_check = log, allowed)",
+                    source.ip(),
+                    user,
+                    aor,
+                    why
+                );
+            }
+        }
 
         let contact = request
             .contact_header()
@@ -1682,6 +1845,12 @@ impl Sbc {
                 self.metrics.inc_registration();
                 self.metrics
                     .set_active_registrations(self.register_handler.count().await);
+                self.events.publish(crate::events::SbcEvent::Registered {
+                    aor: aor.clone(),
+                    contact: contact.clone(),
+                    expires: exp,
+                    ts: crate::events::event_ts(),
+                });
                 self.metrics.inc_sip_response(200);
                 let response_200 = build_register_200(request, &bindings, &call_id, cseq)?;
                 let data = response_200.to_string().into_bytes();
@@ -1693,6 +1862,10 @@ impl Sbc {
                 info!("Unregistered {} contact(s) for {}", count, aor);
                 self.metrics
                     .set_active_registrations(self.register_handler.count().await);
+                self.events.publish(crate::events::SbcEvent::Unregistered {
+                    aor: aor.clone(),
+                    ts: crate::events::event_ts(),
+                });
                 self.metrics.inc_sip_response(200);
                 let response_200 = build_plain_response_for_request(request, 200, "OK")?;
                 let data = response_200.to_string().into_bytes();
@@ -1715,6 +1888,31 @@ impl Sbc {
                 Ok(())
             }
         }
+    }
+
+    /// Hosts a local identity may live on: the digest realm, the SBC's
+    /// domain and public IP, loopback, plus `[security] served_domains`.
+    pub(crate) fn served_domains(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |d: &str| {
+            let d = d.trim().to_ascii_lowercase();
+            if !d.is_empty() && !out.contains(&d) {
+                out.push(d);
+            }
+        };
+        if let Some(auth) = &self.auth {
+            push(&auth.realm);
+        }
+        if let Some(id) = &self.identity {
+            push(&id.sip_domain);
+            push(&id.public_ip);
+        }
+        push("127.0.0.1");
+        push("localhost");
+        for d in &self.identity_policy.served_domains {
+            push(d);
+        }
+        out
     }
 
     /// A REGISTER whose credentials did not verify. A stale nonce gets a
@@ -2703,5 +2901,56 @@ mod cseq_mapping_tests {
             "inserted right after the top Via"
         );
         rsip::SipMessage::try_from(out.as_bytes().to_vec()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn uri_parts() {
+        assert_eq!(
+            uri_user("sip:alice@sip.example.com").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            uri_user("<sips:Alice@h:5061;transport=tls>").as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(uri_user("sip:sip.example.com"), None);
+        assert_eq!(
+            uri_host("sip:alice@Sip.Example.COM:5060;x=1").as_deref(),
+            Some("sip.example.com")
+        );
+        assert_eq!(
+            uri_host("sip:alice@[2001:db8::1]:5060").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(uri_host("sip:203.0.113.1").as_deref(), Some("203.0.113.1"));
+    }
+
+    #[test]
+    fn aor_authorization() {
+        let served = vec!["sip.example.com".to_string(), "203.0.113.1".to_string()];
+        assert!(authorize_aor("alice", "sip:alice@sip.example.com", &served).is_ok());
+        assert!(authorize_aor("alice", "sip:alice@203.0.113.1:5060", &served).is_ok());
+        assert_eq!(
+            authorize_aor("alice", "sip:bob@sip.example.com", &served),
+            Err(AorRejection::User("bob".into()))
+        );
+        assert_eq!(
+            authorize_aor("alice", "sip:Alice@sip.example.com", &served),
+            Err(AorRejection::User("Alice".into())),
+            "user part is case-sensitive (RFC 3261 §19.1.4)"
+        );
+        assert_eq!(
+            authorize_aor("alice", "sip:alice@evil.example", &served),
+            Err(AorRejection::Domain("evil.example".into()))
+        );
+        assert!(
+            authorize_aor("alice", "sip:alice@anything", &[]).is_ok(),
+            "no served domain known: only the user part is checked"
+        );
     }
 }

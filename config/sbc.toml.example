@@ -66,6 +66,15 @@ rate_limit_per_ip = 50
 auth_challenge_timeout = 30
 sip_realm = "sip.example.com"
 enable_digest_auth = true
+# Identity rules. A user authenticated by Digest may only REGISTER its own
+# AOR on a served domain ("enforce" = 403, "log" = report only); an INVITE
+# from a registered phone must carry that phone's identity; an unregistered
+# source claiming a local user is challenged (407). A trunk that presents a
+# local user as From is flagged and relayed unattributed ("allow") or
+# refused ("reject").
+register_aor_check = "enforce"
+served_domains = []            # extra AOR hosts besides sip_realm / public IP
+trunk_local_from = "allow"
 
 # Call guards
 max_call_duration = 14400      # answered call hard cap → BYE both legs (CDR "timeout")

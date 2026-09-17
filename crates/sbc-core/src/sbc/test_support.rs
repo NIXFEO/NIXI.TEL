@@ -265,20 +265,44 @@ pub(crate) fn bye_from_trunk_with(spec: &CallSpec, cseq: u32, extra: &str) -> rs
 /// `handle_invite` receives it. Call-ID `cid-in-1`, CSeq 1, branch
 /// `z9hG4bKtrk1`.
 pub(crate) fn invite_from_trunk(number: &str, max_forwards: u32) -> rsip::Request {
+    invite_from_trunk_as("sip:+33612345678@203.0.113.9", number, max_forwards)
+}
+
+/// Same, presenting `from_uri` as the caller.
+pub(crate) fn invite_from_trunk_as(
+    from_uri: &str,
+    number: &str,
+    max_forwards: u32,
+) -> rsip::Request {
+    invite_from_trunk_tx(from_uri, number, max_forwards, 1)
+}
+
+/// Same with transaction number `tx` (Call-ID `cid-in-{tx}`, branch
+/// `z9hG4bKtrk{tx}`): a distinct call.
+pub(crate) fn invite_from_trunk_tx(
+    from_uri: &str,
+    number: &str,
+    max_forwards: u32,
+    tx: u32,
+) -> rsip::Request {
     request(format!(
         "INVITE sip:{}@127.0.0.1:5060 SIP/2.0\r\n\
-         Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKtrk1;rport\r\n\
+         Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKtrk{}{};rport\r\n\
          Max-Forwards: {}\r\n\
-         From: <sip:+33612345678@203.0.113.9>;tag=g1\r\n\
+         From: <{}>;tag=g1\r\n\
          To: <sip:{}@127.0.0.1>\r\n\
-         Call-ID: cid-in-1\r\n\
+         Call-ID: cid-in-{}\r\n\
          CSeq: 1 INVITE\r\n\
          Contact: <sip:203.0.113.9:5060>\r\n\
          Content-Type: application/sdp\r\n\
          Content-Length: {}\r\n\r\n{}",
         number,
+        tx,
+        "",
         max_forwards,
+        from_uri,
         number,
+        tx,
         TRUNK_SDP.len(),
         TRUNK_SDP
     ))
@@ -325,18 +349,84 @@ pub(crate) fn local_addr() -> SocketAddr {
 /// REGISTER from the local client for `sip:{user}@{realm}` (Call-ID
 /// `cid-reg-1`, branch derived from `cseq`), with `extra` header lines.
 pub(crate) fn register_request(user: &str, realm: &str, cseq: u32, extra: &str) -> rsip::Request {
+    register_request_for(user, &format!("sip:{}@{}", user, realm), realm, cseq, extra)
+}
+
+/// REGISTER whose To/From is `aor` (any user, any host) — what a client
+/// authenticated as `user` sends when it tries to bind someone else.
+pub(crate) fn register_request_for(
+    user: &str,
+    aor: &str,
+    realm: &str,
+    cseq: u32,
+    extra: &str,
+) -> rsip::Request {
     request(format!(
         "REGISTER sip:{realm} SIP/2.0\r\n\
          Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKreg{cseq}\r\n\
          Max-Forwards: 70\r\n\
-         From: <sip:{user}@{realm}>;tag=r1\r\n\
-         To: <sip:{user}@{realm}>\r\n\
+         From: <{aor}>;tag=r1\r\n\
+         To: <{aor}>\r\n\
          Call-ID: cid-reg-1\r\n\
          CSeq: {cseq} REGISTER\r\n\
          Contact: <sip:{user}@127.0.0.1:5080>\r\n\
          Expires: 3600\r\n\
          {extra}Content-Length: 0\r\n\r\n"
     ))
+}
+
+/// INVITE from a registered/local user `user@realm` to `number`, with
+/// `extra` header lines. Pass the source address separately.
+pub(crate) fn invite_from_user(
+    user: &str,
+    realm: &str,
+    number: &str,
+    extra: &str,
+) -> rsip::Request {
+    invite_from_user_tx(user, realm, number, extra, 1)
+}
+
+/// Same with transaction number `tx` (CSeq and Via branch): what a client
+/// sends when it retries after a 407, or places another call.
+pub(crate) fn invite_from_user_tx(
+    user: &str,
+    realm: &str,
+    number: &str,
+    extra: &str,
+    tx: u32,
+) -> rsip::Request {
+    request(format!(
+        "INVITE sip:{number}@{realm} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 10.0.0.9:5080;branch=z9hG4bK{user}{tx};rport\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:{user}@{realm}>;tag={user}-tag\r\n\
+         To: <sip:{number}@{realm}>\r\n\
+         Call-ID: cid-{user}\r\n\
+         CSeq: {tx} INVITE\r\n\
+         Contact: <sip:{user}@10.0.0.9:5080>\r\n\
+         {extra}Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        SDP.len(),
+        SDP
+    ))
+}
+
+/// `Proxy-Authorization:` line for an INVITE answering `nonce`.
+pub(crate) fn proxy_authorization_line(
+    user: &str,
+    realm: &str,
+    password: &str,
+    nonce: &str,
+    uri: &str,
+    nc: &str,
+) -> String {
+    let ha1 = crate::auth::compute_ha1(user, realm, password);
+    let ha2 = crate::auth::compute_ha2("INVITE", uri);
+    let response = crate::auth::compute_response_auth(&ha1, nonce, nc, "cn0nce", &ha2);
+    format!(
+        "Proxy-Authorization: Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm=MD5, cnonce=\"cn0nce\", nc={}, qop=auth\r\n",
+        user, realm, nonce, uri, response, nc
+    )
 }
 
 /// The nonce of a 401's WWW-Authenticate challenge.
@@ -417,6 +507,7 @@ pub(crate) struct SbcBuilder {
     setup_timeout: Duration,
     max_call_duration: Duration,
     digest: Option<(String, std::collections::HashMap<String, String>)>,
+    identity_policy: IdentityPolicy,
 }
 
 impl SbcBuilder {
@@ -428,7 +519,13 @@ impl SbcBuilder {
             setup_timeout: Duration::from_secs(180),
             max_call_duration: Duration::from_secs(14400),
             digest: None,
+            identity_policy: IdentityPolicy::default(),
         }
+    }
+
+    pub(crate) fn identity_policy(mut self, policy: IdentityPolicy) -> Self {
+        self.identity_policy = policy;
+        self
     }
 
     pub(crate) fn setup_timeout(mut self, timeout: Duration) -> Self {
@@ -490,6 +587,7 @@ impl SbcBuilder {
             sbc.auth = Some(Arc::new(DigestAuthenticator::new(realm, users)));
             sbc.enable_digest_auth = true;
         }
+        sbc.identity_policy = self.identity_policy;
         let mut trunk = TrunkConfig::new(TRUNK_NAME.to_string());
         trunk.host = trunk_addr().ip().to_string();
         trunk.port = trunk_addr().port();

@@ -62,6 +62,8 @@ Every call gets exactly one record when it ends, whatever the cause
 | `disconnect_reason` | `normal-clearing`, `cancelled`, `rejected-<code>`, `timeout` (max duration), `setup-timeout`, `rtp-timeout`, `shutdown`, `ws-closed`, `admin-kick`, `dialog-lost` |
 | `reason` | SIP `Reason` header: the peer's on its BYE/CANCEL, the SBC's own on the BYEs it sends |
 | `hangup_by` | who ended the call: `caller`, `callee` (the far end, or its rejection), `sbc` |
+
+Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`): `ban_issued`, `ban_lifted`, `auth_failure`, `destination_blocked`, `user_limit`, `identity_mismatch` (a source claimed an identity that is not its own: REGISTER for another AOR, INVITE From another user, a trunk presenting a local user).
 | `v` | record schema version: `2` from 0.20; `1` rows (older file lines) carry no billing window |
 
 ### SIP users
