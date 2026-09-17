@@ -2075,7 +2075,10 @@ fn build_plain_response(status: u16, reason: &str) -> String {
     format!("SIP/2.0 {} {}\r\nContent-Length: 0\r\n\r\n", status, reason)
 }
 
-/// Build a proper SIP response echoing Via/From/To/Call-ID/CSeq from the request
+/// Build a proper SIP response echoing Via/From/To/Call-ID/CSeq from the request.
+/// The reason phrase on the wire is the canonical one for `status`
+/// (`rsip::StatusCode::reason_phrase`, RFC 3261 §21); `_reason` documents
+/// the caller's intent only.
 fn build_plain_response_for_request(
     request: &Request,
     status: u16,

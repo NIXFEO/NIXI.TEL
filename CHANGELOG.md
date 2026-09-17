@@ -36,6 +36,14 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   INVITE attempt's (RFC 3261 §12.2.1.1), not the leg counter's 1.
 - `security.max_call_duration` is now honoured (default 14400 s, applied on
   reload); the limit was hard-coded to 7200 s.
+- CANCEL follows RFC 3261 §9.2: the caller's INVITE gets a **487 Request
+  Terminated** after the 200 to the CANCEL (it used to hang with no final
+  behind our 100 Trying); a CANCEL that crosses the relayed 200 OK leaves the
+  dialog alone instead of tearing it down and CANCELing an answered trunk
+  leg; a CANCEL for an unknown Call-ID is answered 481.
+- Every response the SBC builds or relays carries the RFC reason phrase
+  ("487 Request Terminated", "422 Session Interval Too Small"); the vendored
+  rsip rendered variant names ("RequestTerminated") for every known code.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

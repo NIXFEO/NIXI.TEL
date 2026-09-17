@@ -705,7 +705,16 @@ impl Sbc {
             .await
     }
 
-    /// Handle CANCEL — relay to callee + send 487 to original caller (RFC 3261 §9)
+    /// Handle CANCEL (RFC 3261 §9.2).
+    ///
+    /// - Unknown Call-ID → 481 (no INVITE transaction to cancel).
+    /// - INVITE already answered (2xx relayed) → 200 to the CANCEL only; the
+    ///   dialog stands and the caller ends it with BYE.
+    /// - INVITE still pending → 200 to the CANCEL, CANCEL of the live
+    ///   attempt toward the callee, then **487 Request Terminated** to the
+    ///   caller's INVITE (built from the CANCEL, which carries the INVITE's
+    ///   Via/From/To/Call-ID per §9.1), so the caller's transaction ends
+    ///   instead of hanging without Timer B behind our 100 Trying.
     pub(crate) async fn handle_cancel(
         &mut self,
         request: Request,
@@ -721,73 +730,138 @@ impl Sbc {
             .map(|h| h.value().to_string())
             .unwrap_or_default();
 
-        if let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await {
-            // Get callee info BEFORE terminating the call
-            let callee_cancel_info = self.b2bua.get_callee_cancel_info(&uuid).await;
-            let current_attempt = self.b2bua.current_attempt(&uuid).await;
-
-            // Terminate call (releases media)
-            self.b2bua.terminate_call(&uuid).await;
-            self.metrics.inc_call_failed();
-
-            // CANCEL toward the callee (if the INVITE was already forwarded).
-            // RFC 3261 §9.1: it must carry the INVITE's own Request-URI, Via
-            // branch and CSeq, so build it from the live attempt — the raw
-            // relay through topology hiding minted a fresh branch and kept
-            // the caller's R-URI/CSeq, which never matched after a retry.
-            if let Some((attempt, tx)) = current_attempt {
-                if let Some(cancel) = crate::sip_builder::build_cancel(&attempt.raw) {
-                    info!(
-                        "B2BUA: CANCEL → callee {} (from INVITE attempt CSeq {})",
-                        attempt.dest, attempt.cseq
-                    );
-                    self.send_sip(
-                        "CANCEL → callee",
-                        cancel.as_bytes(),
-                        attempt.dest,
-                        attempt.transport,
-                        tx.as_ref(),
-                    )
-                    .await;
-                } else {
-                    warn!(
-                        "B2BUA: stored INVITE for call {} is not parseable — CANCEL not sent",
-                        uuid
-                    );
-                }
-            } else if let Some((
-                _out_call_id,
-                _cseq,
-                callee_dest,
-                callee_reply_tx,
-                callee_transport,
-            )) = callee_cancel_info
-            {
-                // Legacy path: no attempt recorded (should not happen for a
-                // forwarded INVITE) — best-effort relay.
-                info!("B2BUA: relaying CANCEL to callee at {}", callee_dest);
-                let raw_cancel = rsip::SipMessage::Request(request.clone()).to_string();
-                let cancel_out = self.apply_outbound_topology(&raw_cancel, callee_transport);
-                self.send_sip(
-                    "CANCEL relay → callee",
-                    cancel_out.as_bytes(),
-                    callee_dest,
-                    callee_transport,
-                    callee_reply_tx.as_ref(),
-                )
+        let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await else {
+            warn!(
+                "CANCEL: no INVITE transaction for Call-ID {} from {} — 481",
+                call_id, source
+            );
+            self.metrics.inc_sip_response(481);
+            let raw = match build_plain_response_for_request(
+                &request,
+                481,
+                "Call/Transaction Does Not Exist",
+            ) {
+                Ok(r) => r.to_string(),
+                Err(_) => build_plain_response(481, "Call/Transaction Does Not Exist"),
+            };
+            self.send_sip("481 → CANCEL", raw.as_bytes(), source, transport, reply_tx)
                 .await;
-            }
-        }
+            return Ok(());
+        };
 
-        // Send 200 OK for CANCEL back to caller (RFC 3261 §9.2)
+        // 200 OK for the CANCEL itself, whatever happens to the INVITE.
         self.metrics.inc_sip_response(200);
         let response_200 = match build_plain_response_for_request(&request, 200, "OK") {
-            Ok(r) => r.to_string().into_bytes(),
-            Err(_) => build_plain_response(200, "OK").into_bytes(),
+            Ok(r) => r.to_string(),
+            Err(_) => build_plain_response(200, "OK"),
         };
-        self.transport
-            .reply(&response_200, source, transport, reply_tx)
-            .await
+        self.send_sip(
+            "200 OK → CANCEL",
+            response_200.as_bytes(),
+            source,
+            transport,
+            reply_tx,
+        )
+        .await;
+
+        // Already answered: the CANCEL has no effect on the dialog (§9.2).
+        let answered = {
+            let calls = self.b2bua.calls_locked().await;
+            calls.get(&uuid).is_some_and(|c| {
+                c.outbound.as_ref().is_some_and(|l| l.established)
+                    || matches!(
+                        c.state,
+                        crate::b2bua::CallState::Connected
+                            | crate::b2bua::CallState::Terminating
+                            | crate::b2bua::CallState::Terminated
+                    )
+            })
+        };
+        if answered {
+            info!(
+                "CANCEL for call {} arrived after its 200 OK — dialog stands, caller must BYE",
+                &uuid[..8.min(uuid.len())]
+            );
+            return Ok(());
+        }
+
+        // Get callee info BEFORE terminating the call
+        let callee_cancel_info = self.b2bua.get_callee_cancel_info(&uuid).await;
+        let current_attempt = self.b2bua.current_attempt(&uuid).await;
+        let caller_invite_cseq = self.b2bua.get_caller_invite_cseq(&uuid).await;
+
+        // Terminate call (releases media)
+        self.b2bua.terminate_call(&uuid).await;
+        self.metrics.inc_call_failed();
+
+        // CANCEL toward the callee (if the INVITE was already forwarded).
+        // RFC 3261 §9.1: it must carry the INVITE's own Request-URI, Via
+        // branch and CSeq, so build it from the live attempt — the raw
+        // relay through topology hiding minted a fresh branch and kept
+        // the caller's R-URI/CSeq, which never matched after a retry.
+        if let Some((attempt, tx)) = current_attempt {
+            if let Some(cancel) = crate::sip_builder::build_cancel(&attempt.raw) {
+                info!(
+                    "B2BUA: CANCEL → callee {} (from INVITE attempt CSeq {})",
+                    attempt.dest, attempt.cseq
+                );
+                self.send_sip(
+                    "CANCEL → callee",
+                    cancel.as_bytes(),
+                    attempt.dest,
+                    attempt.transport,
+                    tx.as_ref(),
+                )
+                .await;
+            } else {
+                warn!(
+                    "B2BUA: stored INVITE for call {} is not parseable — CANCEL not sent",
+                    uuid
+                );
+            }
+        } else if let Some((_out_call_id, _cseq, callee_dest, callee_reply_tx, callee_transport)) =
+            callee_cancel_info
+        {
+            // Legacy path: no attempt recorded (should not happen for a
+            // forwarded INVITE) — best-effort relay.
+            info!("B2BUA: relaying CANCEL to callee at {}", callee_dest);
+            let raw_cancel = rsip::SipMessage::Request(request.clone()).to_string();
+            let cancel_out = self.apply_outbound_topology(&raw_cancel, callee_transport);
+            self.send_sip(
+                "CANCEL relay → callee",
+                cancel_out.as_bytes(),
+                callee_dest,
+                callee_transport,
+                callee_reply_tx.as_ref(),
+            )
+            .await;
+        }
+
+        // 487 to the caller's INVITE. The CANCEL carries the INVITE's Via
+        // (same branch), From, To and Call-ID (§9.1); only the CSeq method
+        // differs. The caller's ACK to it is absorbed by handle_ack.
+        let cseq_num = caller_invite_cseq.or_else(|| {
+            request
+                .cseq_header()
+                .ok()
+                .and_then(|h| h.value().split_whitespace().next()?.parse().ok())
+        });
+        match build_plain_response_for_request(&request, 487, "Request Terminated") {
+            Ok(r) => {
+                let mut raw = r.to_string();
+                if let Some(n) = cseq_num {
+                    if let Ok(mut msg) = crate::topology::RawSipMessage::parse(&raw) {
+                        msg.set_header("CSeq", &format!("{} INVITE", n));
+                        raw = msg.to_string();
+                    }
+                }
+                self.metrics.inc_sip_response(487);
+                self.send_sip("487 → caller", raw.as_bytes(), source, transport, reply_tx)
+                    .await;
+            }
+            Err(e) => warn!("CANCEL: could not build the 487 for call {}: {}", uuid, e),
+        }
+        Ok(())
     }
 
     // REFER (RFC 3515, attended/blind transfer) is not implemented: it is

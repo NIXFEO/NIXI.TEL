@@ -3,7 +3,7 @@ use crate::Error;
 pub use tokenizer::Tokenizer;
 
 macro_rules! create_status_codes {
-    ($($name:ident => $code:expr),*) => {
+    ($($name:ident => $code:expr => $phrase:expr),*) => {
 
         /// The SIP [Response](super::super::Response) status code (or response code as SIP main
         /// RFC refers to them). This is not a `Copy` type because in case of an unknown (= not
@@ -26,6 +26,17 @@ macro_rules! create_status_codes {
                     Self::Other(code, _) => *code,
                 }
             }
+
+            /// The canonical reason phrase (RFC 3261 §21 and the RFCs that
+            /// register the other codes), e.g. `487` → "Request Terminated".
+            pub fn reason_phrase(&self) -> &str {
+                match self {
+                    $(
+                        Self::$name => $phrase,
+                    )*
+                    Self::Other(_, reason) => reason.as_str(),
+                }
+            }
         }
 
         impl From<u16> for StatusCode {
@@ -44,7 +55,7 @@ macro_rules! create_status_codes {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
                     $(
-                        Self::$name => write!(f, "{} {}", stringify!($code), stringify!($name)),
+                        Self::$name => write!(f, "{} {}", stringify!($code), $phrase),
                     )*
                     Self::Other(code, reason) => write!(f, "{} {}", code, reason),
                 }
@@ -67,79 +78,79 @@ macro_rules! create_status_codes {
     }
 }
 
-create_status_codes!(Trying => 100,
-    Ringing => 180,
-    CallIsBeingForwarded => 181,
-    Queued => 182,
-    SessionProgress => 183,
-    EarlyDialogTerminated => 199,
-    OK => 200,
-    Accepted => 201,
-    NoNotification => 204,
-    MultipleChoices => 300,
-    MovedPermanently => 301,
-    MovedTemporarily => 302,
-    UseProxy => 305,
-    AlternativeService => 380,
-    BadRequest => 400,
-    Unauthorized => 401,
-    PaymentRequired => 402,
-    Forbidden => 403,
-    NotFound => 404,
-    MethodNotAllowed => 405,
-    NotAcceptable => 406,
-    ProxyAuthenticationRequired => 407,
-    RequestTimeout => 408,
-    Conflict => 409,
-    Gone => 410,
-    LengthRequired => 411,
-    ConditionalRequestFailed => 412,
-    RequestEntityTooLarge => 413,
-    RequestUriTooLong => 414,
-    UnsupportedMediaType => 415,
-    UnsupportedUriScheme => 416,
-    UnknownResourcePriority => 417,
-    BadExtension => 420,
-    ExtensionRequired => 421,
-    SessionIntervalTooSmall => 422,
-    IntervalTooBrief => 423,
-    BadLocationInformation => 424,
-    UseIdentityHeader => 428,
-    ProvideReferrerIdentity => 429,
-    AnonymityDisallowed => 433,
-    BadIdentityInfo => 436,
-    UnsupportedCertificate => 437,
-    InvalidIdentityHeader => 438,
-    FirstHopLacksOutboundSupport => 439,
-    MaxBreadthExceeded => 440,
-    BadInfoPackage => 469,
-    ConsentNeeded => 470,
-    TemporarilyUnavailable => 480,
-    CallTransactionDoesNotExist => 481,
-    LoopDetected => 482,
-    TooManyHops => 483,
-    AddressIncomplete => 484,
-    Ambiguous => 485,
-    BusyHere => 486,
-    RequestTerminated => 487,
-    NotAcceptableHere => 488,
-    BadEvent => 489,
-    RequestPending => 491,
-    Undecipherable => 493,
-    SecurityAgreementRequired => 494,
-    ServerInternalError => 500,
-    NotImplemented => 501,
-    BadGateway => 502,
-    ServiceUnavailable => 503,
-    ServerTimeOut => 504,
-    VersionNotSupported => 505,
-    MessageTooLarge => 513,
-    PreconditionFailure => 580,
-    BusyEverywhere => 600,
-    Decline => 603,
-    DoesNotExistAnywhere => 604,
-    NotAcceptableGlobal => 606,
-    Unwanted => 607
+create_status_codes!(Trying => 100 => "Trying",
+    Ringing => 180 => "Ringing",
+    CallIsBeingForwarded => 181 => "Call Is Being Forwarded",
+    Queued => 182 => "Queued",
+    SessionProgress => 183 => "Session Progress",
+    EarlyDialogTerminated => 199 => "Early Dialog Terminated",
+    OK => 200 => "OK",
+    Accepted => 201 => "Accepted",
+    NoNotification => 204 => "No Notification",
+    MultipleChoices => 300 => "Multiple Choices",
+    MovedPermanently => 301 => "Moved Permanently",
+    MovedTemporarily => 302 => "Moved Temporarily",
+    UseProxy => 305 => "Use Proxy",
+    AlternativeService => 380 => "Alternative Service",
+    BadRequest => 400 => "Bad Request",
+    Unauthorized => 401 => "Unauthorized",
+    PaymentRequired => 402 => "Payment Required",
+    Forbidden => 403 => "Forbidden",
+    NotFound => 404 => "Not Found",
+    MethodNotAllowed => 405 => "Method Not Allowed",
+    NotAcceptable => 406 => "Not Acceptable",
+    ProxyAuthenticationRequired => 407 => "Proxy Authentication Required",
+    RequestTimeout => 408 => "Request Timeout",
+    Conflict => 409 => "Conflict",
+    Gone => 410 => "Gone",
+    LengthRequired => 411 => "Length Required",
+    ConditionalRequestFailed => 412 => "Conditional Request Failed",
+    RequestEntityTooLarge => 413 => "Request Entity Too Large",
+    RequestUriTooLong => 414 => "Request-URI Too Long",
+    UnsupportedMediaType => 415 => "Unsupported Media Type",
+    UnsupportedUriScheme => 416 => "Unsupported URI Scheme",
+    UnknownResourcePriority => 417 => "Unknown Resource-Priority",
+    BadExtension => 420 => "Bad Extension",
+    ExtensionRequired => 421 => "Extension Required",
+    SessionIntervalTooSmall => 422 => "Session Interval Too Small",
+    IntervalTooBrief => 423 => "Interval Too Brief",
+    BadLocationInformation => 424 => "Bad Location Information",
+    UseIdentityHeader => 428 => "Use Identity Header",
+    ProvideReferrerIdentity => 429 => "Provide Referrer Identity",
+    AnonymityDisallowed => 433 => "Anonymity Disallowed",
+    BadIdentityInfo => 436 => "Bad Identity-Info",
+    UnsupportedCertificate => 437 => "Unsupported Certificate",
+    InvalidIdentityHeader => 438 => "Invalid Identity Header",
+    FirstHopLacksOutboundSupport => 439 => "First Hop Lacks Outbound Support",
+    MaxBreadthExceeded => 440 => "Max-Breadth Exceeded",
+    BadInfoPackage => 469 => "Bad Info Package",
+    ConsentNeeded => 470 => "Consent Needed",
+    TemporarilyUnavailable => 480 => "Temporarily Unavailable",
+    CallTransactionDoesNotExist => 481 => "Call/Transaction Does Not Exist",
+    LoopDetected => 482 => "Loop Detected",
+    TooManyHops => 483 => "Too Many Hops",
+    AddressIncomplete => 484 => "Address Incomplete",
+    Ambiguous => 485 => "Ambiguous",
+    BusyHere => 486 => "Busy Here",
+    RequestTerminated => 487 => "Request Terminated",
+    NotAcceptableHere => 488 => "Not Acceptable Here",
+    BadEvent => 489 => "Bad Event",
+    RequestPending => 491 => "Request Pending",
+    Undecipherable => 493 => "Undecipherable",
+    SecurityAgreementRequired => 494 => "Security Agreement Required",
+    ServerInternalError => 500 => "Server Internal Error",
+    NotImplemented => 501 => "Not Implemented",
+    BadGateway => 502 => "Bad Gateway",
+    ServiceUnavailable => 503 => "Service Unavailable",
+    ServerTimeOut => 504 => "Server Time-out",
+    VersionNotSupported => 505 => "Version Not Supported",
+    MessageTooLarge => 513 => "Message Too Large",
+    PreconditionFailure => 580 => "Precondition Failure",
+    BusyEverywhere => 600 => "Busy Everywhere",
+    Decline => 603 => "Decline",
+    DoesNotExistAnywhere => 604 => "Does Not Exist Anywhere",
+    NotAcceptableGlobal => 606 => "Not Acceptable",
+    Unwanted => 607 => "Unwanted"
 );
 
 #[derive(Debug, PartialEq, Eq, Ord, PartialOrd, Clone, Copy)]

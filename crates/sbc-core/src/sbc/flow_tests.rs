@@ -228,14 +228,106 @@ async fn cancel_targets_the_live_invite_attempt_and_releases_the_call() {
     assert!(cancel.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
 
     let to_caller = drain(&mut call.caller_rx);
-    // Current behaviour: the CANCEL is answered 200 but the INVITE gets no
-    // 487 (the SIP-correctness lot adds it).
-    assert_eq!(to_caller.len(), 1, "{:?}", to_caller);
+    assert_eq!(
+        to_caller.len(),
+        2,
+        "200 OK to the CANCEL, then 487 to the INVITE: {:?}",
+        to_caller
+    );
     assert!(to_caller[0].starts_with("SIP/2.0 200 OK\r\n"));
     assert!(to_caller[0].contains("CSeq: 3 CANCEL\r\n"));
+    let terminated = &to_caller[1];
+    assert!(
+        terminated.starts_with("SIP/2.0 487 Request Terminated\r\n"),
+        "{}",
+        terminated
+    );
+    assert!(terminated.contains("CSeq: 3 INVITE\r\n"), "{}", terminated);
+    assert!(
+        terminated.contains("Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bKcaller\r\n"),
+        "the INVITE transaction's Via: {}",
+        terminated
+    );
+    assert!(terminated.contains("From: <sip:alice@a.example.com>;tag=al-1\r\n"));
+    assert!(
+        terminated.contains("To: <sip:bob@b.example.com>;tag="),
+        "final gets a To tag"
+    );
+    assert!(terminated.contains("Call-ID: cid-1\r\n"));
 
     assert!(!alive(&sbc).await);
     assert_eq!(sbc.media.stats().allocated_ports, 0);
+
+    // The caller's ACK to the 487 is absorbed: nothing forwarded anywhere.
+    sbc.handle_ack(
+        ack_from_caller(&call.spec),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut call.caller_rx).is_empty());
+    assert!(drain(&mut call.callee_rx).is_empty());
+}
+
+/// RFC 3261 §9.2: a CANCEL that crosses the 200 OK has no effect on the
+/// dialog — 200 to the CANCEL, nothing toward the trunk, call untouched.
+#[tokio::test]
+async fn cancel_after_the_200_ok_is_answered_but_leaves_the_call_alone() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+
+    sbc.handle_cancel(
+        cancel_from_caller(&call.spec),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+
+    let to_caller = drain(&mut call.caller_rx);
+    assert_eq!(
+        to_caller.len(),
+        1,
+        "200 OK to the CANCEL only: {:?}",
+        to_caller
+    );
+    assert!(to_caller[0].starts_with("SIP/2.0 200 OK\r\n"));
+    assert!(to_caller[0].contains("CSeq: 3 CANCEL\r\n"));
+    assert!(
+        drain(&mut call.callee_rx).is_empty(),
+        "no CANCEL toward an answered trunk leg"
+    );
+    assert!(alive(&sbc).await, "the dialog stands until the caller BYEs");
+    assert!(sbc.media.stats().allocated_ports > 0);
+}
+
+/// RFC 3261 §9.2: CANCEL for an INVITE transaction we do not have → 481.
+#[tokio::test]
+async fn cancel_for_an_unknown_call_gets_481() {
+    let mut sbc = SbcBuilder::new().build();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let spec = CallSpec::numbered(9);
+    sbc.handle_cancel(
+        cancel_from_caller(&spec),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("CSeq: 3 CANCEL\r\n"));
+    assert!(out[0].contains("Call-ID: cid-9\r\n"));
 }
 
 /// An unanswered INVITE past `invite_timeout` is CANCELed on the first
