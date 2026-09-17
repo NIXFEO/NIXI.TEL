@@ -614,3 +614,22 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod example_config_tests {
+    use super::*;
+
+    /// The shipped example must always parse: every new key documented
+    /// there is a key the binary accepts.
+    #[test]
+    fn example_config_parses_with_every_documented_key() {
+        let raw = include_str!("../../../config/sbc.toml.example");
+        let cfg: SbcConfig = toml::from_str(raw).expect("config/sbc.toml.example parses");
+        assert_eq!(cfg.security.register_aor_check, "enforce");
+        assert_eq!(cfg.security.trunk_local_from, "allow");
+        assert_eq!(cfg.security.call_setup_timeout, 60);
+        assert_eq!(cfg.security.rtp_timeout, 90);
+        assert_eq!(cfg.management.trusted_proxies, vec!["127.0.0.1", "::1"]);
+        assert!(cfg.management.ban_on_auth_failure);
+    }
+}
