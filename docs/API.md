@@ -63,8 +63,9 @@ Every call gets exactly one record when it ends, whatever the cause
 | `reason` | SIP `Reason` header: the peer's on its BYE/CANCEL, the SBC's own on the BYEs it sends |
 | `hangup_by` | who ended the call: `caller`, `callee` (the far end, or its rejection), `sbc` |
 
-Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`): `ban_issued`, `ban_lifted`, `auth_failure`, `destination_blocked`, `user_limit`, `identity_mismatch` (a source claimed an identity that is not its own: REGISTER for another AOR, INVITE From another user, a trunk presenting a local user).
 | `v` | record schema version: `2` from 0.20; `1` rows (older file lines) carry no billing window |
+
+Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`): `ban_issued`, `ban_lifted`, `auth_failure`, `destination_blocked`, `user_limit`, `identity_mismatch` (a source claimed an identity that is not its own: REGISTER for another AOR, INVITE From another user, a trunk presenting a local user).
 
 ### SIP users
 
@@ -72,7 +73,8 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 |---|---|---|
 | GET | `/api/v1/users` | — (never returns password hashes) |
 | POST | `/api/v1/users` | `{"username","password"}` or `{"username","ha1"}`, optional `display_name`, `enabled`, `max_concurrent_calls`, `max_calls_per_minute` |
-| PUT | `/api/v1/users/{u}` | same body; omit password to keep it |
+| PUT | `/api/v1/users/{u}` | same body (full replace of the other fields); omit password to keep it |
+| PATCH | `/api/v1/users/{u}` | any subset of the fields (RFC 7396 merge): only what is sent changes, the password stays unless `password`/`ha1` is given; unknown keys → 400 |
 | DELETE | `/api/v1/users/{u}` | — |
 
 ### DIDs (inbound number → user)
@@ -88,7 +90,7 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 |---|---|---|
 | GET | `/api/v1/trunks` | stored config + live health, password redacted |
 | POST | `/api/v1/trunks` | full field set: `name`, `host`, `port`, `transport` (UDP/TCP/TLS/WS/WSS), `auth_required`, `username`, `password`, `register_with_trunk`, `prefix_patterns[]`, `priority`, `weight`, `cost_per_minute`, `number_format`, `country_code`, `national_prefix`, `caller_number_override`, `allowed_codecs[]`, `max_concurrent_calls`, `tls_sni`, `tls_ca_cert`, `tls_verify`, `tls_client_cert`, `tls_client_key` |
-| GET/PUT/DELETE | `/api/v1/trunks/{name}` | DELETE refuses while calls are active |
+| GET/PUT/PATCH/DELETE | `/api/v1/trunks/{name}` | GET masks `password` as `"***"`; PUT replaces every field (an omitted `password` clears it) and refuses `"***"`; PATCH merges any subset (RFC 7396: `null` clears a field, the password and TLS material stay unless given, unknown keys such as the GET-only `tls`/`health` → 400); DELETE refuses while calls are active |
 | POST | `/api/v1/trunks/{name}/enable` · `/disable` | |
 
 ### Routes (prefix → trunk)

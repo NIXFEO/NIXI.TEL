@@ -368,7 +368,7 @@ pub async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-fn rfc3339(t: std::time::SystemTime) -> String {
+pub(crate) fn rfc3339(t: std::time::SystemTime) -> String {
     // Delegate to the epoch-seconds representation; consumers get a number
     // via ban_json — this string form is only for the persistence row.
     let secs = BanEntry::ts_rfc_secs(t);

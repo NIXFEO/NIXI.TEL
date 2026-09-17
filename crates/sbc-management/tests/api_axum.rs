@@ -1,6 +1,7 @@
 //! Integration tests for the axum management API.
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sbc_core::acl::AclManager;
@@ -45,6 +46,8 @@ async fn make_state() -> AppState {
         api_rate_limit_per_min: 0, // disabled for deterministic tests
         security: Arc::new(sbc_core::security::SecurityManager::new(Default::default())),
         kicks: Arc::new(sbc_core::sbc::AdminKicks::new()),
+        trusted_proxies: Arc::new(sbc_management::rate_limit::default_trusted_proxies()),
+        ban_on_auth_failure: true,
     }
 }
 
@@ -153,6 +156,13 @@ async fn rate_limit_returns_429_over_budget() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("60"),
+        "429 tells the client when to come back"
+    );
 
     // Liveness probes are exempt from the limit.
     let resp = app
@@ -1106,4 +1116,256 @@ async fn cdrs_expose_the_billing_window_newest_first() {
     assert_eq!(items[1]["uuid"], "u1");
     assert_eq!(items[1]["source_ip"], "10.0.0.9");
     assert_eq!(items[1]["disconnect_reason"], "normal-clearing");
+}
+
+#[tokio::test]
+async fn trunk_patch_merges_and_the_masked_password_is_refused() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/trunks",
+            Some(r#"{"name":"t1","host":"203.0.113.9","username":"u","password":"s3cret","auth_required":true}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let store = state.store.clone().unwrap();
+
+    // GET masks the secret; writing that shape back is refused.
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/trunks/t1", None, true))
+        .await
+        .unwrap();
+    let shown = body_json(resp).await;
+    assert_eq!(shown["password"], "***");
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/v1/trunks/t1",
+            Some(&shown.to_string()),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "masked password");
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/t1",
+            Some(r#"{"password":"***"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        store
+            .get_trunk("t1")
+            .await
+            .unwrap()
+            .unwrap()
+            .password
+            .as_deref(),
+        Some("s3cret"),
+        "untouched"
+    );
+
+    // PATCH changes only what it names.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/t1",
+            Some(r#"{"port":5062,"priority":10}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let row = store.get_trunk("t1").await.unwrap().unwrap();
+    assert_eq!(row.port, 5062);
+    assert_eq!(row.priority, 10);
+    assert_eq!(row.password.as_deref(), Some("s3cret"), "kept");
+    assert_eq!(row.username.as_deref(), Some("u"));
+    assert!(row.auth_required);
+
+    // GET-only keys are refused rather than ignored.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/t1",
+            Some(r#"{"tls":{"verify":false}}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // null clears a nullable field (RFC 7396).
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/t1",
+            Some(r#"{"username":null}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(store.get_trunk("t1").await.unwrap().unwrap().username, None);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/nope",
+            Some(r#"{"port":1}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn user_patch_keeps_the_password_and_the_other_fields() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/users",
+            Some(r#"{"username":"alice","password":"pw","display_name":"Alice","max_concurrent_calls":2}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let store = state.store.clone().unwrap();
+    let before = store.get_user("alice").await.unwrap().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/users/alice",
+            Some(r#"{"enabled":false}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after = store.get_user("alice").await.unwrap().unwrap();
+    assert!(!after.enabled);
+    assert_eq!(after.ha1, before.ha1, "password untouched");
+    assert_eq!(after.display_name.as_deref(), Some("Alice"));
+    assert_eq!(after.max_concurrent_calls, Some(2), "limits untouched");
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/users/alice",
+            Some(r#"{"password":"new"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rotated = store.get_user("alice").await.unwrap().unwrap();
+    assert_ne!(rotated.ha1, before.ha1, "password rotated");
+    assert!(!rotated.enabled, "other fields still untouched");
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/users/alice",
+            Some(r#"{"realm":"x"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "realm is not settable"
+    );
+}
+
+/// A brute force on the bearer token is treated like a SIP password guess:
+/// the client's IP is banned (API and SIP) after the fail2ban threshold.
+#[tokio::test]
+async fn bearer_token_brute_force_bans_the_client_ip() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let attacker: std::net::SocketAddr = "198.51.100.7:45000".parse().unwrap();
+    let from = |r: Request<Body>, peer: std::net::SocketAddr| {
+        let mut r = r;
+        r.extensions_mut().insert(ConnectInfo(peer));
+        r
+    };
+
+    let mut banned = false;
+    for _ in 0..25 {
+        let resp = app
+            .clone()
+            .oneshot(from(req("GET", "/api/v1/stats", None, false), attacker))
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::FORBIDDEN {
+            banned = true;
+            break;
+        }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert!(banned, "repeated token failures ban the IP");
+    assert!(state.security.bans.is_banned(attacker.ip()));
+
+    // Even the right token is refused from the banned IP…
+    let resp = app
+        .clone()
+        .oneshot(from(req("GET", "/api/v1/stats", None, true), attacker))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // …while another IP is served, and the probes are public.
+    let resp = app
+        .clone()
+        .oneshot(from(
+            req("GET", "/api/v1/stats", None, true),
+            "203.0.113.5:1".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(from(req("GET", "/health", None, false), attacker))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "/health stays reachable");
+
+    // Headers from an untrusted peer cannot shift the blame onto someone else.
+    let mut spoof = req("GET", "/api/v1/stats", None, false);
+    spoof
+        .headers_mut()
+        .insert("x-forwarded-for", "203.0.113.99".parse().unwrap());
+    let spoof = from(spoof, attacker);
+    let resp = app.clone().oneshot(spoof).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "still the attacker");
+    assert!(!state
+        .security
+        .bans
+        .is_banned("203.0.113.99".parse().unwrap()));
 }

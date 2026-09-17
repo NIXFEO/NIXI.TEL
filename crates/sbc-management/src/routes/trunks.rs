@@ -112,6 +112,13 @@ fn default_max_calls() -> u32 {
 
 impl TrunkBody {
     fn into_row(self, name: String) -> ApiResult<TrunkRow> {
+        // The GET shape masks the secret: writing it back would replace the
+        // real password with three stars.
+        if self.password.as_deref() == Some(MASKED) {
+            return Err(ApiError::bad_request(
+                "password is masked (\"***\"); omit it to keep the current one",
+            ));
+        }
         let host = self
             .host
             .filter(|h| !h.is_empty())
@@ -158,6 +165,44 @@ impl TrunkBody {
 }
 
 /// Stored config + live health, password redacted.
+/// What `GET` shows in place of a stored password.
+const MASKED: &str = "***";
+
+/// The row in `TrunkBody` (wire) shape, secret included: the base a PATCH
+/// is merged onto. Never returned to a client.
+fn trunk_body_json(row: &TrunkRow) -> serde_json::Value {
+    json!({
+        "name": row.name,
+        "enabled": row.enabled,
+        "host": row.host,
+        "port": row.port,
+        "transport": row.transport,
+        "auth_required": row.auth_required,
+        "username": row.username,
+        "password": row.password,
+        "realm": row.realm,
+        "register_with_trunk": row.register_with_trunk,
+        "registration_interval": row.registration_interval,
+        "prefix_patterns": row.prefix_patterns_vec(),
+        "priority": row.priority,
+        "weight": row.weight,
+        "cost_per_minute": row.cost_per_minute,
+        "number_format": row.number_format,
+        "country_code": row.country_code,
+        "national_prefix": row.national_prefix,
+        "caller_number_format": row.caller_number_format,
+        "caller_number_override": row.caller_number_override,
+        "caller_display_name": row.caller_display_name,
+        "allowed_codecs": row.allowed_codecs_vec(),
+        "max_concurrent_calls": row.max_concurrent_calls,
+        "tls_sni": row.tls_sni,
+        "tls_ca_cert": row.tls_ca_cert,
+        "tls_verify": row.tls_verify,
+        "tls_client_cert": row.tls_client_cert,
+        "tls_client_key": row.tls_client_key,
+    })
+}
+
 fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
     let live = state
         .trunks
@@ -188,7 +233,7 @@ fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
         "transport": row.transport,
         "auth_required": row.auth_required,
         "username": row.username,
-        "password": row.password.as_ref().map(|_| "***"),
+        "password": row.password.as_ref().map(|_| MASKED),
         "realm": row.realm,
         "register_with_trunk": row.register_with_trunk,
         "registration_interval": row.registration_interval,
@@ -308,6 +353,30 @@ pub async fn update_trunk(
     {
         return Err(ApiError::not_found(format!("trunk '{}' not found", name)));
     }
+    let row = body.into_row(name.clone())?;
+    store.upsert_trunk(&row).await.map_err(ApiError::internal)?;
+    apply_and_notify(&state, &store, "trunk", "update", &name).await;
+    Ok(Json(trunk_json(&state, &row)))
+}
+
+/// PATCH /api/v1/trunks/{name} — RFC 7396 merge on the wire shape: only
+/// the fields sent change (`null` clears one), the password and TLS
+/// material stay unless given. `"***"` is refused.
+pub async fn patch_trunk(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(patch): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = store(&state)?;
+    let existing = store
+        .get_trunk(&name)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("trunk '{}' not found", name)))?;
+    let mut base = trunk_body_json(&existing);
+    super::merge_patch(&mut base, &patch)?;
+    let body: TrunkBody = serde_json::from_value(base)
+        .map_err(|e| ApiError::bad_request(format!("invalid trunk: {}", e)))?;
     let row = body.into_row(name.clone())?;
     store.upsert_trunk(&row).await.map_err(ApiError::internal)?;
     apply_and_notify(&state, &store, "trunk", "update", &name).await;

@@ -42,6 +42,10 @@ pub struct AppState {
     pub security: Arc<SecurityManager>,
     /// `DELETE /api/v1/calls/{uuid}` hands the uuid to the SIP engine here.
     pub kicks: Arc<sbc_core::sbc::AdminKicks>,
+    /// Reverse proxies whose X-Real-IP / X-Forwarded-For are believed.
+    pub trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    /// Failed bearer-token checks strike the client's IP in fail2ban.
+    pub ban_on_auth_failure: bool,
 }
 
 impl AppState {

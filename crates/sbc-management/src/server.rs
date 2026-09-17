@@ -11,19 +11,23 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 
-use crate::rate_limit::{client_ip, RateLimiter};
+use crate::rate_limit::{client_ip_with, RateLimiter};
 use crate::routes;
 use crate::state::AppState;
 
 const BODY_LIMIT_BYTES: usize = 256 * 1024;
 
 pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router {
-    let rate_limiter = RateLimiter::per_minute(state.api_rate_limit_per_min);
+    let rate_limiter = RateLimitState {
+        limiter: RateLimiter::per_minute(state.api_rate_limit_per_min),
+        trusted: state.trusted_proxies.clone(),
+    };
     let mut app = Router::new()
         // Health & readiness (public)
         .route("/health", get(routes::system::health))
@@ -50,7 +54,9 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
         )
         .route(
             "/api/v1/users/:username",
-            put(routes::config_api::update_user).delete(routes::config_api::delete_user),
+            put(routes::config_api::update_user)
+                .patch(routes::config_api::patch_user)
+                .delete(routes::config_api::delete_user),
         )
         .route(
             "/api/v1/dids",
@@ -69,6 +75,7 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
             "/api/v1/trunks/:name",
             get(routes::trunks::get_trunk)
                 .put(routes::trunks::update_trunk)
+                .patch(routes::trunks::patch_trunk)
                 .delete(routes::trunks::delete_trunk),
         )
         .route(
@@ -155,8 +162,14 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
 /// Per-source-IP rate limit. Requests over budget get `429`, with the
 /// offending IP logged at `warn`. `/health` and `/ready` are exempt so
 /// liveness probes never trip it.
+#[derive(Clone)]
+struct RateLimitState {
+    limiter: RateLimiter,
+    trusted: Arc<Vec<std::net::IpAddr>>,
+}
+
 async fn rate_limit_middleware(
-    State(limiter): State<RateLimiter>,
+    State(rl): State<RateLimitState>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -165,8 +178,8 @@ async fn rate_limit_middleware(
         return next.run(request).await;
     }
 
-    let ip = client_ip(&request);
-    if limiter.check(ip) {
+    let ip = client_ip_with(&request, &rl.trusted);
+    if rl.limiter.check(ip) {
         next.run(request).await
     } else {
         warn!(
@@ -177,8 +190,8 @@ async fn rate_limit_middleware(
         );
         (
             StatusCode::TOO_MANY_REQUESTS,
-            [("content-type", "application/json")],
-            r#"{"error":"rate limit exceeded","code":"too_many_requests"}"#,
+            [("content-type", "application/json"), ("retry-after", "60")],
+            r#"{"error":"rate limit exceeded","code":"too_many_requests","retry_after_secs":60}"#,
         )
             .into_response()
     }
@@ -189,7 +202,13 @@ fn build_cors(origins: &[String]) -> Option<CorsLayer> {
         return None;
     }
     let layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers(Any);
     let layer = if origins.iter().any(|o| o == "*") {
         layer.allow_origin(Any)
@@ -209,10 +228,25 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
         return next.run(request).await;
     }
 
-    let source_ip = client_ip(&request);
+    let source_ip = client_ip_with(&request, &state.trusted_proxies);
     let method = request.method().clone();
+
+    // An IP fail2ban already banned (SIP or API abuse) gets nothing here.
+    if !source_ip.is_unspecified() && state.security.bans.is_banned(source_ip) {
+        warn!(
+            source_ip = %source_ip,
+            method = %method,
+            path = %path,
+            auth = "banned",
+            "management API request from a banned IP"
+        );
+        return forbidden_banned();
+    }
     // Mutations get audited even on success; reads only when auth fails.
-    let is_mutation = matches!(method, Method::POST | Method::PUT | Method::DELETE);
+    let is_mutation = matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
 
     // Defense in depth: the binary refuses to start without a resolved token
     // (see sbc-bin/main.rs), so this arm should be unreachable in production.
@@ -275,8 +309,40 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
             auth = "denied",
             "management API authentication failed"
         );
+        // A brute force on the token is an attack like a SIP password
+        // guess: same window, same ban (SIP and API).
+        if state.ban_on_auth_failure && !source_ip.is_unspecified() {
+            if let Some(entry) = state.security.record_auth_failure(source_ip, None, "API") {
+                state.metrics.inc_security_ban();
+                if let Some(store) = state.store.clone() {
+                    let row = sbc_storage::BanRow {
+                        ip: entry.ip.to_string(),
+                        reason: entry.reason.clone(),
+                        banned_at: crate::routes::security::rfc3339(entry.banned_at),
+                        expires_at: crate::routes::security::rfc3339(entry.expires_at),
+                        failures: entry.failures as i64,
+                        manual: entry.manual,
+                        offense_count: entry.offense_count as i64,
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = store.save_ban(&row).await {
+                            warn!("Ban persistence failed for {}: {}", row.ip, e);
+                        }
+                    });
+                }
+            }
+        }
         unauthorized()
     }
+}
+
+fn forbidden_banned() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [("content-type", "application/json")],
+        r#"{"error":"banned","code":"forbidden"}"#,
+    )
+        .into_response()
 }
 
 fn unauthorized() -> Response {

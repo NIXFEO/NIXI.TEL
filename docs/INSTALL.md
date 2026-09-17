@@ -253,6 +253,10 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         # The caller supplies its own bearer token; nginx does NOT inject one.
         # (Do not set proxy_set_header Authorization here.)
+        # These headers are believed only because nginx is in
+        # [management] trusted_proxies (loopback by default): a proxy on
+        # another host must be listed there or every client is rate-limited
+        # and banned as the proxy's address.
     }
 }
 ```

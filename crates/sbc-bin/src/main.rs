@@ -76,6 +76,15 @@ async fn main() -> Result<()> {
             api_rate_limit_per_min: config.management.api_rate_limit_per_min,
             security: sbc.security(),
             kicks: sbc.admin_kicks(),
+            trusted_proxies: std::sync::Arc::new(
+                config
+                    .management
+                    .trusted_proxies
+                    .iter()
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect(),
+            ),
+            ban_on_auth_failure: config.management.ban_on_auth_failure,
         };
         if state.store.is_none() {
             warn!("Management API: config store unavailable — mutating endpoints return 503");

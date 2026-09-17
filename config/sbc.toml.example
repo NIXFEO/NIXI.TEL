@@ -141,6 +141,12 @@ api_port = 8080
 # to start when enabled without a token (fail-closed).
 api_auth_token = "GENERATE-A-LONG-RANDOM-TOKEN"
 # cors_allowed_origins = ["https://admin.example.com"]
+# Peers whose X-Real-IP / X-Forwarded-For are believed for rate limiting,
+# audit and bans (the nginx of INSTALL.md); from any other peer the TCP
+# address is the client. Failed token checks strike the client's IP in
+# fail2ban like a SIP password guess.
+trusted_proxies = ["127.0.0.1", "::1"]
+ban_on_auth_failure = true
 
 [metrics]
 prometheus_enabled = true

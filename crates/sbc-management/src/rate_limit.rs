@@ -69,35 +69,73 @@ impl RateLimiter {
     }
 }
 
-/// Derive the client IP for rate-limiting / audit.
+/// Proxies believed by `client_ip` (the nginx of INSTALL.md on loopback).
+pub fn default_trusted_proxies() -> Vec<IpAddr> {
+    vec![
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]
+}
+
+/// Derive the client IP for rate limiting, audit and bans.
 ///
-/// Prefers `X-Real-IP`, then the first hop of `X-Forwarded-For` (set by a
-/// trusted reverse proxy), then the TCP peer address from `ConnectInfo`.
-/// Falls back to an unspecified address when nothing is available.
-pub fn client_ip<B>(req: &Request<B>) -> IpAddr {
+/// The TCP peer (`ConnectInfo`) is the client — unless it is one of
+/// `trusted` (a reverse proxy), in which case `X-Real-IP`, else the
+/// rightmost `X-Forwarded-For` hop that is not itself a trusted proxy, is
+/// the client. Headers from an untrusted peer are ignored: anyone can send
+/// them. Without a peer (unit tests driving the router with `oneshot`)
+/// nothing is believed and the unspecified address is returned.
+pub fn client_ip_with<B>(req: &Request<B>, trusted: &[IpAddr]) -> IpAddr {
+    let Some(peer) = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+    else {
+        return UNKNOWN_IP;
+    };
+    if !trusted.contains(&peer) {
+        return peer;
+    }
     if let Some(ip) = req
         .headers()
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse().ok())
+        .and_then(parse_hop)
     {
         return ip;
     }
-
-    if let Some(ip) = req
+    if let Some(list) = req
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|first| first.trim().parse().ok())
     {
-        return ip;
+        let hops: Vec<IpAddr> = list.split(',').filter_map(parse_hop).collect();
+        if let Some(ip) = hops.iter().rev().find(|h| !trusted.contains(h)) {
+            return *ip;
+        }
     }
+    peer
+}
 
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .unwrap_or(UNKNOWN_IP)
+/// `client_ip_with` trusting loopback only.
+pub fn client_ip<B>(req: &Request<B>) -> IpAddr {
+    client_ip_with(req, &default_trusted_proxies())
+}
+
+/// One hop of X-Forwarded-For / X-Real-IP: an IP, possibly with a port.
+fn parse_hop(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<IpAddr>()
+        .ok()
+        .or_else(|| s.parse::<SocketAddr>().ok().map(|a| a.ip()))
+        .or_else(|| {
+            s.strip_prefix('[')
+                .and_then(|r| r.split(']').next())
+                .and_then(|h| h.parse().ok())
+        })
 }
 
 #[cfg(test)]
@@ -143,28 +181,80 @@ mod tests {
         assert!(rl.check(ip), "budget replenishes after the window elapses");
     }
 
+    fn with_peer(mut req: Request<()>, peer: &str) -> Request<()> {
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        req
+    }
+
     #[test]
-    fn client_ip_prefers_x_real_ip() {
+    fn headers_are_believed_only_from_a_trusted_proxy() {
         let req = Request::builder()
             .header("x-real-ip", "198.51.100.10")
             .header("x-forwarded-for", "198.51.100.20, 10.0.0.1")
             .body(())
             .unwrap();
-        assert_eq!(client_ip(&req), "198.51.100.10".parse::<IpAddr>().unwrap());
-    }
+        let via_nginx = with_peer(req, "127.0.0.1:40000");
+        assert_eq!(
+            client_ip(&via_nginx),
+            "198.51.100.10".parse::<IpAddr>().unwrap(),
+            "X-Real-IP from loopback nginx"
+        );
 
-    #[test]
-    fn client_ip_uses_first_forwarded_hop() {
         let req = Request::builder()
-            .header("x-forwarded-for", "198.51.100.20, 10.0.0.1")
+            .header("x-real-ip", "198.51.100.10")
+            .header("x-forwarded-for", "198.51.100.20")
             .body(())
             .unwrap();
-        assert_eq!(client_ip(&req), "198.51.100.20".parse::<IpAddr>().unwrap());
+        let direct = with_peer(req, "203.0.113.5:40000");
+        assert_eq!(
+            client_ip(&direct),
+            "203.0.113.5".parse::<IpAddr>().unwrap(),
+            "an untrusted peer's headers are ignored"
+        );
     }
 
     #[test]
-    fn client_ip_falls_back_to_unspecified() {
-        let req = Request::builder().body(()).unwrap();
-        assert_eq!(client_ip(&req), UNKNOWN_IP);
+    fn forwarded_for_takes_the_rightmost_untrusted_hop() {
+        let trusted: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap(), "10.0.0.1".parse().unwrap()];
+        // client → 203.0.113.9 (spoofable) → 10.0.0.1 (our proxy) → nginx (peer)
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4, 203.0.113.9, 10.0.0.1")
+            .body(())
+            .unwrap();
+        let req = with_peer(req, "127.0.0.1:1");
+        assert_eq!(
+            client_ip_with(&req, &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // Every hop trusted: the peer itself
+        let req = Request::builder()
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(())
+            .unwrap();
+        let req = with_peer(req, "127.0.0.1:1");
+        assert_eq!(
+            client_ip_with(&req, &trusted),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        // Hops with ports (some proxies) and garbage
+        let req = Request::builder()
+            .header("x-forwarded-for", "garbage, 203.0.113.5:1234")
+            .body(())
+            .unwrap();
+        let req = with_peer(req, "127.0.0.1:1");
+        assert_eq!(
+            client_ip_with(&req, &trusted),
+            "203.0.113.5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_unspecified_without_a_peer() {
+        let req = Request::builder()
+            .header("x-real-ip", "198.51.100.10")
+            .body(())
+            .unwrap();
+        assert_eq!(client_ip(&req), UNKNOWN_IP, "no peer: nothing is believed");
     }
 }

@@ -160,6 +160,52 @@ pub async fn update_user(
     Ok(Json(user_json(&row)))
 }
 
+/// PATCH /api/v1/users/{username} — merge on the wire shape: only the
+/// fields sent change; the password (ha1) stays unless `password` or
+/// `ha1` is given.
+pub async fn patch_user(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Json(patch): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let store = store(&state)?;
+    let existing = store
+        .get_user(&username)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("user '{}' not found", username)))?;
+    let mut base = json!({
+        "username": existing.username,
+        "password": serde_json::Value::Null,
+        "ha1": serde_json::Value::Null,
+        "display_name": existing.display_name,
+        "enabled": existing.enabled,
+        "max_concurrent_calls": existing.max_concurrent_calls,
+        "max_calls_per_minute": existing.max_calls_per_minute,
+    });
+    super::merge_patch(&mut base, &patch)?;
+    let body: UserBody = serde_json::from_value(base)
+        .map_err(|e| ApiError::bad_request(format!("invalid user: {}", e)))?;
+    let ha1 = if body.password.is_none() && body.ha1.is_none() {
+        existing.ha1
+    } else {
+        resolve_ha1(&state.realm, &username, &body)?
+    };
+    let row = UserRow {
+        username: username.clone(),
+        ha1,
+        realm: state.realm.clone(),
+        display_name: body.display_name.clone(),
+        enabled: body.enabled,
+        max_concurrent_calls: body.max_concurrent_calls,
+        max_calls_per_minute: body.max_calls_per_minute,
+    };
+    store.upsert_user(&row).await.map_err(ApiError::internal)?;
+    rehydrate_users(&state, &store).await;
+    config_changed(&state, "user", "update", &username);
+    Ok(Json(user_json(&row)))
+}
+
 pub async fn delete_user(
     State(state): State<AppState>,
     Path(username): Path<String>,

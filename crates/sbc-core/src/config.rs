@@ -339,10 +339,27 @@ pub struct ManagementConfig {
     /// minute. Requests over the budget are answered `429 Too Many Requests`.
     #[serde(default = "default_api_rate_limit_per_min")]
     pub api_rate_limit_per_min: u32,
+    /// Reverse proxies whose `X-Real-IP` / `X-Forwarded-For` are believed
+    /// for rate limiting, audit and bans (loopback by default, where the
+    /// nginx of INSTALL.md lives). From any other peer the TCP address is
+    /// the client, whatever headers it sends.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+    /// Failed bearer-token checks count toward fail2ban: a brute force on
+    /// the token gets the offender's IP banned (SIP and API). Turn off when
+    /// operators share a NAT with phones.
+    #[serde(default = "default_ban_on_auth_failure")]
+    pub ban_on_auth_failure: bool,
 }
 
 fn default_api_rate_limit_per_min() -> u32 {
     60
+}
+fn default_trusted_proxies() -> Vec<String> {
+    vec!["127.0.0.1".to_string(), "::1".to_string()]
+}
+fn default_ban_on_auth_failure() -> bool {
+    true
 }
 
 /// Resolve the effective management API bearer token.
@@ -496,6 +513,8 @@ impl Default for SbcConfig {
                 cors_allowed_origins: Vec::new(),
                 allow_public_bind: false,
                 api_rate_limit_per_min: default_api_rate_limit_per_min(),
+                trusted_proxies: default_trusted_proxies(),
+                ban_on_auth_failure: true,
             },
             metrics: MetricsConfig {
                 prometheus_enabled: true,

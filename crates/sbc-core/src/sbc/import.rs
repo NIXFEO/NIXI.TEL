@@ -164,73 +164,6 @@ pub fn now_rfc3339() -> String {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn config_with_seeds() -> SbcConfig {
-        let mut config = SbcConfig::default();
-        config.security.sip_realm = "sip.example.com".to_string();
-        config.security.sip_users = HashMap::from([("alice".to_string(), "secret".to_string())]);
-        config.dids = vec![crate::config::DidMapping {
-            number: "+33123456789".to_string(),
-            user: "alice".to_string(),
-            display_name: None,
-        }];
-        config
-    }
-
-    #[tokio::test]
-    async fn import_seeds_empty_store() {
-        let store = ConfigStore::open_memory().await.unwrap();
-        let (u, d, t) = first_boot_import(&store, &config_with_seeds()).await;
-        assert_eq!((u, d, t), (1, 1, 0));
-
-        let user = store.get_user("alice").await.unwrap().unwrap();
-        assert_eq!(user.ha1, compute_ha1("alice", "sip.example.com", "secret"));
-        assert!(store.get_did("+33123456789").await.unwrap().is_some());
-        assert!(store
-            .get_setting("toml_imported_at")
-            .await
-            .unwrap()
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn import_is_idempotent() {
-        let store = ConfigStore::open_memory().await.unwrap();
-        first_boot_import(&store, &config_with_seeds()).await;
-
-        // Simulate an API-side change, then re-import (e.g. restart)
-        store.delete_user("alice").await.unwrap();
-        let mut bob = sbc_storage::UserRow {
-            username: "bob".to_string(),
-            ha1: "x".repeat(32),
-            realm: "sip.example.com".to_string(),
-            display_name: None,
-            enabled: true,
-            max_concurrent_calls: None,
-            max_calls_per_minute: None,
-        };
-        bob.ha1 = "f".repeat(32);
-        store.upsert_user(&bob).await.unwrap();
-
-        let (u, _, _) = first_boot_import(&store, &config_with_seeds()).await;
-        assert_eq!(u, 0, "non-empty table must not be re-seeded");
-        assert!(store.get_user("alice").await.unwrap().is_none());
-        assert!(store.get_user("bob").await.unwrap().is_some());
-    }
-
-    #[test]
-    fn rfc3339_shape() {
-        let s = now_rfc3339();
-        assert_eq!(s.len(), 20);
-        assert!(s.ends_with('Z'));
-        assert!(s.starts_with("20"));
-    }
-}
-
 /// Seed the anti-fraud settings from TOML once (markers in `settings`):
 /// destination rules (`[security.destinations].rules` + the IRSF seeds when
 /// `seed_irsf_rules` and no TOML deny rule) and `[[security.user_limits.
@@ -324,5 +257,72 @@ pub async fn seed_security(store: &ConfigStore, config: &SbcConfig) {
         }
         Ok(Some(_)) => {}
         Err(e) => warn!("Seed: user limits marker check failed: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn config_with_seeds() -> SbcConfig {
+        let mut config = SbcConfig::default();
+        config.security.sip_realm = "sip.example.com".to_string();
+        config.security.sip_users = HashMap::from([("alice".to_string(), "secret".to_string())]);
+        config.dids = vec![crate::config::DidMapping {
+            number: "+33123456789".to_string(),
+            user: "alice".to_string(),
+            display_name: None,
+        }];
+        config
+    }
+
+    #[tokio::test]
+    async fn import_seeds_empty_store() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let (u, d, t) = first_boot_import(&store, &config_with_seeds()).await;
+        assert_eq!((u, d, t), (1, 1, 0));
+
+        let user = store.get_user("alice").await.unwrap().unwrap();
+        assert_eq!(user.ha1, compute_ha1("alice", "sip.example.com", "secret"));
+        assert!(store.get_did("+33123456789").await.unwrap().is_some());
+        assert!(store
+            .get_setting("toml_imported_at")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn import_is_idempotent() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        first_boot_import(&store, &config_with_seeds()).await;
+
+        // Simulate an API-side change, then re-import (e.g. restart)
+        store.delete_user("alice").await.unwrap();
+        let mut bob = sbc_storage::UserRow {
+            username: "bob".to_string(),
+            ha1: "x".repeat(32),
+            realm: "sip.example.com".to_string(),
+            display_name: None,
+            enabled: true,
+            max_concurrent_calls: None,
+            max_calls_per_minute: None,
+        };
+        bob.ha1 = "f".repeat(32);
+        store.upsert_user(&bob).await.unwrap();
+
+        let (u, _, _) = first_boot_import(&store, &config_with_seeds()).await;
+        assert_eq!(u, 0, "non-empty table must not be re-seeded");
+        assert!(store.get_user("alice").await.unwrap().is_none());
+        assert!(store.get_user("bob").await.unwrap().is_some());
+    }
+
+    #[test]
+    fn rfc3339_shape() {
+        let s = now_rfc3339();
+        assert_eq!(s.len(), 20);
+        assert!(s.ends_with('Z'));
+        assert!(s.starts_with("20"));
     }
 }

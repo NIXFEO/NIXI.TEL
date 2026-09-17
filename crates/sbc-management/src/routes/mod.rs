@@ -70,3 +70,23 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// RFC 7396 JSON Merge Patch on a flat wire-shaped object: `null` removes
+/// (→ `None`), anything else replaces. Keys the base does not know are an
+/// error, so a client that PATCHes with the GET shape (`tls`, `health`,
+/// `active_calls`…) learns about it instead of being silently ignored.
+pub fn merge_patch(base: &mut serde_json::Value, patch: &serde_json::Value) -> ApiResult<()> {
+    let Some(patch) = patch.as_object() else {
+        return Err(ApiError::bad_request("PATCH body must be a JSON object"));
+    };
+    let Some(target) = base.as_object_mut() else {
+        return Err(ApiError::internal("base is not an object"));
+    };
+    for (k, v) in patch {
+        if !target.contains_key(k) {
+            return Err(ApiError::bad_request(format!("unknown field '{}'", k)));
+        }
+        target.insert(k.clone(), v.clone());
+    }
+    Ok(())
+}

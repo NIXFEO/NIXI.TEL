@@ -134,6 +134,17 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `user_limits_seeded_at`). `GET /api/v1/export` is version 2 with
   `destination_rules` and `user_limits`. Migrations are opened with
   `ignore_missing` so a rolled-back binary still opens a newer store.
+- `PATCH /api/v1/trunks/{name}` and `/users/{username}` (RFC 7396 merge on
+  the wire shape): only the fields sent change, the trunk password / TLS
+  material and the user's password stay unless given, `null` clears a
+  field, unknown keys (the GET-only `tls`, `health`…) are 400. A PUT that
+  writes back the masked `"***"` password is refused instead of storing it.
+  SECURITY.md documented PATCH; it was not routed.
+- Management API: `X-Real-IP` / `X-Forwarded-For` are believed only from
+  `[management] trusted_proxies` (loopback by default) — any client could
+  shift rate limits and audit lines onto another address; `429` carries
+  `Retry-After`; failed bearer-token checks strike the client's IP in
+  fail2ban (`ban_on_auth_failure`) and a banned IP is refused by the API.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP
