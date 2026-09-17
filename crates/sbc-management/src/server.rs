@@ -231,17 +231,12 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
     let source_ip = client_ip_with(&request, &state.trusted_proxies);
     let method = request.method().clone();
 
-    // An IP fail2ban already banned (SIP or API abuse) gets nothing here.
-    if !source_ip.is_unspecified() && state.security.bans.is_banned(source_ip) {
-        warn!(
-            source_ip = %source_ip,
-            method = %method,
-            path = %path,
-            auth = "banned",
-            "management API request from a banned IP"
-        );
-        return forbidden_banned();
-    }
+    // fail2ban state of this IP (SIP or API abuse); applied AFTER the
+    // token check: a valid token proves the caller is not the guesser, and
+    // an operator whose office NAT got a SIP ban (a mis-provisioned phone,
+    // or a spoofed-UDP attack) must still reach the API — it is the tool
+    // that lifts bans. Unauthenticated requests from a banned IP get 403.
+    let banned = !source_ip.is_unspecified() && state.security.bans.is_banned(source_ip);
     // Mutations get audited even on success; reads only when auth fails.
     let is_mutation = matches!(
         method,
@@ -291,6 +286,15 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
 
     let path = path.to_string();
     if authorized {
+        if banned {
+            warn!(
+                source_ip = %source_ip,
+                method = %method,
+                path = %path,
+                auth = "ok_from_banned_ip",
+                "management API request with a valid token from an IP fail2ban banned"
+            );
+        }
         if is_mutation {
             info!(
                 source_ip = %source_ip,
@@ -302,6 +306,16 @@ async fn auth_middleware(State(state): State<AppState>, request: Request, next: 
         }
         next.run(request).await
     } else {
+        if banned {
+            warn!(
+                source_ip = %source_ip,
+                method = %method,
+                path = %path,
+                auth = "banned",
+                "management API request from a banned IP without a valid token"
+            );
+            return forbidden_banned();
+        }
         warn!(
             source_ip = %source_ip,
             method = %method,

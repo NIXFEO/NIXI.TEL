@@ -1332,14 +1332,19 @@ async fn bearer_token_brute_force_bans_the_client_ip() {
     assert!(banned, "repeated token failures ban the IP");
     assert!(state.security.bans.is_banned(attacker.ip()));
 
-    // Even the right token is refused from the banned IP…
+    // A valid token is still served from the banned IP (the ban stops the
+    // guessing, not the operator whose NAT got struck)…
     let resp = app
         .clone()
         .oneshot(from(req("GET", "/api/v1/stats", None, true), attacker))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    // …while another IP is served, and the probes are public.
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a valid token is never locked out"
+    );
+    // …another IP is served, and the probes are public.
     let resp = app
         .clone()
         .oneshot(from(

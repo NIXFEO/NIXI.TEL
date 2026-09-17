@@ -1303,7 +1303,8 @@ async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
     );
     assert_eq!(auth_events(&sbc), 0);
 
-    // 4. Same nonce and nc from a different request (another Contact): replay → 403 + strike
+    // 4. Same nonce and nc from a different request (another Contact): replay →
+    //    401 stale=true, no strike (only the password holder can produce it)
     let replay = request(
         rsip::SipMessage::Request(register_request(
             "alice",
@@ -1322,11 +1323,20 @@ async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
         .unwrap();
     let out = drain(&mut rx);
     assert!(
-        out[0].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        out[0].starts_with("SIP/2.0 401 Unauthorized\r\n"),
         "{}",
         out[0]
     );
-    assert_eq!(auth_events(&sbc), 1, "a replay is a strike");
+    assert!(
+        out[0].contains("stale=true"),
+        "re-challenged, never banned: {}",
+        out[0]
+    );
+    assert_eq!(
+        auth_events(&sbc),
+        0,
+        "a replay proves the password is known"
+    );
 
     // 5. Cached nonce that expired: 401 stale=true, no strike
     sbc.auth.as_ref().unwrap().backdate_nonce(&nonce, 301).await;
@@ -1350,12 +1360,12 @@ async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
         out[0]
     );
     assert!(out[0].contains("stale=true"), "{}", out[0]);
-    assert_eq!(auth_events(&sbc), 1, "a stale nonce is not a strike");
+    assert_eq!(auth_events(&sbc), 0, "a stale nonce is not a strike");
     assert_eq!(
         sbc.metrics
             .auth_stale_challenges_total
             .load(std::sync::atomic::Ordering::Relaxed),
-        1
+        2
     );
 
     // 6. Retry on the fresh challenge → 200
@@ -1395,7 +1405,7 @@ async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
         "{}",
         out[0]
     );
-    assert_eq!(auth_events(&sbc), 2);
+    assert_eq!(auth_events(&sbc), 1);
 
     // 8. Not a Digest header at all → 400, no strike
     sbc.handle_request(
@@ -1412,7 +1422,7 @@ async fn register_digest_stale_nonce_is_rechallenged_and_replays_are_refused() {
         "{}",
         out[0]
     );
-    assert_eq!(auth_events(&sbc), 2);
+    assert_eq!(auth_events(&sbc), 1);
 }
 
 fn identity_events(sbc: &Sbc) -> Vec<(String, String, String)> {
@@ -1525,7 +1535,10 @@ async fn register_for_another_users_aor_is_forbidden() {
     );
     assert_eq!(strike_count(&sbc), 0, "a valid credential is never banned");
 
-    // Own user on a foreign domain: refused too
+    // Own user on a foreign domain: reported but allowed until the
+    // operator lists served_domains (phones registered against a LAN IP or
+    // a DNS alias keep working after an upgrade)
+    let events_before = identity_events(&sbc).len();
     sbc.handle_request(
         register_request_for("alice", "sip:alice@evil.example", REALM, 3, ""),
         local_addr(),
@@ -1549,6 +1562,42 @@ async fn register_for_another_users_aor_is_forbidden() {
     )
     .await
     .unwrap();
+    assert!(drain(&mut rx)[0].starts_with("SIP/2.0 200 OK"));
+    assert_eq!(identity_events(&sbc).len(), events_before + 1, "reported");
+
+    // With served_domains configured, a foreign host is refused
+    let mut closed = SbcBuilder::new()
+        .digest_users(REALM, &[("alice", "s3cret")])
+        .identity_policy(IdentityPolicy {
+            served_domains: vec!["sip.example.com".into()],
+            ..IdentityPolicy::default()
+        })
+        .build();
+    closed
+        .handle_request(
+            register_request_for("alice", "sip:alice@evil.example", REALM, 1, ""),
+            local_addr(),
+            rsip::Transport::Udp,
+            Some(&tx),
+        )
+        .await
+        .unwrap();
+    let nonce = nonce_of(&drain(&mut rx)[0]);
+    closed
+        .handle_request(
+            register_request_for(
+                "alice",
+                "sip:alice@evil.example",
+                REALM,
+                2,
+                &authorization_line("alice", REALM, "s3cret", &nonce, "00000001"),
+            ),
+            local_addr(),
+            rsip::Transport::Udp,
+            Some(&tx),
+        )
+        .await
+        .unwrap();
     assert!(drain(&mut rx)[0].starts_with("SIP/2.0 403 "));
 
     // Own user at the SBC's loopback address (Linphone-style IP AOR): fine

@@ -107,13 +107,17 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   and never counts toward fail2ban — clients that cache the challenge across
   re-REGISTERs, or reconnect after an SBC restart, were answered 403 and
   banned after a few tries. Nonce counts must advance (a replayed
-  Authorization is refused), byte-identical UDP retransmissions are
-  accepted, a non-Digest header gets 400. New counter
+  Authorization is re-challenged, not banned: only the password holder can
+  produce one), byte-identical UDP retransmissions are accepted, a
+  non-Digest header gets 400. An unknown user is verified against a dummy
+  HA1 and answered like a known one on a nonce the SBC did not issue (no
+  username oracle, no strike from a forged nonce). New counter
   `sbc_auth_stale_challenges_total`.
 - Identity binding (RFC 3261 §10.3 step 5, §22.3). A REGISTER authenticated
   as alice could bind, or wipe (`Contact: *`), any AOR; an INVITE's From was
   trusted whatever the source. Now: the authenticated user may only bind its
-  own AOR on a served domain (`register_aor_check`, `served_domains`); an
+  own AOR (`register_aor_check`); the AOR host is refused only once
+  `served_domains` is configured, reported otherwise; an
   INVITE from a registered phone must carry one of that phone's identities;
   an unregistered source claiming a local user is challenged with 407 and
   admitted only with the right password; a source that is none of trunk,
@@ -144,7 +148,9 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `[management] trusted_proxies` (loopback by default) — any client could
   shift rate limits and audit lines onto another address; `429` carries
   `Retry-After`; failed bearer-token checks strike the client's IP in
-  fail2ban (`ban_on_auth_failure`) and a banned IP is refused by the API.
+  fail2ban (`ban_on_auth_failure`); unauthenticated requests from a banned
+  IP get 403 while a valid token is always served (the API is the tool
+  that lifts bans).
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

@@ -332,17 +332,19 @@ impl AuthFailure {
         }
     }
 
-    /// Re-challenge with `stale=true` instead of rejecting.
+    /// Re-challenge with `stale=true` instead of rejecting. A replay is
+    /// re-challenged too: only someone who knows the password can produce
+    /// it, so it is never a brute force — and a legitimate client that
+    /// resends an accepted Authorization from a new port (TCP reconnect,
+    /// NAT rebinding) or keeps nc=00000001 must not be banned.
     pub fn is_stale(&self) -> bool {
-        matches!(self, Self::StaleNonce { .. })
+        matches!(self, Self::StaleNonce { .. } | Self::Replay { .. })
     }
 
-    /// Counts toward the fail2ban window.
+    /// Counts toward the fail2ban window: a wrong password or an unknown
+    /// user on a nonce we issued (never on a forged one).
     pub fn is_attack(&self) -> bool {
-        matches!(
-            self,
-            Self::Replay { .. } | Self::BadCredentials { .. } | Self::UnknownUser { .. }
-        )
+        matches!(self, Self::BadCredentials { .. } | Self::UnknownUser { .. })
     }
 }
 
@@ -377,6 +379,11 @@ pub struct DigestAuthenticator {
 
 /// Upper bound on outstanding nonces (see `generate_challenge`).
 pub const MAX_NONCES: usize = 100_000;
+
+/// HA1 used to verify a digest for a user that does not exist, so the
+/// computation (and the outcome on a foreign nonce) never reveals whether
+/// the user exists.
+const DUMMY_HA1: &str = "00000000000000000000000000000000";
 
 impl DigestAuthenticator {
     /// Create with realm and a map of username → plain password
@@ -509,39 +516,43 @@ impl DigestAuthenticator {
 
         // Digest first: the nonce state decides between "stale" and "wrong
         // password" only once we know whether the credentials were right.
-        let ha1 = {
-            let users = self.users.read().await;
-            users
-                .get(&user)
-                .cloned()
-                .ok_or_else(|| AuthFailure::UnknownUser { user: user.clone() })?
-        };
+        // An unknown user is computed against a dummy HA1 so the work (and
+        // the answer on a nonce that is not ours) is the same as for a
+        // known one: no username oracle.
+        let ha1: Option<String> = self.users.read().await.get(&user).cloned();
         let ha2 = compute_ha2(method, &creds.uri);
         let qop_auth = creds.qop.as_deref() == Some("auth");
+        let ha1_for_digest = ha1.as_deref().unwrap_or(DUMMY_HA1);
         let expected = if qop_auth {
             let nc = creds.nc.as_deref().unwrap_or("00000001");
             let cnonce = creds.cnonce.as_deref().unwrap_or("");
-            compute_response_auth(&ha1, &creds.nonce, nc, cnonce, &ha2)
+            compute_response_auth(ha1_for_digest, &creds.nonce, nc, cnonce, &ha2)
         } else {
-            compute_response(&ha1, &creds.nonce, &ha2)
+            compute_response(ha1_for_digest, &creds.nonce, &ha2)
         };
-        let digest_ok = expected == creds.response;
+        let digest_ok = ha1.is_some() && expected == creds.response;
 
         let mut nonces = self.nonces.lock().await;
         let now = Self::now_secs();
         let Some(record) = nonces.get_mut(&creds.nonce) else {
             // Not ours (restart, a cached challenge from long ago, or a
-            // made-up nonce): re-challenge. Same answer whatever the digest,
-            // so a forged nonce cannot be used to test passwords.
+            // made-up nonce): re-challenge. Same answer whatever the digest
+            // or the user, so a forged nonce tests neither passwords nor
+            // usernames, and strikes nobody from a spoofed source.
             return Err(AuthFailure::StaleNonce { user });
         };
         if now.saturating_sub(record.created_at) > self.nonce_ttl {
             nonces.remove(&creds.nonce);
             return Err(if digest_ok {
                 AuthFailure::StaleNonce { user }
+            } else if ha1.is_none() {
+                AuthFailure::UnknownUser { user }
             } else {
                 AuthFailure::BadCredentials { user }
             });
+        }
+        if ha1.is_none() {
+            return Err(AuthFailure::UnknownUser { user });
         }
         if !digest_ok {
             return Err(AuthFailure::BadCredentials { user });
@@ -822,6 +833,26 @@ mod tests {
         let challenge = auth.generate_challenge_with(true).await;
         assert!(challenge.ends_with(", stale=true"), "{}", challenge);
         assert!(!auth.generate_challenge().await.contains("stale"));
+
+        // No username oracle: an unknown user on a forged nonce gets the
+        // same answer as a known one, and never a strike.
+        let header = qop_header("nobody-here", "nobody", "pw", "00000001", "c1");
+        let forged = header.replace("nonce=\"nobody-here\"", "nonce=\"forged\"");
+        assert_eq!(
+            auth.verify(&forged, "REGISTER").await,
+            Err(AuthFailure::StaleNonce {
+                user: "nobody".into()
+            })
+        );
+        // …but on a nonce we issued it is an unknown user (a strike).
+        let nonce = nonce_of(&auth.generate_challenge().await);
+        let header = qop_header(&nonce, "nobody", "pw", "00000001", "c1");
+        assert_eq!(
+            auth.verify(&header, "REGISTER").await,
+            Err(AuthFailure::UnknownUser {
+                user: "nobody".into()
+            })
+        );
     }
 
     #[tokio::test]
@@ -864,7 +895,12 @@ mod tests {
             Err(AuthFailure::StaleNonce { .. })
         ));
         assert!(!AuthFailure::StaleNonce { user: "a".into() }.is_attack());
-        assert!(AuthFailure::Replay { user: "a".into() }.is_attack());
+        assert!(
+            !AuthFailure::Replay { user: "a".into() }.is_attack(),
+            "a replay proves the password is known: re-challenge, never ban"
+        );
+        assert!(AuthFailure::Replay { user: "a".into() }.is_stale());
+        assert!(AuthFailure::BadCredentials { user: "a".into() }.is_attack());
         assert!(matches!(
             auth.verify("garbage", "REGISTER").await,
             Err(AuthFailure::Malformed)

@@ -234,13 +234,17 @@ pub struct SecurityConfig {
     pub enable_digest_auth: bool,
 
     /// REGISTER authorization (RFC 3261 §10.3 step 5): the authenticated
-    /// user may only bind its own AOR on a served domain. `enforce` answers
-    /// 403 on a mismatch, `log` only reports it (upgrade fallback).
+    /// user may only bind its own AOR. `enforce` answers 403 on a user
+    /// mismatch, `log` only reports it (upgrade fallback). The AOR host is
+    /// checked too, but refused only once `served_domains` is set: until
+    /// then a foreign host is reported (phones registered against a LAN IP
+    /// or a DNS alias keep working).
     #[serde(default = "default_register_aor_check")]
     pub register_aor_check: String,
 
     /// Extra hosts accepted as the domain of an AOR or a local From, besides
-    /// `sip_realm`, the SBC domain, its public IP and loopback.
+    /// `sip_realm`, the SBC domain, its public IP and loopback. Setting it
+    /// turns the AOR host check of `register_aor_check` into a refusal.
     #[serde(default)]
     pub served_domains: Vec<String>,
 

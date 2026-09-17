@@ -105,9 +105,21 @@ impl std::fmt::Display for AorRejection {
     }
 }
 
+/// The addr-spec of a name-addr or addr-spec header value: what is
+/// between the LAST `<` and the following `>` (a quoted display name may
+/// contain anything, including `<`, `@` or `;`), else the value up to its
+/// first header parameter.
+pub(crate) fn addr_spec(value: &str) -> &str {
+    let s = value.trim();
+    match (s.rfind('<'), s.rfind('>')) {
+        (Some(a), Some(b)) if a < b => s[a + 1..b].trim(),
+        _ => s.split(';').next().unwrap_or(s).trim(),
+    }
+}
+
 /// User part of a SIP URI ("sip:alice@h;p" → "alice"), None without one.
 pub(crate) fn uri_user(uri: &str) -> Option<String> {
-    let s = uri.trim().trim_start_matches('<');
+    let s = addr_spec(uri);
     let s = s
         .strip_prefix("sips:")
         .or_else(|| s.strip_prefix("sip:"))
@@ -119,7 +131,7 @@ pub(crate) fn uri_user(uri: &str) -> Option<String> {
 
 /// Host of a SIP URI, lowercased, without port, params or brackets.
 pub(crate) fn uri_host(uri: &str) -> Option<String> {
-    let s = uri.trim().trim_start_matches('<');
+    let s = addr_spec(uri);
     let s = s
         .strip_prefix("sips:")
         .or_else(|| s.strip_prefix("sip:"))
@@ -1741,7 +1753,18 @@ impl Sbc {
                         method: "REGISTER".to_string(),
                         ts: crate::events::event_ts(),
                     });
-                if self.identity_policy.enforce_register_aor {
+                // The user half is always enforced under "enforce". The
+                // domain half only once the operator listed served_domains:
+                // phones registered against a LAN IP or a DNS alias must
+                // keep working after an upgrade (reported, not refused).
+                let enforce = match &why {
+                    AorRejection::User(_) => self.identity_policy.enforce_register_aor,
+                    AorRejection::Domain(_) => {
+                        self.identity_policy.enforce_register_aor
+                            && !self.identity_policy.served_domains.is_empty()
+                    }
+                };
+                if enforce {
                     warn!(
                         "REGISTER from {} authenticated as '{}' for {} refused: {}",
                         source.ip(),
@@ -1762,7 +1785,7 @@ impl Sbc {
                     return Ok(());
                 }
                 warn!(
-                    "REGISTER from {} authenticated as '{}' for {}: {} (register_aor_check = log, allowed)",
+                    "REGISTER from {} authenticated as '{}' for {}: {} (reported, allowed: register_aor_check = log or no served_domains configured)",
                     source.ip(),
                     user,
                     aor,
@@ -1942,13 +1965,22 @@ impl Sbc {
         failure: crate::auth::AuthFailure,
     ) -> Result<()> {
         use crate::auth::AuthFailure;
+        let replayed = matches!(failure, AuthFailure::Replay { .. });
         match failure {
-            AuthFailure::StaleNonce { user } => {
-                debug!(
-                    "REGISTER from {} (user {}): stale nonce — re-challenging with stale=true",
-                    source.ip(),
-                    user
-                );
+            AuthFailure::StaleNonce { user } | AuthFailure::Replay { user } => {
+                if replayed {
+                    warn!(
+                        "REGISTER from {} (user {}): replayed Authorization (same nonce and nc from another request) — re-challenging",
+                        source.ip(),
+                        user
+                    );
+                } else {
+                    debug!(
+                        "REGISTER from {} (user {}): stale nonce — re-challenging with stale=true",
+                        source.ip(),
+                        user
+                    );
+                }
                 self.metrics.inc_auth_challenge();
                 self.metrics.inc_auth_stale_challenge();
                 self.metrics.inc_sip_response(401);
@@ -2932,6 +2964,22 @@ mod identity_tests {
             uri_user("sip:alice@sip.example.com").as_deref(),
             Some("alice")
         );
+        assert_eq!(
+            uri_user("\"Bob\" <sip:bob@sip.example.com>;tag=1").as_deref(),
+            Some("bob"),
+            "display names are not the user"
+        );
+        assert_eq!(
+            uri_host("\"x@evil.example\" <sip:alice@sip.example.com>;tag=1").as_deref(),
+            Some("sip.example.com"),
+            "an @ in the display name does not fool the host"
+        );
+        assert_eq!(
+            uri_host("\"<x>\" <sip:alice@h>").as_deref(),
+            Some("h"),
+            "a < inside the display name: the last <…> wins"
+        );
+        assert_eq!(uri_user("<sip:alice@h>").as_deref(), Some("alice"));
         assert_eq!(
             uri_user("<sips:Alice@h:5061;transport=tls>").as_deref(),
             Some("Alice")

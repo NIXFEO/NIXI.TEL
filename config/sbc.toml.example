@@ -73,7 +73,7 @@ enable_digest_auth = true
 # local user as From is flagged and relayed unattributed ("allow") or
 # refused ("reject").
 register_aor_check = "enforce"
-served_domains = []            # extra AOR hosts besides sip_realm / public IP
+served_domains = []            # when set, AOR hosts are restricted to these (+ realm/public IP); empty = foreign hosts only reported
 trunk_local_from = "allow"
 
 # Call guards
