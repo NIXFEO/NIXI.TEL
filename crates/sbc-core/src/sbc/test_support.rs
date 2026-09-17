@@ -200,9 +200,16 @@ fn caller_request(
     ))
 }
 
-/// The caller's ACK to the relayed 200 OK (same CSeq as its INVITE).
+/// The caller's ACK to the relayed 200 OK (same CSeq as its INVITE, its
+/// own transaction: fresh branch, RFC 3261 §17.1.1.3).
 pub(crate) fn ack_from_caller(spec: &CallSpec) -> rsip::Request {
     caller_request(spec, "ACK", spec.cseq, "z9hG4bKack", "", "")
+}
+
+/// The caller's ACK to a non-2xx final: same branch as its INVITE (hop by
+/// hop, part of the INVITE transaction).
+pub(crate) fn ack_for_final_from_caller(spec: &CallSpec) -> rsip::Request {
+    caller_request(spec, "ACK", spec.cseq, "z9hG4bKcaller", "", "")
 }
 
 /// BYE from the caller.
@@ -692,6 +699,12 @@ pub(crate) async fn add_call(sbc: &mut Sbc, spec: CallSpec) -> TestCall {
             Some(trunk_id),
         )
         .await;
+    // The caller's INVITE transaction, as handle_invite registers it: finals
+    // toward the caller are then remembered (absorb) and retransmitted (Timer G).
+    let _ = sbc.invite_tx.begin(&format!(
+        "z9hG4bKcaller|{}|{}|{}",
+        spec.call_id, spec.from_tag, spec.cseq
+    ));
     TestCall {
         spec,
         uuid,

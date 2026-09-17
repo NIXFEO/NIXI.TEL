@@ -73,6 +73,13 @@ impl Sbc {
 
         info!("Received ACK from {} (Call-ID: {})", source, call_id);
 
+        // The ACK to one of OUR non-2xx finals ends its retransmissions
+        // (RFC 3261 §17.2.1 Timer G/H); a 2xx ACK shares the key too and is
+        // harmless there.
+        if let Some(key) = super::invite_tx::InviteTxCache::key_of_request(&request) {
+            self.invite_tx.acked(&key);
+        }
+
         // Try exact match first, then suffix match (some trunks add prefixes to Call-ID
         // in INVITE but send ACK with original shorter Call-ID)
         let maybe_uuid = if let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await {
@@ -662,12 +669,18 @@ impl Sbc {
                                 .and_then(|a| crate::sip_builder::build_cancel(&a.raw))
                         })
                     } else {
-                        c.dialog_info_toward_caller(&sbc_ip, sbc_port).map(|d| {
-                            crate::sip_builder::build_bye(
-                                &d,
-                                Some("SIP;cause=200;text=\"ws-closed\""),
-                            )
-                        })
+                        // Callee's WS died: BYE an answered caller, or give a
+                        // still-ringing caller a final for its INVITE.
+                        c.dialog_info_toward_caller(&sbc_ip, sbc_port)
+                            .map(|d| {
+                                crate::sip_builder::build_bye(
+                                    &d,
+                                    Some("SIP;cause=200;text=\"ws-closed\""),
+                                )
+                            })
+                            .or_else(|| {
+                                c.final_toward_caller(480, Some("SIP;cause=200;text=\"ws-closed\""))
+                            })
                     };
                     let (dest, tp, tx) = if caller_died {
                         (c.callee_dest, c.callee_transport, c.callee_reply_tx.clone())
@@ -678,23 +691,30 @@ impl Sbc {
                             c.caller_reply_tx.clone(),
                         )
                     };
-                    (c.uuid.clone(), bye, dest, tp, tx)
+                    (c.uuid.clone(), bye, dest, tp, tx, !caller_died)
                 })
                 .collect()
         };
 
-        for (uuid, bye, dest, tp, tx) in affected {
+        for (uuid, bye, dest, tp, tx, callee_died) in affected {
             warn!(
                 "WS closed mid-call: terminating call {} (peer {})",
                 &uuid[..8.min(uuid.len())],
                 peer
             );
 
-            if let (Some(bye), Some(dest)) = (bye, dest) {
-                self.send_sip("ws-close BYE", bye.as_bytes(), dest, tp, tx.as_ref())
-                    .await;
+            if let (Some(msg), Some(dest)) = (bye, dest) {
+                self.send_sip(
+                    "ws-close → surviving leg",
+                    msg.as_bytes(),
+                    dest,
+                    tp,
+                    tx.as_ref(),
+                )
+                .await;
             }
-            self.finish_call(&uuid, CallOutcome::WsClosed).await;
+            self.finish_call(&uuid, CallOutcome::WsClosed { callee_died })
+                .await;
         }
     }
 
@@ -843,6 +863,18 @@ impl Sbc {
 
         if let Some((uuid, is_from_caller)) = found {
             let raw_info = rsip::SipMessage::Request(request.clone()).to_string();
+            // The relayed INFO keeps its CSeq: the SBC's own later requests
+            // on that leg must stay above it (RFC 3261 §12.2.1.1).
+            if let Some(cseq) = request
+                .cseq_header()
+                .ok()
+                .and_then(|h| h.typed().ok())
+                .map(|c: rsip::typed::CSeq| c.seq)
+            {
+                self.b2bua
+                    .note_relayed_cseq(&uuid, is_from_caller, cseq)
+                    .await;
+            }
             if is_from_caller {
                 if let Some((tx, dest, tp)) = self.b2bua.get_callee_reply_info(&uuid).await {
                     info!("B2BUA: relaying INFO (caller→callee) to {}", dest);
@@ -932,6 +964,16 @@ impl Sbc {
         }
 
         let (uuid, is_from_caller) = found.unwrap();
+        if let Some(cseq) = request
+            .cseq_header()
+            .ok()
+            .and_then(|h| h.typed().ok())
+            .map(|c: rsip::typed::CSeq| c.seq)
+        {
+            self.b2bua
+                .note_relayed_cseq(&uuid, is_from_caller, cseq)
+                .await;
+        }
 
         // Send 202 Accepted (RFC 3515 §2.4.2)
         self.metrics.inc_sip_response(202);

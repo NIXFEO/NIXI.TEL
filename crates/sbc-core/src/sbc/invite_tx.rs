@@ -11,8 +11,10 @@
 use crate::topology::RawSipMessage;
 use rsip::prelude::*;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// How long a completed transaction keeps replaying its final.
 pub const FINAL_ABSORB: Duration = Duration::from_secs(32);
@@ -20,11 +22,29 @@ pub const FINAL_ABSORB: Duration = Duration::from_secs(32);
 pub const PENDING_ABSORB: Duration = Duration::from_secs(180);
 /// Hard cap: an INVITE flood cannot outrun the sweeper.
 pub const MAX_ENTRIES: usize = 10_000;
+/// RFC 3261 §17.2.1 Timer G: first retransmission of a non-2xx final over
+/// UDP, then doubling up to T2.
+pub const TIMER_T1: Duration = Duration::from_millis(500);
+pub const TIMER_T2: Duration = Duration::from_secs(4);
+/// Retransmissions before giving up (≈ Timer H = 32 s: 0.5+1+2+4×6).
+pub const MAX_RETRANSMITS: u32 = 9;
+
+/// A non-2xx final the SBC generated over UDP: resent until the ACK.
+struct Retransmit {
+    dest: SocketAddr,
+    transport: rsip::Transport,
+    reply_tx: Option<UnboundedSender<Vec<u8>>>,
+    next_at: Instant,
+    interval: Duration,
+    sent: u32,
+}
 
 struct TxEntry {
     last_response: Option<Vec<u8>>,
     first_seen: Instant,
     final_at: Option<Instant>,
+    acked: bool,
+    retransmit: Option<Retransmit>,
 }
 
 #[derive(Default)]
@@ -79,8 +99,8 @@ impl InviteTxCache {
     }
 
     /// Transaction key of an outgoing response, when it answers an INVITE:
-    /// (key, is_final). None for provisional-less garbage or other methods.
-    pub(crate) fn key_of_response(raw: &str) -> Option<(String, bool)> {
+    /// (key, status). None for garbage or other methods.
+    pub(crate) fn key_of_response(raw: &str) -> Option<(String, u16)> {
         if !raw.starts_with("SIP/2.0 ") {
             return None;
         }
@@ -101,7 +121,7 @@ impl InviteTxCache {
             .and_then(|f| param_of(&f, "tag"))
             .unwrap_or_default();
         let status: u16 = raw.split_whitespace().nth(1)?.parse().ok()?;
-        Some((key(&branch, &call_id, &from_tag, &cseq), status >= 200))
+        Some((key(&branch, &call_id, &from_tag, &cseq), status))
     }
 
     /// Register a transaction. `Err(last)` means it is already known
@@ -129,21 +149,104 @@ impl InviteTxCache {
                 last_response: None,
                 first_seen: Instant::now(),
                 final_at: None,
+                acked: false,
+                retransmit: None,
             },
         );
         Ok(())
     }
 
     /// Remember the last response sent for a transaction (called for
-    /// every INVITE response the SBC emits).
-    pub(crate) fn record(&self, key: &str, response: &[u8], is_final: bool) {
+    /// every INVITE response the SBC emits). A non-2xx final over UDP is
+    /// also armed for Timer G retransmission until its ACK (the UAC stops
+    /// retransmitting the INVITE once it has our 100 Trying, so the absorb
+    /// path alone cannot recover a lost final).
+    pub(crate) fn record_sent(
+        &self,
+        key: &str,
+        response: &[u8],
+        status: u16,
+        dest: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<UnboundedSender<Vec<u8>>>,
+    ) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = entries.get_mut(key) {
             e.last_response = Some(response.to_vec());
-            if is_final && e.final_at.is_none() {
+            if status >= 200 && e.final_at.is_none() {
                 e.final_at = Some(Instant::now());
             }
+            if status >= 300
+                && transport == rsip::Transport::Udp
+                && !e.acked
+                && e.retransmit.is_none()
+            {
+                e.retransmit = Some(Retransmit {
+                    dest,
+                    transport,
+                    reply_tx,
+                    next_at: Instant::now() + TIMER_T1,
+                    interval: TIMER_T1,
+                    sent: 0,
+                });
+            }
         }
+    }
+
+    /// The ACK for a transaction's final arrived: stop retransmitting.
+    pub(crate) fn acked(&self, key: &str) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = entries.get_mut(key) {
+            e.acked = true;
+            e.retransmit = None;
+        }
+    }
+
+    /// Finals whose Timer G fired: (bytes, dest, transport, channel).
+    /// Each returned entry is rescheduled (interval doubling up to T2);
+    /// after `MAX_RETRANSMITS` the entry gives up (Timer H).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn due_retransmissions(
+        &self,
+        now: Instant,
+    ) -> Vec<(
+        Vec<u8>,
+        SocketAddr,
+        rsip::Transport,
+        Option<UnboundedSender<Vec<u8>>>,
+    )> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for e in entries.values_mut() {
+            let Some(r) = e.retransmit.as_mut() else {
+                continue;
+            };
+            if r.next_at > now {
+                continue;
+            }
+            if r.sent >= MAX_RETRANSMITS {
+                e.retransmit = None;
+                continue;
+            }
+            if let Some(data) = &e.last_response {
+                out.push((data.clone(), r.dest, r.transport, r.reply_tx.clone()));
+            }
+            r.sent += 1;
+            r.interval = (r.interval * 2).min(TIMER_T2);
+            r.next_at = now + r.interval;
+        }
+        out
+    }
+
+    /// Finals still awaiting their ACK.
+    #[cfg(test)]
+    pub(crate) fn pending_retransmissions(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|e| e.retransmit.is_some())
+            .count()
     }
 
     /// Drop transactions past their absorb window. Returns how many.
@@ -184,13 +287,13 @@ mod tests {
     #[test]
     fn request_and_response_share_the_transaction_key() {
         let k = InviteTxCache::key_of_request(&req(INVITE)).unwrap();
-        let (rk, is_final) = InviteTxCache::key_of_response(RESP).unwrap();
+        let (rk, status) = InviteTxCache::key_of_response(RESP).unwrap();
         assert_eq!(k, rk);
-        assert!(is_final);
+        assert_eq!(status, 486);
         assert_eq!(k, "z9hG4bKabc|c1|t1|7");
         let (_, provisional) =
             InviteTxCache::key_of_response(&RESP.replace("486 Busy Here", "100 Trying")).unwrap();
-        assert!(!provisional);
+        assert_eq!(provisional, 100);
         assert!(
             InviteTxCache::key_of_response(&RESP.replace("7 INVITE", "7 BYE")).is_none(),
             "only INVITE responses are remembered"
@@ -201,18 +304,31 @@ mod tests {
     fn retransmissions_replay_the_last_response_then_expire() {
         let cache = InviteTxCache::new();
         let k = InviteTxCache::key_of_request(&req(INVITE)).unwrap();
+        let dest: SocketAddr = "10.0.0.9:5060".parse().unwrap();
         assert!(cache.begin(&k).is_ok(), "first copy is new");
         assert_eq!(
             cache.begin(&k),
             Err(None),
             "retransmitted before any response"
         );
-        cache.record(&k, b"SIP/2.0 100 Trying\r\n\r\n", false);
+        cache.record_sent(
+            &k,
+            b"SIP/2.0 100 Trying\r\n\r\n",
+            100,
+            dest,
+            rsip::Transport::Udp,
+            None,
+        );
         assert_eq!(
             cache.begin(&k),
             Err(Some(b"SIP/2.0 100 Trying\r\n\r\n".to_vec()))
         );
-        cache.record(&k, RESP.as_bytes(), true);
+        assert_eq!(
+            cache.pending_retransmissions(),
+            0,
+            "provisionals are not retransmitted"
+        );
+        cache.record_sent(&k, RESP.as_bytes(), 486, dest, rsip::Transport::Udp, None);
         assert_eq!(cache.begin(&k), Err(Some(RESP.as_bytes().to_vec())));
         assert_eq!(cache.prune_at(Instant::now() + Duration::from_secs(10)), 0);
         assert_eq!(
@@ -242,5 +358,72 @@ mod tests {
             cache.begin(&format!("k{}", n)).unwrap();
         }
         assert_eq!(cache.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn non_2xx_finals_over_udp_are_retransmitted_until_acked() {
+        let cache = InviteTxCache::new();
+        let dest: SocketAddr = "10.0.0.9:5060".parse().unwrap();
+        let t0 = Instant::now();
+        cache.begin("tx").unwrap();
+        cache.record_sent("tx", RESP.as_bytes(), 486, dest, rsip::Transport::Udp, None);
+        assert_eq!(cache.pending_retransmissions(), 1);
+        assert!(cache.due_retransmissions(t0).is_empty(), "not before T1");
+        let due = cache.due_retransmissions(t0 + Duration::from_millis(600));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, RESP.as_bytes());
+        assert_eq!(due[0].1, dest);
+        assert!(
+            cache
+                .due_retransmissions(t0 + Duration::from_millis(900))
+                .is_empty(),
+            "interval doubled to 1 s"
+        );
+        assert_eq!(
+            cache
+                .due_retransmissions(t0 + Duration::from_millis(1700))
+                .len(),
+            1
+        );
+        cache.acked("tx");
+        assert_eq!(cache.pending_retransmissions(), 0);
+        assert!(cache
+            .due_retransmissions(t0 + Duration::from_secs(60))
+            .is_empty());
+
+        // A second record of the same final does not re-arm after the ACK.
+        cache.record_sent("tx", RESP.as_bytes(), 486, dest, rsip::Transport::Udp, None);
+        assert_eq!(cache.pending_retransmissions(), 0);
+
+        // Reliable transports are never retransmitted (Timer G is UDP only).
+        cache.begin("tcp").unwrap();
+        cache.record_sent(
+            "tcp",
+            RESP.as_bytes(),
+            486,
+            dest,
+            rsip::Transport::Tcp,
+            None,
+        );
+        assert_eq!(cache.pending_retransmissions(), 0);
+
+        // Timer H: give up after MAX_RETRANSMITS.
+        cache.begin("lost").unwrap();
+        cache.record_sent(
+            "lost",
+            RESP.as_bytes(),
+            487,
+            dest,
+            rsip::Transport::Udp,
+            None,
+        );
+        let mut now = t0;
+        let mut sent = 0;
+        for _ in 0..40 {
+            now += Duration::from_secs(4);
+            sent += cache.due_retransmissions(now).len();
+        }
+        assert_eq!(sent, MAX_RETRANSMITS as usize);
+        assert_eq!(cache.pending_retransmissions(), 0);
     }
 }

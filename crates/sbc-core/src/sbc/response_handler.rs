@@ -175,6 +175,7 @@ impl Sbc {
                     // (100 Trying only proves the hop is alive — timer keeps running.)
                     if status >= 180 {
                         self.b2bua.mark_provisional_received(&uuid).await;
+                        self.b2bua.mark_alerting(&uuid).await;
                     }
                     let _ = self.b2bua.handle_ringing(&uuid).await;
                     info!("B2BUA: relaying {} to caller", status);

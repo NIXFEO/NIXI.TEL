@@ -306,9 +306,13 @@ async fn cancel_targets_the_live_invite_attempt_and_releases_the_call() {
     assert_eq!(cdrs[0].billable_secs, 0);
     assert_eq!(cdrs[0].hangup_by, "caller");
 
-    // The caller's ACK to the 487 is absorbed: nothing forwarded anywhere.
+    // Our 487 went over UDP: it is retransmitted (Timer G) until the ACK.
+    assert_eq!(sbc.invite_tx.pending_retransmissions(), 1);
+
+    // The caller's ACK to the 487 is absorbed: nothing forwarded anywhere,
+    // and the retransmissions stop.
     sbc.handle_ack(
-        ack_from_caller(&call.spec),
+        ack_for_final_from_caller(&call.spec),
         caller_addr(),
         rsip::Transport::Udp,
         Some(&call.caller_tx),
@@ -317,6 +321,7 @@ async fn cancel_targets_the_live_invite_attempt_and_releases_the_call() {
     .unwrap();
     assert!(drain(&mut call.caller_rx).is_empty());
     assert!(drain(&mut call.callee_rx).is_empty());
+    assert_eq!(sbc.invite_tx.pending_retransmissions(), 0, "ACKed");
 }
 
 /// RFC 3261 §9.2: a CANCEL that crosses the 200 OK has no effect on the
@@ -860,6 +865,24 @@ async fn unanswered_invite_is_bounded_by_the_setup_timeout() {
     connect(&mut sbc, &mut call).await;
     sbc.check_setup_timeouts().await;
     assert!(alive(&sbc).await);
+    assert!(drain(&mut call.caller_rx).is_empty());
+    assert!(drain(&mut call.callee_rx).is_empty());
+
+    // A ringing callee (180 relayed) is bounded by Timer C (3 min), not by
+    // the setup timeout: a long ring is not a silent trunk.
+    let mut sbc = SbcBuilder::new().setup_timeout(Duration::ZERO).build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    sbc.handle_response(
+        response("180 Ringing", "z9hG4bKaaa", 3, "INVITE", ""),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut call.caller_rx)[0].starts_with("SIP/2.0 180 Ringing"));
+    sbc.check_setup_timeouts().await;
+    assert!(alive(&sbc).await, "still ringing within Timer C");
     assert!(drain(&mut call.caller_rx).is_empty());
     assert!(drain(&mut call.callee_rx).is_empty());
 }
@@ -1884,7 +1907,7 @@ async fn local_users_asserted_identity_headers_never_reach_the_trunk() {
             "alice",
             REALM,
             "+33612345678",
-            "P-Asserted-Identity: <sip:+33100000000@sip.example.com>\r\nP-Preferred-Identity: <sip:ceo@sip.example.com>\r\nRemote-Party-ID: <sip:boss@sip.example.com>;party=calling\r\n",
+            "P-Asserted-Identity: <sip:+33100000000@sip.example.com>\r\nP-Preferred-Identity: <sip:ceo@sip.example.com>\r\nRemote-Party-ID: <sip:boss@sip.example.com>;party=calling\r\nProxy-Authorization: Digest username=\"alice\", realm=\"sip.example.com\", nonce=\"n\", uri=\"sip:x\", response=\"00\"\r\n",
         ),
         phone,
         rsip::Transport::Udp,
@@ -1906,8 +1929,72 @@ async fn local_users_asserted_identity_headers_never_reach_the_trunk() {
     assert!(!invite.contains("P-Preferred-Identity"), "{}", invite);
     assert!(!invite.contains("Remote-Party-ID"), "{}", invite);
     assert!(
+        !invite.to_lowercase().contains("authorization"),
+        "the user's Digest never travels to the carrier: {}",
+        invite
+    );
+    assert!(
         invite.contains("From: <sip:alice@sip.example.com>;tag=alice-tag\r\n"),
         "the verified From is what the trunk sees: {}",
         invite
     );
+}
+
+/// A destination the SBC itself blocks is billed as refused by the SBC on
+/// an outbound attempt, and the final reaches a retransmitted INVITE.
+#[tokio::test]
+async fn blocked_destination_is_refused_by_the_sbc_and_billed_outbound() {
+    let mut sbc = SbcBuilder::new().build();
+    sbc.security
+        .destinations
+        .add_rule(crate::security::DestinationRule {
+            id: "t-premium".into(),
+            prefix: "+33899".into(),
+            deny: true,
+            user: None,
+            description: "premium".into(),
+            enabled: true,
+        });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_invite(
+        invite_from_local("+33899000000", ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 2, "100 then 403: {:?}", out);
+    assert!(
+        out[1].starts_with("SIP/2.0 403 Forbidden\r\n"),
+        "{}",
+        out[1]
+    );
+    let cdrs = sbc.cdr.get_recent(10).await.unwrap();
+    assert_eq!(cdrs.len(), 1);
+    assert_eq!(cdrs[0].disconnect_reason, "rejected-403");
+    assert_eq!(
+        cdrs[0].hangup_by, "sbc",
+        "the SBC refused it, not the far end"
+    );
+    assert_eq!(
+        cdrs[0].direction, "outbound",
+        "known before any trunk was picked"
+    );
+    assert_eq!(cdrs[0].sip_code, Some(403));
+
+    // The same INVITE again (lost 403) gets the 403 again, not a new call.
+    sbc.handle_invite(
+        invite_from_local("+33899000000", ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let again = drain(&mut rx);
+    assert_eq!(again.len(), 1, "{:?}", again);
+    assert!(again[0].starts_with("SIP/2.0 403 "));
+    assert_eq!(sbc.cdr.get_recent(10).await.unwrap().len(), 1);
 }

@@ -1407,6 +1407,10 @@ impl Sbc {
         // with no >=180 provisional, CANCEL and try the next candidate trunk.
         let mut failover_interval = tokio::time::interval(Duration::from_secs(1));
         failover_interval.tick().await;
+        // ── Timer G tick (500 ms): non-2xx finals we generated over UDP are
+        // resent until their ACK (RFC 3261 §17.2.1).
+        let mut retransmit_interval = tokio::time::interval(Duration::from_millis(500));
+        retransmit_interval.tick().await;
         let kicks = self.admin_kicks.clone();
 
         loop {
@@ -1440,6 +1444,9 @@ impl Sbc {
                 }
                 _ = kicks.notified() => {
                     self.process_admin_kicks().await;
+                }
+                _ = retransmit_interval.tick() => {
+                    self.retransmit_finals().await;
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration");
@@ -1998,8 +2005,15 @@ impl Sbc {
         // INVITE gets it again (RFC 3261 §17.2.1).
         if data.starts_with(b"SIP/2.0 ") {
             if let Ok(text) = std::str::from_utf8(data) {
-                if let Some((key, is_final)) = invite_tx::InviteTxCache::key_of_response(text) {
-                    self.invite_tx.record(&key, data, is_final);
+                if let Some((key, status)) = invite_tx::InviteTxCache::key_of_response(text) {
+                    self.invite_tx.record_sent(
+                        &key,
+                        data,
+                        status,
+                        dest,
+                        transport,
+                        reply_tx.cloned(),
+                    );
                 }
             }
         }

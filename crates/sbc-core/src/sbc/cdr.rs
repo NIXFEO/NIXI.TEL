@@ -20,14 +20,18 @@ pub(crate) enum CallOutcome {
     NormalClearing { by_caller: bool },
     /// CANCEL from the caller before the answer.
     Cancelled,
-    /// A final error toward the caller (relayed from the callee or generated).
+    /// A final error relayed from the callee.
     Rejected { code: u16 },
+    /// A final error the SBC generated itself (no route, unknown number,
+    /// blocked destination, unreachable contact…).
+    Refused { code: u16 },
     /// `security.max_call_duration` reached.
     MaxDuration,
     /// SIGTERM / SIGINT.
     Shutdown,
-    /// The WS/WSS connection of one leg closed.
-    WsClosed,
+    /// The WS/WSS connection of one leg closed (`callee_died`: the callee's;
+    /// a still-unanswered caller then got a 480).
+    WsClosed { callee_died: bool },
     /// `DELETE /api/v1/calls/{uuid}`.
     AdminKick,
     /// The callee no longer has the dialog (481/408 to a refresh).
@@ -43,10 +47,10 @@ impl CallOutcome {
         match self {
             Self::NormalClearing { .. } => "normal-clearing".into(),
             Self::Cancelled => "cancelled".into(),
-            Self::Rejected { code } => format!("rejected-{}", code),
+            Self::Rejected { code } | Self::Refused { code } => format!("rejected-{}", code),
             Self::MaxDuration => "timeout".into(),
             Self::Shutdown => "shutdown".into(),
-            Self::WsClosed => "ws-closed".into(),
+            Self::WsClosed { .. } => "ws-closed".into(),
             Self::AdminKick => "admin-kick".into(),
             Self::DialogLost { .. } => "dialog-lost".into(),
             Self::RtpTimeout => "rtp-timeout".into(),
@@ -63,12 +67,13 @@ impl CallOutcome {
         }
         match self {
             Self::Cancelled => Some(487),
-            Self::Rejected { code } => Some(*code),
+            Self::Rejected { code } | Self::Refused { code } => Some(*code),
             Self::SetupTimeout => Some(408),
             Self::Shutdown => Some(503),
             Self::MaxDuration | Self::AdminKick => Some(480),
+            Self::WsClosed { callee_died: true } => Some(480),
             Self::NormalClearing { .. }
-            | Self::WsClosed
+            | Self::WsClosed { callee_died: false }
             | Self::DialogLost { .. }
             | Self::RtpTimeout => None,
         }
@@ -79,14 +84,17 @@ impl CallOutcome {
         match self {
             Self::MaxDuration => Some("Q.850;cause=16;text=\"Call duration exceeded\"".into()),
             Self::Shutdown => Some("Q.850;cause=16;text=\"Server shutdown\"".into()),
-            Self::WsClosed => Some("SIP;cause=200;text=\"ws-closed\"".into()),
+            Self::WsClosed { .. } => Some("SIP;cause=200;text=\"ws-closed\"".into()),
             Self::AdminKick => Some("SIP;cause=200;text=\"Administrative teardown\"".into()),
             Self::RtpTimeout => Some("Q.850;cause=16;text=\"RTP timeout\"".into()),
             Self::SetupTimeout => Some("SIP;cause=408;text=\"No answer\"".into()),
             Self::DialogLost { status } => {
                 Some(format!("SIP;cause={};text=\"Dialog lost\"", status))
             }
-            Self::NormalClearing { .. } | Self::Cancelled | Self::Rejected { .. } => None,
+            Self::NormalClearing { .. }
+            | Self::Cancelled
+            | Self::Rejected { .. }
+            | Self::Refused { .. } => None,
         }
     }
 
@@ -96,6 +104,7 @@ impl CallOutcome {
             Self::NormalClearing { by_caller: true } | Self::Cancelled => "caller",
             Self::NormalClearing { by_caller: false } => "callee",
             Self::Rejected { .. } => "callee",
+            Self::Refused { .. } => "sbc",
             _ => "sbc",
         }
     }
@@ -125,6 +134,9 @@ impl Sbc {
         })
     }
 }
+
+/// RFC 3261 §16.6 Timer C: how long an alerting callee may ring.
+pub(crate) const TIMER_C: Duration = Duration::from_secs(180);
 
 /// Status code of a raw response ("SIP/2.0 486 Busy Here" → 486).
 pub(crate) fn status_code_of(raw: &str) -> Option<u16> {
@@ -321,6 +333,26 @@ impl Sbc {
 }
 
 impl Sbc {
+    /// Timer G: resend the non-2xx finals whose ACK has not arrived.
+    pub(crate) async fn retransmit_finals(&self) {
+        for (data, dest, transport, reply_tx) in self
+            .invite_tx
+            .due_retransmissions(std::time::Instant::now())
+        {
+            debug!(
+                "Timer G: retransmitting a final → {} via {:?}",
+                dest, transport
+            );
+            if let Err(e) = self
+                .transport
+                .reply(&data, dest, transport, reply_tx.as_ref())
+                .await
+            {
+                debug!("Timer G retransmission → {} failed: {}", dest, e);
+            }
+        }
+    }
+
     /// `DELETE /api/v1/calls/{uuid}`: end the queued calls on the wire and
     /// write their CDR ("admin-kick").
     pub(crate) async fn process_admin_kicks(&mut self) {
@@ -366,9 +398,11 @@ impl Sbc {
         }
     }
 
-    /// INVITEs unanswered past `security.call_setup_timeout`: CANCEL
-    /// toward the callee, 408 to the caller, CDR "setup-timeout". Bounds a
-    /// caller whose trunk never answers (failover exhausted, trunk silent).
+    /// Unanswered INVITEs: while the callee has not alerted (no >=180 yet),
+    /// `security.call_setup_timeout` bounds a silent or 100-only trunk;
+    /// once it alerts, RFC 3261 Timer C (3 min, restarted by every
+    /// provisional) bounds the ringing. Then CANCEL toward the callee, 408
+    /// to the caller, CDR "setup-timeout".
     pub(crate) async fn check_setup_timeouts(&mut self) {
         let limit = self.call_setup_timeout;
         let stale: Vec<CallUuid> = {
@@ -384,7 +418,10 @@ impl Sbc {
                             | crate::b2bua::CallState::Ringing
                     )
                 })
-                .filter(|c| c.started_at.elapsed() > limit)
+                .filter(|c| match c.alerting_at {
+                    None => c.started_at.elapsed() > limit,
+                    Some(alerting) => alerting.elapsed() > TIMER_C,
+                })
                 .map(|c| c.uuid.clone())
                 .collect()
         };
@@ -413,7 +450,20 @@ mod tests {
         );
         assert_eq!(CallOutcome::Cancelled.sip_code(false), Some(487));
         assert_eq!(CallOutcome::Cancelled.sip_code(true), Some(200));
-        assert_eq!(CallOutcome::WsClosed.sip_code(false), None);
+        assert_eq!(
+            CallOutcome::WsClosed { callee_died: false }.sip_code(false),
+            None
+        );
+        assert_eq!(
+            CallOutcome::WsClosed { callee_died: true }.sip_code(false),
+            Some(480)
+        );
+        assert_eq!(CallOutcome::Refused { code: 404 }.hangup_by(), "sbc");
+        assert_eq!(CallOutcome::Rejected { code: 486 }.hangup_by(), "callee");
+        assert_eq!(
+            CallOutcome::Refused { code: 404 }.disconnect_reason(),
+            "rejected-404"
+        );
         assert_eq!(CallOutcome::Shutdown.pending_caller_code(), 503);
         assert_eq!(
             CallOutcome::NormalClearing { by_caller: false }.hangup_by(),

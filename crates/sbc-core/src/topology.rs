@@ -416,6 +416,23 @@ pub const UNTRUSTED_IDENTITY_HEADERS: &[&str] = &[
     "x-real-ip",
 ];
 
+/// Remove the caller's Digest credentials (`Authorization`,
+/// `Proxy-Authorization`) from a request the SBC forwards: they were for
+/// the SBC's realm and would hand the carrier (and every hop) material for
+/// an offline dictionary attack on the user's password.
+pub fn strip_credentials(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if !lower.contains("\nauthorization:") && !lower.contains("\nproxy-authorization:") {
+        return raw.to_string();
+    }
+    let Ok(mut msg) = RawSipMessage::parse(raw) else {
+        return raw.to_string();
+    };
+    msg.remove_header("authorization");
+    msg.remove_header("proxy-authorization");
+    msg.to_string()
+}
+
 /// Strip `UNTRUSTED_IDENTITY_HEADERS` from a raw request.
 pub fn strip_untrusted_identity_headers(raw: &str) -> String {
     let Ok(mut msg) = RawSipMessage::parse(raw) else {
@@ -581,6 +598,16 @@ Content-Length: 0\r\n\
         msg.set_header("Max-Forwards", "50");
         let mf = msg.header_values("max-forwards");
         assert_eq!(mf[0], "50");
+    }
+
+    #[test]
+    fn credentials_are_stripped() {
+        let raw = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nProxy-Authorization: Digest username=\"alice\", realm=\"r\", nonce=\"n\", uri=\"sip:b@h\", response=\"abc\"\r\nAuthorization: Digest username=\"alice\"\r\nContent-Length: 0\r\n\r\n";
+        let out = strip_credentials(raw);
+        assert!(!out.to_lowercase().contains("authorization"), "{}", out);
+        assert!(out.contains("Via: SIP/2.0/UDP h;branch=z9hG4bKx\r\n"));
+        let clean = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(strip_credentials(clean), clean);
     }
 
     #[test]

@@ -143,10 +143,9 @@ impl Sbc {
                             "Too Many Concurrent Calls",
                         )?;
                         let data = r.to_string().into_bytes();
-                        return self
-                            .transport
-                            .reply(&data, source, transport, reply_tx)
+                        self.send_sip("403 (limit) → caller", &data, source, transport, reply_tx)
                             .await;
+                        return Ok(());
                     }
                     crate::security::LimitDecision::RateExceeded {
                         current,
@@ -176,10 +175,15 @@ impl Sbc {
                             &format!("\r\nRetry-After: {}\r\nContent-Length:", retry_after_secs),
                         );
                         let _ = raw; // keep formatting simple: send the header-injected variant
-                        return self
-                            .transport
-                            .reply(with_retry.as_bytes(), source, transport, reply_tx)
-                            .await;
+                        self.send_sip(
+                            "503 (rate) → caller",
+                            with_retry.as_bytes(),
+                            source,
+                            transport,
+                            reply_tx,
+                        )
+                        .await;
+                        return Ok(());
                     }
                 }
             }
@@ -197,10 +201,9 @@ impl Sbc {
             self.metrics.inc_sip_response(400);
             let r400 = build_plain_response_for_request(&request, 400, "Bad Request - Via branch")?;
             let data = r400.to_string().into_bytes();
-            return self
-                .transport
-                .reply(&data, source, transport, reply_tx)
+            self.send_sip("400 → caller", &data, source, transport, reply_tx)
                 .await;
+            return Ok(());
         }
 
         // RFC 3261 §16.3 step 4: a request that already exhausted its hop
@@ -339,6 +342,14 @@ impl Sbc {
             if let Some(call) = calls.get_mut(&uuid) {
                 call.caller_number = caller_num;
                 call.callee_number = callee_num;
+                // Direction is known before routing: a trunk-originated
+                // call is inbound, anything else is outbound until the
+                // registrar routes it to a local user (then "local").
+                call.direction = Some(if is_trunk_ip || inbound_trunk.is_some() {
+                    "inbound"
+                } else {
+                    "outbound"
+                });
                 call.trunk_name = inbound_trunk;
             }
         }
@@ -454,6 +465,15 @@ impl Sbc {
         // ── Step 2: Determine destination, transport and outbound reply channel ─
         let (dest, outbound_transport, outbound_reply_tx) = if let Some(ref reg) = registrar_contact
         {
+            // Routed to one of our users: a local call unless a trunk sent it.
+            {
+                let mut calls = self.b2bua.calls_locked().await;
+                if let Some(call) = calls.get_mut(&uuid) {
+                    if call.direction != Some("inbound") {
+                        call.direction = Some("local");
+                    }
+                }
+            }
             // Route to registered contact (e.g., a WebRTC/WSS client)
             let addr: std::net::SocketAddr =
                 match format!("{}:{}", reg.received_ip, reg.received_port).parse() {
@@ -463,7 +483,7 @@ impl Sbc {
                             "Registered contact {} has an unparsable address {}:{} — 500",
                             reg.contact, reg.received_ip, e
                         );
-                        self.finish_call(&uuid, CallOutcome::Rejected { code: 500 })
+                        self.finish_call(&uuid, CallOutcome::Refused { code: 500 })
                             .await;
                         self.metrics.inc_sip_response(500);
                         let r500 = response_for_request(&request, 500, "Server Internal Error");
@@ -504,7 +524,7 @@ impl Sbc {
                         "Registered WS contact {} has no live connection — 480",
                         addr
                     );
-                    self.finish_call(&uuid, CallOutcome::Rejected { code: 480 })
+                    self.finish_call(&uuid, CallOutcome::Refused { code: 480 })
                         .await;
                     self.metrics.inc_sip_response(480);
                     let response_480 =
@@ -527,7 +547,7 @@ impl Sbc {
             // Do NOT fall through to trunk routing (that would loop the call back to the trunk)
             let aor = callee_aor.as_deref().unwrap_or("unknown");
             warn!("DID target {} is not registered — responding 480", aor);
-            self.finish_call(&uuid, CallOutcome::Rejected { code: 480 })
+            self.finish_call(&uuid, CallOutcome::Refused { code: 480 })
                 .await;
             self.metrics.inc_sip_response(480);
             let response_480 = response_for_request(&request, 480, "Temporarily Unavailable");
@@ -550,7 +570,7 @@ impl Sbc {
                 "INVITE from trunk {} to unknown number {} — 404",
                 source, number
             );
-            self.finish_call(&uuid, CallOutcome::Rejected { code: 404 })
+            self.finish_call(&uuid, CallOutcome::Refused { code: 404 })
                 .await;
             self.metrics.inc_sip_response(404);
             let response_404 = response_for_request(&request, 404, "Not Found");
@@ -590,7 +610,7 @@ impl Sbc {
                             rule: rule_id,
                             ts: crate::events::event_ts(),
                         });
-                    self.finish_call(&uuid, CallOutcome::Rejected { code: 403 })
+                    self.finish_call(&uuid, CallOutcome::Refused { code: 403 })
                         .await;
                     self.metrics.inc_security_destination_blocked();
                     self.metrics.inc_sip_response(403);
@@ -609,7 +629,7 @@ impl Sbc {
             let mut candidates = self.router.route_request_candidates(&request);
             if candidates.is_empty() {
                 warn!("Routing failed for INVITE: no candidate trunk");
-                self.finish_call(&uuid, CallOutcome::Rejected { code: 503 })
+                self.finish_call(&uuid, CallOutcome::Refused { code: 503 })
                     .await;
                 self.metrics.inc_sip_response(503);
                 let response_503 = response_for_request(&request, 503, "Service Unavailable");
@@ -676,7 +696,7 @@ impl Sbc {
                 Some(d) => d,
                 None => {
                     error!("Invalid trunk destination for: {}", trunk.host);
-                    self.finish_call(&uuid, CallOutcome::Rejected { code: 503 })
+                    self.finish_call(&uuid, CallOutcome::Refused { code: 503 })
                         .await;
                     self.metrics.inc_sip_response(503);
                     let response_503 = response_for_request(&request, 503, "Service Unavailable");
@@ -888,6 +908,10 @@ impl Sbc {
         let raw_request = crate::topology::strip_unsupported_extensions(
             &rsip::SipMessage::Request(request_with_sdp).to_string(),
         );
+        // Whatever credentials the caller presented were for OUR realm: the
+        // trunk leg is re-originated by the SBC (which injects its own trunk
+        // credentials on a 407). A user's Digest never travels to a carrier.
+        let raw_request = crate::topology::strip_credentials(&raw_request);
         // A local user asserts nobody's identity toward the carrier (RFC
         // 3325 §4): its verified From is what the trunk sees. Trunk-side
         // headers (PAI of a PSTN caller) are kept toward our own users.
@@ -1047,7 +1071,7 @@ impl Sbc {
                         .get(&uuid)
                         .and_then(|c| c.final_toward_caller(503, None))
                 };
-                self.finish_call(&uuid, CallOutcome::Rejected { code: 503 })
+                self.finish_call(&uuid, CallOutcome::Refused { code: 503 })
                     .await;
                 self.metrics.inc_sip_response(503);
                 if let Some(r) = final_503 {

@@ -233,6 +233,15 @@ pub struct B2buaCall {
     /// The caller's INVITE `To` (no tag): needed to build a final response
     /// toward a caller whose INVITE the SBC never answered.
     pub caller_to_raw: Option<String>,
+    /// Last >=180 provisional relayed to the caller: the callee is alerting
+    /// (RFC 3261 §16.6 Timer C is measured from here, not from the INVITE).
+    pub alerting_at: Option<std::time::Instant>,
+    /// Highest CSeq of any request the SBC sent or relayed toward the
+    /// caller (its own BYE must be above it, RFC 3261 §12.2.1.1).
+    pub sent_cseq_toward_caller: u32,
+    /// CDR direction decided at routing time (`inbound` / `outbound` /
+    /// `local`); None falls back to the trunk_id/trunk_name heuristic.
+    pub direction: Option<&'static str>,
 
     /// Reply channel back to the caller (UDP addr or TCP/TLS/WSS connection)
     pub caller_reply_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
@@ -364,6 +373,9 @@ impl B2buaCall {
             answered_at: None,
             peer_reason: None,
             caller_to_raw: None,
+            alerting_at: None,
+            sent_cseq_toward_caller: 0,
+            direction: None,
             caller_reply_tx,
             caller_source: inbound_addr,
             caller_transport,
@@ -444,7 +456,9 @@ impl B2buaCall {
             from_raw,
             to_raw,
             request_uri,
-            cseq: 1,
+            // Above every request already relayed toward the caller
+            // (INFO/REFER keep the callee's CSeq), RFC 3261 §12.2.1.1.
+            cseq: self.sent_cseq_toward_caller + 1,
             local_ip: local_ip.to_string(),
             local_port,
             transport: transport_token(self.caller_transport),
@@ -514,6 +528,9 @@ impl B2buaCall {
     /// CDR direction: `outbound` (user → trunk), `inbound` (trunk → user,
     /// i.e. the source IP belongs to a trunk), else `local` (user → user).
     pub fn direction(&self) -> &'static str {
+        if let Some(d) = self.direction {
+            return d;
+        }
         if self.trunk_id.is_some() {
             "outbound"
         } else if self.trunk_name.is_some() {
@@ -743,6 +760,30 @@ impl B2buaManager {
             call.inbound.from_raw = Some(from_raw);
             call.caller_to_raw = to_raw;
             call.inbound.remote_target = caller_contact;
+        }
+    }
+
+    /// A >=180 provisional was relayed: the callee is alerting (resets the
+    /// Timer C window of the setup bound).
+    pub async fn mark_alerting(&self, uuid: &CallUuid) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.alerting_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A request with `cseq` was relayed toward one leg: the SBC's own
+    /// later requests on that leg must carry a higher CSeq.
+    pub async fn note_relayed_cseq(&self, uuid: &CallUuid, toward_callee: bool, cseq: u32) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            if toward_callee {
+                if let Some(leg) = call.outbound.as_mut() {
+                    leg.cseq = leg.cseq.max(cseq);
+                }
+            } else {
+                call.sent_cseq_toward_caller = call.sent_cseq_toward_caller.max(cseq);
+            }
         }
     }
 
@@ -1067,13 +1108,7 @@ impl B2buaManager {
             if sdp.is_empty() {
                 continue; // no SDP to refresh with — skip rather than break media
             }
-            let invite_cseq = call
-                .original_outbound_invite
-                .as_deref()
-                .and_then(parse_cseq_number)
-                .unwrap_or(1);
-            let leg_cseq = call.outbound.as_ref().map(|l| l.cseq).unwrap_or(1);
-            d.cseq = invite_cseq.max(leg_cseq) + 1;
+            d.cseq = call.next_outbound_cseq();
             if let Some(leg) = call.outbound.as_mut() {
                 leg.cseq = d.cseq;
             }
@@ -1429,9 +1464,10 @@ impl B2buaManager {
         local_port: u16,
         reason: Option<&str>,
     ) -> Option<String> {
-        let calls = self.calls.lock().await;
-        let call = calls.get(uuid)?;
+        let mut calls = self.calls.lock().await;
+        let call = calls.get_mut(uuid)?;
         let d = call.dialog_info_toward_caller(local_ip, local_port)?;
+        call.sent_cseq_toward_caller = d.cseq;
         Some(crate::sip_builder::build_bye(&d, reason))
     }
 
