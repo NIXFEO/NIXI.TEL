@@ -51,6 +51,7 @@ impl AppState {
             dids: self.dids.clone(),
             trunks: self.trunks.clone(),
             acl: self.acl.clone(),
+            security: self.security.clone(),
         }
     }
 

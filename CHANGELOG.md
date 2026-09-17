@@ -122,6 +122,18 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   user. Every mismatch is a `identity_mismatch` security event and counts
   in `sbc_security_identity_mismatches_total`; CDR `caller` is the verified
   identity. `Registered` / `Unregistered` SSE events are published.
+- Anti-fraud settings survive a restart. Destination rules created through
+  the API lived in memory only and the `users.max_concurrent_calls` /
+  `max_calls_per_minute` columns were never loaded: migration 0002 adds
+  `destination_rules`, the API writes store-first and re-hydrates,
+  `PUT /api/v1/security/user-limits/{user}` writes the user row (404 for an
+  unknown user), the global defaults go to `settings`, and both are loaded
+  at boot and on reload. `[security.destinations].rules`, the IRSF seeds and
+  `[[security.user_limits.overrides]]` are imported once at first boot like
+  users/trunks/DIDs (markers `destination_rules_seeded_at`,
+  `user_limits_seeded_at`). `GET /api/v1/export` is version 2 with
+  `destination_rules` and `user_limits`. Migrations are opened with
+  `ignore_missing` so a rolled-back binary still opens a newer store.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

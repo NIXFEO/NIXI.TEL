@@ -32,6 +32,8 @@ async fn rehydrate_users(state: &AppState, store: &ConfigStore) {
     if let Some(auth) = &state.auth {
         let _ = apply_users(auth, store).await;
     }
+    // The per-user limits ride on the user rows.
+    let _ = sbc_core::sbc::hydrate::apply_user_limits(&state.security, store).await;
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -283,9 +285,30 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Json<serde_json:
         .await
         .map_err(ApiError::internal)?
         .unwrap_or_else(|| "allow".to_string());
+    let destination_rules = store
+        .list_destination_rules()
+        .await
+        .map_err(ApiError::internal)?;
+    let as_u32 = |v: Option<String>| v.and_then(|v| v.parse::<u32>().ok());
+    let default_concurrent = as_u32(
+        store
+            .get_setting(sbc_core::sbc::hydrate::SETTING_DEFAULT_CONCURRENT)
+            .await
+            .ok()
+            .flatten(),
+    );
+    let default_cpm = as_u32(
+        store
+            .get_setting(sbc_core::sbc::hydrate::SETTING_DEFAULT_CPM)
+            .await
+            .ok()
+            .flatten(),
+    );
 
+    // version 2 (0.20): destination_rules and the API-set user-limit
+    // defaults; per-user overrides are the users' max_* columns.
     Ok(Json(json!({
-        "version": 1,
+        "version": 2,
         "exported_at": event_ts(),
         "users": users,
         "dids": dids,
@@ -293,5 +316,10 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Json<serde_json:
         "routes": routes,
         "acl_rules": acl,
         "acl_default_action": acl_default,
+        "destination_rules": destination_rules,
+        "user_limits": {
+            "default_max_concurrent_calls": default_concurrent,
+            "default_max_calls_per_minute": default_cpm,
+        },
     })))
 }

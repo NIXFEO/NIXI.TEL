@@ -10,5 +10,5 @@ pub mod models;
 pub mod store;
 
 pub use error::{Error, Result};
-pub use models::{AclRuleRow, BanRow, DidRow, RouteRow, TrunkRow, UserRow};
+pub use models::{AclRuleRow, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow};
 pub use store::{ConfigStore, Table};

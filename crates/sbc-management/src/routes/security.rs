@@ -9,6 +9,13 @@ use serde_json::json;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use sbc_core::events::{event_ts, SbcEvent};
+use sbc_core::sbc::hydrate::{
+    apply_destinations, apply_user_limits, SETTING_DEFAULT_CONCURRENT, SETTING_DEFAULT_CPM,
+};
+use sbc_storage::ConfigStore;
+use tracing::warn;
+
 use super::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -95,6 +102,24 @@ pub async fn delete_ban(
 
 // ── Destination rules ─────────────────────────────────────────────────────────
 
+/// Re-hydrate the anti-fraud managers from the store and announce the change.
+async fn apply_security(
+    state: &AppState,
+    store: &ConfigStore,
+    entity: &str,
+    action: &str,
+    id: &str,
+) {
+    let _ = apply_destinations(&state.security, store).await;
+    let _ = apply_user_limits(&state.security, store).await;
+    state.events.publish(SbcEvent::ConfigChanged {
+        entity: entity.to_string(),
+        action: action.to_string(),
+        id: id.to_string(),
+        ts: event_ts(),
+    });
+}
+
 pub async fn list_destination_rules(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "default_action": if state.security.destinations.default_action_deny() { "deny" } else { "allow" },
@@ -104,6 +129,8 @@ pub async fn list_destination_rules(State(state): State<AppState>) -> Json<serde
 
 #[derive(Deserialize)]
 pub struct DestinationRuleBody {
+    /// Optional stable id (lets an export be replayed); a fresh uuid otherwise.
+    pub id: Option<String>,
     pub prefix: String,
     pub action: String,
     pub user: Option<String>,
@@ -124,14 +151,43 @@ pub async fn create_destination_rule(
         _ => return Err(ApiError::bad_request("action must be 'allow' or 'deny'")),
     };
     let rule = DestinationRule {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: body
+            .id
+            .filter(|i| !i.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         prefix: body.prefix,
         deny,
         user: body.user,
         description: body.description,
         enabled: true,
     };
-    state.security.destinations.add_rule(rule.clone());
+    match &state.store {
+        Some(store) => {
+            let row = sbc_storage::DestinationRuleRow {
+                id: rule.id.clone(),
+                prefix: rule.prefix.clone(),
+                action: if deny { "deny".into() } else { "allow".into() },
+                user: rule.user.clone(),
+                description: rule.description.clone(),
+                enabled: true,
+            };
+            let created = store
+                .upsert_destination_rule(&row)
+                .await
+                .map_err(ApiError::internal)?;
+            if !created {
+                return Err(ApiError::conflict(format!(
+                    "destination rule '{}' already exists",
+                    rule.id
+                )));
+            }
+            apply_security(&state, store, "destination_rule", "create", &rule.id).await;
+        }
+        None => {
+            warn!("Destination rule created in memory only (config store unavailable)");
+            state.security.destinations.add_rule(rule.clone());
+        }
+    }
     Ok((
         StatusCode::CREATED,
         Json(serde_json::to_value(&rule).unwrap_or_default()),
@@ -142,8 +198,19 @@ pub async fn delete_destination_rule(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if !state.security.destinations.remove_rule(&id) {
+    let in_memory = state.security.destinations.remove_rule(&id);
+    let in_store = match &state.store {
+        Some(store) => store
+            .delete_destination_rule(&id)
+            .await
+            .map_err(ApiError::internal)?,
+        None => false,
+    };
+    if !in_memory && !in_store {
         return Err(ApiError::not_found(format!("rule '{}' not found", id)));
+    }
+    if let Some(store) = &state.store {
+        apply_security(&state, store, "destination_rule", "delete", &id).await;
     }
     Ok(Json(json!({ "id": id, "deleted": true })))
 }
@@ -181,12 +248,29 @@ pub struct DefaultLimitsBody {
 pub async fn set_default_limits(
     State(state): State<AppState>,
     Json(body): Json<DefaultLimitsBody>,
-) -> Json<serde_json::Value> {
+) -> ApiResult<Json<serde_json::Value>> {
     state.security.user_limits.set_defaults(
         body.default_max_concurrent_calls,
         body.default_max_calls_per_minute,
     );
-    Json(json!({ "updated": true }))
+    if let Some(store) = &state.store {
+        store
+            .set_setting(
+                SETTING_DEFAULT_CONCURRENT,
+                &body.default_max_concurrent_calls.to_string(),
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        store
+            .set_setting(
+                SETTING_DEFAULT_CPM,
+                &body.default_max_calls_per_minute.to_string(),
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        apply_security(&state, store, "user_limits", "update", "defaults").await;
+    }
+    Ok(Json(json!({ "updated": true })))
 }
 
 #[derive(Deserialize)]
@@ -195,27 +279,67 @@ pub struct UserLimitBody {
     pub max_calls_per_minute: Option<u32>,
 }
 
+/// Per-user overrides live on the user row (`users.max_*`): the user must
+/// exist in the store. Without a store they stay in memory.
 pub async fn set_user_limits(
     State(state): State<AppState>,
     Path(user): Path<String>,
     Json(body): Json<UserLimitBody>,
-) -> Json<serde_json::Value> {
-    state.security.user_limits.set_override(
-        &user,
-        UserLimits {
-            max_concurrent_calls: body.max_concurrent_calls,
-            max_calls_per_minute: body.max_calls_per_minute,
-        },
-    );
-    Json(json!({ "user": user, "updated": true }))
+) -> ApiResult<Json<serde_json::Value>> {
+    match &state.store {
+        Some(store) => {
+            let updated = store
+                .set_user_limits(
+                    &user,
+                    body.max_concurrent_calls.map(i64::from),
+                    body.max_calls_per_minute.map(i64::from),
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            if !updated {
+                return Err(ApiError::not_found(format!("user '{}' not found", user)));
+            }
+            apply_security(&state, store, "user_limits", "update", &user).await;
+        }
+        None => {
+            warn!("User limit override set in memory only (config store unavailable)");
+            state.security.user_limits.set_override(
+                &user,
+                UserLimits {
+                    max_concurrent_calls: body.max_concurrent_calls,
+                    max_calls_per_minute: body.max_calls_per_minute,
+                },
+            );
+        }
+    }
+    Ok(Json(json!({ "user": user, "updated": true })))
 }
 
 pub async fn delete_user_limits(
     State(state): State<AppState>,
     Path(user): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if !state.security.user_limits.remove_override(&user) {
-        return Err(ApiError::not_found(format!("no override for '{}'", user)));
+    match &state.store {
+        Some(store) => {
+            let row = store
+                .get_user(&user)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found(format!("user '{}' not found", user)))?;
+            if row.max_concurrent_calls.is_none() && row.max_calls_per_minute.is_none() {
+                return Err(ApiError::not_found(format!("no override for '{}'", user)));
+            }
+            store
+                .set_user_limits(&user, None, None)
+                .await
+                .map_err(ApiError::internal)?;
+            apply_security(&state, store, "user_limits", "delete", &user).await;
+        }
+        None => {
+            if !state.security.user_limits.remove_override(&user) {
+                return Err(ApiError::not_found(format!("no override for '{}'", user)));
+            }
+        }
     }
     Ok(Json(json!({ "user": user, "deleted": true })))
 }

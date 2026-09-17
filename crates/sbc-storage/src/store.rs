@@ -10,10 +10,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tracing::info;
 
-use crate::models::{AclRuleRow, BanRow, DidRow, RouteRow, TrunkRow, UserRow};
+use crate::models::{AclRuleRow, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow};
 use crate::{Error, Result};
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+/// Embedded migrations. `ignore_missing` lets an older binary (rolled back
+/// after an upgrade) open a store that already carries newer migrations
+/// instead of refusing with VersionMissing and running TOML-only.
+fn migrator() -> sqlx::migrate::Migrator {
+    let mut m = sqlx::migrate!("./migrations");
+    m.set_ignore_missing(true);
+    m
+}
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
@@ -76,7 +83,7 @@ impl ConfigStore {
     }
 
     async fn migrate(&self) -> Result<()> {
-        MIGRATOR
+        migrator()
             .run(&self.pool)
             .await
             .map_err(|e| Error::Database(format!("migrate: {}", e)))
@@ -401,6 +408,77 @@ impl ConfigStore {
         Ok(res.rows_affected() > 0)
     }
 
+    // ── destination rules (anti-IRSF) ─────────────────────────────────────
+
+    pub async fn list_destination_rules(&self) -> Result<Vec<DestinationRuleRow>> {
+        sqlx::query_as::<_, DestinationRuleRow>(
+            "SELECT id, prefix, action, user, description, enabled
+             FROM destination_rules ORDER BY user, prefix, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    /// Insert or replace a rule; true when it did not exist yet.
+    pub async fn upsert_destination_rule(&self, row: &DestinationRuleRow) -> Result<bool> {
+        let existing = sqlx::query("SELECT id FROM destination_rules WHERE id = ?")
+            .bind(&row.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            "INSERT INTO destination_rules (id, prefix, action, user, description, enabled)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                prefix = excluded.prefix, action = excluded.action, user = excluded.user,
+                description = excluded.description, enabled = excluded.enabled",
+        )
+        .bind(&row.id)
+        .bind(&row.prefix)
+        .bind(&row.action)
+        .bind(&row.user)
+        .bind(&row.description)
+        .bind(row.enabled)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(existing.is_none())
+    }
+
+    pub async fn delete_destination_rule(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM destination_rules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    // ── per-user limits (columns of `users`) ──────────────────────────────
+
+    /// Set (or clear, with None) a user's limit overrides. False when the
+    /// user does not exist.
+    pub async fn set_user_limits(
+        &self,
+        username: &str,
+        max_concurrent_calls: Option<i64>,
+        max_calls_per_minute: Option<i64>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE users SET max_concurrent_calls = ?, max_calls_per_minute = ?,
+                              updated_at = datetime('now')
+             WHERE username = ?",
+        )
+        .bind(max_concurrent_calls)
+        .bind(max_calls_per_minute)
+        .bind(username)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     // ── bans ─────────────────────────────────────────────────────────────
 
     pub async fn save_ban(&self, row: &BanRow) -> Result<()> {
@@ -477,6 +555,7 @@ impl ConfigStore {
             Table::Trunks => "SELECT COUNT(*) FROM trunks",
             Table::Routes => "SELECT COUNT(*) FROM routes",
             Table::AclRules => "SELECT COUNT(*) FROM acl_rules",
+            Table::DestinationRules => "SELECT COUNT(*) FROM destination_rules",
         };
         let (count,): (i64,) = sqlx::query_as(sql)
             .fetch_one(&self.pool)
@@ -493,6 +572,7 @@ pub enum Table {
     Trunks,
     Routes,
     AclRules,
+    DestinationRules,
 }
 
 const TRUNK_COLS: &str = "name, enabled, host, port, transport, auth_required, username, \

@@ -491,6 +491,7 @@ impl Sbc {
             Ok(store) => {
                 let store = Arc::new(store);
                 import::first_boot_import(&store, config).await;
+                import::seed_security(&store, config).await;
 
                 // The store is the source of truth from here on: hydrate the
                 // runtime managers from it (TOML entries were seeded above).
@@ -499,6 +500,7 @@ impl Sbc {
                     dids: did_mappings.clone(),
                     trunks: trunk_manager.clone(),
                     acl: acl.clone(),
+                    security: security.clone(),
                 };
                 if let Err(e) = hydrate::hydrate_all(&handles, &store).await {
                     warn!(
@@ -638,6 +640,7 @@ impl Sbc {
             dids: self.did_mappings.clone(),
             trunks: self.trunk_manager.clone(),
             acl: self.acl.clone(),
+            security: self.security.clone(),
         }
     }
 
@@ -709,6 +712,7 @@ impl Sbc {
                 dids: self.did_mappings.clone(),
                 trunks: self.trunk_manager.clone(),
                 acl: self.acl.clone(),
+                security: self.security.clone(),
             };
             hydrate::hydrate_all(&handles, &store).await?;
             self.refresh_trunk_ips().await;

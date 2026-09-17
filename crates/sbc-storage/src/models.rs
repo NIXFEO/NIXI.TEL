@@ -105,3 +105,16 @@ pub struct BanRow {
     pub manual: bool,
     pub offense_count: i64,
 }
+
+/// Anti-IRSF destination rule (`destination_rules`, migration 0002).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DestinationRuleRow {
+    pub id: String,
+    pub prefix: String,
+    /// "allow" | "deny"
+    pub action: String,
+    /// Restrict the rule to one user (NULL = everyone).
+    pub user: Option<String>,
+    pub description: String,
+    pub enabled: bool,
+}

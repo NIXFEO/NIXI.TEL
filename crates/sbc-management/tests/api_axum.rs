@@ -459,7 +459,9 @@ async fn export_returns_full_dump() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["version"], 1);
+    assert_eq!(json["version"], 2);
+    assert!(json["destination_rules"].is_array());
+    assert!(json["user_limits"].is_object());
     assert_eq!(json["users"].as_array().unwrap().len(), 1);
     assert!(json["trunks"].is_array());
 }
@@ -646,7 +648,22 @@ async fn security_destination_rules_crud() {
     let id = rule["id"].as_str().expect("rule id").to_string();
     assert_eq!(rule["prefix"], "+33899");
     assert_eq!(rule["deny"], true);
-    assert_eq!(state.security.destinations.list_rules().len(), builtin + 1);
+    // Persisted, and the runtime now mirrors the store (the built-in seeds
+    // are written to the store at first boot in production; this test store
+    // was never seeded, so the store's single rule is the whole policy).
+    let stored = state
+        .store
+        .as_ref()
+        .unwrap()
+        .list_destination_rules()
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, id);
+    assert_eq!(stored[0].action, "deny");
+    let live = state.security.destinations.list_rules();
+    assert_eq!(live.len(), 1, "store is the source of truth: {:?}", live);
+    let _ = builtin;
 
     let resp = app
         .clone()
@@ -655,7 +672,14 @@ async fn security_destination_rules_crud() {
         .unwrap();
     let list = body_json(resp).await;
     let rules = list["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), builtin + 1);
+    let fresh = sbc_core::security::SecurityManager::new(Default::default());
+    sbc_core::sbc::hydrate::apply_destinations(&fresh, state.store.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        fresh.destinations.list_rules().iter().any(|r| r.id == id),
+        "a fresh runtime hydrated from the store gets the rule back"
+    );
     let mine = rules
         .iter()
         .find(|r| r["id"] == id.as_str())
@@ -673,7 +697,20 @@ async fn security_destination_rules_crud() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(state.security.destinations.list_rules().len(), builtin);
+    assert!(state
+        .store
+        .as_ref()
+        .unwrap()
+        .list_destination_rules()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!state
+        .security
+        .destinations
+        .list_rules()
+        .iter()
+        .any(|r| r.id == id));
 
     let resp = app
         .clone()
@@ -693,6 +730,31 @@ async fn security_user_limits_defaults_and_overrides() {
     let state = make_state().await;
     let app = build_router(state.clone(), &[]);
 
+    // Overrides live on the user row: an unknown user is 404.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/v1/security/user-limits/nobody",
+            Some(r#"{"max_concurrent_calls":1}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/users",
+            Some(r#"{"username":"alice","password":"pw"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let store = state.store.clone().unwrap();
+
     let resp = app
         .clone()
         .oneshot(req(
@@ -704,6 +766,15 @@ async fn security_user_limits_defaults_and_overrides() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        store
+            .get_setting(sbc_core::sbc::hydrate::SETTING_DEFAULT_CONCURRENT)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("3"),
+        "defaults are persisted"
+    );
 
     let resp = app
         .clone()
@@ -743,6 +814,8 @@ async fn security_user_limits_defaults_and_overrides() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(state.security.user_limits.overrides().is_empty());
+    let row = store.get_user("alice").await.unwrap().unwrap();
+    assert_eq!(row.max_concurrent_calls, None, "cleared on the user row");
 
     let resp = app
         .clone()
@@ -755,6 +828,30 @@ async fn security_user_limits_defaults_and_overrides() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Limits set through the user API are enforced too (same row, same
+    // hydration), and a fresh runtime hydrated from the store sees them.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/v1/users/alice",
+            Some(r#"{"password":"pw","max_calls_per_minute":4}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        state.security.user_limits.limits_for("alice"),
+        (3, 4),
+        "defaults from settings, cpm from the user row"
+    );
+    let fresh = sbc_core::security::SecurityManager::new(Default::default());
+    sbc_core::sbc::hydrate::apply_user_limits(&fresh, &store)
+        .await
+        .unwrap();
+    assert_eq!(fresh.user_limits.limits_for("alice"), (3, 4));
 }
 
 // ── DIDs ──────────────────────────────────────────────────────────────────────

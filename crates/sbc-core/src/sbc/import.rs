@@ -4,7 +4,7 @@
 //! act as bootstrap seeds and the store remains the source of truth
 //! afterwards. Runs at every boot; a non-empty table is left untouched.
 
-use sbc_storage::{ConfigStore, DidRow, Table, TrunkRow, UserRow};
+use sbc_storage::{ConfigStore, DestinationRuleRow, DidRow, Table, TrunkRow, UserRow};
 use tracing::{info, warn};
 
 use crate::auth::compute_ha1;
@@ -228,5 +228,101 @@ mod tests {
         assert_eq!(s.len(), 20);
         assert!(s.ends_with('Z'));
         assert!(s.starts_with("20"));
+    }
+}
+
+/// Seed the anti-fraud settings from TOML once (markers in `settings`):
+/// destination rules (`[security.destinations].rules` + the IRSF seeds when
+/// `seed_irsf_rules` and no TOML deny rule) and `[[security.user_limits.
+/// overrides]]` for users that exist in the store with no limits yet. Like
+/// users/trunks/DIDs, the store is the source of truth afterwards.
+pub async fn seed_security(store: &ConfigStore, config: &SbcConfig) {
+    let features = &config.security.features;
+
+    match store.get_setting("destination_rules_seeded_at").await {
+        Ok(None) => {
+            let mut rows: Vec<DestinationRuleRow> = features
+                .destinations
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(i, r)| DestinationRuleRow {
+                    id: format!("cfg-{}", i),
+                    prefix: r.prefix.clone(),
+                    action: if r.action.eq_ignore_ascii_case("deny") {
+                        "deny".into()
+                    } else {
+                        "allow".into()
+                    },
+                    user: r.user.clone(),
+                    description: r.description.clone(),
+                    enabled: true,
+                })
+                .collect();
+            if features.destinations.seed_irsf_rules && !rows.iter().any(|r| r.action == "deny") {
+                for (prefix, desc) in crate::security::destination::IRSF_SEED {
+                    rows.push(DestinationRuleRow {
+                        id: format!("irsf{}", prefix),
+                        prefix: prefix.to_string(),
+                        action: "deny".into(),
+                        user: None,
+                        description: desc.to_string(),
+                        enabled: true,
+                    });
+                }
+            }
+            let mut n = 0;
+            for row in &rows {
+                match store.upsert_destination_rule(row).await {
+                    Ok(_) => n += 1,
+                    Err(e) => warn!("Seed destination rule '{}' failed: {}", row.id, e),
+                }
+            }
+            let _ = store
+                .set_setting("destination_rules_seeded_at", &now_rfc3339())
+                .await;
+            info!("First-boot seed: {} destination rules", n);
+        }
+        Ok(Some(_)) => {}
+        Err(e) => warn!("Seed: destination rules marker check failed: {}", e),
+    }
+
+    match store.get_setting("user_limits_seeded_at").await {
+        Ok(None) => {
+            let mut n = 0;
+            for o in &features.user_limits.overrides {
+                match store.get_user(&o.user).await {
+                    Ok(Some(u))
+                        if u.max_concurrent_calls.is_none() && u.max_calls_per_minute.is_none() =>
+                    {
+                        let ok = store
+                            .set_user_limits(
+                                &o.user,
+                                o.max_concurrent_calls.map(i64::from),
+                                o.max_calls_per_minute.map(i64::from),
+                            )
+                            .await
+                            .unwrap_or(false);
+                        if ok {
+                            n += 1;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => warn!(
+                        "Seed: [[security.user_limits.overrides]] user '{}' is not in the store — skipped",
+                        o.user
+                    ),
+                    Err(e) => warn!("Seed: user '{}' lookup failed: {}", o.user, e),
+                }
+            }
+            let _ = store
+                .set_setting("user_limits_seeded_at", &now_rfc3339())
+                .await;
+            if n > 0 {
+                info!("First-boot seed: {} user limit overrides", n);
+            }
+        }
+        Ok(Some(_)) => {}
+        Err(e) => warn!("Seed: user limits marker check failed: {}", e),
     }
 }

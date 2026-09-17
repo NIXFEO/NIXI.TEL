@@ -4,6 +4,7 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -109,6 +110,16 @@ impl UserLimitsManager {
             ),
             None => (dc, dr),
         }
+    }
+
+    /// Replace every override (hydration from the store). Rate windows
+    /// are untouched. Returns the count.
+    pub fn replace_overrides(&self, overrides: HashMap<String, UserLimits>) -> usize {
+        self.overrides.clear();
+        for (user, limits) in overrides {
+            self.overrides.insert(user, limits);
+        }
+        self.overrides.len()
     }
 
     pub fn set_override(&self, user: &str, limits: UserLimits) {

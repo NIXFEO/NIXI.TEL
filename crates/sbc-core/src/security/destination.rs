@@ -87,7 +87,7 @@ pub struct DestinationPolicy {
 }
 
 /// Unambiguous international premium/satellite ranges (IRSF magnets).
-const IRSF_SEED: &[(&str, &str)] = &[
+pub const IRSF_SEED: &[(&str, &str)] = &[
     ("+881", "Global Mobile Satellite System"),
     ("+882", "International Networks"),
     ("+883", "International Networks"),
@@ -209,6 +209,13 @@ impl DestinationPolicy {
 
     pub fn list_rules(&self) -> Vec<DestinationRule> {
         self.rules.read().unwrap().clone()
+    }
+
+    /// Replace every rule (hydration from the store). Returns the count.
+    pub fn replace_rules(&self, rules: Vec<DestinationRule>) -> usize {
+        let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        *guard = rules;
+        guard.len()
     }
 
     pub fn add_rule(&self, rule: DestinationRule) {

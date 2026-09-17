@@ -113,9 +113,9 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 | GET | `/api/v1/security/status` | bans, blocks, limits, last 100 events |
 | GET/POST | `/api/v1/security/bans` | `{"ip","duration_secs?","reason?"}` — persisted across restarts |
 | DELETE | `/api/v1/security/bans/{ip}` | lift a ban |
-| GET/POST | `/api/v1/security/destination-rules` | `{"prefix","action","user?","description?"}` |
+| GET/POST | `/api/v1/security/destination-rules` | `{"prefix","action","user?","description?","id?"}` — persisted across restarts (table `destination_rules`; TOML rules and the IRSF seeds are imported once at first boot) |
 | DELETE | `/api/v1/security/destination-rules/{id}` | |
-| GET/PUT | `/api/v1/security/user-limits` | defaults `{"default_max_concurrent_calls","default_max_calls_per_minute"}` |
+| GET/PUT | `/api/v1/security/user-limits` | defaults `{"default_max_concurrent_calls","default_max_calls_per_minute"}` — defaults persisted in `settings`, per-user overrides on the user row (`users.max_*`, so the user must exist) |
 | PUT/DELETE | `/api/v1/security/user-limits/{user}` | per-user override |
 
 ### Config

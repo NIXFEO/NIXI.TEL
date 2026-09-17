@@ -258,6 +258,93 @@ pub async fn apply_acl(acl: &AclManager, store: &ConfigStore) -> crate::Result<u
     Ok(count)
 }
 
+/// Load the anti-IRSF destination rules from the store. With no stored
+/// rule the in-memory set (TOML/IRSF seeds) is kept, so a store that was
+/// never seeded cannot silently disable the protection.
+pub async fn apply_destinations(
+    security: &crate::security::SecurityManager,
+    store: &ConfigStore,
+) -> crate::Result<usize> {
+    let rows = store
+        .list_destination_rules()
+        .await
+        .map_err(|e| crate::Error::Config(format!("load destination rules: {}", e)))?;
+    if rows.is_empty() {
+        let kept = security.destinations.list_rules().len();
+        if kept > 0 {
+            warn!(
+                "Hydrate: store has no destination rules — keeping the {} in memory",
+                kept
+            );
+        }
+        return Ok(kept);
+    }
+    let rules: Vec<crate::security::DestinationRule> = rows
+        .into_iter()
+        .map(|r| crate::security::DestinationRule {
+            id: r.id,
+            prefix: r.prefix,
+            deny: r.action.eq_ignore_ascii_case("deny"),
+            user: r.user,
+            description: r.description,
+            enabled: r.enabled,
+        })
+        .collect();
+    let count = security.destinations.replace_rules(rules);
+    info!("Hydrate: destination rules — {}", count);
+    Ok(count)
+}
+
+/// Load per-user limit overrides (users.max_* columns) and the global
+/// defaults (settings `user_limits.default_max_concurrent_calls` /
+/// `user_limits.default_max_calls_per_minute`, when both are set).
+pub async fn apply_user_limits(
+    security: &crate::security::SecurityManager,
+    store: &ConfigStore,
+) -> crate::Result<usize> {
+    let rows = store
+        .list_users()
+        .await
+        .map_err(|e| crate::Error::Config(format!("load user limits: {}", e)))?;
+    let clamp = |v: Option<i64>| v.map(|v| u32::try_from(v.max(0)).unwrap_or(u32::MAX));
+    let overrides: HashMap<String, crate::security::UserLimits> = rows
+        .into_iter()
+        .filter(|r| r.max_concurrent_calls.is_some() || r.max_calls_per_minute.is_some())
+        .map(|r| {
+            (
+                r.username,
+                crate::security::UserLimits {
+                    max_concurrent_calls: clamp(r.max_concurrent_calls),
+                    max_calls_per_minute: clamp(r.max_calls_per_minute),
+                },
+            )
+        })
+        .collect();
+    let count = security.user_limits.replace_overrides(overrides);
+
+    let concurrent = store
+        .get_setting(SETTING_DEFAULT_CONCURRENT)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u32>().ok());
+    let cpm = store
+        .get_setting(SETTING_DEFAULT_CPM)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u32>().ok());
+    if let (Some(c), Some(m)) = (concurrent, cpm) {
+        security.user_limits.set_defaults(c, m);
+    }
+    info!("Hydrate: user limit overrides — {}", count);
+    Ok(count)
+}
+
+/// Settings keys holding the API-set global user limits.
+pub const SETTING_DEFAULT_CONCURRENT: &str = "user_limits.default_max_concurrent_calls";
+pub const SETTING_DEFAULT_CPM: &str = "user_limits.default_max_calls_per_minute";
+
 /// Shared handles the API layer needs to re-hydrate the runtime after writes.
 #[derive(Clone)]
 pub struct RuntimeHandles {
@@ -265,6 +352,7 @@ pub struct RuntimeHandles {
     pub dids: Arc<RwLock<Vec<DidMapping>>>,
     pub trunks: Arc<TrunkManager>,
     pub acl: Arc<AclManager>,
+    pub security: Arc<crate::security::SecurityManager>,
 }
 
 /// Hydrate everything from the store.
@@ -275,6 +363,8 @@ pub async fn hydrate_all(handles: &RuntimeHandles, store: &ConfigStore) -> crate
     apply_dids(&handles.dids, store).await?;
     apply_trunks_and_routes(&handles.trunks, store).await?;
     apply_acl(&handles.acl, store).await?;
+    apply_destinations(&handles.security, store).await?;
+    apply_user_limits(&handles.security, store).await?;
     Ok(())
 }
 
