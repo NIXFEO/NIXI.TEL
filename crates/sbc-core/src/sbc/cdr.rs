@@ -90,6 +90,16 @@ impl CallOutcome {
         }
     }
 
+    /// Which side ended the call (CDR `hangup_by`).
+    pub(crate) fn hangup_by(&self) -> &'static str {
+        match self {
+            Self::NormalClearing { by_caller: true } | Self::Cancelled => "caller",
+            Self::NormalClearing { by_caller: false } => "callee",
+            Self::Rejected { .. } => "callee",
+            _ => "sbc",
+        }
+    }
+
     /// Final sent to a caller whose INVITE is still unanswered when the SBC
     /// hangs the call up on its own.
     pub(crate) fn pending_caller_code(&self) -> u16 {
@@ -98,6 +108,21 @@ impl CallOutcome {
             Self::Shutdown => 503,
             _ => 480,
         }
+    }
+}
+
+impl Sbc {
+    /// Whether `source` is a trunk address or shares a /24 with one
+    /// (clustered trunks answer and hang up from sibling hosts).
+    pub(crate) async fn source_is_trunk_related(&self, source: SocketAddr) -> bool {
+        let source_ip = source.ip().to_string();
+        self.trunk_ips.read().await.iter().any(|tip| {
+            tip == &source_ip || {
+                let tip_prefix = tip.rsplit_once('.').map(|x| x.0);
+                let src_prefix = source_ip.rsplit_once('.').map(|x| x.0);
+                tip_prefix.is_some() && tip_prefix == src_prefix
+            }
+        })
     }
 }
 
@@ -185,6 +210,7 @@ impl Sbc {
         record.sip_code = outcome.sip_code(answered);
         record.source_ip = s.source_ip;
         record.reason = s.peer_reason.or_else(|| outcome.reason_header());
+        record.hangup_by = outcome.hangup_by().to_string();
 
         match self.cdr.insert(&record).await {
             Ok(()) => {
@@ -389,6 +415,12 @@ mod tests {
         assert_eq!(CallOutcome::Cancelled.sip_code(true), Some(200));
         assert_eq!(CallOutcome::WsClosed.sip_code(false), None);
         assert_eq!(CallOutcome::Shutdown.pending_caller_code(), 503);
+        assert_eq!(
+            CallOutcome::NormalClearing { by_caller: false }.hangup_by(),
+            "callee"
+        );
+        assert_eq!(CallOutcome::Cancelled.hangup_by(), "caller");
+        assert_eq!(CallOutcome::RtpTimeout.hangup_by(), "sbc");
         assert_eq!(CallOutcome::SetupTimeout.sip_code(false), Some(408));
         assert!(CallOutcome::MaxDuration
             .reason_header()

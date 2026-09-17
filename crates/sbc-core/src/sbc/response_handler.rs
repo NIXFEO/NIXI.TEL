@@ -989,7 +989,14 @@ impl Sbc {
         let (sbc_ip, sbc_port) = self.sbc_addr();
         if let Some(bye) = self
             .b2bua
-            .build_relay_bye_toward_caller(uuid, &sbc_ip, sbc_port)
+            .build_relay_bye_toward_caller(
+                uuid,
+                &sbc_ip,
+                sbc_port,
+                CallOutcome::DialogLost { status }
+                    .reason_header()
+                    .as_deref(),
+            )
             .await
         {
             if let Some((tx, addr, tp)) = self.b2bua.get_caller_reply_info(uuid).await {

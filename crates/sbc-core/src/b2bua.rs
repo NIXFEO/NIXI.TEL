@@ -1184,7 +1184,8 @@ impl B2buaManager {
 
         call.callee_sdp = callee_sdp.clone();
         call.establish_outbound(callee_tag);
-        if call.answered_at.is_none() {
+        let first_answer = call.answered_at.is_none();
+        if first_answer {
             call.answered_at = Some(std::time::SystemTime::now());
         }
 
@@ -1197,10 +1198,13 @@ impl B2buaManager {
 
         info!("B2BUA: call {} state → {}", uuid, call.state.as_str());
         drop(calls);
-        self.emit(crate::events::SbcEvent::CallAnswered {
-            uuid: uuid.clone(),
-            ts: crate::events::event_ts(),
-        });
+        // 200 OK retransmissions re-enter here: one SSE event per call.
+        if first_answer {
+            self.emit(crate::events::SbcEvent::CallAnswered {
+                uuid: uuid.clone(),
+                ts: crate::events::event_ts(),
+            });
+        }
         Ok(())
     }
 
@@ -1362,6 +1366,7 @@ impl B2buaManager {
         uuid: &CallUuid,
         local_ip: &str,
         local_port: u16,
+        reason: Option<&str>,
     ) -> Option<String> {
         let mut calls = self.calls.lock().await;
         let call = calls.get_mut(uuid)?;
@@ -1370,7 +1375,7 @@ impl B2buaManager {
         // first INVITE's: a 407/422 retry raised it) and the leg counter.
         d.cseq = call.next_outbound_cseq();
         call.outbound.as_mut()?.cseq = d.cseq;
-        Some(crate::sip_builder::build_bye(&d, None))
+        Some(crate::sip_builder::build_bye(&d, reason))
     }
 
     /// Build a fresh in-dialog BYE toward the caller (used when relaying a
@@ -1381,11 +1386,12 @@ impl B2buaManager {
         uuid: &CallUuid,
         local_ip: &str,
         local_port: u16,
+        reason: Option<&str>,
     ) -> Option<String> {
         let calls = self.calls.lock().await;
         let call = calls.get(uuid)?;
         let d = call.dialog_info_toward_caller(local_ip, local_port)?;
-        Some(crate::sip_builder::build_bye(&d, None))
+        Some(crate::sip_builder::build_bye(&d, reason))
     }
 
     /// Count non-terminated calls originated by `user` (per-user limits).
@@ -2027,7 +2033,7 @@ mod tests {
 
         // Before identity capture: no synthetic BYE possible
         assert!(mgr
-            .build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060)
+            .build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060, None)
             .await
             .is_none());
 
@@ -2058,7 +2064,7 @@ mod tests {
 
         // Toward caller: From = answered To (callee side), To = caller's From
         let bye = mgr
-            .build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060)
+            .build_relay_bye_toward_caller(&uuid, "1.2.3.4", 5060, None)
             .await
             .unwrap();
         assert!(
@@ -2072,7 +2078,7 @@ mod tests {
 
         // Toward callee: From/To as sent on the outbound leg
         let bye2 = mgr
-            .build_relay_bye_toward_callee(&uuid, "1.2.3.4", 5060)
+            .build_relay_bye_toward_callee(&uuid, "1.2.3.4", 5060, None)
             .await
             .unwrap();
         assert!(bye2.contains("From: <sip:caller@pstn.example.com>;tag=caller-tag\r\n"));

@@ -60,7 +60,8 @@ Every call gets exactly one record when it ends, whatever the cause
 | `duration_secs`, `billable_secs` | setup → end; answer → end (0 when unanswered) |
 | `sip_code` | final status the caller's INVITE got: 200 once answered, 487 cancelled, 408 setup timeout, the relayed/generated code otherwise, `null` when none was sent |
 | `disconnect_reason` | `normal-clearing`, `cancelled`, `rejected-<code>`, `timeout` (max duration), `setup-timeout`, `rtp-timeout`, `shutdown`, `ws-closed`, `admin-kick`, `dialog-lost` |
-| `reason` | SIP `Reason` header: the peer's on its BYE, the SBC's own on the BYEs it sends |
+| `reason` | SIP `Reason` header: the peer's on its BYE/CANCEL, the SBC's own on the BYEs it sends |
+| `hangup_by` | who ended the call: `caller`, `callee` (the far end, or its rejection), `sbc` |
 | `v` | record schema version: `2` from 0.20; `1` rows (older file lines) carry no billing window |
 
 ### SIP users

@@ -223,6 +223,10 @@ impl Sbc {
             .map(|h| h.value().to_string())
             .unwrap_or_default();
 
+        // The peer's Reason (RFC 3326, e.g. Q.850 cause) travels on the
+        // relayed BYE and into the CDR.
+        let peer_reason = super::cdr::header_value(&request, "reason");
+
         // Find by EITHER inbound or outbound Call-ID, using source IP to disambiguate
         // (both legs share the same Call-ID in our half-B2BUA)
         let mut found = self
@@ -236,16 +240,7 @@ impl Sbc {
         // IP (e.g. 198.51.100.11) than the INVITE was sent to (198.51.100.10).
         if found.is_none() {
             let source_ip = source.ip().to_string();
-            // Check if source is a trunk IP or in the same /24 as a known trunk
-            let is_trunk_related = self.trunk_ips.read().await.iter().any(|tip| {
-                tip == &source_ip || {
-                    // Same /24 subnet check for trunk clusters
-                    let tip_prefix = tip.rsplit_once('.').map(|x| x.0);
-                    let src_prefix = source_ip.rsplit_once('.').map(|x| x.0);
-                    tip_prefix.is_some() && tip_prefix == src_prefix
-                }
-            });
-            if is_trunk_related {
+            if self.source_is_trunk_related(source).await {
                 info!(
                     "BYE from trunk-related IP {} — retrying lookup without source filter",
                     source_ip
@@ -291,7 +286,12 @@ impl Sbc {
                         .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
                     let fresh_bye = self
                         .b2bua
-                        .build_relay_bye_toward_callee(&uuid, &sbc_ip, sbc_port)
+                        .build_relay_bye_toward_callee(
+                            &uuid,
+                            &sbc_ip,
+                            sbc_port,
+                            peer_reason.as_deref(),
+                        )
                         .await;
 
                     let bye_out = if let Some(fresh) = fresh_bye {
@@ -340,7 +340,12 @@ impl Sbc {
                         .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
                     let fresh_bye = self
                         .b2bua
-                        .build_relay_bye_toward_caller(&uuid, &sbc_ip, sbc_port)
+                        .build_relay_bye_toward_caller(
+                            &uuid,
+                            &sbc_ip,
+                            sbc_port,
+                            peer_reason.as_deref(),
+                        )
                         .await;
 
                     let bye_out = if let Some(fresh) = fresh_bye {
@@ -378,7 +383,7 @@ impl Sbc {
 
             // Peer's Reason (Q.850 cause) travels into the CDR; one CDR,
             // counters, gauges and the release all happen in finish_call.
-            if let Some(reason) = super::cdr::header_value(&request, "reason") {
+            if let Some(reason) = peer_reason.clone() {
                 self.b2bua.set_peer_reason(&uuid, reason).await;
             }
             self.finish_call(
@@ -438,7 +443,16 @@ impl Sbc {
             .map(|h| h.value().to_string())
             .unwrap_or_default();
 
-        let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await else {
+        // Exact Call-ID first; a clustered trunk may CANCEL with the
+        // truncated Call-ID it also uses on ACK/BYE (suffix match).
+        let mut found = self.b2bua.find_by_inbound_call_id(&call_id).await;
+        if found.is_none() && self.source_is_trunk_related(source).await {
+            found = self.b2bua.find_by_inbound_call_id_suffix(&call_id).await;
+            if found.is_some() {
+                info!("CANCEL: matched call via Call-ID suffix '{}'", call_id);
+            }
+        }
+        let Some(uuid) = found else {
             warn!(
                 "CANCEL: no INVITE transaction for Call-ID {} from {} — 481",
                 call_id, source
@@ -498,7 +512,11 @@ impl Sbc {
         let current_attempt = self.b2bua.current_attempt(&uuid).await;
         let caller_invite_cseq = self.b2bua.get_caller_invite_cseq(&uuid).await;
 
-        // CDR "cancelled", counters, media release
+        // CDR "cancelled" (with the caller's Reason, RFC 3326), counters,
+        // media release
+        if let Some(reason) = super::cdr::header_value(&request, "reason") {
+            self.b2bua.set_peer_reason(&uuid, reason).await;
+        }
         self.finish_call(&uuid, CallOutcome::Cancelled).await;
 
         // CANCEL toward the callee (if the INVITE was already forwarded).

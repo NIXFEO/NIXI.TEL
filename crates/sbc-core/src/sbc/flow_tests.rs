@@ -126,6 +126,7 @@ async fn full_call_relays_200_ack_and_bye_then_releases_media_and_writes_a_cdr()
     assert!(cdr.ended_at >= cdr.answered_at.unwrap());
     assert!(cdr.billable_secs <= cdr.duration_secs);
     assert_eq!(cdr.reason, None, "the caller's BYE carried no Reason");
+    assert_eq!(cdr.hangup_by, "caller");
 
     // A second teardown of the same call writes nothing.
     assert!(!sbc.finish_call(&call.uuid, CallOutcome::AdminKick).await);
@@ -183,6 +184,11 @@ async fn bye_from_another_host_of_the_trunk_cluster_is_relayed_to_the_caller() {
     assert!(bye.contains("To: <sip:alice@a.example.com>;tag=al-1\r\n"));
     assert!(bye.contains("Call-ID: cid-1\r\n"));
     assert!(
+        bye.contains("Reason: Q.850;cause=16;text=\"Normal call clearing\"\r\n"),
+        "the trunk's Reason is relayed to the caller: {}",
+        bye
+    );
+    assert!(
         drain(&mut call.callee_rx).is_empty(),
         "nothing goes back toward the trunk"
     );
@@ -198,6 +204,7 @@ async fn bye_from_another_host_of_the_trunk_cluster_is_relayed_to_the_caller() {
         "the trunk's Reason header is kept for billing"
     );
     assert_eq!(cdrs[0].sip_code, Some(200));
+    assert_eq!(cdrs[0].hangup_by, "callee");
 }
 
 /// CANCEL from the caller cancels the LIVE attempt (after a 422 retry: the
@@ -297,6 +304,7 @@ async fn cancel_targets_the_live_invite_attempt_and_releases_the_call() {
     assert_eq!(cdrs[0].sip_code, Some(487));
     assert_eq!(cdrs[0].answered_at, None);
     assert_eq!(cdrs[0].billable_secs, 0);
+    assert_eq!(cdrs[0].hangup_by, "caller");
 
     // The caller's ACK to the 487 is absorbed: nothing forwarded anywhere.
     sbc.handle_ack(
@@ -854,4 +862,67 @@ async fn unanswered_invite_is_bounded_by_the_setup_timeout() {
     assert!(alive(&sbc).await);
     assert!(drain(&mut call.caller_rx).is_empty());
     assert!(drain(&mut call.callee_rx).is_empty());
+}
+
+/// A clustered trunk may CANCEL with the truncated Call-ID it uses on its
+/// ACK/BYE: matched by suffix when the source is trunk-related.
+#[tokio::test]
+async fn cancel_with_a_truncated_call_id_from_the_trunk_matches_by_suffix() {
+    let mut sbc = SbcBuilder::new().build();
+    let spec = CallSpec {
+        call_id: "14823298-118e8248-104858689_65703785@host".into(),
+        ..CallSpec::default()
+    };
+    let mut call = add_call(&mut sbc, spec.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let short = CallSpec {
+        call_id: "104858689_65703785@host".into(),
+        ..spec.clone()
+    };
+    sbc.handle_cancel(
+        cancel_from_caller(&short),
+        "203.0.113.77:5060".parse().unwrap(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+
+    let out = drain(&mut rx);
+    assert_eq!(
+        out.len(),
+        2,
+        "200 to the CANCEL, 487 to the INVITE: {:?}",
+        out
+    );
+    assert!(out[0].starts_with("SIP/2.0 200 OK\r\n"));
+    assert!(out[1].starts_with("SIP/2.0 487 Request Terminated\r\n"));
+    assert!(!call_alive(&sbc, &spec.call_id).await);
+    assert_eq!(sbc.media.stats().allocated_ports, 0);
+    let to_trunk = drain(&mut call.callee_rx);
+    assert_eq!(
+        to_trunk.len(),
+        1,
+        "the live attempt is CANCELed: {:?}",
+        to_trunk
+    );
+    assert!(to_trunk[0].starts_with("CANCEL "));
+
+    // From a non-trunk source the truncated Call-ID is unknown → 481.
+    let mut sbc = SbcBuilder::new().build();
+    let _call = add_call(&mut sbc, spec.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_cancel(
+        cancel_from_caller(&short),
+        "198.51.100.7:5060".parse().unwrap(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].starts_with("SIP/2.0 481 "), "{}", out[0]);
+    assert!(call_alive(&sbc, &spec.call_id).await);
 }

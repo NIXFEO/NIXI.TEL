@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 /// setup→end span; bill on `billable_secs`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CdrRecord {
+    #[serde(default = "uuid_v4")]
     pub id: String,
     pub call_id: String,
     pub caller: String,
@@ -57,6 +58,9 @@ pub struct CdrRecord {
     /// SIP Reason header (peer's on a BYE, the SBC's own otherwise).
     #[serde(default)]
     pub reason: Option<String>,
+    /// Who ended the call: caller | callee | sbc ("" on legacy rows).
+    #[serde(default)]
+    pub hangup_by: String,
 }
 
 fn legacy_version() -> u8 {
@@ -92,6 +96,7 @@ impl CdrRecord {
             billable_secs: 0,
             source_ip: String::new(),
             reason: None,
+            hangup_by: String::new(),
         }
     }
 
@@ -261,28 +266,37 @@ impl FileCdrStorage {
         // Load existing CDRs from file (if it exists)
         let inner = InMemoryCdrStorage::new();
         if path.exists() {
-            match tokio::fs::read_to_string(&path).await {
-                Ok(contents) => {
-                    let mut loaded = 0u64;
+            match tokio::fs::File::open(&path).await {
+                Ok(file) => {
+                    use tokio::io::AsyncBufReadExt;
+                    // Stream the file: only the last MAX_CACHED_CDRS rows are
+                    // kept, without ever holding the whole file in memory.
+                    let mut tail: std::collections::VecDeque<CdrRecord> =
+                        std::collections::VecDeque::with_capacity(1024);
                     let mut skipped = 0u64;
-                    let lines: Vec<&str> = contents.lines().collect();
-                    let tail_start = lines.len().saturating_sub(MAX_CACHED_CDRS);
-                    for line in &lines[tail_start..] {
+                    let mut older = 0u64;
+                    let mut lines = tokio::io::BufReader::new(file).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
                         let line = line.trim();
                         if line.is_empty() || !line.starts_with('{') {
                             continue;
                         }
                         match parse_cdr_json(line) {
                             Some(record) => {
-                                inner.insert_cdr(&record).await.ok();
-                                loaded += 1;
+                                if tail.len() >= MAX_CACHED_CDRS {
+                                    tail.pop_front();
+                                    older += 1;
+                                }
+                                tail.push_back(record);
                             }
                             None => skipped += 1,
                         }
                     }
+                    let loaded = tail.len();
+                    *inner.records.lock().await = tail;
                     info!(
                         "CDR file storage: loaded {} records from {:?} ({} unparsable, {} older rows left on disk)",
-                        loaded, path, skipped, tail_start
+                        loaded, path, skipped, older
                     );
                 }
                 Err(e) => {
@@ -411,6 +425,7 @@ fn parse_cdr_json_legacy(json: &str) -> Option<CdrRecord> {
         billable_secs: 0,
         source_ip: String::new(),
         reason: None,
+        hangup_by: String::new(),
     })
 }
 
