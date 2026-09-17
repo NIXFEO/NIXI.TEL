@@ -136,8 +136,13 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `[[security.user_limits.overrides]]` are imported once at first boot like
   users/trunks/DIDs (markers `destination_rules_seeded_at`,
   `user_limits_seeded_at`). `GET /api/v1/export` is version 2 with
-  `destination_rules` and `user_limits`. Migrations are opened with
-  `ignore_missing` so a rolled-back binary still opens a newer store.
+  `destination_rules` and `user_limits`. From this release on, the
+  migrator ignores applied migrations it does not know, so a later
+  rollback to 0.20 only swaps the binary. Rolling back *from* 0.20 to an
+  older binary is different: that binary refuses a store carrying
+  migration 0002 — see INSTALL.md §10 (delete the `_sqlx_migrations` row
+  or restore the pre-upgrade store copy that `scripts/deploy.sh` now
+  takes).
 - `PATCH /api/v1/trunks/{name}` and `/users/{username}` (RFC 7396 merge on
   the wire shape): only the fields sent change, the trunk password / TLS
   material and the user's password stay unless given, `null` clears a

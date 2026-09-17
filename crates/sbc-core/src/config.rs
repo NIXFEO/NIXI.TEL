@@ -347,8 +347,10 @@ pub struct ManagementConfig {
     /// for rate limiting, audit and bans (loopback by default, where the
     /// nginx of INSTALL.md lives). From any other peer the TCP address is
     /// the client, whatever headers it sends.
+    /// An entry that is not an IP address is a config error at startup
+    /// rather than a proxy silently not trusted.
     #[serde(default = "default_trusted_proxies")]
-    pub trusted_proxies: Vec<String>,
+    pub trusted_proxies: Vec<IpAddr>,
     /// Failed bearer-token checks count toward fail2ban: a brute force on
     /// the token gets the offender's IP banned (SIP and API). Turn off when
     /// operators share a NAT with phones.
@@ -359,8 +361,11 @@ pub struct ManagementConfig {
 fn default_api_rate_limit_per_min() -> u32 {
     60
 }
-fn default_trusted_proxies() -> Vec<String> {
-    vec!["127.0.0.1".to_string(), "::1".to_string()]
+fn default_trusted_proxies() -> Vec<IpAddr> {
+    vec![
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]
 }
 fn default_ban_on_auth_failure() -> bool {
     true
@@ -633,7 +638,22 @@ mod example_config_tests {
         assert_eq!(cfg.security.trunk_local_from, "allow");
         assert_eq!(cfg.security.call_setup_timeout, 60);
         assert_eq!(cfg.security.rtp_timeout, 90);
-        assert_eq!(cfg.management.trusted_proxies, vec!["127.0.0.1", "::1"]);
+        assert_eq!(
+            cfg.management.trusted_proxies,
+            vec![
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            ]
+        );
+        let broken = raw.replace(
+            "trusted_proxies = [\"127.0.0.1\", \"::1\"]",
+            "trusted_proxies = [\"nginx\"]",
+        );
+        assert_ne!(broken, raw, "the example documents trusted_proxies");
+        assert!(
+            toml::from_str::<SbcConfig>(&broken).is_err(),
+            "a proxy that is not an IP is a config error at startup"
+        );
         assert!(cfg.management.ban_on_auth_failure);
     }
 }

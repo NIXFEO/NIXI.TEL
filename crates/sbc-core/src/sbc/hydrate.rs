@@ -270,10 +270,29 @@ pub async fn apply_destinations(
         .await
         .map_err(|e| crate::Error::Config(format!("load destination rules: {}", e)))?;
     if rows.is_empty() {
+        // Seeded store with no rows: the operator deleted every rule (or
+        // never had any) and the store is the truth. Unseeded store (a
+        // pre-0.20 database, or a seed that failed): the TOML/IRSF rules
+        // still live in memory only, keep them until the seed lands.
+        let seeded = store
+            .get_setting(super::import::DESTINATION_RULES_SEEDED_KEY)
+            .await
+            .map_err(|e| crate::Error::Config(format!("load seed marker: {}", e)))?
+            .is_some();
+        if seeded {
+            let dropped = security.destinations.replace_rules(Vec::new());
+            if dropped > 0 {
+                info!(
+                    "Hydrate: destination rules — 0 (store empty, {} in-memory rules dropped)",
+                    dropped
+                );
+            }
+            return Ok(0);
+        }
         let kept = security.destinations.list_rules().len();
         if kept > 0 {
             warn!(
-                "Hydrate: store has no destination rules — keeping the {} in memory",
+                "Hydrate: store not yet seeded and has no destination rules — keeping the {} in memory",
                 kept
             );
         }
@@ -416,6 +435,57 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn destinations_hydrate_follows_the_store_once_seeded() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let security = crate::security::SecurityManager::new(Default::default());
+        security
+            .destinations
+            .add_rule(crate::security::DestinationRule {
+                id: "mem".into(),
+                prefix: "+999".into(),
+                deny: true,
+                user: None,
+                description: String::new(),
+                enabled: true,
+            });
+        let in_memory = security.destinations.list_rules().len();
+        assert!(in_memory >= 1);
+
+        // Unseeded store, no rows: the in-memory rules survive.
+        assert_eq!(
+            apply_destinations(&security, &store).await.unwrap(),
+            in_memory
+        );
+        assert_eq!(security.destinations.list_rules().len(), in_memory);
+
+        // Seeded store, no rows: the operator deleted them all — memory follows.
+        store
+            .set_setting(
+                super::super::import::DESTINATION_RULES_SEEDED_KEY,
+                "2026-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_destinations(&security, &store).await.unwrap(), 0);
+        assert!(security.destinations.list_rules().is_empty());
+
+        // Rows again: loaded.
+        store
+            .upsert_destination_rule(&sbc_storage::DestinationRuleRow {
+                id: "r1".into(),
+                prefix: "+882".into(),
+                action: "deny".into(),
+                user: None,
+                description: String::new(),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(apply_destinations(&security, &store).await.unwrap(), 1);
+        assert_eq!(security.destinations.list_rules()[0].id, "r1");
     }
 
     #[tokio::test]

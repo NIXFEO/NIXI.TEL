@@ -172,7 +172,7 @@ pub async fn create_destination_rule(
                 enabled: true,
             };
             let created = store
-                .upsert_destination_rule(&row)
+                .insert_destination_rule(&row)
                 .await
                 .map_err(ApiError::internal)?;
             if !created {

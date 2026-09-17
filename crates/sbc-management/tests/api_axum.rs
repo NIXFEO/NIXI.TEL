@@ -658,6 +658,34 @@ async fn security_destination_rules_crud() {
     let id = rule["id"].as_str().expect("rule id").to_string();
     assert_eq!(rule["prefix"], "+33899");
     assert_eq!(rule["deny"], true);
+
+    // Creating again with the same id is a conflict and does not overwrite.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/security/destination-rules",
+            Some(&format!(
+                r#"{{"id":"{}","prefix":"+1900","action":"allow"}}"#,
+                id
+            )),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let stored = state
+        .store
+        .as_ref()
+        .unwrap()
+        .list_destination_rules()
+        .await
+        .unwrap();
+    let row = stored.iter().find(|r| r.id == id).expect("rule row");
+    assert_eq!(
+        (row.prefix.as_str(), row.action.as_str()),
+        ("+33899", "deny")
+    );
     // Persisted, and the runtime now mirrors the store (the built-in seeds
     // are written to the store at first boot in production; this test store
     // was never seeded, so the store's single rule is the whole policy).

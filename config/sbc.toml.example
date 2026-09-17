@@ -144,7 +144,8 @@ api_auth_token = "GENERATE-A-LONG-RANDOM-TOKEN"
 # Peers whose X-Real-IP / X-Forwarded-For are believed for rate limiting,
 # audit and bans (the nginx of INSTALL.md); from any other peer the TCP
 # address is the client. Failed token checks strike the client's IP in
-# fail2ban like a SIP password guess.
+# fail2ban like a SIP password guess; a banned IP gets 403 without a valid
+# token, a valid token is always served (the API is what lifts bans).
 trusted_proxies = ["127.0.0.1", "::1"]
 ban_on_auth_failure = true
 

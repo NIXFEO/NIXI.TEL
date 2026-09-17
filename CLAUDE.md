@@ -29,7 +29,7 @@ MIT licensed. Runs in production; contributions welcome — see
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # ~480 tests
+cargo test --workspace          # ~485 tests
 cargo clippy --workspace
 ```
 

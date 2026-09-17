@@ -331,8 +331,9 @@ that builds locally: rsync of the sources, timestamped backups, a temporary
 swapfile and a memory-capped release build (see the small-VPS note), a
 refusal to restart while calls are active, graceful stop, binary swap,
 start, `/health`, the API smoke test and swap removal. `--dry-run` shows what
-would change; `--rollback` restores the most recent backups. The binary
-reports the deployed commit in `sbc --version` and at startup.
+would change; `--rollback` restores the most recent binary and config
+backups (never the store — see below). The binary reports the deployed
+commit in `sbc --version` and at startup.
 
 Manual equivalent:
 
@@ -348,9 +349,31 @@ bash scripts/api_smoke.sh                               # verify
 sudo systemctl stop sbc && sudo cp /usr/local/bin/sbc.bak /usr/local/bin/sbc && sudo systemctl start sbc
 ```
 
-The SQLite store and TOML file are untouched by binary upgrades. Back up
-`sqlite_path` and grab a config snapshot via `GET /api/v1/export` before
-major upgrades.
+The TOML file is untouched by binary upgrades. The SQLite store is
+**migrated forward at startup**: schema migrations are embedded in the
+binary, applied once and recorded in `_sqlx_migrations`. `scripts/deploy.sh`
+copies the store next to the other backups (`sbc-db-<timestamp>.db`); do the
+same by hand (`sqlite3 <sqlite_path> ".backup <copy>"`) and grab a config
+snapshot via `GET /api/v1/export` before major upgrades.
+
+**Rolling back across a migration.** A binary older than 0.20 refuses to
+open a store that carries a migration it does not know (0.20 added
+`0002_security_persistence`), so `--rollback` from 0.20 to 0.19 leaves the
+service down until you either
+
+```bash
+# keep the data (the new tables stay, the old binary ignores them):
+sudo systemctl stop sbc
+sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version = 2"
+sudo systemctl start sbc
+# — or — restore the pre-upgrade copy (loses every change made since):
+sudo systemctl stop sbc && sudo cp -p /opt/sbc/backups/sbc-db-<timestamp>.db /var/lib/sbc/sbc.db && sudo systemctl start sbc
+```
+
+`--rollback` prints the applied migration versions and this reminder
+instead of touching the store. From 0.20 on, the migrator ignores applied
+migrations it does not know, so a rollback to 0.20 or later only swaps the
+binary.
 
 **Small VPS (2 GB RAM, no swap):** a full release build can be OOM-killed
 and the kernel may pick the running SBC as the victim. Add a temporary

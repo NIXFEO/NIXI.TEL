@@ -420,7 +420,27 @@ impl ConfigStore {
         .map_err(db_err)
     }
 
-    /// Insert or replace a rule; true when it did not exist yet.
+    /// Insert a rule only if its id is free; false (nothing written) when
+    /// it exists — the API's create, which must not overwrite.
+    pub async fn insert_destination_rule(&self, row: &DestinationRuleRow) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO destination_rules (id, prefix, action, user, description, enabled)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.prefix)
+        .bind(&row.action)
+        .bind(&row.user)
+        .bind(&row.description)
+        .bind(row.enabled)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Insert or replace a rule (seeding, import); true when it did not
+    /// exist yet.
     pub async fn upsert_destination_rule(&self, row: &DestinationRuleRow) -> Result<bool> {
         let existing = sqlx::query("SELECT id FROM destination_rules WHERE id = ?")
             .bind(&row.id)

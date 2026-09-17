@@ -8,7 +8,12 @@
 # the release binary under a memory cap (a 2 GB box OOM-kills otherwise),
 # refuse to restart while calls are active, stop gracefully (BYEs), swap the
 # binary, start, check /health, run the API smoke test, remove the swap.
-# --rollback restores the most recent backups and restarts.
+# The SQLite store (database.sqlite_path of the remote config) is copied
+# with the backups: the binary migrates it forward at startup and an older
+# binary may refuse the migrated store.
+# --rollback restores the most recent binary and config backups and
+# restarts; it never touches the store, it prints the applied migrations
+# and the remediation from INSTALL.md §10 instead.
 #
 # Overridable: SBC_REMOTE_SRC (/root/sbc) SBC_REMOTE_CARGO (/root/.cargo/bin/cargo)
 #              SBC_REMOTE_CONFIG (/opt/sbc/config/production.toml) SBC_MAX_WAIT (600 s)
@@ -33,13 +38,24 @@ TS="$(date -u +%Y%m%d-%H%M%S)"
 
 say() { printf '\n== %s\n' "$*"; }
 
+# database.sqlite_path of the remote config (first match), empty if unset.
+REMOTE_DB_CMD="sed -n 's/^[[:space:]]*sqlite_path[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p' $CONFIG | head -1"
+
 if [ "$MODE" = rollback ]; then
-  say "Rolling back on $HOST to the most recent backups"
+  say "Rolling back on $HOST to the most recent binary and config backups (store untouched)"
   ssh "$HOST" "set -e
     B=\$(ls -t $BIN.bak.* | head -1); C=\$(ls -t $CONFIG.bak.* | head -1)
     echo \"binary: \$B\"; echo \"config: \$C\"
     systemctl stop sbc && cp -p \"\$B\" $BIN && cp -p \"\$C\" $CONFIG && systemctl start sbc
-    sleep 3; systemctl is-active sbc; curl -s -m 3 http://127.0.0.1:8080/health; echo"
+    sleep 3; systemctl is-active sbc || true; curl -s -m 3 http://127.0.0.1:8080/health; echo
+    DB=\$($REMOTE_DB_CMD)
+    if [ -n \"\$DB\" ] && [ -f \"\$DB\" ] && command -v sqlite3 >/dev/null; then
+      echo \"store: \$DB — applied migrations: \$(sqlite3 \"\$DB\" 'SELECT group_concat(version) FROM _sqlx_migrations' 2>/dev/null)\"
+    fi
+    echo 'NOTE: the SQLite store was not restored. If the service does not start because the'
+    echo 'restored binary does not know a migration, see INSTALL.md §10: delete that row from'
+    echo \"_sqlx_migrations (sqlite3 \$DB \\\"DELETE FROM _sqlx_migrations WHERE version = N\\\") or, losing\"
+    echo \"every change since, restore $BACKUPS/sbc-db-<timestamp>.db while stopped.\""
   exit 0
 fi
 
@@ -59,6 +75,17 @@ ssh "$HOST" "set -e
   mkdir -p $BACKUPS
   tar czf $BACKUPS/sbc-src-$TS.tgz -C \$(dirname $SRC) \$(basename $SRC) --exclude=\$(basename $SRC)/target
   cp -p $BIN $BIN.bak.$TS; cp -p $CONFIG $CONFIG.bak.$TS
+  DB=\$($REMOTE_DB_CMD)
+  if [ -n \"\$DB\" ] && [ -f \"\$DB\" ]; then
+    if command -v sqlite3 >/dev/null; then
+      sqlite3 \"\$DB\" \".backup '$BACKUPS/sbc-db-$TS.db'\"
+    else
+      cp -p \"\$DB\" $BACKUPS/sbc-db-$TS.db; [ -f \"\$DB-wal\" ] && cp -p \"\$DB-wal\" $BACKUPS/sbc-db-$TS.db-wal || true
+    fi
+    echo \"store backup: $BACKUPS/sbc-db-$TS.db\"
+  else
+    echo 'store backup: skipped (no sqlite_path in config or file missing)'
+  fi
   if ! swapon --show | grep -q swapfile.build; then
     fallocate -l 2G /swapfile.build && chmod 600 /swapfile.build && mkswap /swapfile.build >/dev/null && swapon /swapfile.build
   fi

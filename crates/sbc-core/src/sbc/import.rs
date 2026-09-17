@@ -169,10 +169,17 @@ pub fn now_rfc3339() -> String {
 /// `seed_irsf_rules` and no TOML deny rule) and `[[security.user_limits.
 /// overrides]]` for users that exist in the store with no limits yet. Like
 /// users/trunks/DIDs, the store is the source of truth afterwards.
+/// Settings marker: the TOML destination rules (and IRSF seeds) were
+/// imported. Written only once every row was stored, so an incomplete
+/// seed is retried at the next boot (the upsert is idempotent).
+pub const DESTINATION_RULES_SEEDED_KEY: &str = "destination_rules_seeded_at";
+/// Settings marker: the TOML per-user limit overrides were imported.
+pub const USER_LIMITS_SEEDED_KEY: &str = "user_limits_seeded_at";
+
 pub async fn seed_security(store: &ConfigStore, config: &SbcConfig) {
     let features = &config.security.features;
 
-    match store.get_setting("destination_rules_seeded_at").await {
+    match store.get_setting(DESTINATION_RULES_SEEDED_KEY).await {
         Ok(None) => {
             let mut rows: Vec<DestinationRuleRow> = features
                 .destinations
@@ -211,33 +218,49 @@ pub async fn seed_security(store: &ConfigStore, config: &SbcConfig) {
                     Err(e) => warn!("Seed destination rule '{}' failed: {}", row.id, e),
                 }
             }
-            let _ = store
-                .set_setting("destination_rules_seeded_at", &now_rfc3339())
-                .await;
-            info!("First-boot seed: {} destination rules", n);
+            if n == rows.len() {
+                match store
+                    .set_setting(DESTINATION_RULES_SEEDED_KEY, &now_rfc3339())
+                    .await
+                {
+                    Ok(()) => info!("First-boot seed: {} destination rules", n),
+                    Err(e) => warn!("Seed: destination rules marker not written: {}", e),
+                }
+            } else {
+                warn!(
+                    "First-boot seed: {}/{} destination rules stored — marker not written, the seed is retried at the next boot",
+                    n,
+                    rows.len()
+                );
+            }
         }
         Ok(Some(_)) => {}
         Err(e) => warn!("Seed: destination rules marker check failed: {}", e),
     }
 
-    match store.get_setting("user_limits_seeded_at").await {
+    match store.get_setting(USER_LIMITS_SEEDED_KEY).await {
         Ok(None) => {
             let mut n = 0;
+            let mut failed = 0;
             for o in &features.user_limits.overrides {
                 match store.get_user(&o.user).await {
                     Ok(Some(u))
                         if u.max_concurrent_calls.is_none() && u.max_calls_per_minute.is_none() =>
                     {
-                        let ok = store
+                        match store
                             .set_user_limits(
                                 &o.user,
                                 o.max_concurrent_calls.map(i64::from),
                                 o.max_calls_per_minute.map(i64::from),
                             )
                             .await
-                            .unwrap_or(false);
-                        if ok {
-                            n += 1;
+                        {
+                            Ok(true) => n += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                failed += 1;
+                                warn!("Seed: user limits for '{}' failed: {}", o.user, e);
+                            }
                         }
                     }
                     Ok(Some(_)) => {}
@@ -245,14 +268,27 @@ pub async fn seed_security(store: &ConfigStore, config: &SbcConfig) {
                         "Seed: [[security.user_limits.overrides]] user '{}' is not in the store — skipped",
                         o.user
                     ),
-                    Err(e) => warn!("Seed: user '{}' lookup failed: {}", o.user, e),
+                    Err(e) => {
+                        failed += 1;
+                        warn!("Seed: user '{}' lookup failed: {}", o.user, e);
+                    }
                 }
             }
-            let _ = store
-                .set_setting("user_limits_seeded_at", &now_rfc3339())
-                .await;
-            if n > 0 {
-                info!("First-boot seed: {} user limit overrides", n);
+            if failed == 0 {
+                if let Err(e) = store
+                    .set_setting(USER_LIMITS_SEEDED_KEY, &now_rfc3339())
+                    .await
+                {
+                    warn!("Seed: user limits marker not written: {}", e);
+                }
+                if n > 0 {
+                    info!("First-boot seed: {} user limit overrides", n);
+                }
+            } else {
+                warn!(
+                    "First-boot seed: {} user limit overrides failed — marker not written, retried at the next boot",
+                    failed
+                );
             }
         }
         Ok(Some(_)) => {}
@@ -316,6 +352,34 @@ mod tests {
         assert_eq!(u, 0, "non-empty table must not be re-seeded");
         assert!(store.get_user("alice").await.unwrap().is_none());
         assert!(store.get_user("bob").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn security_seed_runs_once_and_marks_the_store() {
+        let store = ConfigStore::open_memory().await.unwrap();
+        let mut config = config_with_seeds();
+        config.security.features.destinations.seed_irsf_rules = true;
+        seed_security(&store, &config).await;
+        let seeded = store.list_destination_rules().await.unwrap();
+        assert!(!seeded.is_empty(), "IRSF seeds stored");
+        assert!(store
+            .get_setting(DESTINATION_RULES_SEEDED_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_setting(USER_LIMITS_SEEDED_KEY)
+            .await
+            .unwrap()
+            .is_some());
+
+        // The operator deletes every rule through the API; a restart must
+        // not bring the seeds back.
+        for r in &seeded {
+            assert!(store.delete_destination_rule(&r.id).await.unwrap());
+        }
+        seed_security(&store, &config).await;
+        assert!(store.list_destination_rules().await.unwrap().is_empty());
     }
 
     #[test]
