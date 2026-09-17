@@ -53,6 +53,34 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   user is answered 404 instead of being routed back out to a trunk by LCR.
 - Max-Forwards is decremented on the trunk leg and an INVITE arriving with
   Max-Forwards: 0 is answered 483 (RFC 3261 §16.3, §16.6).
+- **CDRs billing can trust.** `started_at` was the hangup instant and
+  `ended_at` lay in the future; only BYE, lost-dialog and WS-close wrote a
+  record. Every call now ends through one path (`finish_call`) that writes
+  exactly one CDR with the real cause and the setup / answer / end window:
+  `answered_at`, `billable_secs`, `sip_code`, `direction`, `uuid`,
+  `source_ip`, `reason` (the peer's Q.850 Reason on its BYE), schema `v` = 2
+  (older file rows read back as `v` = 1). CANCEL (`cancelled`, 487),
+  rejected finals (`rejected-<code>`), max duration (`timeout`), shutdown,
+  WS close, admin kick, RTP timeout and setup timeout are all recorded;
+  `sbc_active_calls` no longer drifts after an API kick. `GET /api/v1/cdrs`
+  pages are newest first; the API keeps the last 10 000 records in memory.
+- `security.rtp_timeout` was never read and the RTP relay only stopped
+  itself on inactivity, leaving the SIP dialog and the ports allocated
+  until a peer BYE or the max-duration BYE. The SBC now BYEs both legs
+  and releases the call (`rtp-timeout`).
+- `security.call_setup_timeout` (60 s) was never read: an INVITE nobody
+  answers within it is CANCELed toward the callee and answered 408 to the
+  caller (`setup-timeout`), which also bounds a call whose failover
+  candidates are exhausted.
+- `DELETE /api/v1/calls/{uuid}` released the call silently (no BYE to
+  either peer, active-call gauge never decremented). It now answers 202 and
+  the SIP engine ends the call on the wire (BYE/CANCEL both legs, CDR
+  `admin-kick`).
+- Teardowns the SBC initiates while a call is still ringing (shutdown,
+  setup timeout, max duration) answer the caller's INVITE with a final
+  (503 / 408 / 480) instead of a BYE for a dialog that does not exist.
+- Synthetic BYEs and the `CallEnded` SSE event carry the real reason
+  (`shutdown`, `timeout`, `rtp-timeout`, …) instead of "terminated".
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

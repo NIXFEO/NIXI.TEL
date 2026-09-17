@@ -44,6 +44,7 @@ async fn make_state() -> AppState {
         api_token: Some(TOKEN.to_string()),
         api_rate_limit_per_min: 0, // disabled for deterministic tests
         security: Arc::new(sbc_core::security::SecurityManager::new(Default::default())),
+        kicks: Arc::new(sbc_core::sbc::AdminKicks::new()),
     }
 }
 
@@ -896,7 +897,7 @@ async fn cdrs_are_paged_and_need_a_token() {
 }
 
 #[tokio::test]
-async fn delete_call_tears_it_down_and_releases_media() {
+async fn delete_call_queues_an_admin_kick_for_the_engine() {
     let state = make_state().await;
     let app = build_router(state.clone(), &[]);
     const SDP: &str =
@@ -932,10 +933,18 @@ async fn delete_call_tears_it_down_and_releases_media() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["terminated"], true);
-    assert!(state.b2bua.active_calls().await.is_empty());
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(resp).await["terminating"], true);
+    // The API has no SIP transport: the engine drains this queue and ends
+    // the call on the wire (BYE both legs, CDR admin-kick).
+    assert_eq!(state.kicks.pending(), vec![uuid.clone()]);
+    assert_eq!(
+        state.b2bua.active_calls().await.len(),
+        1,
+        "still present until the engine processes the kick"
+    );
 
+    // A second request is idempotent (queued once).
     let resp = app
         .clone()
         .oneshot(req(
@@ -946,5 +955,58 @@ async fn delete_call_tears_it_down_and_releases_media() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "gone");
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(state.kicks.pending().len(), 1);
+}
+
+#[tokio::test]
+async fn cdrs_expose_the_billing_window_newest_first() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    for (n, answered) in [(1u64, true), (2, false)] {
+        let mut r = sbc_core::storage::CdrRecord::new(
+            format!("cid-{}", n),
+            "alice".into(),
+            "+33612345678".into(),
+        )
+        .with_window(
+            t0 + std::time::Duration::from_secs(n * 100),
+            answered.then_some(t0 + std::time::Duration::from_secs(n * 100 + 5)),
+            t0 + std::time::Duration::from_secs(n * 100 + 65),
+        )
+        .with_disconnect_reason(if answered {
+            "normal-clearing"
+        } else {
+            "cancelled"
+        });
+        r.uuid = format!("u{}", n);
+        r.direction = "outbound".into();
+        r.sip_code = Some(if answered { 200 } else { 487 });
+        r.source_ip = "10.0.0.9".into();
+        state.cdr.insert(&r).await.unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/cdrs?limit=10", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let page = body_json(resp).await;
+    let items = page["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["call_id"], "cid-2", "newest first");
+    assert_eq!(items[0]["v"], 2);
+    assert_eq!(items[0]["sip_code"], 487);
+    assert!(items[0]["answered_at"].is_null());
+    assert_eq!(items[0]["billable_secs"], 0);
+    assert_eq!(items[0]["duration_secs"], 65);
+    assert_eq!(items[1]["call_id"], "cid-1");
+    assert_eq!(items[1]["answered_at"], 1_700_000_105u64);
+    assert_eq!(items[1]["billable_secs"], 60);
+    assert_eq!(items[1]["direction"], "outbound");
+    assert_eq!(items[1]["uuid"], "u1");
+    assert_eq!(items[1]["source_ip"], "10.0.0.9");
+    assert_eq!(items[1]["disconnect_reason"], "normal-clearing");
 }

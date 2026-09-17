@@ -110,6 +110,14 @@ pub struct RtpSession {
     /// Global RTP inactivity-timeout counter (from SbcMetrics)
     global_rtp_timeout_counter: Option<Arc<AtomicU64>>,
 
+    /// Seconds without any packet before the relay gives up
+    /// (`security.rtp_timeout`, default 90).
+    rtp_timeout_secs: u64,
+
+    /// Where the relay reports its own session id when it stops on
+    /// inactivity, so the SBC can end the SIP dialog (`MediaManager`).
+    timed_out_tx: Option<mpsc::UnboundedSender<String>>,
+
     /// SRTP context for leg A — decrypt direction (decrypt packets FROM caller).
     /// For SDES-SRTP: same context as send. For DTLS-SRTP: separate keys.
     /// Uses Arc<Mutex<Option>> so the DTLS handshake task can hot-swap the context
@@ -354,6 +362,8 @@ impl RtpSession {
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
             global_rtp_timeout_counter: None,
+            rtp_timeout_secs: 90,
+            timed_out_tx: None,
             srtp_recv_ctx_a: Arc::new(AsyncMutex::new(None)),
             srtp_send_ctx_a: Arc::new(AsyncMutex::new(None)),
             srtp_context_b: Arc::new(AsyncMutex::new(None)),
@@ -397,6 +407,16 @@ impl RtpSession {
     /// Attach global RTP inactivity-timeout counter (from SbcMetrics)
     pub fn set_global_rtp_timeout_counter(&mut self, counter: Arc<AtomicU64>) {
         self.global_rtp_timeout_counter = Some(counter);
+    }
+
+    /// Inactivity budget before the relay stops (`security.rtp_timeout`).
+    pub fn set_rtp_timeout(&mut self, secs: u64) {
+        self.rtp_timeout_secs = secs.max(1);
+    }
+
+    /// Report an inactivity stop on this channel (session id).
+    pub fn set_timed_out_notifier(&mut self, tx: mpsc::UnboundedSender<String>) {
+        self.timed_out_tx = Some(tx);
     }
 
     /// Set transcoder for A→B direction (caller to callee)
@@ -589,6 +609,8 @@ impl RtpSession {
         let global_srtp_encrypt_counter = self.global_srtp_encrypt_counter.clone();
         let global_srtp_decrypt_counter = self.global_srtp_decrypt_counter.clone();
         let global_rtp_timeout_counter = self.global_rtp_timeout_counter.clone();
+        let rtp_timeout_secs = self.rtp_timeout_secs;
+        let timed_out_tx = self.timed_out_tx.clone();
 
         // SRTP contexts — Arc<Mutex<Option<SrtpContext>>> allows hot-swap after DTLS handshake
         let srtp_recv_a = self.srtp_recv_ctx_a.clone();
@@ -672,8 +694,8 @@ impl RtpSession {
                 );
             }
 
-            // RTP inactivity timeout: 90 seconds (covers DTLS handshake + ICE negotiation)
-            let rtp_timeout_secs: u64 = 90;
+            // RTP inactivity timeout (`security.rtp_timeout`, default 90 s —
+            // covers DTLS handshake + ICE negotiation), checked every 15 s.
             let mut rtp_timeout_interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(15));
             // Initialize last_activity to now
@@ -709,6 +731,11 @@ impl RtpSession {
                                 session_id, idle_secs, rtp_timeout_secs, pkt_count);
                             if let Some(ref c) = global_rtp_timeout_counter {
                                 c.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // Hand the SIP side the session id: the dialog
+                            // must end too (BYE both legs, CDR rtp-timeout).
+                            if let Some(ref tx) = timed_out_tx {
+                                let _ = tx.send(session_id.clone());
                             }
                             break;
                         }

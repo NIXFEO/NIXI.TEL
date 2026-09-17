@@ -223,6 +223,16 @@ pub struct B2buaCall {
 
     /// Timestamp when call started
     pub started_at: std::time::Instant,
+    /// Wall-clock INVITE time (CDR `started_at`).
+    pub started_wall: std::time::SystemTime,
+    /// Wall-clock time of the 200 OK toward the caller (CDR `answered_at`);
+    /// None while ringing. Set once, 200 OK retransmissions leave it alone.
+    pub answered_at: Option<std::time::SystemTime>,
+    /// Reason header the peer put on its BYE (CDR `reason`).
+    pub peer_reason: Option<String>,
+    /// The caller's INVITE `To` (no tag): needed to build a final response
+    /// toward a caller whose INVITE the SBC never answered.
+    pub caller_to_raw: Option<String>,
 
     /// Reply channel back to the caller (UDP addr or TCP/TLS/WSS connection)
     pub caller_reply_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
@@ -350,6 +360,10 @@ impl B2buaCall {
             callee_sdp: None,
             media_session_id: None,
             started_at: std::time::Instant::now(),
+            started_wall: std::time::SystemTime::now(),
+            answered_at: None,
+            peer_reason: None,
+            caller_to_raw: None,
             caller_reply_tx,
             caller_source: inbound_addr,
             caller_transport,
@@ -495,6 +509,49 @@ impl B2buaCall {
         let mut d = self.dialog_info_toward_callee(local_ip, local_port)?;
         d.cseq = self.next_outbound_cseq();
         Some(crate::sip_builder::build_bye(&d, reason))
+    }
+
+    /// CDR direction: `outbound` (user → trunk), `inbound` (trunk → user,
+    /// i.e. the source IP belongs to a trunk), else `local` (user → user).
+    pub fn direction(&self) -> &'static str {
+        if self.trunk_id.is_some() {
+            "outbound"
+        } else if self.trunk_name.is_some() {
+            "inbound"
+        } else {
+            "local"
+        }
+    }
+
+    /// A final response to the caller's still-unanswered INVITE, built from
+    /// the identity captured when it arrived (its own Via list, From, To,
+    /// Call-ID and CSeq), for teardowns the SBC initiates while ringing.
+    pub fn final_toward_caller(&self, code: u16, reason: Option<&str>) -> Option<String> {
+        if self.caller_original_vias.is_empty() {
+            return None;
+        }
+        let from = self.inbound.from_raw.as_deref()?;
+        let to = self.caller_to_raw.as_deref()?;
+        let cseq = self.caller_invite_cseq?;
+        let phrase = rsip::StatusCode::from(code).reason_phrase().to_string();
+        let mut out = format!("SIP/2.0 {} {}\r\n", code, phrase);
+        for via in &self.caller_original_vias {
+            out.push_str(via);
+            out.push_str("\r\n");
+        }
+        out.push_str(&format!("From: {}\r\n", from));
+        out.push_str(&format!(
+            "To: {};tag=sbc-{}\r\n",
+            to,
+            &self.uuid[..8.min(self.uuid.len())]
+        ));
+        out.push_str(&format!("Call-ID: {}\r\n", self.inbound.call_id));
+        out.push_str(&format!("CSeq: {} INVITE\r\n", cseq));
+        if let Some(r) = reason {
+            out.push_str(&format!("Reason: {}\r\n", r));
+        }
+        out.push_str("Content-Length: 0\r\n\r\n");
+        Some(out)
     }
 }
 
@@ -678,12 +735,22 @@ impl B2buaManager {
         &self,
         uuid: &CallUuid,
         from_raw: String,
+        to_raw: Option<String>,
         caller_contact: Option<String>,
     ) {
         let mut calls = self.calls.lock().await;
         if let Some(call) = calls.get_mut(uuid) {
             call.inbound.from_raw = Some(from_raw);
+            call.caller_to_raw = to_raw;
             call.inbound.remote_target = caller_contact;
+        }
+    }
+
+    /// Reason header the peer put on its BYE (goes into the CDR).
+    pub async fn set_peer_reason(&self, uuid: &CallUuid, reason: String) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.peer_reason = Some(reason);
         }
     }
 
@@ -1117,6 +1184,9 @@ impl B2buaManager {
 
         call.callee_sdp = callee_sdp.clone();
         call.establish_outbound(callee_tag);
+        if call.answered_at.is_none() {
+            call.answered_at = Some(std::time::SystemTime::now());
+        }
 
         // Update media session with callee SDP
         if let (Some(media_id), Some(sdp)) = (&call.media_session_id.clone(), callee_sdp) {
@@ -1175,8 +1245,15 @@ impl B2buaManager {
         Ok(())
     }
 
-    /// Mark call as fully terminated
+    /// Mark call as fully terminated (`CallEnded` reason "terminated").
+    /// Handler code goes through `Sbc::finish_call`, which passes the real
+    /// cause; this form remains for direct callers (API, tests).
     pub async fn terminate_call(&self, uuid: &CallUuid) {
+        self.terminate_call_with_reason(uuid, "terminated").await
+    }
+
+    /// Release the call and publish `CallEnded { reason }`.
+    pub async fn terminate_call_with_reason(&self, uuid: &CallUuid, reason: &str) {
         let mut calls = self.calls.lock().await;
         let duration = if let Some(call) = calls.get_mut(uuid) {
             call.state = CallState::Terminated;
@@ -1210,7 +1287,7 @@ impl B2buaManager {
             self.emit(crate::events::SbcEvent::CallEnded {
                 uuid: uuid.clone(),
                 duration_secs,
-                reason: "terminated".to_string(),
+                reason: reason.to_string(),
                 ts: crate::events::event_ts(),
             });
         }
@@ -1957,6 +2034,7 @@ mod tests {
         mgr.set_inbound_dialog(
             &uuid,
             "<sip:caller@pstn.example.com>;tag=caller-tag".to_string(),
+            None,
             Some("sip:caller@192.168.1.100:5060".to_string()),
         )
         .await;
@@ -2861,6 +2939,7 @@ mod invite_attempt_tests {
         mgr.set_inbound_dialog(
             &uuid,
             "<sip:caller@pstn.example.com>;tag=caller-tag".into(),
+            None,
             None,
         )
         .await;

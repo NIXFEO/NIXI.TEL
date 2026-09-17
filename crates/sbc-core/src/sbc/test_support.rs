@@ -245,8 +245,9 @@ pub(crate) fn cancel_from_caller(spec: &CallSpec) -> rsip::Request {
     ))
 }
 
-/// BYE from the trunk side (leg B): From/To swapped, its own CSeq space.
-pub(crate) fn bye_from_trunk(spec: &CallSpec, cseq: u32) -> rsip::Request {
+/// BYE from the trunk side (leg B): From/To swapped, its own CSeq space,
+/// plus `extra` header lines (each `\r\n`-terminated), e.g. a Reason.
+pub(crate) fn bye_from_trunk_with(spec: &CallSpec, cseq: u32, extra: &str) -> rsip::Request {
     request(format!(
         "BYE sip:sbc@127.0.0.1:5060 SIP/2.0\r\n\
          Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKtrunkbye\r\n\
@@ -255,8 +256,8 @@ pub(crate) fn bye_from_trunk(spec: &CallSpec, cseq: u32) -> rsip::Request {
          To: <sip:alice@a.example.com>;tag={}\r\n\
          Call-ID: {}\r\n\
          CSeq: {} BYE\r\n\
-         Content-Length: 0\r\n\r\n",
-        spec.from_tag, spec.call_id, cseq
+         {}Content-Length: 0\r\n\r\n",
+        spec.from_tag, spec.call_id, cseq, extra
     ))
 }
 
@@ -339,6 +340,7 @@ pub(crate) struct SbcBuilder {
     identity: Option<SbcIdentity>,
     session_timer: Option<(u32, u32)>,
     invite_timeout: Duration,
+    setup_timeout: Duration,
     max_call_duration: Duration,
 }
 
@@ -348,8 +350,14 @@ impl SbcBuilder {
             identity: None,
             session_timer: Some((1800, 90)),
             invite_timeout: Duration::from_secs(5),
+            setup_timeout: Duration::from_secs(180),
             max_call_duration: Duration::from_secs(14400),
         }
+    }
+
+    pub(crate) fn setup_timeout(mut self, timeout: Duration) -> Self {
+        self.setup_timeout = timeout;
+        self
     }
 
     /// Public identity used in synthetic requests (default: 127.0.0.1:5060).
@@ -388,6 +396,7 @@ impl SbcBuilder {
         sbc.identity = self.identity;
         sbc.session_timer = self.session_timer;
         sbc.invite_timeout = self.invite_timeout;
+        sbc.call_setup_timeout = self.setup_timeout;
         sbc.max_call_duration = self.max_call_duration;
         let mut trunk = TrunkConfig::new(TRUNK_NAME.to_string());
         trunk.host = trunk_addr().ip().to_string();
@@ -452,9 +461,16 @@ pub(crate) async fn add_call(sbc: &mut Sbc, spec: CallSpec) -> TestCall {
         .set_inbound_dialog(
             &uuid,
             format!("<sip:alice@a.example.com>;tag={}", spec.from_tag),
+            Some("<sip:bob@b.example.com>".into()),
             Some("sip:alice@10.0.0.9:5060".into()),
         )
         .await;
+    {
+        let mut calls = sbc.b2bua.calls_locked().await;
+        let call = calls.get_mut(&uuid).unwrap();
+        call.caller_number = Some("alice".into());
+        call.callee_number = Some("bob".into());
+    }
     let raw = invite_for(&spec, &spec.branch, spec.cseq);
     sbc.b2bua
         .store_outbound_invite(&uuid, raw.clone(), trunk_id)

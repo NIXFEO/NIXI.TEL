@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
             api_token,
             api_rate_limit_per_min: config.management.api_rate_limit_per_min,
             security: sbc.security(),
+            kicks: sbc.admin_kicks(),
         };
         if state.store.is_none() {
             warn!("Management API: config store unavailable — mutating endpoints return 503");

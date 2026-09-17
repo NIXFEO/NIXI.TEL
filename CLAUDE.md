@@ -77,6 +77,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `sbc/invite_handler.rs` | INVITE routing, trunk failover, 407/422 retries, session-timer offer |
 | `sbc/response_handler.rs` | Response relay, non-2xx ACK + per-attempt attribution, SDP, WebRTC/DTLS/SRTP, session-timer completion |
 | `sbc/call_handler.rs` | BYE/CANCEL/ACK/INFO, re-INVITE, timeouts, graceful shutdown |
+| `sbc/cdr.rs` | `CallOutcome`, `finish_call` (single CDR/metrics/release path), `hangup_both_legs`, RTP/setup timeouts, admin kicks |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
@@ -164,8 +165,12 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   three failed refreshes in a row) tears the call down with a BYE to the
   caller instead of refreshing a dead dialog forever.
 
-Some callees (e.g. Jambonz-based) drop media without sending BYE — the 90s
-RTP inactivity timeout tears those down.
+Some callees (e.g. Jambonz-based) drop media without sending BYE — after
+`security.rtp_timeout` (90 s) without RTP the SBC BYEs both legs and writes a
+`rtp-timeout` CDR. Every call ends through `sbc/cdr.rs::finish_call` (one
+CDR per call, real cause, setup/answer/end window) whatever the path: BYE,
+CANCEL, rejected final, `max_call_duration`, `call_setup_timeout`, RTP
+timeout, shutdown, WS close, admin kick, lost dialog.
 
 ## Known minor issues
 

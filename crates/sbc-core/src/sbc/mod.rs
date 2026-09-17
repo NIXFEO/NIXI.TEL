@@ -9,6 +9,8 @@ pub(crate) use invite_handler::extract_contact_uri as invite_handler_contact_uri
 mod response_handler;
 pub(crate) use response_handler::parse_session_expires as response_handler_session_expires;
 mod call_handler;
+mod cdr;
+pub(crate) use cdr::CallOutcome;
 #[cfg(test)]
 mod flow_tests;
 pub mod hydrate;
@@ -46,6 +48,49 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
 /// Integrated SBC combining all layers
+/// Administrative teardown requests (`DELETE /api/v1/calls/{uuid}`). The
+/// API has no SIP transport: it queues the uuid here and the event loop
+/// ends the call properly (BYE/CANCEL on both legs, CDR "admin-kick").
+#[derive(Default)]
+pub struct AdminKicks {
+    queue: std::sync::Mutex<Vec<String>>,
+    notify: tokio::sync::Notify,
+}
+
+impl AdminKicks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a call for teardown and wake the event loop.
+    pub fn request(&self, uuid: String) {
+        if let Ok(mut q) = self.queue.lock() {
+            if !q.contains(&uuid) {
+                q.push(uuid);
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    /// Take every queued uuid.
+    pub fn drain(&self) -> Vec<String> {
+        self.queue
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+
+    /// Queued uuids (not yet processed by the engine).
+    pub fn pending(&self) -> Vec<String> {
+        self.queue.lock().map(|q| q.clone()).unwrap_or_default()
+    }
+
+    /// Resolves when a request was queued (permit-based: never misses one).
+    pub async fn notified(&self) {
+        self.notify.notified().await
+    }
+}
+
 pub struct Sbc {
     /// Transport layer (UDP, TCP, TLS, WSS)
     transport: TransportManager,
@@ -117,6 +162,13 @@ pub struct Sbc {
     /// Outbound INVITE answer timeout before trunk failover.
     invite_timeout: Duration,
 
+    /// `security.call_setup_timeout`: an INVITE unanswered this long is
+    /// CANCELed toward the callee and answered 408 to the caller.
+    call_setup_timeout: Duration,
+
+    /// Teardown requests from the management API.
+    admin_kicks: Arc<AdminKicks>,
+
     /// Hard cap on a connected call (`security.max_call_duration`): past it
     /// the SBC BYEs both legs, so a callee that vanished without BYE cannot
     /// pin a trunk session forever.
@@ -155,6 +207,7 @@ impl Sbc {
         media_mgr.set_global_srtp_encrypt_counter(metrics.srtp_encrypted_total.clone());
         media_mgr.set_global_srtp_decrypt_counter(metrics.srtp_decrypted_total.clone());
         media_mgr.set_global_rtp_timeout_counter(metrics.rtp_timeouts_total.clone());
+        media_mgr.set_rtp_timeout(config.security.rtp_timeout.max(10));
         media_mgr.set_global_transcode_counter(metrics.transcoded_total.clone());
         let media = Arc::new(media_mgr);
 
@@ -406,6 +459,8 @@ impl Sbc {
             config_store,
             events,
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
+            call_setup_timeout: Duration::from_secs(config.security.call_setup_timeout.max(10)),
+            admin_kicks: Arc::new(AdminKicks::new()),
             max_call_duration: Duration::from_secs(config.security.max_call_duration.max(60)),
             security,
             session_timer: config.security.session_timer_enabled.then(|| {
@@ -511,6 +566,15 @@ impl Sbc {
                 max_call_duration.as_secs()
             );
             self.max_call_duration = max_call_duration;
+        }
+        let setup_timeout = Duration::from_secs(config.security.call_setup_timeout.max(10));
+        if setup_timeout != self.call_setup_timeout {
+            info!(
+                "Reload: call_setup_timeout {}s → {}s",
+                self.call_setup_timeout.as_secs(),
+                setup_timeout.as_secs()
+            );
+            self.call_setup_timeout = setup_timeout;
         }
 
         // ── SQLite store present: it is the source of truth for dynamic
@@ -711,6 +775,8 @@ impl Sbc {
             config_store: None,
             events: crate::events::EventBus::new(),
             invite_timeout: Duration::from_secs(5),
+            call_setup_timeout: Duration::from_secs(60),
+            admin_kicks: Arc::new(AdminKicks::new()),
             max_call_duration: Duration::from_secs(14400),
             session_timer: None,
             security: Arc::new(crate::security::SecurityManager::new(Default::default())),
@@ -1212,6 +1278,7 @@ impl Sbc {
         // with no >=180 provisional, CANCEL and try the next candidate trunk.
         let mut failover_interval = tokio::time::interval(Duration::from_secs(1));
         failover_interval.tick().await;
+        let kicks = self.admin_kicks.clone();
 
         loop {
             #[cfg(unix)]
@@ -1235,9 +1302,14 @@ impl Sbc {
                 }
                 _ = failover_interval.tick() => {
                     self.check_invite_failover().await;
+                    self.check_setup_timeouts().await;
+                    self.check_media_timeouts().await;
                     for event in self.transport.drain_events() {
                         self.handle_transport_event(event).await;
                     }
+                }
+                _ = kicks.notified() => {
+                    self.process_admin_kicks().await;
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration");
@@ -1704,6 +1776,10 @@ impl Sbc {
     }
     pub fn security(&self) -> Arc<crate::security::SecurityManager> {
         self.security.clone()
+    }
+    /// Queue shared with the management API for `DELETE /api/v1/calls/{uuid}`.
+    pub fn admin_kicks(&self) -> Arc<AdminKicks> {
+        self.admin_kicks.clone()
     }
     pub fn trunk_ips(&self) -> Arc<tokio::sync::RwLock<Vec<String>>> {
         self.trunk_ips.clone()

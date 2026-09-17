@@ -2,304 +2,59 @@ use super::*;
 
 impl Sbc {
     /// Check for calls that have exceeded `security.max_call_duration` and
-    /// terminate them (BYE on both legs). This prevents phantom sessions when
-    /// the callee drops without sending BYE. Runs every 30 s from the event loop.
+    /// terminate them (BYE on both legs, CDR "timeout"). This prevents
+    /// phantom sessions when the callee drops without sending BYE. Runs
+    /// every 30 s from the event loop.
     pub(crate) async fn check_call_timeouts(&mut self) {
         let max_duration = self.max_call_duration;
-
-        let (sbc_ip, sbc_port) = self
-            .identity
-            .as_ref()
-            .map(|id| (id.public_ip.clone(), id.sip_port))
-            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
-        const TIMEOUT_REASON: &str = "Q.850;cause=16;text=\"Call duration exceeded\"";
-
-        let calls = self.b2bua.calls_locked().await;
-        let timed_out: Vec<_> = calls
-            .values()
-            .filter(|c| c.started_at.elapsed() > max_duration)
-            .map(|c| {
-                (
-                    c.uuid.clone(),
-                    c.inbound.call_id.clone(),
-                    c.caller_source,
-                    c.caller_transport,
-                    c.caller_reply_tx.clone(),
-                    c.callee_dest,
-                    c.callee_transport,
-                    c.callee_reply_tx.clone(),
-                    c.media_session_id.clone(),
-                    c.outbound.as_ref().map(|l| l.call_id.clone()),
-                    c.started_at.elapsed().as_secs(),
-                    c.dialog_info_toward_caller(&sbc_ip, sbc_port)
-                        .map(|d| crate::sip_builder::build_bye(&d, Some(TIMEOUT_REASON))),
-                    c.bye_toward_callee(&sbc_ip, sbc_port, Some(TIMEOUT_REASON)),
-                )
-            })
-            .collect();
-        drop(calls);
-
-        if timed_out.is_empty() {
-            return;
-        }
-
-        for (
-            uuid,
-            call_id,
-            caller_addr,
-            caller_transport,
-            caller_tx,
-            callee_dest,
-            callee_transport,
-            callee_tx,
-            media_id,
-            outbound_call_id,
-            duration,
-            bye_toward_caller,
-            bye_toward_callee,
-        ) in timed_out
-        {
-            warn!("Call timeout: {} (Call-ID: {}) exceeded {}s (active {}s) — sending BYE to both sides",
-                &uuid[..8], call_id, max_duration.as_secs(), duration);
-
-            // BYE to caller (trunk) — real dialog identity when captured,
-            // legacy best-effort otherwise
-            let bye_caller = bye_toward_caller.unwrap_or_else(|| {
-                format!(
-                    "BYE sip:bye@{} SIP/2.0\r\n\
-                 Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
-                 From: <sip:sbc@{}>;tag=timeout-{}\r\n\
-                 To: <sip:caller@{}>\r\n\
-                 Call-ID: {}\r\n\
-                 CSeq: 1 BYE\r\n\
-                 Reason: Q.850;cause=16;text=\"Call duration exceeded\"\r\n\
-                 Content-Length: 0\r\n\r\n",
-                    caller_addr.ip(),
-                    sbc_ip,
-                    &uuid::Uuid::new_v4().to_string()[..8],
-                    sbc_ip,
-                    &uuid[..8],
-                    caller_addr.ip(),
-                    call_id
-                )
-            });
-            self.send_sip(
-                "timeout BYE → caller",
-                bye_caller.as_bytes(),
-                caller_addr,
-                caller_transport,
-                caller_tx.as_ref(),
-            )
-            .await;
-
-            // BYE to callee
-            if let Some(dest) = callee_dest {
-                let callee_call_id = outbound_call_id.as_deref().unwrap_or(&call_id);
-                let bye_callee = bye_toward_callee.clone().unwrap_or_else(|| {
-                    format!(
-                        "BYE sip:bye@{} SIP/2.0\r\n\
-                     Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
-                     From: <sip:sbc@{}>;tag=timeout-{}\r\n\
-                     To: <sip:callee@{}>\r\n\
-                     Call-ID: {}\r\n\
-                     CSeq: 1 BYE\r\n\
-                     Reason: Q.850;cause=16;text=\"Call duration exceeded\"\r\n\
-                     Content-Length: 0\r\n\r\n",
-                        dest.ip(),
-                        sbc_ip,
-                        &uuid::Uuid::new_v4().to_string()[..8],
-                        sbc_ip,
-                        &uuid[..8],
-                        dest.ip(),
-                        callee_call_id
+        let timed_out: Vec<(crate::b2bua::CallUuid, String, u64)> = {
+            let calls = self.b2bua.calls_locked().await;
+            calls
+                .values()
+                .filter(|c| c.started_at.elapsed() > max_duration)
+                .map(|c| {
+                    (
+                        c.uuid.clone(),
+                        c.inbound.call_id.clone(),
+                        c.started_at.elapsed().as_secs(),
                     )
-                });
-                self.send_sip(
-                    "timeout BYE → callee",
-                    bye_callee.as_bytes(),
-                    dest,
-                    callee_transport,
-                    callee_tx.as_ref(),
-                )
-                .await;
-            }
-
-            // Terminate media session
-            if let Some(ref mid) = media_id {
-                if let Err(e) = self.media.terminate_session(mid) {
-                    warn!("Timeout: failed to terminate media session {}: {}", mid, e);
-                }
-            }
-
-            // Cleanup B2BUA state and metrics
-            self.metrics.inc_call_terminated();
-            self.b2bua.terminate_call(&uuid).await;
+                })
+                .collect()
+        };
+        for (uuid, call_id, duration) in timed_out {
+            warn!(
+                "Call timeout: {} (Call-ID: {}) exceeded {}s (active {}s) — sending BYE to both sides",
+                &uuid[..8.min(uuid.len())],
+                call_id,
+                max_duration.as_secs(),
+                duration
+            );
+            let outcome = CallOutcome::MaxDuration;
+            self.hangup_both_legs(&uuid, &outcome).await;
+            self.finish_call(&uuid, outcome).await;
         }
     }
 
-    /// Send BYE to all active call peers before shutdown.
-    /// This prevents phantom sessions on remote trunks (e.g. trunk OverMaxCall).
+    /// SIGTERM/SIGINT: end every call on the wire (BYE to established legs,
+    /// CANCEL to a pending callee, 503 to a still-ringing caller), write
+    /// its CDR ("shutdown") and release it. Prevents phantom sessions on
+    /// remote trunks (e.g. trunk OverMaxCall).
     pub(crate) async fn graceful_shutdown(&mut self) {
-        let (sbc_ip, sbc_port) = self
-            .identity
-            .as_ref()
-            .map(|id| (id.public_ip.clone(), id.sip_port))
-            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
-        const SHUTDOWN_REASON: &str = "Q.850;cause=16;text=\"Server shutdown\"";
-
-        let calls = self.b2bua.calls_locked().await;
-        let active: Vec<_> = calls
-            .values()
-            .map(|c| {
-                (
-                    c.uuid.clone(),
-                    c.inbound.call_id.clone(),
-                    c.caller_source,
-                    c.caller_transport,
-                    c.caller_reply_tx.clone(),
-                    c.callee_dest,
-                    c.callee_transport,
-                    c.callee_reply_tx.clone(),
-                    c.media_session_id.clone(),
-                    c.outbound.as_ref().map(|l| l.call_id.clone()),
-                    c.dialog_info_toward_caller(&sbc_ip, sbc_port)
-                        .map(|d| crate::sip_builder::build_bye(&d, Some(SHUTDOWN_REASON))),
-                    c.bye_toward_callee(&sbc_ip, sbc_port, Some(SHUTDOWN_REASON)),
-                    // INVITE still pending toward the callee (no 200 OK yet): a
-                    // BYE cannot match — CANCEL the live attempt instead.
-                    c.invite_attempts
-                        .last()
-                        .and_then(|a| crate::sip_builder::build_cancel(&a.raw)),
-                )
-            })
-            .collect();
-        drop(calls);
-
-        let count = active.len();
-        if count == 0 {
+        let active: Vec<crate::b2bua::CallUuid> =
+            self.b2bua.calls_locked().await.keys().cloned().collect();
+        if active.is_empty() {
             info!("Graceful shutdown: no active calls");
             return;
         }
-
-        info!(
-            "Graceful shutdown: sending BYE for {} active call(s)",
-            count
-        );
-
-        for (
-            uuid,
-            call_id,
-            caller_addr,
-            caller_transport,
-            caller_tx,
-            callee_dest,
-            callee_transport,
-            callee_tx,
-            media_id,
-            outbound_call_id,
-            bye_toward_caller,
-            bye_toward_callee,
-            cancel_toward_callee,
-        ) in active
-        {
-            // Build BYE for caller leg — real dialog identity when captured
-            let bye_caller = bye_toward_caller.unwrap_or_else(|| {
-                format!(
-                    "BYE sip:bye@{} SIP/2.0\r\n\
-                 Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
-                 From: <sip:sbc@{}>;tag=shutdown-{}\r\n\
-                 To: <sip:caller@{}>\r\n\
-                 Call-ID: {}\r\n\
-                 CSeq: 1 BYE\r\n\
-                 Reason: Q.850;cause=16;text=\"Server shutdown\"\r\n\
-                 Content-Length: 0\r\n\r\n",
-                    caller_addr.ip(),
-                    sbc_ip,
-                    &uuid::Uuid::new_v4().to_string()[..8],
-                    sbc_ip,
-                    &uuid[..8],
-                    caller_addr.ip(),
-                    call_id
-                )
-            });
-            info!(
-                "Shutdown BYE → caller {} (call {})",
-                caller_addr,
-                &uuid[..8]
-            );
-            self.send_sip(
-                "shutdown BYE → caller",
-                bye_caller.as_bytes(),
-                caller_addr,
-                caller_transport,
-                caller_tx.as_ref(),
-            )
-            .await;
-
-            // Callee leg: BYE when the dialog is established, CANCEL when
-            // the INVITE is still pending (a BYE would leave a ghost session
-            // on the trunk — the OverMaxCall case).
-            if let Some(dest) = callee_dest {
-                if let (None, Some(cancel)) = (&bye_toward_callee, &cancel_toward_callee) {
-                    info!(
-                        "Shutdown CANCEL → callee {} (call {}, INVITE pending)",
-                        dest,
-                        &uuid[..8]
-                    );
-                    self.send_sip(
-                        "shutdown CANCEL → callee",
-                        cancel.as_bytes(),
-                        dest,
-                        callee_transport,
-                        callee_tx.as_ref(),
-                    )
-                    .await;
-                } else {
-                    let callee_call_id = outbound_call_id.as_deref().unwrap_or(&call_id);
-                    let bye_callee = bye_toward_callee.clone().unwrap_or_else(|| {
-                        format!(
-                            "BYE sip:bye@{} SIP/2.0\r\n\
-                         Via: SIP/2.0/UDP {}:5060;branch=z9hG4bK{}\r\n\
-                         From: <sip:sbc@{}>;tag=shutdown-{}\r\n\
-                         To: <sip:callee@{}>\r\n\
-                         Call-ID: {}\r\n\
-                         CSeq: 1 BYE\r\n\
-                         Reason: Q.850;cause=16;text=\"Server shutdown\"\r\n\
-                         Content-Length: 0\r\n\r\n",
-                            dest.ip(),
-                            sbc_ip,
-                            &uuid::Uuid::new_v4().to_string()[..8],
-                            sbc_ip,
-                            &uuid[..8],
-                            dest.ip(),
-                            callee_call_id
-                        )
-                    });
-                    info!("Shutdown BYE → callee {} (call {})", dest, &uuid[..8]);
-                    self.send_sip(
-                        "shutdown BYE → callee",
-                        bye_callee.as_bytes(),
-                        dest,
-                        callee_transport,
-                        callee_tx.as_ref(),
-                    )
-                    .await;
-                }
-            }
-
-            // Terminate media session
-            if let Some(ref mid) = media_id {
-                if let Err(e) = self.media.terminate_session(mid) {
-                    warn!("Shutdown: failed to terminate media session {}: {}", mid, e);
-                } else {
-                    info!("Shutdown: terminated media session {}", mid);
-                }
-            }
+        info!("Graceful shutdown: ending {} active call(s)", active.len());
+        for uuid in active {
+            let outcome = CallOutcome::Shutdown;
+            self.hangup_both_legs(&uuid, &outcome).await;
+            self.finish_call(&uuid, outcome).await;
         }
-
         // Give time for BYE packets to be sent
         tokio::time::sleep(Duration::from_millis(500)).await;
-        info!("Graceful shutdown: all BYEs sent");
+        info!("Graceful shutdown: all calls ended");
     }
 
     /// Handle ACK — must be relayed to callee so dialog completes (RFC 3261 §13.2.2.4)
@@ -621,65 +376,18 @@ impl Sbc {
                 }
             }
 
-            // ── CDR: record the terminated call (enriched) ──────────────────
-            {
-                let calls = self.b2bua.calls_locked().await;
-                if let Some(call) = calls.get(&uuid) {
-                    let call_id = call.inbound.call_id.clone();
-                    let caller = call
-                        .caller_number
-                        .clone()
-                        .unwrap_or_else(|| call.inbound.call_id.clone());
-                    let callee = call.callee_number.clone().unwrap_or_else(|| {
-                        call.outbound
-                            .as_ref()
-                            .map(|l| l.call_id.clone())
-                            .unwrap_or_default()
-                    });
-                    let duration = call.duration_secs();
-                    let is_webrtc = call.caller_is_webrtc;
-                    let codec = call.codec.clone();
-                    let trunk_name = call.trunk_name.clone();
-                    drop(calls); // release lock before async call
-
-                    let mut record = crate::storage::CdrRecord::new(call_id, caller, callee)
-                        .with_duration(duration)
-                        .with_webrtc(is_webrtc)
-                        .with_disconnect_reason("normal-clearing");
-                    if let Some(c) = codec.as_deref() {
-                        record = record.with_codec(c);
-                    }
-                    record.trunk_id = trunk_name;
-                    if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
-                        warn!("CDR recording failed: {}", e);
-                    } else {
-                        self.metrics.record_cdr_written();
-                        info!(
-                            "CDR: {} → {} ({} secs, codec={}, trunk={}, webrtc={})",
-                            record.caller,
-                            record.callee,
-                            duration,
-                            record.codec.as_deref().unwrap_or("unknown"),
-                            record.trunk_id.as_deref().unwrap_or("local"),
-                            is_webrtc
-                        );
-                    }
-                }
+            // Peer's Reason (Q.850 cause) travels into the CDR; one CDR,
+            // counters, gauges and the release all happen in finish_call.
+            if let Some(reason) = super::cdr::header_value(&request, "reason") {
+                self.b2bua.set_peer_reason(&uuid, reason).await;
             }
-
-            // ── Metrics: call terminated (inc_call_terminated also decrements active_calls) ──
-            self.metrics.inc_call_terminated();
-
-            // Update gauges after termination
-            {
-                let stats = self.b2bua.stats().await;
-                self.metrics.set_active_webrtc(stats.webrtc_calls as u64);
-            }
-            self.metrics
-                .set_allocated_ports(self.media.stats().allocated_ports as u64);
-
-            // Mark call terminated
-            self.b2bua.terminate_call(&uuid).await;
+            self.finish_call(
+                &uuid,
+                CallOutcome::NormalClearing {
+                    by_caller: is_from_caller,
+                },
+            )
+            .await;
         } else if self.b2bua.was_recently_terminated(&call_id) {
             // Late BYE for a dialog we already tore down (Genesys sends these
             // 1-8 min after teardown) — benign, answered 200 below.
@@ -790,9 +498,8 @@ impl Sbc {
         let current_attempt = self.b2bua.current_attempt(&uuid).await;
         let caller_invite_cseq = self.b2bua.get_caller_invite_cseq(&uuid).await;
 
-        // Terminate call (releases media)
-        self.b2bua.terminate_call(&uuid).await;
-        self.metrics.inc_call_failed();
+        // CDR "cancelled", counters, media release
+        self.finish_call(&uuid, CallOutcome::Cancelled).await;
 
         // CANCEL toward the callee (if the INVITE was already forwarded).
         // RFC 3261 §9.1: it must carry the INVITE's own Request-URI, Via
@@ -953,26 +660,12 @@ impl Sbc {
                             c.caller_reply_tx.clone(),
                         )
                     };
-                    (
-                        c.uuid.clone(),
-                        bye,
-                        dest,
-                        tp,
-                        tx,
-                        c.media_session_id.clone(),
-                        c.inbound.call_id.clone(),
-                        c.caller_number.clone(),
-                        c.callee_number.clone(),
-                        c.duration_secs(),
-                        c.caller_is_webrtc,
-                    )
+                    (c.uuid.clone(), bye, dest, tp, tx)
                 })
                 .collect()
         };
 
-        for (uuid, bye, dest, tp, tx, media_id, call_id, caller, callee, duration, is_webrtc) in
-            affected
-        {
+        for (uuid, bye, dest, tp, tx) in affected {
             warn!(
                 "WS closed mid-call: terminating call {} (peer {})",
                 &uuid[..8.min(uuid.len())],
@@ -983,27 +676,7 @@ impl Sbc {
                 self.send_sip("ws-close BYE", bye.as_bytes(), dest, tp, tx.as_ref())
                     .await;
             }
-            if let Some(mid) = media_id {
-                let _ = self.media.terminate_session(&mid);
-            }
-
-            // CDR with explicit disconnect reason
-            let record = crate::storage::CdrRecord::new(
-                call_id,
-                caller.unwrap_or_default(),
-                callee.unwrap_or_default(),
-            )
-            .with_duration(duration)
-            .with_webrtc(is_webrtc)
-            .with_disconnect_reason("ws-closed");
-            if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
-                warn!("CDR recording failed (ws-closed): {}", e);
-            } else {
-                self.metrics.record_cdr_written();
-            }
-
-            self.metrics.inc_call_terminated();
-            self.b2bua.terminate_call(&uuid).await;
+            self.finish_call(&uuid, CallOutcome::WsClosed).await;
         }
     }
 

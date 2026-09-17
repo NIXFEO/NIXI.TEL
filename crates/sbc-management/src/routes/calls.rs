@@ -1,6 +1,7 @@
 //! Calls, registrations and CDR endpoints.
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
@@ -29,17 +30,22 @@ pub async fn list_calls(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::Value::Array(items))
 }
 
-/// DELETE /api/v1/calls/{uuid} — administrative teardown.
+/// DELETE /api/v1/calls/{uuid} — administrative teardown. The SIP engine
+/// ends the call (BYE/CANCEL on both legs, CDR "admin-kick") within its
+/// next loop iteration; the call disappears from `GET /api/v1/calls` then.
 pub async fn kick_call(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let active = state.b2bua.active_calls().await;
     if !active.iter().any(|c| c.uuid == uuid) {
         return Err(ApiError::not_found(format!("call '{}' not found", uuid)));
     }
-    state.b2bua.terminate_call(&uuid).await;
-    Ok(Json(json!({ "uuid": uuid, "terminated": true })))
+    state.kicks.request(uuid.clone());
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "uuid": uuid, "terminating": true })),
+    ))
 }
 
 pub async fn list_registrations(

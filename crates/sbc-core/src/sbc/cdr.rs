@@ -1,0 +1,414 @@
+//! One teardown path for every way a call ends.
+//!
+//! `finish_call` is the only place that writes a CDR, updates the call
+//! counters, publishes the `CallEnded` reason and releases the B2BUA entry,
+//! so billing sees every call exactly once with its real cause and a
+//! setup / answer / end window. `hangup_both_legs` is the wire side for the
+//! teardowns the SBC initiates itself (max duration, shutdown, RTP timeout,
+//! admin kick, setup timeout).
+
+use super::*;
+use crate::b2bua::CallUuid;
+use crate::storage::CdrRecord;
+use std::time::SystemTime;
+
+/// Why a call ended. `disconnect_reason` is the CDR vocabulary; `sip_code`
+/// the final status the caller's INVITE got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallOutcome {
+    /// BYE from a peer (`by_caller`: the inbound leg hung up).
+    NormalClearing { by_caller: bool },
+    /// CANCEL from the caller before the answer.
+    Cancelled,
+    /// A final error toward the caller (relayed from the callee or generated).
+    Rejected { code: u16 },
+    /// `security.max_call_duration` reached.
+    MaxDuration,
+    /// SIGTERM / SIGINT.
+    Shutdown,
+    /// The WS/WSS connection of one leg closed.
+    WsClosed,
+    /// `DELETE /api/v1/calls/{uuid}`.
+    AdminKick,
+    /// The callee no longer has the dialog (481/408 to a refresh).
+    DialogLost { status: u16 },
+    /// No RTP for `security.rtp_timeout` seconds.
+    RtpTimeout,
+    /// No answer within `security.call_setup_timeout`.
+    SetupTimeout,
+}
+
+impl CallOutcome {
+    pub(crate) fn disconnect_reason(&self) -> String {
+        match self {
+            Self::NormalClearing { .. } => "normal-clearing".into(),
+            Self::Cancelled => "cancelled".into(),
+            Self::Rejected { code } => format!("rejected-{}", code),
+            Self::MaxDuration => "timeout".into(),
+            Self::Shutdown => "shutdown".into(),
+            Self::WsClosed => "ws-closed".into(),
+            Self::AdminKick => "admin-kick".into(),
+            Self::DialogLost { .. } => "dialog-lost".into(),
+            Self::RtpTimeout => "rtp-timeout".into(),
+            Self::SetupTimeout => "setup-timeout".into(),
+        }
+    }
+
+    /// Final status the caller's INVITE transaction received (200 once the
+    /// call was answered; None when the SBC sent no final, e.g. the caller's
+    /// own connection died).
+    pub(crate) fn sip_code(&self, answered: bool) -> Option<u16> {
+        if answered {
+            return Some(200);
+        }
+        match self {
+            Self::Cancelled => Some(487),
+            Self::Rejected { code } => Some(*code),
+            Self::SetupTimeout => Some(408),
+            Self::Shutdown => Some(503),
+            Self::MaxDuration | Self::AdminKick => Some(480),
+            Self::NormalClearing { .. }
+            | Self::WsClosed
+            | Self::DialogLost { .. }
+            | Self::RtpTimeout => None,
+        }
+    }
+
+    /// Reason header carried by the BYE/CANCEL the SBC sends for this outcome.
+    pub(crate) fn reason_header(&self) -> Option<String> {
+        match self {
+            Self::MaxDuration => Some("Q.850;cause=16;text=\"Call duration exceeded\"".into()),
+            Self::Shutdown => Some("Q.850;cause=16;text=\"Server shutdown\"".into()),
+            Self::WsClosed => Some("SIP;cause=200;text=\"ws-closed\"".into()),
+            Self::AdminKick => Some("SIP;cause=200;text=\"Administrative teardown\"".into()),
+            Self::RtpTimeout => Some("Q.850;cause=16;text=\"RTP timeout\"".into()),
+            Self::SetupTimeout => Some("SIP;cause=408;text=\"No answer\"".into()),
+            Self::DialogLost { status } => {
+                Some(format!("SIP;cause={};text=\"Dialog lost\"", status))
+            }
+            Self::NormalClearing { .. } | Self::Cancelled | Self::Rejected { .. } => None,
+        }
+    }
+
+    /// Final sent to a caller whose INVITE is still unanswered when the SBC
+    /// hangs the call up on its own.
+    pub(crate) fn pending_caller_code(&self) -> u16 {
+        match self {
+            Self::SetupTimeout => 408,
+            Self::Shutdown => 503,
+            _ => 480,
+        }
+    }
+}
+
+/// Status code of a raw response ("SIP/2.0 486 Busy Here" → 486).
+pub(crate) fn status_code_of(raw: &str) -> Option<u16> {
+    raw.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// First value of header `name` (case-insensitive) on a request.
+pub(crate) fn header_value(request: &Request, name: &str) -> Option<String> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    request.headers.iter().find_map(|h| {
+        let line = h.to_string();
+        line.get(..prefix.len())
+            .filter(|p| p.eq_ignore_ascii_case(&prefix))
+            .map(|_| line[prefix.len()..].trim().to_string())
+    })
+}
+
+/// What the CDR needs, read under one lock hold.
+struct CallSnapshot {
+    call_id: String,
+    caller: String,
+    callee: String,
+    started_wall: SystemTime,
+    answered_at: Option<SystemTime>,
+    is_webrtc: bool,
+    codec: Option<String>,
+    trunk_name: Option<String>,
+    direction: &'static str,
+    source_ip: String,
+    peer_reason: Option<String>,
+}
+
+impl Sbc {
+    /// Write the CDR, update the call counters and gauges, publish
+    /// `CallEnded` with the real reason and release the call. Idempotent:
+    /// a uuid that is already gone writes nothing (two paths may race, e.g.
+    /// a WS close right after a BYE). Returns whether a call was ended.
+    pub(crate) async fn finish_call(&mut self, uuid: &CallUuid, outcome: CallOutcome) -> bool {
+        let snapshot = {
+            let calls = self.b2bua.calls_locked().await;
+            calls.get(uuid).map(|c| CallSnapshot {
+                call_id: c.inbound.call_id.clone(),
+                caller: c
+                    .caller_number
+                    .clone()
+                    .unwrap_or_else(|| c.inbound.call_id.clone()),
+                callee: c.callee_number.clone().unwrap_or_else(|| {
+                    c.outbound
+                        .as_ref()
+                        .map(|l| l.call_id.clone())
+                        .unwrap_or_default()
+                }),
+                started_wall: c.started_wall,
+                answered_at: c.answered_at,
+                is_webrtc: c.caller_is_webrtc,
+                codec: c.codec.clone(),
+                trunk_name: c.trunk_name.clone(),
+                direction: c.direction(),
+                source_ip: c.caller_source.ip().to_string(),
+                peer_reason: c.peer_reason.clone(),
+            })
+        };
+        let Some(s) = snapshot else {
+            debug!(
+                "finish_call({}): call {} already gone",
+                outcome.disconnect_reason(),
+                uuid
+            );
+            return false;
+        };
+
+        let ended = SystemTime::now();
+        let answered = s.answered_at.is_some();
+        let reason = outcome.disconnect_reason();
+        let mut record = CdrRecord::new(s.call_id, s.caller, s.callee)
+            .with_window(s.started_wall, s.answered_at, ended)
+            .with_webrtc(s.is_webrtc)
+            .with_disconnect_reason(&reason);
+        record.codec = s.codec;
+        record.trunk_id = s.trunk_name;
+        record.uuid = uuid.clone();
+        record.direction = s.direction.to_string();
+        record.sip_code = outcome.sip_code(answered);
+        record.source_ip = s.source_ip;
+        record.reason = s.peer_reason.or_else(|| outcome.reason_header());
+
+        match self.cdr.insert(&record).await {
+            Ok(()) => {
+                self.metrics.record_cdr_written();
+                info!(
+                    "CDR: {} → {} ({}, {} billable s of {} s, codec={}, trunk={}, sip={:?}, webrtc={})",
+                    record.caller,
+                    record.callee,
+                    record.disconnect_reason,
+                    record.billable_secs,
+                    record.duration_secs,
+                    record.codec.as_deref().unwrap_or("unknown"),
+                    record.trunk_id.as_deref().unwrap_or("local"),
+                    record.sip_code,
+                    record.is_webrtc
+                );
+            }
+            Err(e) => warn!("CDR recording failed ({}): {}", reason, e),
+        }
+
+        if answered {
+            self.metrics.inc_call_terminated();
+        } else {
+            self.metrics.inc_call_failed();
+        }
+        self.b2bua.terminate_call_with_reason(uuid, &reason).await;
+        let stats = self.b2bua.stats().await;
+        self.metrics.set_active_webrtc(stats.webrtc_calls as u64);
+        self.metrics
+            .set_allocated_ports(self.media.stats().allocated_ports as u64);
+        true
+    }
+
+    /// Wire side of a teardown the SBC initiates: BYE (with `reason`) to
+    /// each established leg, CANCEL to a callee whose INVITE is still
+    /// pending, and a final (`outcome.pending_caller_code()`) to a caller
+    /// whose INVITE the SBC never answered. State is untouched: call
+    /// `finish_call` afterwards.
+    pub(crate) async fn hangup_both_legs(&mut self, uuid: &CallUuid, outcome: &CallOutcome) {
+        let (sbc_ip, sbc_port) = self
+            .identity
+            .as_ref()
+            .map(|id| (id.public_ip.clone(), id.sip_port))
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 5060));
+        let reason = outcome.reason_header();
+        let pending_code = outcome.pending_caller_code();
+
+        let plan = {
+            let calls = self.b2bua.calls_locked().await;
+            let Some(c) = calls.get(uuid) else { return };
+            let toward_caller = c
+                .dialog_info_toward_caller(&sbc_ip, sbc_port)
+                .map(|d| crate::sip_builder::build_bye(&d, reason.as_deref()))
+                .map(|m| ("BYE → caller", m))
+                .or_else(|| {
+                    c.final_toward_caller(pending_code, reason.as_deref())
+                        .map(|m| ("final → caller", m))
+                });
+            let toward_callee = c
+                .bye_toward_callee(&sbc_ip, sbc_port, reason.as_deref())
+                .map(|m| ("BYE → callee", m))
+                .or_else(|| {
+                    c.invite_attempts
+                        .last()
+                        .and_then(|a| crate::sip_builder::build_cancel(&a.raw))
+                        .map(|m| ("CANCEL → callee", m))
+                });
+            let callee_target = c
+                .invite_attempts
+                .last()
+                .map(|a| (a.dest, a.transport))
+                .or_else(|| c.callee_dest.map(|d| (d, c.callee_transport)));
+            (
+                toward_caller,
+                c.caller_source,
+                c.caller_transport,
+                c.caller_reply_tx.clone(),
+                toward_callee,
+                callee_target,
+                c.callee_reply_tx.clone(),
+            )
+        };
+        let (
+            toward_caller,
+            caller_addr,
+            caller_tp,
+            caller_tx,
+            toward_callee,
+            callee_target,
+            callee_tx,
+        ) = plan;
+
+        if let Some((what, msg)) = toward_caller {
+            self.send_sip(
+                what,
+                msg.as_bytes(),
+                caller_addr,
+                caller_tp,
+                caller_tx.as_ref(),
+            )
+            .await;
+        }
+        if let (Some((what, msg)), Some((dest, tp))) = (toward_callee, callee_target) {
+            self.send_sip(what, msg.as_bytes(), dest, tp, callee_tx.as_ref())
+                .await;
+        }
+    }
+}
+
+impl Sbc {
+    /// `DELETE /api/v1/calls/{uuid}`: end the queued calls on the wire and
+    /// write their CDR ("admin-kick").
+    pub(crate) async fn process_admin_kicks(&mut self) {
+        for uuid in self.admin_kicks.drain() {
+            let outcome = CallOutcome::AdminKick;
+            self.hangup_both_legs(&uuid, &outcome).await;
+            if self.finish_call(&uuid, outcome).await {
+                info!("Admin kick: call {} ended", &uuid[..8.min(uuid.len())]);
+            } else {
+                debug!("Admin kick: call {} already gone", uuid);
+            }
+        }
+    }
+
+    /// Relays that stopped on RTP inactivity: end their SIP dialogs (BYE
+    /// both legs, CDR "rtp-timeout"), releasing the ports they held.
+    pub(crate) async fn check_media_timeouts(&mut self) {
+        let sessions = self.media.drain_timed_out();
+        if sessions.is_empty() {
+            return;
+        }
+        let uuids: Vec<(String, CallUuid)> = {
+            let calls = self.b2bua.calls_locked().await;
+            sessions
+                .iter()
+                .filter_map(|sid| {
+                    calls
+                        .values()
+                        .find(|c| c.media_session_id.as_deref() == Some(sid.as_str()))
+                        .map(|c| (sid.clone(), c.uuid.clone()))
+                })
+                .collect()
+        };
+        for (sid, uuid) in uuids {
+            warn!(
+                "RTP timeout on media session {} — ending call {}",
+                sid,
+                &uuid[..8.min(uuid.len())]
+            );
+            let outcome = CallOutcome::RtpTimeout;
+            self.hangup_both_legs(&uuid, &outcome).await;
+            self.finish_call(&uuid, outcome).await;
+        }
+    }
+
+    /// INVITEs unanswered past `security.call_setup_timeout`: CANCEL
+    /// toward the callee, 408 to the caller, CDR "setup-timeout". Bounds a
+    /// caller whose trunk never answers (failover exhausted, trunk silent).
+    pub(crate) async fn check_setup_timeouts(&mut self) {
+        let limit = self.call_setup_timeout;
+        let stale: Vec<CallUuid> = {
+            let calls = self.b2bua.calls_locked().await;
+            calls
+                .values()
+                .filter(|c| c.answered_at.is_none())
+                .filter(|c| {
+                    matches!(
+                        c.state,
+                        crate::b2bua::CallState::Initiated
+                            | crate::b2bua::CallState::Proceeding
+                            | crate::b2bua::CallState::Ringing
+                    )
+                })
+                .filter(|c| c.started_at.elapsed() > limit)
+                .map(|c| c.uuid.clone())
+                .collect()
+        };
+        for uuid in stale {
+            warn!(
+                "Setup timeout: call {} unanswered after {}s — CANCEL + 408",
+                &uuid[..8.min(uuid.len())],
+                limit.as_secs()
+            );
+            let outcome = CallOutcome::SetupTimeout;
+            self.hangup_both_legs(&uuid, &outcome).await;
+            self.finish_call(&uuid, outcome).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_vocabulary() {
+        assert_eq!(
+            CallOutcome::Rejected { code: 486 }.disconnect_reason(),
+            "rejected-486"
+        );
+        assert_eq!(CallOutcome::Cancelled.sip_code(false), Some(487));
+        assert_eq!(CallOutcome::Cancelled.sip_code(true), Some(200));
+        assert_eq!(CallOutcome::WsClosed.sip_code(false), None);
+        assert_eq!(CallOutcome::Shutdown.pending_caller_code(), 503);
+        assert_eq!(CallOutcome::SetupTimeout.sip_code(false), Some(408));
+        assert!(CallOutcome::MaxDuration
+            .reason_header()
+            .unwrap()
+            .contains("cause=16"));
+    }
+
+    #[test]
+    fn status_and_header_helpers() {
+        assert_eq!(status_code_of("SIP/2.0 486 Busy Here\r\n"), Some(486));
+        assert_eq!(status_code_of("garbage"), None);
+        let raw = "BYE sip:a@b SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nFrom: <sip:a@b>;tag=1\r\nTo: <sip:c@d>;tag=2\r\nCall-ID: x\r\nCSeq: 2 BYE\r\nReason: Q.850;cause=16;text=\"Normal call clearing\"\r\nContent-Length: 0\r\n\r\n";
+        let req = match rsip::SipMessage::try_from(raw.as_bytes().to_vec()).unwrap() {
+            rsip::SipMessage::Request(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(
+            header_value(&req, "Reason").as_deref(),
+            Some("Q.850;cause=16;text=\"Normal call clearing\"")
+        );
+        assert_eq!(header_value(&req, "X-Nope"), None);
+    }
+}

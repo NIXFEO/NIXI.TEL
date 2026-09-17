@@ -40,6 +40,8 @@ pub struct AppState {
     pub api_rate_limit_per_min: u32,
     /// Anti-fraud manager (bans, destination rules, user limits).
     pub security: Arc<SecurityManager>,
+    /// `DELETE /api/v1/calls/{uuid}` hands the uuid to the SIP engine here.
+    pub kicks: Arc<sbc_core::sbc::AdminKicks>,
 }
 
 impl AppState {

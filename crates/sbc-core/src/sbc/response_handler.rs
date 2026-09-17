@@ -1010,40 +1010,8 @@ impl Sbc {
             warn!("Session refresh {}: dialog lost on the trunk, no caller dialog identity — releasing call {}", status, uuid);
         }
 
-        let cdr = {
-            let calls = self.b2bua.calls_locked().await;
-            calls.get(uuid).map(|c| {
-                (
-                    c.inbound.call_id.clone(),
-                    c.caller_number.clone().unwrap_or_default(),
-                    c.callee_number.clone().unwrap_or_default(),
-                    c.duration_secs(),
-                    c.caller_is_webrtc,
-                    c.codec.clone(),
-                    c.trunk_name.clone(),
-                )
-            })
-        };
-        if let Some((call_id, caller, callee, duration, is_webrtc, codec, trunk_name)) = cdr {
-            let mut record = crate::storage::CdrRecord::new(call_id, caller, callee)
-                .with_duration(duration)
-                .with_webrtc(is_webrtc)
-                .with_disconnect_reason("dialog-lost");
-            if let Some(c) = codec.as_deref() {
-                record = record.with_codec(c);
-            }
-            record.trunk_id = trunk_name;
-            if let Err(e) = self.cdr.storage().insert_cdr(&record).await {
-                warn!("CDR recording failed (dialog-lost): {}", e);
-            } else {
-                self.metrics.record_cdr_written();
-            }
-        }
-
-        self.metrics.inc_call_terminated();
-        self.b2bua.terminate_call(uuid).await;
-        self.metrics
-            .set_allocated_ports(self.media.stats().allocated_ports as u64);
+        self.finish_call(uuid, CallOutcome::DialogLost { status })
+            .await;
     }
 
     /// Relay a final error to the caller (Vias + CSeq restored) and tear the
@@ -1055,6 +1023,7 @@ impl Sbc {
         caller_info: CallerReplyInfo,
         caller_cseq: Option<u32>,
     ) {
+        let code = super::cdr::status_code_of(&raw_response).unwrap_or(500);
         if let Some((reply_tx, caller_addr, caller_transport)) = caller_info {
             let caller_vias = self.b2bua.get_caller_vias(uuid).await;
             let raw = rewrite_response_for_caller(
@@ -1072,10 +1041,7 @@ impl Sbc {
             )
             .await;
         }
-        self.b2bua.terminate_call(uuid).await;
-        self.metrics.inc_call_failed();
-        self.metrics
-            .set_allocated_ports(self.media.stats().allocated_ports as u64);
+        self.finish_call(uuid, CallOutcome::Rejected { code }).await;
     }
 
     /// ACK a non-2xx final of the live callee-leg INVITE (RFC 3261

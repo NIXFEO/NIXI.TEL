@@ -238,6 +238,9 @@ pub struct SecurityConfig {
     pub max_call_duration: u64,
 
     /// Call setup timeout in seconds (max time in Initiated/Proceeding, default 60)
+    /// Seconds an INVITE may stay unanswered (no 200 OK) before the SBC
+    /// CANCELs it toward the callee and answers 408 to the caller (CDR
+    /// "setup-timeout"). Keep it above the longest ring time you expect.
     #[serde(default = "default_call_setup_timeout")]
     pub call_setup_timeout: u64,
 

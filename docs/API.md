@@ -40,9 +40,28 @@ is replaying it through the CRUD endpoints.
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/v1/calls` | active calls |
-| DELETE | `/api/v1/calls/{uuid}` | administrative teardown |
+| DELETE | `/api/v1/calls/{uuid}` | administrative teardown: `202`, the SIP engine BYEs/CANCELs both legs within a second and writes a CDR `admin-kick` |
 | GET | `/api/v1/registrations` | registered contacts |
-| GET | `/api/v1/cdrs?limit=&offset=` | paginated CDRs (`has_more` flag) |
+| GET | `/api/v1/cdrs?limit=&offset=` | paginated CDRs, newest first (`has_more` flag); the API serves the last 10 000 records, the CDR file is the source of truth |
+
+#### CDR record
+
+Every call gets exactly one record when it ends, whatever the cause
+(`disconnect_reason`). Bill on `billable_secs` (answer → end);
+`duration_secs` is the whole setup → end span, as before.
+
+| Field | Meaning |
+|---|---|
+| `id`, `uuid`, `call_id` | record id, B2BUA call uuid (as in `/calls` and SSE), SIP Call-ID |
+| `caller`, `callee`, `source_ip` | From user, dialed number (DID-mapped user for inbound), caller's IP |
+| `direction` | `outbound` (user → trunk), `inbound` (trunk → user), `local` (user → user) |
+| `trunk_id`, `codec`, `is_webrtc` | trunk name, negotiated codec, WebRTC caller |
+| `started_at`, `answered_at`, `ended_at` | unix seconds: INVITE, 200 OK toward the caller (`null` if never answered), end |
+| `duration_secs`, `billable_secs` | setup → end; answer → end (0 when unanswered) |
+| `sip_code` | final status the caller's INVITE got: 200 once answered, 487 cancelled, 408 setup timeout, the relayed/generated code otherwise, `null` when none was sent |
+| `disconnect_reason` | `normal-clearing`, `cancelled`, `rejected-<code>`, `timeout` (max duration), `setup-timeout`, `rtp-timeout`, `shutdown`, `ws-closed`, `admin-kick`, `dialog-lost` |
+| `reason` | SIP `Reason` header: the peer's on its BYE, the SBC's own on the BYEs it sends |
+| `v` | record schema version: `2` from 0.20; `1` rows (older file lines) carry no billing window |
 
 ### SIP users
 

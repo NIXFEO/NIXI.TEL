@@ -68,9 +68,9 @@ sip_realm = "sip.example.com"
 enable_digest_auth = true
 
 # Call guards
-max_call_duration = 14400      # hard cap, seconds
-call_setup_timeout = 60
-rtp_timeout = 90               # RTP inactivity teardown
+max_call_duration = 14400      # answered call hard cap → BYE both legs (CDR "timeout")
+call_setup_timeout = 60        # unanswered INVITE → CANCEL + 408 to the caller (CDR "setup-timeout")
+rtp_timeout = 90               # no RTP for this long → BYE both legs (CDR "rtp-timeout")
 invite_timeout = 5             # no >=180 within 5s → trunk failover
 
 # RFC 4028 session timers (refresh re-INVITEs on the trunk leg so >4h

@@ -67,6 +67,14 @@ pub struct MediaManager {
 
     /// Global transcoded packet counter (from SbcMetrics)
     global_transcode_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+
+    /// `security.rtp_timeout`: inactivity budget handed to every relay.
+    rtp_timeout_secs: u64,
+
+    /// Relays that stopped on inactivity report their session id here;
+    /// the SBC drains it from its event loop to end the SIP dialogs.
+    timed_out_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    timed_out_rx: std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 /// Media session information
@@ -130,22 +138,18 @@ pub struct MediaStats {
 impl MediaManager {
     /// Create a new media manager
     pub fn new(public_ip: Option<IpAddr>) -> Self {
-        Self {
-            port_allocator: Arc::new(PortAllocator::new()),
-            sessions: Arc::new(DashMap::new()),
-            public_ip,
-            global_rtp_counter: None,
-            global_srtp_encrypt_counter: None,
-            global_srtp_decrypt_counter: None,
-            global_rtp_timeout_counter: None,
-            global_transcode_counter: None,
-        }
+        Self::with_allocator(Arc::new(PortAllocator::new()), public_ip)
     }
 
     /// Create a new media manager with custom port range
     pub fn with_port_range(port_range: std::ops::Range<u16>, public_ip: Option<IpAddr>) -> Self {
+        Self::with_allocator(Arc::new(PortAllocator::with_range(port_range)), public_ip)
+    }
+
+    fn with_allocator(port_allocator: Arc<PortAllocator>, public_ip: Option<IpAddr>) -> Self {
+        let (timed_out_tx, timed_out_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            port_allocator: Arc::new(PortAllocator::with_range(port_range)),
+            port_allocator,
             sessions: Arc::new(DashMap::new()),
             public_ip,
             global_rtp_counter: None,
@@ -153,7 +157,33 @@ impl MediaManager {
             global_srtp_decrypt_counter: None,
             global_rtp_timeout_counter: None,
             global_transcode_counter: None,
+            rtp_timeout_secs: 90,
+            timed_out_tx,
+            timed_out_rx: std::sync::Mutex::new(timed_out_rx),
         }
+    }
+
+    /// `security.rtp_timeout`: seconds without RTP before a relay stops
+    /// and the SBC ends the call.
+    pub fn set_rtp_timeout(&mut self, secs: u64) {
+        self.rtp_timeout_secs = secs.max(1);
+    }
+
+    /// Session ids whose relay stopped on inactivity since the last call.
+    pub fn drain_timed_out(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(mut rx) = self.timed_out_rx.lock() {
+            while let Ok(id) = rx.try_recv() {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Report a session as timed out (what a relay does on inactivity;
+    /// also a test hook).
+    pub fn mark_timed_out(&self, session_id: &str) {
+        let _ = self.timed_out_tx.send(session_id.to_string());
     }
 
     /// Attach global RTP packet counter from SbcMetrics for Prometheus reporting
@@ -456,6 +486,8 @@ impl MediaManager {
         if let Some(ref counter) = self.global_rtp_timeout_counter {
             rtp_session.set_global_rtp_timeout_counter(counter.clone());
         }
+        rtp_session.set_rtp_timeout(self.rtp_timeout_secs);
+        rtp_session.set_timed_out_notifier(self.timed_out_tx.clone());
 
         // Attach global transcoded packet counter for Prometheus metrics
         if let Some(ref counter) = self.global_transcode_counter {

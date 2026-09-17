@@ -9,28 +9,69 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-/// Enregistrement CDR (Call Detail Record)
-#[derive(Debug, Clone)]
+/// Call Detail Record.
+///
+/// Legacy keys (`v` = 1 rows, written before 0.20) keep their names and
+/// types; `v` = 2 rows add the billing window (`answered_at`,
+/// `billable_secs`), the final status toward the caller (`sip_code`), the
+/// `direction`, the B2BUA `uuid`, the caller's `source_ip` and the SIP
+/// `reason` (Q.850) when one was given. `duration_secs` stays the
+/// setup→end span; bill on `billable_secs`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CdrRecord {
     pub id: String,
     pub call_id: String,
     pub caller: String,
     pub callee: String,
     pub trunk_id: Option<String>,
+    /// Seconds from the INVITE to the end of the call (ring time included).
     pub duration_secs: u64,
     pub codec: Option<String>,
     pub is_webrtc: bool,
+    /// normal-clearing | cancelled | rejected-<code> | timeout | shutdown |
+    /// ws-closed | admin-kick | dialog-lost | rtp-timeout | setup-timeout
     pub disconnect_reason: String,
+    /// Unix seconds of the INVITE.
     pub started_at: u64,
+    /// Unix seconds of the end of the call.
     pub ended_at: u64,
+    /// Record schema version (1 = before 0.20, no billing window).
+    #[serde(default = "legacy_version")]
+    pub v: u8,
+    #[serde(default)]
+    pub uuid: String,
+    /// outbound (user → trunk) | inbound (trunk → user) | local (user → user)
+    #[serde(default)]
+    pub direction: String,
+    /// Final status the caller's INVITE got (200 when answered).
+    #[serde(default)]
+    pub sip_code: Option<u16>,
+    /// Unix seconds of the 200 OK toward the caller; None = never answered.
+    #[serde(default)]
+    pub answered_at: Option<u64>,
+    /// Seconds from the answer to the end; 0 when never answered.
+    #[serde(default)]
+    pub billable_secs: u64,
+    #[serde(default)]
+    pub source_ip: String,
+    /// SIP Reason header (peer's on a BYE, the SBC's own otherwise).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn legacy_version() -> u8 {
+    1
+}
+
+pub const CDR_SCHEMA_VERSION: u8 = 2;
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 impl CdrRecord {
     pub fn new(call_id: String, caller: String, callee: String) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = unix_secs(SystemTime::now());
         Self {
             id: uuid_v4(),
             call_id,
@@ -43,9 +84,40 @@ impl CdrRecord {
             disconnect_reason: "normal".to_string(),
             started_at: now,
             ended_at: now,
+            v: CDR_SCHEMA_VERSION,
+            uuid: String::new(),
+            direction: String::new(),
+            sip_code: None,
+            answered_at: None,
+            billable_secs: 0,
+            source_ip: String::new(),
+            reason: None,
         }
     }
 
+    /// The call's real window: `started` = INVITE, `answered` = 200 OK
+    /// toward the caller (None when never answered), `ended` = teardown.
+    /// `duration_secs` is the whole span, `billable_secs` the answered part.
+    pub fn with_window(
+        mut self,
+        started: SystemTime,
+        answered: Option<SystemTime>,
+        ended: SystemTime,
+    ) -> Self {
+        let started_s = unix_secs(started);
+        let ended_s = unix_secs(ended).max(started_s);
+        self.started_at = started_s;
+        self.ended_at = ended_s;
+        self.duration_secs = ended_s - started_s;
+        self.answered_at = answered.map(unix_secs);
+        self.billable_secs = self
+            .answered_at
+            .map(|a| ended_s.saturating_sub(a))
+            .unwrap_or(0);
+        self
+    }
+
+    /// Legacy helper: `ended_at = started_at + secs` (no answer time).
     pub fn with_duration(mut self, secs: u64) -> Self {
         self.duration_secs = secs;
         self.ended_at = self.started_at + secs;
@@ -67,52 +139,22 @@ impl CdrRecord {
         self
     }
 
-    /// Escape a string value for safe embedding inside a JSON string literal.
-    fn json_escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 4);
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 => {
-                    out.push_str(&format!("\\u{:04x}", c as u32));
-                }
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
+    /// One JSON object (JSON-lines file format and API items). Legacy keys
+    /// come first, in their historical order.
     pub fn to_json(&self) -> String {
-        let trunk = self
-            .trunk_id
-            .as_deref()
-            .map(|t| format!("\"{}\"", Self::json_escape(t)))
-            .unwrap_or_else(|| "null".to_string());
-        let codec = self
-            .codec
-            .as_deref()
-            .map(|c| format!("\"{}\"", Self::json_escape(c)))
-            .unwrap_or_else(|| "null".to_string());
-        format!(
-            r#"{{"id":"{}","call_id":"{}","caller":"{}","callee":"{}","trunk_id":{},"duration_secs":{},"codec":{},"is_webrtc":{},"disconnect_reason":"{}","started_at":{},"ended_at":{}}}"#,
-            Self::json_escape(&self.id),
-            Self::json_escape(&self.call_id),
-            Self::json_escape(&self.caller),
-            Self::json_escape(&self.callee),
-            trunk,
-            self.duration_secs,
-            codec,
-            self.is_webrtc,
-            Self::json_escape(&self.disconnect_reason),
-            self.started_at,
-            self.ended_at,
-        )
+        serde_json::to_string(self).unwrap_or_else(|e| {
+            error!("CDR serialization failed: {}", e);
+            format!(
+                r#"{{"id":"{}","call_id":"{}","error":"serialize"}}"#,
+                self.id, self.call_id
+            )
+        })
     }
 }
+
+/// Most recent records kept in memory for the API; the file is the source
+/// of truth for billing.
+pub const MAX_CACHED_CDRS: usize = 10_000;
 
 /// Statistiques de stockage
 #[derive(Debug, Clone, Default)]
@@ -134,7 +176,7 @@ pub trait CdrStorage: Send + Sync {
 
 /// Stockage en mémoire (pour développement et tests)
 pub struct InMemoryCdrStorage {
-    records: Arc<Mutex<Vec<CdrRecord>>>,
+    records: Arc<Mutex<std::collections::VecDeque<CdrRecord>>>,
     insert_count: Arc<std::sync::atomic::AtomicU64>,
     error_count: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -142,10 +184,15 @@ pub struct InMemoryCdrStorage {
 impl InMemoryCdrStorage {
     pub fn new() -> Self {
         Self {
-            records: Arc::new(Mutex::new(Vec::new())),
+            records: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             insert_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             error_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    fn note_error(&self) {
+        self.error_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -159,7 +206,10 @@ impl Default for InMemoryCdrStorage {
 impl CdrStorage for InMemoryCdrStorage {
     async fn insert_cdr(&self, record: &CdrRecord) -> Result<()> {
         let mut records = self.records.lock().await;
-        records.push(record.clone());
+        if records.len() >= MAX_CACHED_CDRS {
+            records.pop_front();
+        }
+        records.push_back(record.clone());
         self.insert_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("CDR inserted in memory: call_id={}", record.call_id);
@@ -175,7 +225,7 @@ impl CdrStorage for InMemoryCdrStorage {
         let records = self.records.lock().await;
         let count = records.len();
         let start = count.saturating_sub(limit);
-        Ok(records[start..].to_vec())
+        Ok(records.range(start..).cloned().collect())
     }
 
     async fn stats(&self) -> StorageStats {
@@ -214,22 +264,25 @@ impl FileCdrStorage {
             match tokio::fs::read_to_string(&path).await {
                 Ok(contents) => {
                     let mut loaded = 0u64;
-                    let records = inner.records.lock().await;
-                    drop(records); // release before insert
-                    for line in contents.lines() {
+                    let mut skipped = 0u64;
+                    let lines: Vec<&str> = contents.lines().collect();
+                    let tail_start = lines.len().saturating_sub(MAX_CACHED_CDRS);
+                    for line in &lines[tail_start..] {
                         let line = line.trim();
                         if line.is_empty() || !line.starts_with('{') {
                             continue;
                         }
-                        // Minimal JSON parsing — extract fields
-                        if let Some(record) = parse_cdr_json(line) {
-                            inner.insert_cdr(&record).await.ok();
-                            loaded += 1;
+                        match parse_cdr_json(line) {
+                            Some(record) => {
+                                inner.insert_cdr(&record).await.ok();
+                                loaded += 1;
+                            }
+                            None => skipped += 1,
                         }
                     }
                     info!(
-                        "CDR file storage: loaded {} existing records from {:?}",
-                        loaded, path
+                        "CDR file storage: loaded {} records from {:?} ({} unparsable, {} older rows left on disk)",
+                        loaded, path, skipped, tail_start
                     );
                 }
                 Err(e) => {
@@ -261,16 +314,19 @@ impl CdrStorage for FileCdrStorage {
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = file.write_all(json_line.as_bytes()).await {
                     error!("CDR file write error: {}", e);
+                    self.inner.note_error();
                     return Err(Error::Transport(format!("CDR file write: {}", e)));
                 }
                 // Flush so data reaches the kernel buffer before the handle drops.
                 if let Err(e) = file.flush().await {
                     error!("CDR file flush error: {}", e);
+                    self.inner.note_error();
                     return Err(Error::Transport(format!("CDR file write: {}", e)));
                 }
             }
             Err(e) => {
                 error!("CDR file open error: {}", e);
+                self.inner.note_error();
                 return Err(Error::Transport(format!("CDR file open: {}", e)));
             }
         }
@@ -293,8 +349,17 @@ impl CdrStorage for FileCdrStorage {
     }
 }
 
-/// Parse a CDR JSON line into a CdrRecord (minimal parser)
+/// Parse one JSON line: serde for well-formed rows (v1 and v2), the
+/// historical substring parser as a fallback for damaged legacy lines.
 fn parse_cdr_json(json: &str) -> Option<CdrRecord> {
+    match serde_json::from_str::<CdrRecord>(json) {
+        Ok(r) => Some(r),
+        Err(_) => parse_cdr_json_legacy(json),
+    }
+}
+
+/// Minimal substring parser for pre-0.20 lines that serde rejects.
+fn parse_cdr_json_legacy(json: &str) -> Option<CdrRecord> {
     // Extract fields from JSON object using simple string matching
     let get_str = |key: &str| -> Option<String> {
         let search = format!("\"{}\":\"", key);
@@ -338,6 +403,14 @@ fn parse_cdr_json(json: &str) -> Option<CdrRecord> {
         disconnect_reason: get_str("disconnect_reason").unwrap_or_else(|| "unknown".to_string()),
         started_at: get_u64("started_at"),
         ended_at: get_u64("ended_at"),
+        v: 1,
+        uuid: String::new(),
+        direction: String::new(),
+        sip_code: None,
+        answered_at: None,
+        billable_secs: 0,
+        source_ip: String::new(),
+        reason: None,
     })
 }
 
@@ -387,7 +460,12 @@ impl CdrManager {
         })
     }
 
-    /// Enregistrer un appel terminé
+    /// Store one finished call's record (the SBC's single write path).
+    pub async fn insert(&self, record: &CdrRecord) -> Result<()> {
+        self.storage.insert_cdr(record).await
+    }
+
+    /// Enregistrer un appel terminé (legacy helper, tests only: no window).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_call(
         &self,
@@ -421,16 +499,18 @@ impl CdrManager {
         self.storage.list_recent_cdrs(limit).await
     }
 
-    /// Paginated recent CDRs (most recent first): skip `offset`, take `limit`.
-    /// The fetch window is capped at offset+limit, so the returned count only
-    /// signals whether more pages may exist.
+    /// Paginated recent CDRs, **newest first**: skip `offset`, take `limit`.
+    /// The fetch window is capped at offset+limit (and at the in-memory
+    /// cache), so the returned count only signals whether more pages may
+    /// exist.
     pub async fn get_page(&self, limit: usize, offset: usize) -> Result<(Vec<CdrRecord>, usize)> {
-        let window = self
+        let mut window = self
             .storage
             .list_recent_cdrs(offset.saturating_add(limit))
             .await?;
         let total = window.len();
-        let page = window.into_iter().skip(offset).collect();
+        window.reverse();
+        let page = window.into_iter().skip(offset).take(limit).collect();
         Ok((page, total))
     }
 
@@ -456,6 +536,100 @@ impl CdrManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_window_computes_the_billing_window() {
+        let t0 = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let r = CdrRecord::new("c".into(), "a".into(), "b".into()).with_window(
+            t0,
+            Some(t0 + std::time::Duration::from_secs(20)),
+            t0 + std::time::Duration::from_secs(80),
+        );
+        assert_eq!(r.v, CDR_SCHEMA_VERSION);
+        assert_eq!(r.started_at, 1_700_000_000);
+        assert_eq!(r.answered_at, Some(1_700_000_020));
+        assert_eq!(r.ended_at, 1_700_000_080);
+        assert_eq!(r.duration_secs, 80, "setup → end");
+        assert_eq!(r.billable_secs, 60, "answer → end");
+
+        let unanswered = CdrRecord::new("c".into(), "a".into(), "b".into()).with_window(
+            t0,
+            None,
+            t0 + std::time::Duration::from_secs(15),
+        );
+        assert_eq!(unanswered.answered_at, None);
+        assert_eq!(unanswered.billable_secs, 0);
+        assert_eq!(unanswered.duration_secs, 15);
+
+        // A clock that went backwards never yields a negative span.
+        let backwards = CdrRecord::new("c".into(), "a".into(), "b".into()).with_window(
+            t0 + std::time::Duration::from_secs(5),
+            None,
+            t0,
+        );
+        assert_eq!(backwards.duration_secs, 0);
+        assert_eq!(backwards.ended_at, backwards.started_at);
+    }
+
+    #[test]
+    fn json_round_trip_and_legacy_rows() {
+        let t0 = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut r = CdrRecord::new("c1".into(), "alice".into(), "+33612".into())
+            .with_window(t0, Some(t0), t0 + std::time::Duration::from_secs(3))
+            .with_codec("PCMU")
+            .with_disconnect_reason("normal-clearing");
+        r.direction = "outbound".into();
+        r.sip_code = Some(200);
+        r.reason = Some("Q.850;cause=16;text=\"x\"".into());
+        let json = r.to_json();
+        assert!(json.starts_with("{\"id\":"), "legacy keys first: {}", json);
+        assert!(json.contains("\"billable_secs\":3"));
+        let back = parse_cdr_json(&json).expect("parses");
+        assert_eq!(back.call_id, "c1");
+        assert_eq!(back.reason.as_deref(), Some("Q.850;cause=16;text=\"x\""));
+        assert_eq!(back.sip_code, Some(200));
+        assert_eq!(back.v, 2);
+
+        // A row written before 0.20: legacy keys only.
+        let legacy = r#"{"id":"x","call_id":"c","caller":"a","callee":"b","trunk_id":null,"duration_secs":5,"codec":null,"is_webrtc":false,"disconnect_reason":"normal-clearing","started_at":1,"ended_at":6}"#;
+        let old = parse_cdr_json(legacy).expect("legacy parses");
+        assert_eq!(
+            old.v, 1,
+            "legacy rows are marked so billing can tell them apart"
+        );
+        assert_eq!(old.duration_secs, 5);
+        assert_eq!(old.billable_secs, 0);
+        assert_eq!(old.answered_at, None);
+        assert_eq!(old.sip_code, None);
+        assert!(parse_cdr_json("not json at all").is_none());
+    }
+
+    #[tokio::test]
+    async fn pages_are_newest_first_and_bounded() {
+        let mgr = CdrManager::new_memory();
+        for n in 0..5u64 {
+            let mut r = CdrRecord::new(format!("c{}", n), "a".into(), "b".into());
+            r.started_at = n;
+            mgr.insert(&r).await.unwrap();
+        }
+        let (page, fetched) = mgr.get_page(2, 0).await.unwrap();
+        assert_eq!(fetched, 2);
+        assert_eq!(
+            page.iter().map(|r| r.call_id.as_str()).collect::<Vec<_>>(),
+            ["c4", "c3"]
+        );
+        let (page, _) = mgr.get_page(2, 2).await.unwrap();
+        assert_eq!(
+            page.iter().map(|r| r.call_id.as_str()).collect::<Vec<_>>(),
+            ["c2", "c1"]
+        );
+        let (page, fetched) = mgr.get_page(2, 4).await.unwrap();
+        assert_eq!(fetched, 5, "window capped at what exists");
+        assert_eq!(
+            page.iter().map(|r| r.call_id.as_str()).collect::<Vec<_>>(),
+            ["c0"]
+        );
+    }
 
     #[tokio::test]
     async fn test_cdr_record_creation() {

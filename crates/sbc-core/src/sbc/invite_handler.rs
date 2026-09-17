@@ -313,14 +313,33 @@ impl Sbc {
         // shutdown) that the caller accepts instead of answering 481.
         {
             let from_raw = request.from_header().ok().map(|h| h.value().to_string());
+            let to_raw = request.to_header().ok().map(|h| h.value().to_string());
             let caller_contact = request
                 .contact_header()
                 .ok()
                 .map(|h| extract_contact_uri(h.value()));
             if let Some(from_raw) = from_raw {
                 self.b2bua
-                    .set_inbound_dialog(&uuid, from_raw, caller_contact)
+                    .set_inbound_dialog(&uuid, from_raw, to_raw, caller_contact)
                     .await;
+            }
+        }
+
+        // ── CDR identity, known from the INVITE itself: caller/callee
+        // numbers and, for a trunk-originated call, the trunk name from the
+        // source IP — so a call rejected before routing is billed right.
+        {
+            let caller_num =
+                request.from_header().ok().and_then(|h| h.typed().ok()).map(
+                    |from: rsip::typed::From| from.uri.user().unwrap_or("unknown").to_string(),
+                );
+            let callee_num = request.uri.user().map(str::to_string);
+            let inbound_trunk = self.trunk_manager.name_for_ip(&source_ip);
+            let mut calls = self.b2bua.calls_locked().await;
+            if let Some(call) = calls.get_mut(&uuid) {
+                call.caller_number = caller_num;
+                call.callee_number = callee_num;
+                call.trunk_name = inbound_trunk;
             }
         }
 
@@ -471,8 +490,8 @@ impl Sbc {
                         "Registered WS contact {} has no live connection — 480",
                         addr
                     );
-                    self.b2bua.terminate_call(&uuid).await;
-                    self.metrics.inc_call_failed();
+                    self.finish_call(&uuid, CallOutcome::Rejected { code: 480 })
+                        .await;
                     self.metrics.inc_sip_response(480);
                     let response_480 =
                         response_for_request(&request, 480, "Temporarily Unavailable");
@@ -494,8 +513,8 @@ impl Sbc {
             // Do NOT fall through to trunk routing (that would loop the call back to the trunk)
             let aor = callee_aor.as_deref().unwrap_or("unknown");
             warn!("DID target {} is not registered — responding 480", aor);
-            self.b2bua.terminate_call(&uuid).await;
-            self.metrics.inc_call_failed();
+            self.finish_call(&uuid, CallOutcome::Rejected { code: 480 })
+                .await;
             self.metrics.inc_sip_response(480);
             let response_480 = response_for_request(&request, 480, "Temporarily Unavailable");
             self.send_sip(
@@ -517,8 +536,8 @@ impl Sbc {
                 "INVITE from trunk {} to unknown number {} — 404",
                 source, number
             );
-            self.b2bua.terminate_call(&uuid).await;
-            self.metrics.inc_call_failed();
+            self.finish_call(&uuid, CallOutcome::Rejected { code: 404 })
+                .await;
             self.metrics.inc_sip_response(404);
             let response_404 = response_for_request(&request, 404, "Not Found");
             self.send_sip(
@@ -557,9 +576,9 @@ impl Sbc {
                             rule: rule_id,
                             ts: crate::events::event_ts(),
                         });
-                    self.b2bua.terminate_call(&uuid).await;
+                    self.finish_call(&uuid, CallOutcome::Rejected { code: 403 })
+                        .await;
                     self.metrics.inc_security_destination_blocked();
-                    self.metrics.inc_call_failed();
                     self.metrics.inc_sip_response(403);
                     let r403 = build_plain_response_for_request(
                         &request,
@@ -576,8 +595,8 @@ impl Sbc {
             let mut candidates = self.router.route_request_candidates(&request);
             if candidates.is_empty() {
                 warn!("Routing failed for INVITE: no candidate trunk");
-                self.b2bua.terminate_call(&uuid).await;
-                self.metrics.inc_call_failed();
+                self.finish_call(&uuid, CallOutcome::Rejected { code: 503 })
+                    .await;
                 self.metrics.inc_sip_response(503);
                 let response_503 = response_for_request(&request, 503, "Service Unavailable");
                 self.send_sip(
@@ -643,8 +662,8 @@ impl Sbc {
                 Some(d) => d,
                 None => {
                     error!("Invalid trunk destination for: {}", trunk.host);
-                    self.b2bua.terminate_call(&uuid).await;
-                    self.metrics.inc_call_failed();
+                    self.finish_call(&uuid, CallOutcome::Rejected { code: 503 })
+                        .await;
                     self.metrics.inc_sip_response(503);
                     let response_503 = response_for_request(&request, 503, "Service Unavailable");
                     self.send_sip(
@@ -662,27 +681,19 @@ impl Sbc {
             (dest, trunk.transport.to_rsip_transport(), None)
         };
 
-        // ── CDR enrichment: store caller/callee numbers and trunk name ──────
+        // ── CDR enrichment: the callee after DID mapping (the local user a
+        // PSTN number resolved to). Caller number and inbound trunk name were
+        // set right after create_call.
         {
-            let caller_num =
-                request.from_header().ok().and_then(|h| h.typed().ok()).map(
-                    |from: rsip::typed::From| from.uri.user().unwrap_or("unknown").to_string(),
-                );
             let callee_num = callee_aor
                 .as_deref()
                 .and_then(|aor| aor.strip_prefix("sip:"))
                 .and_then(|s| s.split('@').next())
                 .map(|s| s.to_string());
-            // Inbound (PSTN → registered user) calls carry no outbound trunk,
-            // so trunk_name is unset above. Attribute them to the originating
-            // trunk by matching the source IP, so the CDR trunk_id is populated.
-            let inbound_trunk = self.trunk_manager.name_for_ip(&source.ip().to_string());
             let mut calls = self.b2bua.calls_locked().await;
             if let Some(call) = calls.get_mut(&uuid) {
-                call.caller_number = caller_num;
-                call.callee_number = callee_num;
-                if call.trunk_name.is_none() {
-                    call.trunk_name = inbound_trunk;
+                if callee_num.is_some() {
+                    call.callee_number = callee_num;
                 }
             }
         }
