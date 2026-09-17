@@ -894,6 +894,48 @@ impl B2buaManager {
         }
         st.pending_refresh_cseq = None;
         let raw = st.pending_refresh_raw.take();
+        let ack = raw.and_then(|r| crate::sip_builder::build_ack_for_non_2xx(&r, response_to));
+
+        // 491 Request Pending (RFC 3261 §14.1): the peer has its own
+        // re-INVITE in flight — not a failure. Retry after 2.1–4 s: in half
+        // mode neither side owns the Call-ID, so a mid-range delay breaks
+        // the symmetric glare (the 30 s tick makes it the next tick anyway).
+        if status == 491 {
+            use rand::Rng;
+            let delay_ms = 2100 + rand::thread_rng().gen_range(0..1900u64);
+            st.next_refresh_at = std::time::Instant::now() + Duration::from_millis(delay_ms);
+            info!(
+                "Session refresh 491 for call {} (CSeq {}) — glare, retrying in {} ms",
+                uuid, cseq, delay_ms
+            );
+            return Some(RefreshFailure {
+                ack,
+                dest: call.callee_dest?,
+                transport: call.callee_transport,
+                reply_tx: call.callee_reply_tx.clone(),
+                dialog_gone: false,
+            });
+        }
+
+        // 405 / 501 / 420: the peer does not do re-INVITE refreshes at
+        // all. Stop refreshing this call and keep it (its own timer, if
+        // any, is the peer's business).
+        if matches!(status, 405 | 501 | 420) {
+            warn!(
+                "Session refresh rejected {} for call {} (CSeq {}) — peer does not support re-INVITE refresh, timer disabled for this call",
+                status, uuid, cseq
+            );
+            call.session_timer = None;
+            return Some(RefreshFailure {
+                ack,
+                dest: call.callee_dest?,
+                transport: call.callee_transport,
+                reply_tx: call.callee_reply_tx.clone(),
+                dialog_gone: false,
+            });
+        }
+        let st = call.session_timer.as_mut()?;
+
         // A 422 that actually raises the interval is progress, not a failure.
         let progressed = status == 422 && min_se_422.is_some_and(|m| m > st.interval_secs);
         if status == 422 {
@@ -923,7 +965,6 @@ impl B2buaManager {
                 status, uuid, cseq, backoff_secs, st.interval_secs, st.min_se
             );
         }
-        let ack = raw.and_then(|r| crate::sip_builder::build_ack_for_non_2xx(&r, response_to));
         Some(RefreshFailure {
             ack,
             dest: call.callee_dest?,

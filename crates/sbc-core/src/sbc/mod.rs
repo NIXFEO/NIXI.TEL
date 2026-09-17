@@ -10,6 +10,7 @@ mod response_handler;
 pub(crate) use response_handler::parse_session_expires as response_handler_session_expires;
 mod call_handler;
 mod cdr;
+mod invite_tx;
 pub(crate) use cdr::CallOutcome;
 #[cfg(test)]
 mod flow_tests;
@@ -168,6 +169,10 @@ pub struct Sbc {
 
     /// Teardown requests from the management API.
     admin_kicks: Arc<AdminKicks>,
+
+    /// INVITE server transactions in flight or just completed: a
+    /// retransmission replays the last response (RFC 3261 §17.2.1).
+    invite_tx: invite_tx::InviteTxCache,
 
     /// Hard cap on a connected call (`security.max_call_duration`): past it
     /// the SBC BYEs both legs, so a callee that vanished without BYE cannot
@@ -461,6 +466,7 @@ impl Sbc {
             invite_timeout: Duration::from_secs(config.security.invite_timeout.max(1)),
             call_setup_timeout: Duration::from_secs(config.security.call_setup_timeout.max(10)),
             admin_kicks: Arc::new(AdminKicks::new()),
+            invite_tx: invite_tx::InviteTxCache::new(),
             max_call_duration: Duration::from_secs(config.security.max_call_duration.max(60)),
             security,
             session_timer: config.security.session_timer_enabled.then(|| {
@@ -777,6 +783,7 @@ impl Sbc {
             invite_timeout: Duration::from_secs(5),
             call_setup_timeout: Duration::from_secs(60),
             admin_kicks: Arc::new(AdminKicks::new()),
+            invite_tx: invite_tx::InviteTxCache::new(),
             max_call_duration: Duration::from_secs(14400),
             session_timer: None,
             security: Arc::new(crate::security::SecurityManager::new(Default::default())),
@@ -1299,6 +1306,7 @@ impl Sbc {
                 _ = call_timeout_interval.tick() => {
                     self.check_call_timeouts().await;
                     self.send_session_refreshes().await;
+                    self.invite_tx.prune();
                 }
                 _ = failover_interval.tick() => {
                     self.check_invite_failover().await;
@@ -1466,12 +1474,19 @@ impl Sbc {
             }
             Method::Info => self.handle_info(request, source, transport, reply_tx).await,
             method => {
-                warn!("Unhandled SIP method: {}", method);
-                self.metrics.inc_sip_response(501);
-                let response_501 = response_for_request(&request, 501, "Not Implemented");
+                // RFC 3261 §8.2.1: a method the UAS does not support → 405
+                // with what it does (PRACK, UPDATE, SUBSCRIBE, NOTIFY,
+                // MESSAGE, PUBLISH…).
+                warn!("Unsupported SIP method {} from {} — 405", method, source);
+                self.metrics.inc_sip_response(405);
+                let mut response_405 = response_for_request(&request, 405, "Method Not Allowed");
+                if let Ok(mut m) = crate::topology::RawSipMessage::parse(&response_405) {
+                    m.set_header("Allow", crate::sip_builder::ALLOWED_METHODS);
+                    response_405 = m.to_string();
+                }
                 self.send_sip(
-                    "501 → source",
-                    response_501.as_bytes(),
+                    "405 → source",
+                    response_405.as_bytes(),
                     source,
                     transport,
                     reply_tx,
@@ -1727,6 +1742,15 @@ impl Sbc {
         transport: rsip::Transport,
         reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> bool {
+        // Every response to an INVITE is remembered so a retransmitted
+        // INVITE gets it again (RFC 3261 §17.2.1).
+        if data.starts_with(b"SIP/2.0 ") {
+            if let Ok(text) = std::str::from_utf8(data) {
+                if let Some((key, is_final)) = invite_tx::InviteTxCache::key_of_response(text) {
+                    self.invite_tx.record(&key, data, is_final);
+                }
+            }
+        }
         match self.transport.reply(data, dest, transport, reply_tx).await {
             Ok(()) => true,
             Err(e) => {

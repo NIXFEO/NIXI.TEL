@@ -10,6 +10,15 @@
 //! Header order follows RFC 3261 conventions: Via, Max-Forwards, From, To,
 //! Call-ID, CSeq, extras, Content-Length last.
 
+/// Methods the SBC implements (RFC 3261 §20.5 `Allow`). Anything else is
+/// answered 405 with this list.
+pub const ALLOWED_METHODS: &str = "INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, INFO, REFER";
+
+/// Extensions the SBC supports (RFC 3261 §20.37 `Supported`). A request
+/// that `Require`s another one is answered 420; other tokens are stripped
+/// from forwarded `Supported` headers so a peer never relies on them.
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["timer"];
+
 use rand::Rng;
 
 /// Dialog identity for one leg, as the peer knows it.

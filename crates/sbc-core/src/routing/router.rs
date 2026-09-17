@@ -316,10 +316,10 @@ impl Router {
             "application/sdp",
         )));
         headers.push(rsip::Header::Allow(rsip::headers::Allow::new(
-            "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO",
+            crate::sip_builder::ALLOWED_METHODS,
         )));
         headers.push(rsip::Header::Supported(rsip::headers::Supported::new(
-            "replaces, timer",
+            crate::sip_builder::SUPPORTED_EXTENSIONS.join(", "),
         )));
 
         headers.push(rsip::Header::ContentLength(Default::default()));

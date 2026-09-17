@@ -81,6 +81,27 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   (503 / 408 / 480) instead of a BYE for a dialog that does not exist.
 - Synthetic BYEs and the `CallEnded` SSE event carry the real reason
   (`shutdown`, `timeout`, `rtp-timeout`, …) instead of "terminated".
+- An INVITE whose forward fails (dead TCP/TLS peer, unregistered TLS
+  destination, closed WS) is failed over to the next trunk, else answered
+  503 and released; it used to stay ringing with its RTP ports until the
+  4 h cap. The attempt is recorded before the send so failover can use it.
+- Retransmitted INVITEs (lost 100 Trying or final) are absorbed and get the
+  last response again (RFC 3261 §17.2.1); each copy used to create a second
+  call with its own media session, leaking the first one's ports.
+- Honest capabilities: `Allow` lists what the SBC implements, `Supported`
+  is `timer` only; a `Require` of anything else is answered 420 with
+  `Unsupported`; unsupported tokens (100rel, replaces, gruu…) are stripped
+  from forwarded `Supported` headers so a trunk never waits for PRACKs the
+  SBC cannot relay; unknown methods get 405 + Allow instead of 501.
+- Responses to relayed INFO/REFER (and to the SBC's own CANCEL/BYE) no
+  longer fall into the INVITE logic (a 200 OK to a DTMF INFO re-ran the
+  answer path on the dialog).
+- Session-refresh answers are classified: 491 Request Pending retries after
+  2.1–4 s without counting as a failure; 405/501/420 disable the timer for
+  that call and keep it; 481/408 tear down; other rejections strike with
+  backoff as before.
+- Relayed BYEs carry the peer's `Reason` header; a CANCEL from a trunk
+  with a truncated Call-ID is matched by suffix like ACK/BYE.
 
 ### Added
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP

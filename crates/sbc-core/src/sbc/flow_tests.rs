@@ -926,3 +926,279 @@ async fn cancel_with_a_truncated_call_id_from_the_trunk_matches_by_suffix() {
     assert!(out[0].starts_with("SIP/2.0 481 "), "{}", out[0]);
     assert!(call_alive(&sbc, &spec.call_id).await);
 }
+
+/// The INVITE cannot be sent anywhere (no listener, no other trunk): the
+/// caller gets a 503 for its INVITE and nothing is left behind.
+#[tokio::test]
+async fn invite_that_cannot_be_forwarded_is_answered_503_and_released() {
+    let mut sbc = SbcBuilder::new().build();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_local("+33612345678", ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 2, "100 Trying then 503: {:?}", out);
+    assert!(out[0].starts_with("SIP/2.0 100 Trying\r\n"));
+    assert!(
+        out[1].starts_with("SIP/2.0 503 Service Unavailable\r\n"),
+        "{}",
+        out[1]
+    );
+    assert!(out[1].contains("Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKloc1;rport\r\n"));
+    assert!(out[1].contains("CSeq: 1 INVITE\r\n"));
+    assert!(out[1].contains("Call-ID: cid-out-1\r\n"));
+    assert!(out[1].contains("To: <sip:+33612345678@127.0.0.1>;tag=sbc-"));
+
+    assert!(sbc.b2bua.calls_locked().await.is_empty(), "no orphan call");
+    assert_eq!(sbc.media.stats().allocated_ports, 0, "no orphan ports");
+    let cdrs = sbc.cdr.get_recent(10).await.unwrap();
+    assert_eq!(cdrs.len(), 1);
+    assert_eq!(cdrs[0].disconnect_reason, "rejected-503");
+    assert_eq!(cdrs[0].direction, "outbound");
+    assert_eq!(cdrs[0].trunk_id.as_deref(), Some(TRUNK_NAME));
+    assert_eq!(cdrs[0].caller, "alice");
+    assert_eq!(cdrs[0].callee, "+33612345678");
+
+    // A UDP retransmission of that INVITE only gets the 503 again.
+    sbc.handle_invite(
+        invite_from_local("+33612345678", ""),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let again = drain(&mut rx);
+    assert_eq!(again.len(), 1, "replayed final only: {:?}", again);
+    assert!(again[0].starts_with("SIP/2.0 503 "));
+    assert_eq!(
+        sbc.cdr.get_recent(10).await.unwrap().len(),
+        1,
+        "no second call"
+    );
+    assert!(sbc.b2bua.calls_locked().await.is_empty());
+}
+
+/// RFC 3261 §17.2.1: a retransmitted INVITE (lost 100 Trying) is absorbed
+/// while the first copy's call lives; a new transaction is a new call.
+#[tokio::test]
+async fn retransmitted_invite_is_absorbed_while_the_call_is_ringing() {
+    let mut sbc = SbcBuilder::new().build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_trunk("+33999000111", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let first = drain(&mut rx);
+    assert_eq!(first.len(), 2, "100 then 404: {:?}", first);
+
+    sbc.handle_invite(
+        invite_from_trunk("+33999000111", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let again = drain(&mut rx);
+    assert_eq!(again.len(), 1, "the last response only: {:?}", again);
+    assert!(again[0].starts_with("SIP/2.0 404 Not Found\r\n"));
+    assert_eq!(
+        sbc.cdr.get_recent(10).await.unwrap().len(),
+        1,
+        "one call, one CDR"
+    );
+
+    // Same Call-ID but a new branch/CSeq: a new INVITE transaction.
+    let fresh = request(
+        rsip::SipMessage::Request(invite_from_trunk("+33999000111", 70))
+            .to_string()
+            .replace("branch=z9hG4bKtrk1", "branch=z9hG4bKtrk2")
+            .replace("CSeq: 1 INVITE", "CSeq: 2 INVITE"),
+    );
+    sbc.handle_invite(fresh, trunk_addr(), rsip::Transport::Udp, Some(&tx))
+        .await
+        .unwrap();
+    let third = drain(&mut rx);
+    assert_eq!(third.len(), 2, "processed anew: {:?}", third);
+    assert_eq!(sbc.cdr.get_recent(10).await.unwrap().len(), 2);
+}
+
+/// RFC 3261 §8.2.2.3: an extension we do not implement cannot be required.
+#[tokio::test]
+async fn invite_requiring_an_unsupported_extension_is_answered_420() {
+    let mut sbc = SbcBuilder::new().build();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_invite(
+        invite_from_local(
+            "+33612345678",
+            "Require: 100rel, timer\r\nSupported: 100rel\r\n",
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "420 only, no 100 Trying: {:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 420 Bad Extension\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("Unsupported: 100rel\r\n"), "{}", out[0]);
+    assert!(
+        !out[0].contains("Unsupported: 100rel, timer"),
+        "timer IS supported"
+    );
+    assert!(sbc.b2bua.calls_locked().await.is_empty());
+    assert_eq!(sbc.media.stats().allocated_ports, 0);
+}
+
+/// RFC 3261 §8.2.1: a method the SBC does not implement gets 405 + Allow.
+#[tokio::test]
+async fn unsupported_method_is_answered_405_with_allow() {
+    let mut sbc = SbcBuilder::new().build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let subscribe = request(
+        "SUBSCRIBE sip:alice@127.0.0.1 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKsub1\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:bob@203.0.113.9>;tag=s1\r\n\
+         To: <sip:alice@127.0.0.1>\r\n\
+         Call-ID: cid-sub-1\r\n\
+         CSeq: 1 SUBSCRIBE\r\n\
+         Event: presence\r\n\
+         Content-Length: 0\r\n\r\n"
+            .to_string(),
+    );
+    sbc.handle_request(subscribe, trunk_addr(), rsip::Transport::Udp, Some(&tx))
+        .await
+        .unwrap();
+    let out = drain(&mut rx);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(
+        out[0].starts_with("SIP/2.0 405 Method Not Allowed\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(
+        out[0].contains(&format!(
+            "Allow: {}\r\n",
+            crate::sip_builder::ALLOWED_METHODS
+        )),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("CSeq: 1 SUBSCRIBE\r\n"));
+}
+
+/// A 200 OK to a relayed INFO never reaches the INVITE logic.
+#[tokio::test]
+async fn response_to_a_relayed_info_is_dropped() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+    let media_id = sbc.b2bua.get_media_session_id(&call.uuid).await.unwrap();
+
+    sbc.handle_response(
+        response("200 OK", "z9hG4bKinfo", 9, "INFO", ""),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        drain(&mut call.caller_rx).is_empty(),
+        "nothing relayed to the caller"
+    );
+    assert!(
+        drain(&mut call.callee_rx).is_empty(),
+        "no ACK toward the trunk"
+    );
+    assert!(alive(&sbc).await);
+    assert_eq!(
+        sbc.b2bua.get_media_session_id(&call.uuid).await.as_deref(),
+        Some(media_id.as_str())
+    );
+}
+
+/// What actually leaves toward the trunk: unsupported extensions stripped
+/// from Supported, one hop consumed, the session-timer offer in place.
+#[tokio::test]
+async fn forwarded_invite_carries_only_supported_extensions() {
+    let mut sbc = SbcBuilder::new().identity("127.0.0.1", 5060).build();
+    sbc.start(&udp_loopback(), None).await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let mut trunk = crate::routing::TrunkConfig::new("loop".to_string());
+    trunk.host = "127.0.0.1".to_string();
+    trunk.port = peer_addr.port();
+    sbc.add_trunk(trunk);
+    assert!(sbc.trunk_manager.disable_trunk(&trunk_id(&sbc)));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    sbc.handle_invite(
+        invite_from_local(
+            "+33612345678",
+            "Supported: 100rel, timer, replaces\r\nAllow: INVITE, ACK, PRACK\r\n",
+        ),
+        local_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+
+    let to_caller = drain(&mut rx);
+    assert_eq!(to_caller.len(), 1, "100 Trying: {:?}", to_caller);
+    assert!(to_caller[0].starts_with("SIP/2.0 100 Trying\r\n"));
+
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        .await
+        .expect("the INVITE reaches the trunk")
+        .unwrap();
+    let invite = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(invite.starts_with("INVITE sip:"), "{}", invite);
+    assert!(!invite.contains("100rel"), "100rel stripped: {}", invite);
+    assert!(
+        !invite.contains("replaces"),
+        "replaces stripped: {}",
+        invite
+    );
+    assert_eq!(invite.matches("Supported:").count(), 1, "{}", invite);
+    assert!(invite.contains("Supported: timer\r\n"), "{}", invite);
+    assert!(invite.contains("Session-Expires: 1800\r\n"), "{}", invite);
+    assert!(invite.contains("Max-Forwards: 69\r\n"), "{}", invite);
+    assert!(
+        invite.contains("Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK")
+            && !invite.contains("z9hG4bKloc1"),
+        "topology hidden: the SBC's own Via: {}",
+        invite
+    );
+    assert!(invite.contains("Record-Route: "), "{}", invite);
+    assert!(
+        invite.find("Supported:").unwrap() < invite.find("Content-Length:").unwrap(),
+        "{}",
+        invite
+    );
+    assert!(call_alive(&sbc, "cid-out-1").await);
+}

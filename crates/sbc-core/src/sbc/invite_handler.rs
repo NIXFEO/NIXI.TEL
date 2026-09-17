@@ -42,6 +42,37 @@ impl Sbc {
             }
         }
 
+        // ── Retransmission? (RFC 3261 §17.2.1) ─────────────────────────
+        // The client did not see our 100 Trying, or our final was lost:
+        // replay the last response for that transaction and stop — the
+        // first copy already created the call and its media session.
+        let tx_key = super::invite_tx::InviteTxCache::key_of_request(&request);
+        if let Some(key) = tx_key.as_deref() {
+            if let Err(last) = self.invite_tx.begin(key) {
+                match last {
+                    Some(resp) => {
+                        debug!(
+                            "Retransmitted INVITE from {} (tx {}) — replaying last response",
+                            source, key
+                        );
+                        self.send_sip(
+                            "retransmitted INVITE → last response",
+                            &resp,
+                            source,
+                            transport,
+                            reply_tx,
+                        )
+                        .await;
+                    }
+                    None => debug!(
+                        "Retransmitted INVITE from {} (tx {}) — still being processed",
+                        source, key
+                    ),
+                }
+                return Ok(());
+            }
+        }
+
         // ── Anti-spam: reject INVITE from unregistered/unknown sources ──
         // Allow if any of:
         //   (1) source IP matches a registered user's received_ip
@@ -230,6 +261,25 @@ impl Sbc {
             self.metrics.inc_sip_response(483);
             let r483 = response_for_request(&request, 483, "Too Many Hops");
             self.send_sip("483 → caller", r483.as_bytes(), source, transport, reply_tx)
+                .await;
+            return Ok(());
+        }
+
+        // RFC 3261 §8.2.2.3: an extension we do not implement cannot be
+        // required of us (100rel/PRACK, gruu, …) → 420 + Unsupported.
+        let unsupported = unsupported_required_extensions(&request);
+        if !unsupported.is_empty() {
+            warn!(
+                "INVITE from {} requires {:?} — 420 Bad Extension",
+                source, unsupported
+            );
+            self.metrics.inc_sip_response(420);
+            let mut r420 = response_for_request(&request, 420, "Bad Extension");
+            if let Ok(mut m) = crate::topology::RawSipMessage::parse(&r420) {
+                m.set_header("Unsupported", &unsupported.join(", "));
+                r420 = m.to_string();
+            }
+            self.send_sip("420 → caller", r420.as_bytes(), source, transport, reply_tx)
                 .await;
             return Ok(());
         }
@@ -455,9 +505,23 @@ impl Sbc {
         let (dest, outbound_transport, outbound_reply_tx) = if let Some(ref reg) = registrar_contact
         {
             // Route to registered contact (e.g., a WebRTC/WSS client)
-            let addr: std::net::SocketAddr = format!("{}:{}", reg.received_ip, reg.received_port)
-                .parse()
-                .map_err(|e| Error::Other(format!("Invalid registered addr: {}", e)))?;
+            let addr: std::net::SocketAddr =
+                match format!("{}:{}", reg.received_ip, reg.received_port).parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        error!(
+                            "Registered contact {} has an unparsable address {}:{} — 500",
+                            reg.contact, reg.received_ip, e
+                        );
+                        self.finish_call(&uuid, CallOutcome::Rejected { code: 500 })
+                            .await;
+                        self.metrics.inc_sip_response(500);
+                        let r500 = response_for_request(&request, 500, "Server Internal Error");
+                        self.send_sip("500 → caller", r500.as_bytes(), source, transport, reply_tx)
+                            .await;
+                        return Ok(());
+                    }
+                };
 
             let reg_transport = match reg.transport.as_str() {
                 "WSS" => rsip::Transport::Wss,
@@ -869,7 +933,11 @@ impl Sbc {
         }
 
         // ── Step 3b: Apply topology hiding on outbound message ────────────────
-        let raw_request = rsip::SipMessage::Request(request_with_sdp).to_string();
+        // Extensions we cannot honour never reach the other leg (100rel would
+        // make the trunk wait for PRACKs the SBC does not relay).
+        let raw_request = crate::topology::strip_unsupported_extensions(
+            &rsip::SipMessage::Request(request_with_sdp).to_string(),
+        );
         // Use the OUTBOUND transport name (not the inbound one), so the Via header
         // reflects the correct transport the callee must use to reply.
         let outbound_transport_name = match outbound_transport {
@@ -951,22 +1019,13 @@ impl Sbc {
             }
         };
 
-        self.transport
-            .reply(
-                outbound_raw.as_bytes(),
-                dest,
-                outbound_transport,
-                outbound_reply_tx.as_ref(),
-            )
-            .await?;
-        info!("Forwarded INVITE to {} via {:?}", dest, outbound_transport);
-
-        // ── Record the INVITE attempt ──────────────────────────────────
+        // ── Record the INVITE attempt before sending it ─────────────────
         // The raw INVITE as sent is the source for CANCEL, non-2xx ACK,
         // 407/422 retries, failover re-sends and refresh re-INVITEs; its
         // Via branch attributes the trunk's responses to this attempt.
-        // (trunk_id was stored earlier for trunk-routed calls; None for
-        // registrar-routed callees.)
+        // Recorded first so that a send that fails can still fail over
+        // from it. (trunk_id was stored earlier for trunk-routed calls;
+        // None for registrar-routed callees.)
         let trunk_id = self
             .b2bua
             .get_auth_retry_info(&uuid)
@@ -1000,6 +1059,53 @@ impl Sbc {
             )
             .await;
 
+        if let Err(e) = self
+            .transport
+            .reply(
+                outbound_raw.as_bytes(),
+                dest,
+                outbound_transport,
+                outbound_reply_tx.as_ref(),
+            )
+            .await
+        {
+            // Dead TCP/TLS peer, unregistered TLS destination, closed WS…:
+            // the call must not sit ringing behind our 100 Trying. Try the
+            // next trunk; with none left, 503 the caller and release.
+            warn!(
+                "INVITE toward {} via {:?} could not be sent: {} — failing over",
+                dest, outbound_transport, e
+            );
+            self.metrics.inc_sip_send_failure(outbound_transport);
+            if !self.failover_to_next_trunk(&uuid).await {
+                warn!(
+                    "INVITE for call {} could not be forwarded anywhere — 503 to the caller",
+                    &uuid[..8.min(uuid.len())]
+                );
+                let final_503 = {
+                    let calls = self.b2bua.calls_locked().await;
+                    calls
+                        .get(&uuid)
+                        .and_then(|c| c.final_toward_caller(503, None))
+                };
+                self.finish_call(&uuid, CallOutcome::Rejected { code: 503 })
+                    .await;
+                self.metrics.inc_sip_response(503);
+                if let Some(r) = final_503 {
+                    self.send_sip(
+                        "503 (setup failed) → caller",
+                        r.as_bytes(),
+                        source,
+                        transport,
+                        reply_tx,
+                    )
+                    .await;
+                }
+            }
+            return Ok(());
+        }
+        info!("Forwarded INVITE to {} via {:?}", dest, outbound_transport);
+
         // Store callee's Request-URI for ACK relay
         self.b2bua
             .set_callee_request_uri(&uuid, callee_request_uri_str)
@@ -1027,16 +1133,16 @@ impl Sbc {
                 attempt,
                 self.invite_timeout
             );
-            self.failover_to_next_trunk(&uuid).await;
+            let _ = self.failover_to_next_trunk(&uuid).await;
         }
     }
 
     /// CANCEL the current outbound attempt and re-send the stored INVITE,
     /// retargeted to the next candidate trunk (fresh Via branch, R-URI and
     /// number normalization for that trunk).
-    pub(crate) async fn failover_to_next_trunk(&mut self, uuid: &crate::b2bua::CallUuid) {
+    pub(crate) async fn failover_to_next_trunk(&mut self, uuid: &crate::b2bua::CallUuid) -> bool {
         let Some(next_id) = self.b2bua.take_next_failover_candidate(uuid).await else {
-            return;
+            return false;
         };
         let Some(trunk) = self.trunk_manager.get_trunk(&next_id) else {
             warn!(
@@ -1057,7 +1163,9 @@ impl Sbc {
         // Snapshot the previous attempt (stored INVITE + current callee dest)
         let (stored_invite, prev_dest, prev_transport, callee_reply_tx) = {
             let calls = self.b2bua.calls_locked().await;
-            let Some(call) = calls.get(uuid) else { return };
+            let Some(call) = calls.get(uuid) else {
+                return false;
+            };
             (
                 call.original_outbound_invite.clone(),
                 call.callee_dest,
@@ -1070,7 +1178,7 @@ impl Sbc {
                 "Failover: no stored outbound INVITE for call {} — cannot fail over",
                 uuid
             );
-            return;
+            return false;
         };
 
         // 1. CANCEL the previous attempt (harmless if the trunk never got it)
@@ -1095,7 +1203,7 @@ impl Sbc {
                 "Failover: could not retarget INVITE for trunk '{}'",
                 trunk.name
             );
-            return;
+            return false;
         };
         let new_transport = trunk.transport.to_rsip_transport();
 
@@ -1131,6 +1239,7 @@ impl Sbc {
                 }
             }
         }
+        true
     }
 
     /// Handle 422 Session Interval Too Small from a trunk (RFC 4028 §7.4):
@@ -1459,6 +1568,35 @@ fn request_has_rfc3261_branch(request: &Request) -> bool {
 
 /// Extract the URI from a Contact header value: `"Bob" <sip:b@1.2.3.4:5060;transport=tcp>;expires=60`
 /// → `sip:b@1.2.3.4:5060;transport=tcp`. Falls back to the trimmed value.
+/// Extensions the request `Require`s (or `Proxy-Require`s) that the SBC
+/// does not implement (RFC 3261 §8.2.2.3), lowercase, deduplicated.
+pub(crate) fn unsupported_required_extensions(request: &Request) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in request.headers.iter() {
+        let line = h.to_string();
+        let lower = line.to_ascii_lowercase();
+        let value = if let Some(v) = lower.strip_prefix("require:") {
+            v
+        } else if let Some(v) = lower.strip_prefix("proxy-require:") {
+            v
+        } else {
+            continue;
+        };
+        for token in value.split(',') {
+            let t = token.trim();
+            if !t.is_empty()
+                && !crate::sip_builder::SUPPORTED_EXTENSIONS
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(t))
+                && !out.iter().any(|o| o == t)
+            {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Value of the request's Max-Forwards header, None when absent or unparsable.
 pub(crate) fn max_forwards(request: &Request) -> Option<u32> {
     request

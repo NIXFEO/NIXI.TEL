@@ -81,9 +81,13 @@ impl Sbc {
             // 4. ACK every non-2xx INVITE final (RFC 3261 §17.1.1.3) so UDP
             //    peers stop retransmitting it for 32 s.
             if let Some((resp_cseq, method)) = response_cseq(&response) {
-                if method.eq_ignore_ascii_case("CANCEL") || method.eq_ignore_ascii_case("BYE") {
+                // Nothing awaits the answers to what the SBC sent itself
+                // (CANCEL/BYE) or relayed and already answered locally
+                // (INFO/REFER); letting a 200 OK to a DTMF INFO reach the
+                // INVITE arm would re-run the answer logic on the dialog.
+                if !method.eq_ignore_ascii_case("INVITE") {
                     debug!(
-                        "{} to our {} on call {} — SBC-originated transaction, dropped",
+                        "{} to {} on call {} — not an INVITE transaction, dropped",
                         status, method, uuid
                     );
                     return Ok(());
@@ -831,8 +835,13 @@ impl Sbc {
                                     fo.attempt = fo.attempt.saturating_sub(1);
                                 }
                             }
-                            self.failover_to_next_trunk(&uuid).await;
-                            return Ok(());
+                            if self.failover_to_next_trunk(&uuid).await {
+                                return Ok(());
+                            }
+                            warn!(
+                                "B2BUA: failover exhausted for call {} — relaying the {}",
+                                uuid, status
+                            );
                         }
                     }
 
@@ -1759,6 +1768,70 @@ mod transaction_tests {
         assert!(to_caller[0].contains("To: <sip:alice@a.example.com>;tag=al-1\r\n"));
         assert!(!alive(&sbc).await);
         assert_eq!(sbc.media.stats().allocated_ports, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_491_retries_soon_and_405_disables_the_timer_but_keeps_the_call() {
+        let (mut sbc, uuid, mut caller_rx, mut callee_rx) = sbc_with_call().await;
+        let (cseq, branch) = arm_and_refresh(&sbc, &uuid, &mut callee_rx).await;
+
+        // 491 Request Pending: glare, not a failure — ACK, retry shortly
+        sbc.handle_response(
+            response("491 Request Pending", &branch, cseq, "INVITE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
+        let out = drain(&mut callee_rx);
+        assert_eq!(out.len(), 1, "{:?}", out);
+        assert!(out[0].starts_with("ACK ") && out[0].contains(&format!("CSeq: {} ACK", cseq)));
+        {
+            let calls = sbc.b2bua.calls_locked().await;
+            let st = calls[&uuid].session_timer.as_ref().expect("timer kept");
+            assert_eq!(st.refresh_failures, 0, "491 is not a strike");
+            let wait = st
+                .next_refresh_at
+                .saturating_duration_since(std::time::Instant::now());
+            assert!(
+                wait >= Duration::from_secs(2) && wait <= Duration::from_secs(4),
+                "retry in 2.1–4 s, got {:?}",
+                wait
+            );
+        }
+        assert!(drain(&mut caller_rx).is_empty());
+        assert!(alive(&sbc).await);
+
+        // 405 to the next refresh: the peer never refreshes by re-INVITE —
+        // timer off for this call, call kept.
+        let (cseq2, branch2) = arm_and_refresh(&sbc, &uuid, &mut callee_rx).await;
+        sbc.handle_response(
+            response("405 Method Not Allowed", &branch2, cseq2, "INVITE", ""),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
+        let out = drain(&mut callee_rx);
+        assert_eq!(out.len(), 1, "ACK only: {:?}", out);
+        assert!(out[0].starts_with("ACK "));
+        assert!(drain(&mut caller_rx).is_empty(), "no BYE to the caller");
+        assert!(alive(&sbc).await, "the call survives");
+        assert!(
+            sbc.b2bua.calls_locked().await[&uuid]
+                .session_timer
+                .is_none(),
+            "no further refresh for this call"
+        );
+        assert!(
+            sbc.b2bua
+                .due_session_refreshes("127.0.0.1", 5060)
+                .await
+                .is_empty(),
+            "nothing is due any more"
+        );
     }
 
     #[tokio::test]

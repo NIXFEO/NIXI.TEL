@@ -294,6 +294,34 @@ pub(crate) async fn register_trunk_ip(sbc: &Sbc) {
     }
 }
 
+/// A fresh INVITE from a local (loopback) client to `number`, with `extra`
+/// header lines: what a co-located PBX sends the SBC for an outbound call.
+/// Call-ID `cid-out-1`, CSeq 1, branch `z9hG4bKloc1`.
+pub(crate) fn invite_from_local(number: &str, extra: &str) -> rsip::Request {
+    request(format!(
+        "INVITE sip:{}@127.0.0.1:5060 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKloc1;rport\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:alice@127.0.0.1>;tag=loc1\r\n\
+         To: <sip:{}@127.0.0.1>\r\n\
+         Call-ID: cid-out-1\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:alice@127.0.0.1:5080>\r\n\
+         {}Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        number,
+        number,
+        extra,
+        SDP.len(),
+        SDP
+    ))
+}
+
+/// Source address of `invite_from_local`.
+pub(crate) fn local_addr() -> SocketAddr {
+    "127.0.0.1:5080".parse().unwrap()
+}
+
 /// Everything queued on a leg, as text, oldest first.
 pub(crate) fn drain(rx: &mut UnboundedReceiver<Vec<u8>>) -> Vec<String> {
     let mut out = Vec::new();

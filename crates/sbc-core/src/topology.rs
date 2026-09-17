@@ -402,6 +402,65 @@ pub fn apply_topology_hiding_outbound(
     Ok(msg.to_string())
 }
 
+/// Drop from `Supported` (and its compact form `k`) every extension the
+/// SBC does not implement, so a peer never negotiates one with us in the
+/// middle (e.g. `100rel`: the trunk would send reliable provisionals,
+/// wait for PRACKs the SBC cannot relay, and fail the call). The header
+/// disappears when nothing is left.
+pub fn strip_unsupported_extensions(raw: &str) -> String {
+    let Ok(mut msg) = RawSipMessage::parse(raw) else {
+        return raw.to_string();
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for value in msg.header_values("supported") {
+        for token in value.split(',') {
+            let t = token.trim();
+            if crate::sip_builder::SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(t))
+                && !kept.iter().any(|k| k.eq_ignore_ascii_case(t))
+            {
+                kept.push(t.to_string());
+            }
+        }
+    }
+    let had_any = !msg.header_values("supported").is_empty();
+    if !had_any {
+        return raw.to_string();
+    }
+    if kept.is_empty() {
+        msg.remove_header("supported");
+        msg.remove_header("k");
+        return msg.to_string();
+    }
+    // Rewrite the first Supported line in place (header order kept), fold
+    // any other Supported/k lines into it.
+    let value = kept.join(", ");
+    let mut seen = false;
+    msg.headers.retain(|h| {
+        let name = h
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if name == "supported" || name == "k" {
+            if seen {
+                return false;
+            }
+            seen = true;
+        }
+        true
+    });
+    msg.remove_header("k");
+    if msg.header_values("supported").is_empty() {
+        msg.append_header(format!("Supported: {}", value));
+    } else {
+        msg.set_header("Supported", &value);
+    }
+    msg.to_string()
+}
+
 /// Strip headers that could reveal internal topology or user identity
 /// beyond what's needed (e.g. P-Asserted-Identity, X-Forwarded-For).
 pub fn strip_privacy_headers(raw: &str) -> Result<String> {
@@ -493,6 +552,27 @@ Content-Length: 0\r\n\
         msg.set_header("Max-Forwards", "50");
         let mf = msg.header_values("max-forwards");
         assert_eq!(mf[0], "50");
+    }
+
+    #[test]
+    fn unsupported_extensions_are_stripped_from_supported() {
+        let raw = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nSupported: 100rel, timer, replaces\r\nk: gruu\r\nContent-Length: 0\r\n\r\n";
+        let out = strip_unsupported_extensions(raw);
+        assert!(out.contains("Supported: timer\r\n"), "{}", out);
+        assert!(!out.contains("100rel") && !out.contains("gruu") && !out.contains("replaces"));
+        assert_eq!(out.matches("Supported:").count(), 1);
+        assert!(
+            out.find("Supported:").unwrap() < out.find("Content-Length:").unwrap(),
+            "rewritten in place, not appended: {}",
+            out
+        );
+
+        let none = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nSupported: 100rel\r\nContent-Length: 0\r\n\r\n";
+        let out = strip_unsupported_extensions(none);
+        assert!(!out.to_lowercase().contains("supported:"), "{}", out);
+
+        let untouched = "INVITE sip:b@h SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bKx\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(strip_unsupported_extensions(untouched), untouched);
     }
 
     #[test]
