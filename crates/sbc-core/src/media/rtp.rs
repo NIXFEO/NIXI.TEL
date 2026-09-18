@@ -17,7 +17,8 @@ use crate::media::endpoint::{EndpointPolicy, Observation, Verdict};
 use crate::media::srtp::SrtpContext;
 use crate::media::stats::{DropReason, Leg};
 use crate::media::stun::{
-    build_binding_response_with_integrity, classify_packet, MultiplexedPacketType,
+    build_binding_response_with_integrity, classify_packet, validate_binding_request,
+    MultiplexedPacketType,
 };
 use crate::media::PortPair;
 use crate::transcoding::Transcoder;
@@ -636,6 +637,12 @@ impl RtpSession {
         });
     }
 
+    /// The leg-A endpoint the relay is using right now: the signalled one,
+    /// or whatever it learned from the first packet it accepted.
+    pub async fn learned_endpoint_a(&self) -> Option<SocketAddr> {
+        *self.endpoint_a_shared.lock().await
+    }
+
     /// Set endpoint B (callee's real RTP address) — pre-configured from SDP
     pub fn set_endpoint_b(&mut self, addr: SocketAddr) {
         debug!("Session {} endpoint B: {}", self.session_id, addr);
@@ -912,6 +919,19 @@ impl RtpSession {
                             if webrtc_mode_a {
                                 match classify_packet(data_slice) {
                                     MultiplexedPacketType::Stun => {
+                                        // Authenticate the check before answering it or
+                                        // learning anything from it (RFC 5389 §10.2): the
+                                        // relay used to answer every Binding Request that
+                                        // reached the port and adopt its source as the
+                                        // call's endpoint, so one spoofed datagram could
+                                        // take the audio.
+                                        if let Some(ref pwd) = ice_pwd_local {
+                                            if let Err(why) = validate_binding_request(data_slice, pwd) {
+                                                debug!("STUN A: refused a Binding Request from {} ({})", source, why.label());
+                                                media_stats.note_drop(DropReason::IceAuth);
+                                                continue;
+                                            }
+                                        }
                                         // ICE connectivity check — respond with Binding Response + MESSAGE-INTEGRITY
                                         match build_binding_response_with_integrity(data_slice, source, ice_pwd_local.as_deref()) {
                                             Ok(response) => {
@@ -1327,6 +1347,15 @@ impl RtpSession {
                             if webrtc_mode_b {
                                 match classify_packet(data_slice_b) {
                                     MultiplexedPacketType::Stun => {
+                                        // Same on the callee leg: an unauthenticated check
+                                        // must not be answered, nor learned from.
+                                        if let Some(ref pwd) = ice_pwd_local_b {
+                                            if let Err(why) = validate_binding_request(data_slice_b, pwd) {
+                                                debug!("STUN B: refused a Binding Request from {} ({})", source, why.label());
+                                                media_stats.note_drop(DropReason::IceAuth);
+                                                continue;
+                                            }
+                                        }
                                         // ICE connectivity check — respond with Binding Response + MESSAGE-INTEGRITY
                                         match build_binding_response_with_integrity(data_slice_b, source, ice_pwd_local_b.as_deref()) {
                                             Ok(response) => {
@@ -2295,5 +2324,113 @@ mod tests {
         let s = session.unwrap();
         assert_eq!(s.ports_a.rtp, 10020);
         assert_eq!(s.ports_b.rtp, 10022);
+    }
+}
+
+#[cfg(test)]
+mod ice_auth_tests {
+    use super::*;
+    use crate::media::port_allocator::PortPair;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    /// A Binding Request signed with `pwd`, as an ICE agent sends one.
+    fn signed_check(pwd: &str) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0x2112A442u32.to_be_bytes());
+        b.extend_from_slice(&[3u8; 12]);
+        // USERNAME "sbc:peer"
+        b.extend_from_slice(&0x0006u16.to_be_bytes());
+        b.extend_from_slice(&8u16.to_be_bytes());
+        b.extend_from_slice(b"sbc:peer");
+        let set_len = |b: &mut Vec<u8>, l: usize| {
+            b[2] = (l >> 8) as u8;
+            b[3] = (l & 0xFF) as u8;
+        };
+        let n = b.len();
+        set_len(&mut b, n - 20 + 24);
+        let mut mac = <Hmac<Sha1>>::new_from_slice(pwd.as_bytes()).unwrap();
+        mac.update(&b);
+        let tag = mac.finalize().into_bytes();
+        b.extend_from_slice(&0x0008u16.to_be_bytes());
+        b.extend_from_slice(&0x0014u16.to_be_bytes());
+        b.extend_from_slice(&tag[..20]);
+        b
+    }
+
+    /// The relay answered every Binding Request that reached the media
+    /// port and took its source as the call's endpoint. One spoofed
+    /// datagram was enough to be handed the audio of a WebRTC leg; now
+    /// only a check signed with the password we published in our own SDP
+    /// is answered.
+    #[tokio::test]
+    async fn an_unsigned_ice_check_is_neither_answered_nor_learned_from() {
+        let ports_a = PortPair::new(10240).unwrap();
+        let ports_b = PortPair::new(10242).unwrap();
+        let mut session = RtpSession::new_two_leg("ice-auth".to_string(), ports_a, ports_b)
+            .await
+            .unwrap();
+        let stats = session.media_stats();
+        let pwd = "theSbcIcePasswordFromItsOwnSdp";
+        let _dtls_rx = session.enable_webrtc_mode_a(Some(pwd.to_string()));
+        session.start().await.unwrap();
+
+        let leg_a = format!("127.0.0.1:{}", ports_a.rtp);
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 2048];
+
+        // 1. A bare Binding Request (no MESSAGE-INTEGRITY): ignored.
+        let mut bare = Vec::new();
+        bare.extend_from_slice(&0x0001u16.to_be_bytes());
+        bare.extend_from_slice(&0u16.to_be_bytes());
+        bare.extend_from_slice(&0x2112A442u32.to_be_bytes());
+        bare.extend_from_slice(&[1u8; 12]);
+        attacker.send_to(&bare, &leg_a).await.unwrap();
+
+        // 2. One signed with the wrong password: ignored too.
+        attacker
+            .send_to(&signed_check("not-our-password"), &leg_a)
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), attacker.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the relay answered an unauthenticated ICE check"
+        );
+        assert!(
+            session.learned_endpoint_a().await.is_none(),
+            "an unauthenticated check must not become the call's endpoint"
+        );
+        assert_eq!(
+            stats.drops(DropReason::IceAuth),
+            2,
+            "both refusals are counted"
+        );
+
+        // 3. The real peer, signing with the password from our SDP: answered
+        //    and learned.
+        attacker.send_to(&signed_check(pwd), &leg_a).await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), attacker.recv_from(&mut buf))
+            .await
+            .expect("the authenticated check is answered")
+            .unwrap();
+        assert_eq!(
+            u16::from_be_bytes([buf[0], buf[1]]),
+            0x0101,
+            "a Binding Response ({} bytes)",
+            n
+        );
+        assert_eq!(
+            session.learned_endpoint_a().await,
+            Some(attacker.local_addr().unwrap()),
+            "the authenticated peer is the endpoint"
+        );
+        assert_eq!(stats.drops(DropReason::IceAuth), 2, "no new refusal");
     }
 }

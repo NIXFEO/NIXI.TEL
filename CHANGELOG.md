@@ -23,6 +23,29 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `sbc_sip_transaction_timeouts_total` (requests nobody ever answered),
   with the alert rules `SBCTransactionTimeouts` and
   `SBCRequestRetransmissionsHigh`.
+- **The DTLS peer's certificate is verified against the SDP
+  fingerprint.** A DTLS-SRTP certificate is self-signed, so the handshake
+  runs with `insecure_skip_verify` and the X.509 chain proves nothing:
+  what binds the session to the call is that the certificate hashes to
+  the `a=fingerprint` the signalling carried (RFC 8122 §5, RFC 5763
+  §6.6). Nothing compared them — the checker existed and had no caller,
+  and the offer's fingerprint never reached the DTLS context — so any
+  host that could reach the media port could complete the handshake and
+  take the call's audio. The fingerprint is now carried from the offer
+  and from the answer into the context, checked after the handshake, and
+  a mismatch, a missing certificate or a missing `a=fingerprint` all fail
+  it. Every hash RFC 8122 allows is supported, and the comparison is on
+  the bytes so a peer's lower-case or colon-free spelling still matches.
+- **An ICE connectivity check is authenticated before it is answered or
+  believed.** The relay replied to every STUN Binding Request that
+  reached the media port *and adopted its source as the call's
+  endpoint*, so a single spoofed datagram could be handed the audio of a
+  WebRTC leg. A Binding Request must now carry a USERNAME and a
+  MESSAGE-INTEGRITY that verifies against the ice-pwd the SBC published
+  in its own SDP (RFC 5389 §10.2, RFC 8445 §7.3), with the FINGERPRINT
+  checked when present; a refusal is silent and counted as the media
+  drop reason `ice-auth`. Where the SBC has no local ICE credentials
+  (every non-WebRTC call) nothing changes.
 - **SRTP keeps a rollover counter per SSRC and per direction, and a
   replay window.** RFC 3711 §3.3.1 builds the 48-bit packet index from
   `2^16 · ROC + SEQ`, and the ROC is not on the wire: both ends derive it

@@ -55,10 +55,13 @@ pub enum DropReason {
     /// An RTCP datagram refused on the RTCP port (wrong source, or not
     /// RTCP-shaped).
     Rtcp,
+    /// An ICE Binding Request whose MESSAGE-INTEGRITY did not verify
+    /// against our own ice-pwd: not this call's peer (RFC 5389 §10.2).
+    IceAuth,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 7] = [
+    pub const ALL: [DropReason; 8] = [
         Self::NotRtp,
         Self::NoEndpoint,
         Self::PayloadType,
@@ -66,6 +69,7 @@ impl DropReason {
         Self::Srtp,
         Self::SendFailed,
         Self::Rtcp,
+        Self::IceAuth,
     ];
 
     pub fn label(self) -> &'static str {
@@ -77,6 +81,7 @@ impl DropReason {
             Self::Srtp => "srtp",
             Self::SendFailed => "send-failed",
             Self::Rtcp => "rtcp",
+            Self::IceAuth => "ice-auth",
         }
     }
 
@@ -89,6 +94,7 @@ impl DropReason {
             Self::Srtp => 4,
             Self::SendFailed => 5,
             Self::Rtcp => 6,
+            Self::IceAuth => 7,
         }
     }
 }
@@ -212,7 +218,7 @@ pub struct CallMediaStats {
     started: Instant,
     pub caller: LegStats,
     pub callee: LegStats,
-    drops: [AtomicU64; 7],
+    drops: [AtomicU64; DropReason::ALL.len()],
     /// Monotonic ms of the last packet actually **delivered** to a peer:
     /// the inactivity watchdog's input. A packet that arrives but dies at
     /// the transcoder or the SRTP layer must not keep a dead call alive.

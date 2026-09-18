@@ -94,30 +94,48 @@ impl CertificateFingerprint {
         format!("{} {}", self.algorithm, self.fingerprint)
     }
 
-    /// Verify fingerprint matches certificate
-    pub fn verify(&self, cert_der: &[u8]) -> Result<bool> {
-        use sha2::{Digest, Sha256};
-
-        if self.algorithm != "sha-256" {
-            return Err(Error::Media(format!(
-                "Unsupported hash algorithm: {}",
-                self.algorithm
-            )));
-        }
-
-        // Compute SHA-256 of certificate
-        let mut hasher = Sha256::new();
-        hasher.update(cert_der);
-        let hash = hasher.finalize();
-
-        // Format as hex with colons
-        let computed = hash
+    /// The certificate's fingerprint under this attribute's algorithm,
+    /// as SDP writes it (upper-case hex, colon separated).
+    pub fn digest_of(algorithm: &str, cert_der: &[u8]) -> Result<String> {
+        use sha1::Sha1;
+        use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+        let bytes: Vec<u8> = match algorithm.to_ascii_lowercase().as_str() {
+            "sha-256" => Sha256::digest(cert_der).to_vec(),
+            "sha-384" => Sha384::digest(cert_der).to_vec(),
+            "sha-512" => Sha512::digest(cert_der).to_vec(),
+            "sha-224" => Sha224::digest(cert_der).to_vec(),
+            // RFC 8122 §5 allows it and some SIP endpoints still send it.
+            "sha-1" => Sha1::digest(cert_der).to_vec(),
+            other => {
+                return Err(Error::Media(format!(
+                    "Unsupported fingerprint hash algorithm: {}",
+                    other
+                )))
+            }
+        };
+        Ok(bytes
             .iter()
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
-            .join(":");
+            .join(":"))
+    }
 
-        Ok(computed == self.fingerprint.to_uppercase())
+    /// Whether this certificate is the one the SDP named.
+    ///
+    /// This is the **only** thing that authenticates a DTLS-SRTP peer: the
+    /// certificate is self-signed, so the X.509 chain says nothing and the
+    /// handshake runs with `insecure_skip_verify`. Without this check
+    /// anyone who can reach the media port completes the handshake and
+    /// takes the call's audio (RFC 8122 §5, RFC 5763 §6.6).
+    pub fn verify(&self, cert_der: &[u8]) -> Result<bool> {
+        let computed = Self::digest_of(&self.algorithm, cert_der)?;
+        // Compare on the bytes, not the punctuation: peers differ on case
+        // and some omit the colons.
+        let expected = self
+            .fingerprint
+            .to_ascii_uppercase()
+            .replace([':', ' ', '-'], "");
+        Ok(computed.replace(':', "") == expected)
     }
 }
 
@@ -271,10 +289,19 @@ impl DtlsContext {
         .map_err(|_| Error::Media("DTLS handshake timeout (15s)".to_string()))?
         .map_err(|e| Error::Media(format!("DTLS handshake failed: {}", e)))?;
 
-        info!("DTLS handshake completed successfully");
-
         // Export SRTP keying material (RFC 5764)
         let state = dtls_conn.connection_state().await;
+
+        // Authenticate the peer. The certificate is self-signed, so the
+        // handshake itself proves nothing (`insecure_skip_verify` above):
+        // what binds this DTLS session to the call is that the
+        // certificate hashes to the fingerprint the signalling carried
+        // (RFC 8122 §5, RFC 5763 §6.6). Nothing checked it, so any host
+        // that could reach the media port could complete the handshake
+        // and take the audio.
+        self.verify_peer_certificate(&state.peer_certificates)?;
+
+        info!("DTLS handshake completed successfully");
 
         // For SRTP_AES128_CM_HMAC_SHA1_80: key=16 bytes, salt=14 bytes
         // Total: 2 * (16 + 14) = 60 bytes
@@ -311,6 +338,39 @@ impl DtlsContext {
         *self.srtp_keys.lock().await = Some(keys);
         *self.handshake_complete.lock().await = true;
 
+        Ok(())
+    }
+
+    /// The peer's certificate must hash to the fingerprint the SDP named.
+    /// No fingerprint, no certificate, or a mismatch all fail the
+    /// handshake: an unauthenticated DTLS-SRTP session is worth less than
+    /// no session, because it looks encrypted.
+    fn verify_peer_certificate(&self, peer_certificates: &[Vec<u8>]) -> Result<()> {
+        let Some(expected) = self.remote_fingerprint.as_ref() else {
+            return Err(Error::Media(
+                "DTLS peer rejected: the offer/answer carried no a=fingerprint, \
+                 so nothing binds this certificate to the call (RFC 8122 §5)"
+                    .to_string(),
+            ));
+        };
+        let Some(leaf) = peer_certificates.first() else {
+            return Err(Error::Media(
+                "DTLS peer rejected: the handshake produced no peer certificate".to_string(),
+            ));
+        };
+        if !expected.verify(leaf)? {
+            let actual = CertificateFingerprint::digest_of(&expected.algorithm, leaf)
+                .unwrap_or_else(|_| "<unhashable>".to_string());
+            return Err(Error::Media(format!(
+                "DTLS peer rejected: certificate {} does not match the {} fingerprint \
+                 {} from the SDP",
+                actual, expected.algorithm, expected.fingerprint
+            )));
+        }
+        info!(
+            "DTLS peer certificate matches the {} fingerprint from the SDP",
+            expected.algorithm
+        );
         Ok(())
     }
 
@@ -622,5 +682,135 @@ mod tests {
 
         let stats = manager.stats().await;
         assert_eq!(stats.total_contexts, 1);
+    }
+}
+
+#[cfg(test)]
+mod peer_verification_tests {
+    use super::*;
+
+    /// A DTLS-SRTP certificate is self-signed: the handshake runs with
+    /// `insecure_skip_verify`, so the *only* thing that ties the session
+    /// to the call is the SDP fingerprint. Nothing checked it, which means
+    /// any host that could reach the media port could complete the
+    /// handshake and take the audio (RFC 8122 §5, RFC 5763 §6.6).
+    #[tokio::test]
+    async fn the_peers_certificate_must_match_the_sdp_fingerprint() {
+        let mut ctx = DtlsContext::new(DtlsRole::Passive).unwrap();
+        // Two different peers, each with its own self-signed certificate.
+        let peer = DtlsContext::new(DtlsRole::Active).unwrap();
+        let impostor = DtlsContext::new(DtlsRole::Active).unwrap();
+        assert_ne!(
+            peer.local_fingerprint().fingerprint,
+            impostor.local_fingerprint().fingerprint
+        );
+
+        // No fingerprint at all: refused, and the message says why.
+        let err = ctx
+            .verify_peer_certificate(std::slice::from_ref(&peer.cert_der))
+            .expect_err("a session nothing authenticates is refused");
+        assert!(format!("{}", err).contains("a=fingerprint"), "{}", err);
+
+        // The fingerprint the peer signalled: accepted.
+        ctx.set_remote_fingerprint(peer.local_fingerprint().clone());
+        ctx.verify_peer_certificate(std::slice::from_ref(&peer.cert_der))
+            .expect("the real peer is accepted");
+
+        // Someone else's certificate under that fingerprint: refused.
+        let err = ctx
+            .verify_peer_certificate(std::slice::from_ref(&impostor.cert_der))
+            .expect_err("a substituted certificate is refused");
+        let msg = format!("{}", err);
+        assert!(msg.contains("does not match"), "{}", msg);
+        assert!(
+            msg.contains(&peer.local_fingerprint().fingerprint),
+            "the message names the fingerprint we expected: {}",
+            msg
+        );
+
+        // A handshake that yielded no certificate at all: refused.
+        let err = ctx
+            .verify_peer_certificate(&[])
+            .expect_err("no certificate, no session");
+        assert!(format!("{}", err).contains("no peer certificate"));
+    }
+
+    /// Peers write the hex differently. The comparison is on the bytes.
+    #[tokio::test]
+    async fn the_comparison_ignores_case_and_punctuation() {
+        let peer = DtlsContext::new(DtlsRole::Active).unwrap();
+        let canonical = peer.local_fingerprint().fingerprint.clone();
+        for written in [
+            canonical.clone(),
+            canonical.to_lowercase(),
+            canonical.replace(':', ""),
+            canonical.to_lowercase().replace(':', ""),
+        ] {
+            let fp = CertificateFingerprint {
+                algorithm: "sha-256".to_string(),
+                fingerprint: written.clone(),
+            };
+            assert!(
+                fp.verify(&peer.cert_der).unwrap(),
+                "rejected its own certificate written as {}",
+                written
+            );
+        }
+    }
+
+    /// Every hash RFC 8122 §5 allows, and nothing else.
+    #[tokio::test]
+    async fn the_hash_algorithms_are_the_ones_the_rfc_allows() {
+        let peer = DtlsContext::new(DtlsRole::Active).unwrap();
+        for (algorithm, bytes) in [
+            ("sha-1", 20),
+            ("sha-224", 28),
+            ("sha-256", 32),
+            ("sha-384", 48),
+            ("sha-512", 64),
+        ] {
+            let digest = CertificateFingerprint::digest_of(algorithm, &peer.cert_der)
+                .unwrap_or_else(|e| panic!("{} unsupported: {}", algorithm, e));
+            assert_eq!(
+                digest.split(':').count(),
+                bytes,
+                "{} digest length",
+                algorithm
+            );
+            let fp = CertificateFingerprint {
+                algorithm: algorithm.to_string(),
+                fingerprint: digest,
+            };
+            assert!(fp.verify(&peer.cert_der).unwrap(), "{}", algorithm);
+        }
+        // An algorithm we cannot compute is an error, never a pass.
+        let fp = CertificateFingerprint {
+            algorithm: "md5".to_string(),
+            fingerprint: "AA:BB".to_string(),
+        };
+        assert!(fp.verify(&peer.cert_der).is_err());
+    }
+
+    /// The session must hand the offer's fingerprint to the DTLS context,
+    /// or the check above has nothing to compare against.
+    #[test]
+    fn the_session_carries_the_offers_fingerprint_into_the_context() {
+        let offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             m=audio 50000 UDP/TLS/RTP/SAVPF 111 0\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=ice-ufrag:abcd\r\na=ice-pwd:0123456789abcdef\r\n\
+             a=fingerprint:sha-256 \
+             11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:\
+             11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+             a=setup:actpass\r\n";
+        let session =
+            crate::media::webrtc_handler::WebRtcSession::new("c1".to_string(), offer).unwrap();
+        let fp = session
+            .dtls_context
+            .remote_fingerprint
+            .as_ref()
+            .expect("the offer's fingerprint reached the DTLS context");
+        assert_eq!(fp.algorithm, "sha-256");
+        assert!(fp.fingerprint.starts_with("11:22:33:44"));
     }
 }

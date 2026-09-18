@@ -216,8 +216,14 @@ impl WebRtcSession {
             ice_agent.set_remote_credentials(ufrag.clone(), pwd.clone());
         }
 
-        // Create DTLS context
-        let dtls_context = DtlsContext::new(sbc_role)?;
+        // Create DTLS context, carrying the peer's fingerprint: it is what
+        // authenticates the DTLS handshake (the certificates are
+        // self-signed), and `perform_handshake` refuses a session without
+        // it.
+        let mut dtls_context = DtlsContext::new(sbc_role)?;
+        if let Some(fp) = remote_info.fingerprint.clone() {
+            dtls_context.set_remote_fingerprint(fp);
+        }
 
         Ok(Self {
             call_id,
@@ -344,6 +350,12 @@ impl WebRtcSession {
         if let (Some(ufrag), Some(pwd)) = (&self.remote_info.ice_ufrag, &self.remote_info.ice_pwd) {
             self.ice_agent
                 .set_remote_credentials(ufrag.clone(), pwd.clone());
+        }
+        // The answer carries the callee's certificate fingerprint: without
+        // it the handshake has nothing to authenticate against and is
+        // refused.
+        if let Some(fp) = self.remote_info.fingerprint.clone() {
+            self.dtls_context.set_remote_fingerprint(fp);
         }
         // Update DTLS role: if callee chose "active", SBC must be "passive"
         // If callee chose "passive", SBC must be "active"

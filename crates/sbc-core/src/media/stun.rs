@@ -487,6 +487,144 @@ pub fn build_binding_response(request_data: &[u8], source: SocketAddr) -> Result
     build_binding_response_with_integrity(request_data, source, None)
 }
 
+/// Why an ICE Binding Request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StunReject {
+    /// Not a STUN Binding Request at all.
+    NotARequest,
+    /// No MESSAGE-INTEGRITY attribute: an ICE connectivity check must
+    /// carry one (RFC 8445 §7.3).
+    NoIntegrity,
+    /// MESSAGE-INTEGRITY does not verify against our own ice-pwd: whoever
+    /// sent this does not hold the password we published in the SDP.
+    BadIntegrity,
+    /// No USERNAME attribute (RFC 8445 §7.3 requires it).
+    NoUsername,
+    /// FINGERPRINT present but wrong: not a STUN message we should parse.
+    BadFingerprint,
+}
+
+impl StunReject {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotARequest => "not-a-request",
+            Self::NoIntegrity => "no-integrity",
+            Self::BadIntegrity => "bad-integrity",
+            Self::NoUsername => "no-username",
+            Self::BadFingerprint => "bad-fingerprint",
+        }
+    }
+}
+
+/// Authenticate an inbound ICE Binding Request against our own ice-pwd
+/// (RFC 5389 §10.2 short-term credentials, as ICE uses them in RFC 8445
+/// §7.3).
+///
+/// This is what makes the media port ours: the SBC answered every Binding
+/// Request that reached it and **learned the sender as the call's
+/// endpoint**, so a single spoofed datagram could take over the audio of
+/// a WebRTC leg. The HMAC-SHA1 is keyed with the password we published in
+/// our own SDP, so only the peer that read it can produce one.
+///
+/// The USERNAME must be present but its ufrag half is not compared: the
+/// password is generated per session, so a verifying HMAC already proves
+/// the sender holds *this* call's credentials.
+pub fn validate_binding_request(
+    data: &[u8],
+    local_ice_pwd: &str,
+) -> std::result::Result<(), StunReject> {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    use subtle::ConstantTimeEq;
+
+    if data.len() < 20 {
+        return Err(StunReject::NotARequest);
+    }
+    if u16::from_be_bytes([data[0], data[1]]) != StunMessageType::BindingRequest.to_u16() {
+        return Err(StunReject::NotARequest);
+    }
+    if u32::from_be_bytes([data[4], data[5], data[6], data[7]]) != STUN_MAGIC_COOKIE {
+        return Err(StunReject::NotARequest);
+    }
+    let declared = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let end = 20usize.saturating_add(declared).min(data.len());
+
+    // Walk the attributes, keeping the offsets the two checksums need.
+    let mut offset = 20usize;
+    let mut integrity: Option<(usize, [u8; 20])> = None;
+    let mut fingerprint: Option<(usize, u32)> = None;
+    let mut has_username = false;
+    while offset + 4 <= end {
+        let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        let value_at = offset + 4;
+        if value_at + attr_len > end {
+            return Err(StunReject::NotARequest);
+        }
+        match attr_type {
+            0x0006 => has_username = true,
+            0x0008 if attr_len == 20 => {
+                let mut mac = [0u8; 20];
+                mac.copy_from_slice(&data[value_at..value_at + 20]);
+                // The first MESSAGE-INTEGRITY wins: anything after it is
+                // not covered by the HMAC and must not be trusted.
+                if integrity.is_none() {
+                    integrity = Some((offset, mac));
+                }
+            }
+            0x8028 if attr_len == 4 => {
+                let v = u32::from_be_bytes([
+                    data[value_at],
+                    data[value_at + 1],
+                    data[value_at + 2],
+                    data[value_at + 3],
+                ]);
+                if fingerprint.is_none() {
+                    fingerprint = Some((offset, v));
+                }
+            }
+            _ => {}
+        }
+        offset = value_at + ((attr_len + 3) & !3);
+    }
+
+    // FINGERPRINT first: it is cheap and tells a mangled datagram from a
+    // real one before any HMAC work.
+    if let Some((at, claimed)) = fingerprint {
+        if crc32_stun(&data[..at]) ^ 0x5354554E != claimed {
+            return Err(StunReject::BadFingerprint);
+        }
+    }
+
+    let Some((mi_at, claimed)) = integrity else {
+        return Err(StunReject::NoIntegrity);
+    };
+    if !has_username {
+        return Err(StunReject::NoUsername);
+    }
+
+    // RFC 5389 §15.4: the HMAC covers the message up to the
+    // MESSAGE-INTEGRITY attribute, with the header length rewritten to
+    // the value it would have if MESSAGE-INTEGRITY were the last
+    // attribute (so a trailing FINGERPRINT is excluded).
+    let mut covered = data[..mi_at].to_vec();
+    let length_with_mi = (mi_at - 20 + 24) as u16;
+    covered[2] = (length_with_mi >> 8) as u8;
+    covered[3] = (length_with_mi & 0xFF) as u8;
+
+    let mut mac = match <Hmac<Sha1>>::new_from_slice(local_ice_pwd.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return Err(StunReject::BadIntegrity),
+    };
+    mac.update(&covered);
+    let computed = mac.finalize().into_bytes();
+    if computed[..20].ct_eq(&claimed).into() {
+        Ok(())
+    } else {
+        Err(StunReject::BadIntegrity)
+    }
+}
+
 /// Build a STUN Binding Response with MESSAGE-INTEGRITY and FINGERPRINT.
 ///
 /// `local_ice_pwd` is the SBC's ice-pwd used as the HMAC-SHA1 key.
@@ -787,4 +925,183 @@ mod tests {
     //     let public_addr = client.binding_request().await.unwrap();
     //     println!("Public address: {}", public_addr);
     // }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    /// Build a Binding Request the way an ICE agent does: USERNAME,
+    /// MESSAGE-INTEGRITY keyed with the *receiver's* password, then
+    /// FINGERPRINT.
+    fn binding_request(username: &str, pwd: &str, with_integrity: bool) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&StunMessageType::BindingRequest.to_u16().to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // length, patched below
+        bytes.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        bytes.extend_from_slice(&[7u8; 12]); // transaction id
+
+        // USERNAME, padded to 4 bytes.
+        let u = username.as_bytes();
+        bytes.extend_from_slice(&0x0006u16.to_be_bytes());
+        bytes.extend_from_slice(&(u.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(u);
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+        let set_len = |bytes: &mut Vec<u8>, len: usize| {
+            let l = len as u16;
+            bytes[2] = (l >> 8) as u8;
+            bytes[3] = (l & 0xFF) as u8;
+        };
+        let n = bytes.len();
+        set_len(&mut bytes, n - 20);
+
+        if with_integrity {
+            let n = bytes.len();
+            set_len(&mut bytes, n - 20 + 24);
+            let mut mac = <Hmac<Sha1>>::new_from_slice(pwd.as_bytes()).unwrap();
+            mac.update(&bytes);
+            let tag = mac.finalize().into_bytes();
+            bytes.extend_from_slice(&0x0008u16.to_be_bytes());
+            bytes.extend_from_slice(&0x0014u16.to_be_bytes());
+            bytes.extend_from_slice(&tag[..20]);
+        }
+
+        // FINGERPRINT last, covering everything before it.
+        let n = bytes.len();
+        set_len(&mut bytes, n - 20 + 8);
+        let crc = crc32_stun(&bytes) ^ 0x5354554E;
+        bytes.extend_from_slice(&0x8028u16.to_be_bytes());
+        bytes.extend_from_slice(&0x0004u16.to_be_bytes());
+        bytes.extend_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
+    /// The relay answered every Binding Request that reached the media
+    /// port and adopted its source as the call's endpoint. Only the peer
+    /// that read our ice-pwd out of the SDP can produce a verifying
+    /// MESSAGE-INTEGRITY (RFC 5389 §10.2, RFC 8445 §7.3).
+    #[test]
+    fn only_a_check_signed_with_our_password_is_accepted() {
+        let ours = "sbcPasswordFromOurOwnSdp";
+        let req = binding_request("sbcUfrag:peerUfrag", ours, true);
+        validate_binding_request(&req, ours).expect("the real peer");
+
+        // Someone who never read our SDP.
+        assert_eq!(
+            validate_binding_request(&req, "a-different-password"),
+            Err(StunReject::BadIntegrity)
+        );
+        // A check with no MESSAGE-INTEGRITY at all.
+        let bare = binding_request("sbcUfrag:peerUfrag", ours, false);
+        assert_eq!(
+            validate_binding_request(&bare, ours),
+            Err(StunReject::NoIntegrity)
+        );
+    }
+
+    /// One flipped byte anywhere in the covered message must fail: that is
+    /// what stops an attacker editing a captured check.
+    #[test]
+    fn a_tampered_check_fails() {
+        let ours = "sbcPassword";
+        let req = binding_request("sbcUfrag:peerUfrag", ours, true);
+        // The USERNAME is inside the HMAC's coverage.
+        let mut tampered = req.clone();
+        tampered[24] ^= 0x01;
+        assert!(matches!(
+            validate_binding_request(&tampered, ours),
+            Err(StunReject::BadIntegrity) | Err(StunReject::BadFingerprint)
+        ));
+        // And the tag itself.
+        let mut clipped = req.clone();
+        let n = clipped.len();
+        clipped[n - 12] ^= 0xFF;
+        assert!(validate_binding_request(&clipped, ours).is_err());
+    }
+
+    /// Not a Binding Request, not our business.
+    #[test]
+    fn anything_that_is_not_a_binding_request_is_refused() {
+        let ours = "pwd";
+        assert_eq!(
+            validate_binding_request(b"short", ours),
+            Err(StunReject::NotARequest)
+        );
+        // A Binding *Response* (a peer's answer, not a check).
+        let mut resp = binding_request("a:b", ours, true);
+        resp[0..2].copy_from_slice(&StunMessageType::BindingResponse.to_u16().to_be_bytes());
+        assert_eq!(
+            validate_binding_request(&resp, ours),
+            Err(StunReject::NotARequest)
+        );
+        // A wrong magic cookie (RFC 5389 §6).
+        let mut bad_magic = binding_request("a:b", ours, true);
+        bad_magic[4] ^= 0xFF;
+        assert_eq!(
+            validate_binding_request(&bad_magic, ours),
+            Err(StunReject::NotARequest)
+        );
+    }
+
+    /// Our own response must verify under the same rules we apply to the
+    /// peer's request: one implementation of §15.4, used both ways.
+    #[test]
+    fn our_response_carries_an_integrity_the_same_code_verifies() {
+        let ours = "sbcPassword";
+        let req = binding_request("sbcUfrag:peerUfrag", ours, true);
+        let source: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let resp = build_binding_response_with_integrity(&req, source, Some(ours)).unwrap();
+
+        // Re-read it the way the peer would: type, mapped address, and an
+        // integrity over the same coverage.
+        let parsed = StunMessage::from_bytes(&resp).expect("parses");
+        assert_eq!(parsed.message_type, StunMessageType::BindingResponse);
+        assert_eq!(parsed.transaction_id, [7u8; 12]);
+        assert_eq!(parsed.mapped_address(), Some(source));
+
+        // Now verify its MESSAGE-INTEGRITY and FINGERPRINT the way a
+        // browser would, with the coverage rules written out here rather
+        // than reused from the builder — that is what makes this a check
+        // of the builder and not of itself.
+        //
+        // Layout: … MESSAGE-INTEGRITY (24 bytes) FINGERPRINT (8 bytes).
+        let fp_at = resp.len() - 8;
+        let mi_at = fp_at - 24;
+        assert_eq!(
+            u16::from_be_bytes([resp[mi_at], resp[mi_at + 1]]),
+            0x0008,
+            "MESSAGE-INTEGRITY sits where the layout says"
+        );
+        assert_eq!(u16::from_be_bytes([resp[fp_at], resp[fp_at + 1]]), 0x8028);
+
+        // FINGERPRINT: CRC32 of everything before it, XOR 0x5354554E.
+        let claimed_fp = u32::from_be_bytes([
+            resp[fp_at + 4],
+            resp[fp_at + 5],
+            resp[fp_at + 6],
+            resp[fp_at + 7],
+        ]);
+        assert_eq!(crc32_stun(&resp[..fp_at]) ^ 0x5354554E, claimed_fp);
+
+        // MESSAGE-INTEGRITY: HMAC-SHA1 over the message up to it, with the
+        // header length rewritten as if it were the last attribute.
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        let mut covered = resp[..mi_at].to_vec();
+        let l = (mi_at - 20 + 24) as u16;
+        covered[2] = (l >> 8) as u8;
+        covered[3] = (l & 0xFF) as u8;
+        let mut mac = <Hmac<Sha1>>::new_from_slice(ours.as_bytes()).unwrap();
+        mac.update(&covered);
+        assert_eq!(
+            &mac.finalize().into_bytes()[..20],
+            &resp[mi_at + 4..mi_at + 24],
+            "the response's integrity is the one a peer computes"
+        );
+    }
 }

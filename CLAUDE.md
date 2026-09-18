@@ -116,7 +116,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `media/port_allocator.rs` | RTP/RTCP pairs: forward allocation from a cursor, 30 s quarantine before reuse (a new call must not inherit the previous peer's stray packets) |
 | `media/endpoint.rs` | Where a call's media may come from: a pure verdict ladder (signalled address, NAT rebinding, trunk sibling, same stream, quiet peer), count-only until the operator has the data |
 | `media/stats.rs` | Per-call, per-leg media counters (rx/tx packets and bytes, loss, SSRC changes, endpoint moves, drops by reason), the inactivity watchdog's monotonic clock and the one-way detector. Relaxed atomics only, ~150 ns per packet measured in a debug build (`the_per_packet_accounting_stays_cheap`): no lock and no allocation may enter this path |
-| `media/{sdp,srtp_crypto,ice,dtls,stun}.rs` | SDP rewriting, SRTP, ICE, DTLS, STUN |
+| `media/{sdp,srtp_crypto,ice,dtls,stun}.rs` | SDP rewriting, SRTP (rollover counter + replay window per SSRC), ICE, DTLS (peer certificate checked against the SDP fingerprint), STUN (a Binding Request is authenticated before it is answered) |
 | `transport/{udp,tcp,tls,ws}.rs` · `transport/tls_connect.rs` | Listeners + real outbound TCP/TLS: an outbound connection reads its peer's answers back into the pipeline (§18.2.2) and the pool replaces a closed one |
 | `transport/tls_identity.rs` | Reloadable listener certificates (load + key/cert check, atomic swap, registry, expiry gauge) behind `/api/v1/tls/*` and reload |
 | `transcoding.rs` | Opus ↔ G.711 (PCMU/PCMA) with resampling; codec identity from `a=rtpmap` (+ the RFC 3551 static table), a pair with no decoder/encoder is refused rather than relabelled |
