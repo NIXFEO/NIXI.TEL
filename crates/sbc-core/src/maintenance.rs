@@ -61,6 +61,9 @@ pub struct MaintenanceTask {
     metrics: Arc<SbcMetrics>,
     /// Expired bindings are published as `Unregistered { reason: "expired" }`.
     events: Option<crate::events::EventBus>,
+    /// The media plane's own decay: quarantined RTP ports and the
+    /// counters of calls whose CDR was written.
+    media: Option<Arc<crate::media::MediaManager>>,
     config: MaintenanceConfig,
 }
 
@@ -82,7 +85,15 @@ impl MaintenanceTask {
             metrics,
             config,
             events,
+            media: None,
         }
+    }
+
+    /// Also decay the media plane (quarantined ports, ended-call
+    /// counters) on every sweep.
+    pub fn with_media(mut self, media: Arc<crate::media::MediaManager>) -> Self {
+        self.media = Some(media);
+        self
     }
 
     /// Spawn the sweeper task.
@@ -129,6 +140,9 @@ impl MaintenanceTask {
             ban_windows: self.security.bans.prune_stale_windows(),
             rate_windows: self.security.user_limits.prune_idle_windows(),
         };
+        if let Some(media) = &self.media {
+            media.sweep();
+        }
 
         self.metrics
             .set_dos_tracked_ips(self.dos.tracked_ips().await as u64);

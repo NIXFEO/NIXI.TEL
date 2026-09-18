@@ -300,6 +300,10 @@ impl Sbc {
                 // not get: 503 (try elsewhere / retry), not 500.
                 warn!("B2BUA create_call failed: {} — 503 to the caller", e);
                 self.metrics.inc_media_relay_failure();
+                // No call state exists, so `finish_call` — and its CDR —
+                // cannot run: count the attempt as failed instead (noted
+                // in docs/API.md next to the "one CDR per call" rule).
+                self.metrics.inc_call_failed();
                 self.metrics.inc_sip_response(503);
                 let response_503 = response_for_request(&request, 503, "Service Unavailable");
                 self.send_sip(

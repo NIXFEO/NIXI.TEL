@@ -49,7 +49,10 @@ it carries the whole truth; `?dry_run=true` only reports).
 #### CDR record
 
 Every call gets exactly one record when it ends, whatever the cause
-(`disconnect_reason`). Bill on `billable_secs` (answer → end);
+(`disconnect_reason`) — with one exception: an INVITE refused with `503`
+because no RTP ports were free never becomes a call, so it has no record
+(it is counted in `sbc_calls_failed_total` and
+`sbc_media_relay_failures_total`). Bill on `billable_secs` (answer → end);
 `duration_secs` is the whole setup → end span, as before.
 
 | Field | Meaning |
@@ -67,7 +70,7 @@ Every call gets exactly one record when it ends, whatever the cause
 | `reason` | SIP `Reason` header: the peer's on its BYE/CANCEL, the SBC's own on the BYEs it sends |
 | `hangup_by` | who ended the call: `caller`, `callee` (the far end, or its rejection), `sbc` |
 
-| `v` | record schema version: `2` from 0.20; `1` rows (older file lines) carry no billing window |
+| `v` | record schema version: `3` (media facts, this release), `2` (billing window, 0.20), `1` (older JSONL lines: no billing window, no media facts) |
 
 Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`): `ban_issued`, `ban_lifted`, `auth_failure`, `destination_blocked`, `user_limit`, `identity_mismatch` (a source claimed an identity that is not its own: REGISTER for another AOR, INVITE From another user, a trunk presenting a local user).
 
@@ -150,7 +153,7 @@ TOML-only box the seed keys are re-applied by a reload).
 | reload | `security.max_call_duration` (0 = unlimited, any other value floored at 60 s), `call_setup_timeout`, `rtp_timeout`, `invite_timeout`, `session_timer_enabled`, `session_expires`, `min_se`, `register_aor_check`, `register_min_expires` / `register_max_expires` / `register_default_expires`, `served_domains`, `trunk_local_from`, `rate_limit_per_ip`, `[security.ban]` (including `enabled = false`, which stops enforcing every ban, stored and manual ones included), `[security.destinations]` `enabled` / `default_action` / `default_country_code`, `[security.user_limits]` `enabled` / `default_*` | SIGHUP or `POST /api/v1/reload` (timers and limits apply to new calls) |
 | restart | `general.cdr_file`, `[network]` listeners and `public_ipv4`, `media.rtp_port_range`, `[database]`, `[cdr]`, `security.sip_realm`, `enable_digest_auth`, `[management]`, `[trunk_health]`, `[logging]` | `systemctl restart sbc` (graceful) |
 | seed | `[security.sip_users]`, `[[trunks]]`, `[[dids]]`, `[security.destinations] rules` / `seed_irsf_rules`, `[[security.user_limits.overrides]]` | imported once at first boot into the store, then the API. On a TOML-only box (no store) a reload re-applies the users and DIDs and adds trunks that are missing from the runtime; it never removes or rewrites what is already there |
-| unused | `general.name` / `instance_id`, `network.public_ipv6`, `security.rate_limit_global` / `auth_challenge_timeout`, `media.rtcp_enabled` / `transcoding_threads` / `codecs`, `media.webrtc.turn_enabled`, `[metrics]` | nothing (they parse, nothing reads them) |
+| unused | `general.name` / `instance_id`, `network.public_ipv6`, `security.rate_limit_global` / `auth_challenge_timeout`, `media.rtcp_enabled` / `transcoding_threads` / `codecs`, the whole `[media.webrtc]` block (WebRTC is enabled by adding a WS/WSS listener), `[metrics]` | nothing (they parse, nothing reads them) |
 
 ## SSE events
 

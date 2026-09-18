@@ -18,8 +18,73 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 
 ### Fixed
 
-Lot 4 (media), first block — every one of these was found by specifying the
-media plane against the code and having the specs adversarially reviewed:
+Lot 4 (media). The items were specified against the code, the specs were
+adversarially reviewed, and the resulting diff was reviewed again: that
+second pass found 28 real defects in this very work, including two that
+broke its headline feature. Both rounds are folded in below.
+
+- **The CDR's media facts survive the teardown order.** They were read
+  after the media session — and its counters — had already been released
+  by the BYE handler, so every successful call recorded
+  `media_flags = "no-relay"` and zero delivered packets. The counters now
+  outlive the session until the CDR is written (bounded, swept by the 60 s
+  sweeper), and a flow test drives a real BYE-terminated call.
+- **`one-way-caller` / `one-way-callee` named the wrong side**, inverted
+  against the docs, the record's own comments and
+  `sbc_media_one_way_calls_total{leg}`. Both are now derived from the same
+  `Leg` label so they cannot drift again.
+- The drop tally was blank exactly where audio goes missing: the payload-
+  type filter, the G.711 frame-size check, the transcoder's own failures
+  and the WebRTC no-key path never incremented anything, so "packets in,
+  packets out, the difference explained" did not hold. Every `continue` on
+  the media path now lands on a reason, RTCP has its own, and the tally is
+  visible in the per-call summary.
+- RTCP multiplexed on the RTP port was run through the audio accounting
+  (its bytes 2..12 are a length and an NTP stamp, not a sequence number
+  and an SSRC), poisoning the loss and SSRC counters and refreshing the
+  one-way detector. It is now its own class: relayed, counted apart.
+- ICE and DTLS are only passed through on a leg that negotiated them. On a
+  plain SIP/RTP leg they are junk, and because a passthrough datagram used
+  to count as delivered audio, an ICE keepalive from a dead call's far end
+  could keep it billed for hours.
+- Sequence-loss accounting followed RFC 3550 §A.3 only half way: a
+  reordered packet moved the high-water mark backwards, so the next
+  in-order packet was booked as loss. SSRC 0 and sequence 0 are legal
+  values and no longer double as "nothing seen yet".
+- **Opus on any payload type but 111 lost its audio.** Identifying codecs
+  by name (below) made the SBC accept Opus at 109 (Firefox), but the relay
+  still filtered and stamped `Codec::pt()` = 111, so every packet was
+  dropped as an unexpected payload type. The transcoder now carries the
+  numbers the two SDPs negotiated.
+- A payload type nothing names is no longer a codec: two legs with an
+  un-named PT 96 were treated as sharing a codec (the very mistake the
+  rtpmap work set out to remove). Comfort noise (13, 19) is in the static
+  table, and `a=rtpmap` lines are read only inside the first usable
+  `m=audio` section, so a video section cannot name an audio format and a
+  rejected stream (port 0) cannot decide the codec.
+- The Opus decode buffer is sized for the largest *packet* (120 ms), not
+  one frame, and `decode_fec` was still at 20 ms.
+- The pre-dial 503 had a hole: with one port pair left, `create_session`
+  "fell back" to single-leg mode and the relay then bound the same ports
+  twice, so the failure surfaced *after* the callee answered. Both pairs
+  are now required.
+- The media-unavailable teardown ACKs the trunk's 200 OK before the BYE
+  (RFC 3261 §13.2.2.4): an unACKed 2xx makes a trunk retransmit and keep
+  a billed ghost session.
+- The port quarantine is swept by the 60 s sweeper too, so the pool's
+  gauges decay even when no call starts.
+- An INVITE refused for want of ports counts in `sbc_calls_failed_total`
+  (it can produce no CDR: the call never existed), and docs/API.md says so
+  next to the "exactly one record per call" rule.
+- Migration 0004's rollback note was wrong in a way that would have
+  bricked the next upgrade: SQLite cannot add a column twice, so the
+  version-4 row must be kept. Also fixed: the documented watchdog cadence
+  (15 s, not 30), the CDR schema version row, the scope of the 8-character
+  Call-ID floor (the log span only), the remaining dead `[media.webrtc]`
+  keys, and the one-way alert now says that holds and silence-suppressed
+  legs are counted too.
+
+The first block, specified before all that:
 
 - **A call the SBC cannot anchor media for is refused or ended, not billed
   in silence.** The caller's SDP is rewritten to the SBC's own address, so

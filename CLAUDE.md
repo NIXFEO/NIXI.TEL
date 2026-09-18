@@ -174,9 +174,12 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
 - **Variable IPs** — INVITE, ACK and BYE may arrive from different IPs in the
   same /24; BYE lookup falls back to the trunk's subnet without a source filter.
 - **Truncated Call-IDs** — INVITE `prefix-prefix-core@host` vs BYE `core@host`;
-  matched by suffix (at least 8 characters, so an empty or tiny Call-ID
-  cannot match a live call). Media sessions are keyed by the call's uuid
-  for the same reason: two concurrent calls can share a Call-ID.
+  matched by suffix. Dialog matching accepts any suffix (that is the
+  interop feature); the **log span**'s own lookup additionally requires 8
+  characters (`MIN_CALL_ID_SUFFIX`), so an empty or tiny Call-ID cannot
+  stamp an unrelated call's uuid on a scanner's lines. Media sessions are
+  keyed by the call's uuid for the same reason: two concurrent calls can
+  share a Call-ID.
 - **Late BYEs** — a second BYE can arrive 1–8 min after teardown; recognized
   via a 10-min terminated-dialog ring buffer and answered 200.
 - **OverMaxCall** — if the SBC doesn't BYE on shutdown, ghost sessions

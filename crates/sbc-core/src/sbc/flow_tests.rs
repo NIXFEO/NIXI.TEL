@@ -7,6 +7,97 @@
 use super::test_support::*;
 use super::*;
 
+/// The CDR's media facts must survive the teardown order: on the everyday
+/// BYE path the media session is released *before* the CDR is written, and
+/// reading the counters afterwards used to report "no relay, nothing
+/// delivered" for every successful call.
+#[tokio::test]
+async fn a_bye_terminated_call_keeps_its_media_facts_in_the_cdr() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    let media_id = sbc.b2bua.get_media_session_id(&call.uuid).await.unwrap();
+    connect(&mut sbc, &mut call).await;
+
+    // Two packets delivered each way, as a real call would.
+    let stats = sbc
+        .media
+        .call_media_stats(&media_id)
+        .expect("live counters");
+    for _ in 0..2 {
+        stats.note_tx(crate::media::stats::Leg::Caller, 172);
+        stats.note_tx(crate::media::stats::Leg::Callee, 172);
+        stats.note_rx(crate::media::stats::Leg::Caller, &rtp_packet(1, 1));
+        stats.note_rx(crate::media::stats::Leg::Callee, &rtp_packet(2, 1));
+    }
+
+    sbc.handle_bye(
+        bye_from_caller(&call.spec, 4),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+
+    let cdr = sbc.cdr.get_recent(1).await.unwrap().pop().expect("one CDR");
+    assert_eq!(cdr.disconnect_reason, "normal-clearing");
+    assert_eq!(
+        (cdr.rtp_tx_caller, cdr.rtp_tx_callee),
+        (2, 2),
+        "the delivered counts survive the media release"
+    );
+    assert_eq!(cdr.media_flags, "", "a healthy call carries no flag");
+    // And the counters are not kept for ever.
+    assert_eq!(sbc.media.ended_stats_len(), 0, "released after the CDR");
+}
+
+/// `one-way-<leg>` must name the side that went silent, the same way the
+/// metric label does.
+#[tokio::test]
+async fn the_cdr_one_way_flag_names_the_silent_leg() {
+    use crate::media::stats::Leg;
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    let media_id = sbc.b2bua.get_media_session_id(&call.uuid).await.unwrap();
+    connect(&mut sbc, &mut call).await;
+
+    let stats = sbc.media.call_media_stats(&media_id).unwrap();
+    // The caller talks, the callee never does.
+    for _ in 0..5 {
+        stats.note_rx(Leg::Caller, &rtp_packet(1, 1));
+        stats.note_tx(Leg::Callee, 172);
+    }
+    assert_eq!(
+        stats.one_way_leg(0).map(|l| l.label()),
+        Some("callee"),
+        "the relay names the callee as the silent side"
+    );
+
+    sbc.handle_bye(
+        bye_from_caller(&call.spec, 4),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    let cdr = sbc.cdr.get_recent(1).await.unwrap().pop().expect("one CDR");
+    assert_eq!(
+        cdr.media_flags, "one-way-callee",
+        "the CDR names the same side as the metric"
+    );
+}
+
+/// A minimal RTP packet for the counter tests.
+fn rtp_packet(ssrc: u32, seq: u16) -> Vec<u8> {
+    let mut p = vec![0x80, 0x00];
+    p.extend_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&0u32.to_be_bytes());
+    p.extend_from_slice(&ssrc.to_be_bytes());
+    p.extend_from_slice(&[0xd5u8; 160]);
+    p
+}
+
 /// Genesys truncates Call-IDs, so two live calls can share one: their
 /// media sessions, ports and counters must still be separate.
 #[tokio::test]
@@ -85,9 +176,28 @@ async fn an_invite_with_no_media_port_is_refused_with_503() {
         "the caller must get a 503, got: {}",
         all
     );
-    assert!(
-        sbc.media.stats().allocated_ports == 0,
-        "no port was leaked by the refusal"
+    assert_eq!(
+        sbc.metrics
+            .calls_failed_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a call refused for lack of media counts as failed (no CDR is possible: \
+         the call never existed)"
+    );
+
+    // With one pair free, the leg-B allocation must be refused too — the
+    // old "single-leg fallback" bound leg A's ports twice and only failed
+    // after the callee had answered.
+    let one_pair = crate::media::MediaManager::with_port_range(21000..21002, None);
+    let err = one_pair
+        .create_session("one-pair".into(), Some(SDP))
+        .await
+        .expect_err("two pairs are required");
+    assert!(err.to_string().contains("No available ports"), "{}", err);
+    assert_eq!(
+        one_pair.stats().allocated_ports,
+        0,
+        "the first pair is given back, not leaked"
     );
     assert_eq!(
         sbc.metrics

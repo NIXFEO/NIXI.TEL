@@ -756,6 +756,25 @@ impl Sbc {
                         .await;
                     }
                     if relay_failed {
+                        // ACK the trunk's 2xx first (RFC 3261 §13.2.2.4):
+                        // the caller's own ACK will not arrive in time to
+                        // be forwarded, and an unACKed 200 makes the trunk
+                        // retransmit and keep a billed ghost session.
+                        let (sbc_ip, sbc_port) = self.sbc_addr();
+                        if let Some((ack, dest, transport, tx)) = self
+                            .b2bua
+                            .ack_for_answered_callee(&uuid, &sbc_ip, sbc_port)
+                            .await
+                        {
+                            self.send_sip(
+                                "ACK (media unavailable) → callee",
+                                ack.as_bytes(),
+                                dest,
+                                transport,
+                                tx.as_ref(),
+                            )
+                            .await;
+                        }
                         // Both dialogs exist now (the caller has its 200), so
                         // end them the way every other SBC-initiated teardown
                         // does: BYE both legs, one CDR with the real cause.

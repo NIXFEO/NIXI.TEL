@@ -240,41 +240,44 @@ impl Sbc {
             .media_session_id
             .as_deref()
             .and_then(|id| self.media.call_media_stats(id));
-        let mut flags: Vec<&str> = Vec::new();
+        let mut flags: Vec<String> = Vec::new();
         match &media {
-            None => flags.push("no-relay"),
+            None => flags.push("no-relay".to_string()),
             Some(stats) => {
-                record.rtp_tx_caller = stats
-                    .caller
-                    .tx_packets
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                record.rtp_tx_callee = stats
-                    .callee
-                    .tx_packets
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                use crate::media::stats::Leg;
+                let rx = |leg: Leg| {
+                    stats
+                        .leg(leg)
+                        .rx_packets
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                };
+                let tx = |leg: Leg| {
+                    stats
+                        .leg(leg)
+                        .tx_packets
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                };
+                record.rtp_tx_caller = tx(Leg::Caller);
+                record.rtp_tx_callee = tx(Leg::Callee);
                 if record.rtp_tx_caller == 0 && record.rtp_tx_callee == 0 {
-                    flags.push("no-media");
+                    flags.push("no-media".to_string());
                 } else {
-                    if stats
-                        .caller
-                        .rx_packets
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        == 0
-                    {
-                        flags.push("one-way-callee");
-                    }
-                    if stats
-                        .callee
-                        .rx_packets
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        == 0
-                    {
-                        flags.push("one-way-caller");
+                    // `one-way-<leg>` names the side that never sent, the
+                    // same convention as `sbc_media_one_way_calls_total`
+                    // and `Leg::label()` — derived from it so the two
+                    // cannot drift apart again.
+                    for leg in [Leg::Caller, Leg::Callee] {
+                        if rx(leg) == 0 {
+                            flags.push(format!("one-way-{}", leg.label()));
+                        }
                     }
                 }
             }
         }
         record.media_flags = flags.join(",");
+        if let Some(id) = s.media_session_id.as_deref() {
+            self.media.forget_media_stats(id);
+        }
 
         match self.cdr.insert(&record).await {
             Ok(outcome) => {

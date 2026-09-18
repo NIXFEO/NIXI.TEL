@@ -305,30 +305,52 @@ fn looks_like_rtp(data: &[u8]) -> bool {
     data.len() >= 12 && (data[0] >> 6) == 2
 }
 
+/// An RTCP packet on its own port: 8 bytes is the shortest valid one (an
+/// empty Receiver Report), version 2, and a payload type in the RFC 5761
+/// range. `looks_like_rtp`'s 12-byte floor would drop those.
+fn looks_like_rtcp(data: &[u8]) -> bool {
+    data.len() >= 8 && (data[0] >> 6) == 2 && (192..=223).contains(&data[1])
+}
+
 /// What the relay does with a datagram that landed on a media port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaInput {
-    /// RTP or RTCP: relayed, and counted as this leg's media.
+    /// RTP: relayed, and counted as this leg's audio.
     Rtp,
-    /// Plausible ICE or DTLS: relayed untouched (two SIP peers can run
-    /// their own DTLS-SRTP through this SBC), not counted as audio.
+    /// RTCP multiplexed on the RTP port (RFC 5761): relayed, counted
+    /// apart — its bytes 2..12 are not a sequence number and an SSRC, so
+    /// running it through the audio accounting would poison the loss and
+    /// SSRC-change counters and refresh the one-way detector.
+    Rtcp,
+    /// Plausible ICE or DTLS **on a leg that negotiated it**: relayed
+    /// untouched (a WebRTC peer runs its own DTLS-SRTP through the SBC),
+    /// counted apart and never treated as audio activity — otherwise a
+    /// keepalive from a dead call's far end keeps it billed for hours.
     Passthrough,
     /// None of the above: not relayed at all. Relaying it would feed the
-    /// peer garbage and — worse — refresh the inactivity watchdog, so a
-    /// source spraying the port could keep a silent call billed alive.
+    /// peer garbage, and counting it as activity would let a source
+    /// spraying the port keep a silent call billed alive.
     Junk,
 }
 
 /// Classify a datagram by the minimum each protocol's header needs: an RTP
-/// header (12 bytes, version 2), a STUN header with its magic cookie
-/// (RFC 5389 §6), or a DTLS record header (RFC 6347 §4.1).
-fn classify_media_input(data: &[u8]) -> MediaInput {
+/// header (12 bytes, version 2), the RFC 5761 §4 RTCP payload-type range,
+/// a STUN header with its magic cookie (RFC 5389 §6), or a DTLS record
+/// header (RFC 6347 §4.1). ICE and DTLS are plausible only on a leg that
+/// negotiated them: on a plain SIP/RTP leg they are junk.
+fn classify_media_input(data: &[u8], webrtc: bool) -> MediaInput {
     match data.first() {
-        Some(128..=191) if looks_like_rtp(data) => MediaInput::Rtp,
-        Some(0..=3) if data.len() >= 20 && data[4..8] == [0x21, 0x12, 0xA4, 0x42] => {
+        Some(128..=191) if looks_like_rtp(data) => {
+            if (192..=223).contains(&data[1]) {
+                MediaInput::Rtcp
+            } else {
+                MediaInput::Rtp
+            }
+        }
+        Some(0..=3) if webrtc && data.len() >= 20 && data[4..8] == [0x21, 0x12, 0xA4, 0x42] => {
             MediaInput::Passthrough
         }
-        Some(20..=63) if data.len() >= 13 => MediaInput::Passthrough,
+        Some(20..=63) if webrtc && data.len() >= 13 => MediaInput::Passthrough,
         _ => MediaInput::Junk,
     }
 }
@@ -927,9 +949,10 @@ impl RtpSession {
                                 .ssrc
                                 .load(Ordering::Relaxed);
                             let quiet_for = media_stats.quiet_for(Leg::Caller);
-                            match classify_media_input(&data) {
+                            match classify_media_input(&data, webrtc_mode_a) {
                                 MediaInput::Rtp => media_stats.note_rx(Leg::Caller, &data),
-                                MediaInput::Passthrough => {}
+                                MediaInput::Rtcp => media_stats.note_rtcp(Leg::Caller),
+                                MediaInput::Passthrough => media_stats.note_passthrough(Leg::Caller),
                                 MediaInput::Junk => {
                                     debug!(
                                         "RTP A: dropping a {}-byte datagram from {} that is not media",
@@ -951,12 +974,11 @@ impl RtpSession {
                                     signalled: signalled_a,
                                     source,
                                     plausible: looks_like_rtp(&data),
-                                    same_stream: live_ssrc != 0
-                                        && data.len() >= 12
+                                    same_stream: data.len() >= 12
                                         && live_ssrc
-                                            == u32::from_be_bytes([
+                                            == u64::from(u32::from_be_bytes([
                                                 data[8], data[9], data[10], data[11],
-                                            ]),
+                                            ])),
                                     latched_quiet_for: quiet_for,
                                 });
                                 match verdict {
@@ -1035,6 +1057,7 @@ impl RtpSession {
                                     // DROP the packet — browser sends SRTP which we can't decrypt.
                                     // Relaying encrypted SRTP to the trunk would produce garbled audio.
                                     debug!("RTP A→B: dropping packet (WebRTC mode, DTLS/SRTP not yet ready)");
+                                    media_stats.note_drop(DropReason::Srtp);
                                     continue;
                                 }
                             }
@@ -1053,7 +1076,7 @@ impl RtpSession {
                                     // DTMF telephone-event (PT 96-127) and Comfort Noise (CN=13)
                                     // must NOT be transcoded — relay them as-is (RFC 4733).
                                     // Unknown PTs that aren't DTMF/CN are dropped.
-                                    let expected_pt = tc.src.pt();
+                                    let expected_pt = tc.src_pt();
                                     // DTMF iff the packet carries leg-A's negotiated
                                     // telephone-event PT (fallback: any dynamic PT when
                                     // the SDP didn't negotiate one — legacy behavior).
@@ -1063,6 +1086,7 @@ impl RtpSession {
                                     if actual_pt != expected_pt && !is_dtmf_or_cn {
                                         debug!("RTP A→B: skip unknown PT {} (expected {}), {} bytes",
                                             actual_pt, expected_pt, data.len());
+                                        media_stats.note_drop(DropReason::PayloadType);
                                         continue;
                                     }
                                     if is_dtmf_or_cn {
@@ -1092,6 +1116,7 @@ impl RtpSession {
                                         if (tc.src == crate::transcoding::Codec::Pcma || tc.src == crate::transcoding::Codec::Pcmu)
                                             && payload_len != 160 {
                                             debug!("Transcode A→B: skip non-standard G.711 frame ({} bytes, expected 160)", payload_len);
+                                            media_stats.note_drop(DropReason::Transcode);
                                             continue;
                                         }
 
@@ -1125,7 +1150,7 @@ impl RtpSession {
                                                 new_pkt.extend_from_slice(&data[..12]);
                                                 // Clear extension bit (X=0) and CSRC count (CC=0)
                                                 new_pkt[0] = 0x80; // V=2, P=0, X=0, CC=0
-                                                new_pkt[1] = (data[1] & 0x80) | tc.dst.pt();
+                                                new_pkt[1] = (data[1] & 0x80) | tc.dst_pt();
                                                 new_pkt.extend_from_slice(&transcoded);
 
                                                 // ── RTP timestamp rewrite for clock rate conversion ──
@@ -1152,6 +1177,7 @@ impl RtpSession {
                                             }
                                             Err(e) => {
                                                 warn!("Transcode A→B error: {} (dropping packet)", e);
+                                                media_stats.note_drop(DropReason::Transcode);
                                                 continue;
                                             }
                                         }
@@ -1180,6 +1206,7 @@ impl RtpSession {
                                         }
                                         Err(e) => {
                                             warn!("SRTP B (DTLS) encrypt error: {} (dropping packet)", e);
+                                            media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
                                     }
@@ -1328,9 +1355,10 @@ impl RtpSession {
                                 .ssrc
                                 .load(Ordering::Relaxed);
                             let quiet_for = media_stats.quiet_for(Leg::Callee);
-                            match classify_media_input(&data) {
+                            match classify_media_input(&data, webrtc_mode_b) {
                                 MediaInput::Rtp => media_stats.note_rx(Leg::Callee, &data),
-                                MediaInput::Passthrough => {}
+                                MediaInput::Rtcp => media_stats.note_rtcp(Leg::Callee),
+                                MediaInput::Passthrough => media_stats.note_passthrough(Leg::Callee),
                                 MediaInput::Junk => {
                                     debug!(
                                         "RTP B: dropping a {}-byte datagram from {} that is not media",
@@ -1352,12 +1380,11 @@ impl RtpSession {
                                     signalled: signalled_b,
                                     source,
                                     plausible: looks_like_rtp(&data),
-                                    same_stream: live_ssrc != 0
-                                        && data.len() >= 12
+                                    same_stream: data.len() >= 12
                                         && live_ssrc
-                                            == u32::from_be_bytes([
+                                            == u64::from(u32::from_be_bytes([
                                                 data[8], data[9], data[10], data[11],
-                                            ]),
+                                            ])),
                                     latched_quiet_for: quiet_for,
                                 });
                                 match verdict {
@@ -1475,13 +1502,14 @@ impl RtpSession {
 
                                     // ── PT filtering (Phase 16: DTMF relay) ──
                                     // DTMF telephone-event (PT 96-127) and CN (PT 13) bypass transcoding
-                                    let expected_pt_b = tc.src.pt();
+                                    let expected_pt_b = tc.src_pt();
                                     let is_dtmf_b = dtmf_pt_b.map(|p| p == actual_pt_b)
                                         .unwrap_or(actual_pt_b >= 96);
                                     let is_dtmf_or_cn_b = is_dtmf_b || actual_pt_b == 13;
                                     if actual_pt_b != expected_pt_b && !is_dtmf_or_cn_b {
                                         debug!("RTP B→A: skip unknown PT {} (expected {}), {} bytes",
                                             actual_pt_b, expected_pt_b, data.len());
+                                        media_stats.note_drop(DropReason::PayloadType);
                                         continue;
                                     }
                                     if is_dtmf_or_cn_b {
@@ -1506,6 +1534,7 @@ impl RtpSession {
                                         if (tc.src == crate::transcoding::Codec::Pcma || tc.src == crate::transcoding::Codec::Pcmu)
                                             && payload_len != 160 {
                                             debug!("Transcode B→A: skip non-standard G.711 frame ({} bytes, expected 160)", payload_len);
+                                            media_stats.note_drop(DropReason::Transcode);
                                             continue;
                                         }
                                         let payload_vec = data[header_len..].to_vec();
@@ -1523,7 +1552,7 @@ impl RtpSession {
                                                 new_pkt.extend_from_slice(&data[..12]);
                                                 // Clear extension bit and CSRC count for clean output
                                                 new_pkt[0] = 0x80; // V=2, P=0, X=0, CC=0
-                                                new_pkt[1] = (data[1] & 0x80) | tc.dst.pt();
+                                                new_pkt[1] = (data[1] & 0x80) | tc.dst_pt();
                                                 new_pkt.extend_from_slice(&transcoded);
 
                                                 // ── RTP timestamp rewrite for clock rate conversion ──
@@ -1540,7 +1569,7 @@ impl RtpSession {
 
                                                 debug!("Transcode B→A: {} → {} bytes (hdr={}, PT {}→{})",
                                                     payload_len, transcoded.len(), header_len,
-                                                    tc.src.pt(), tc.dst.pt());
+                                                    tc.src_pt(), tc.dst_pt());
                                                 data = new_pkt;
                                                 if let Some(ref c) = global_transcode_counter {
                                                     c.fetch_add(1, Ordering::Relaxed);
@@ -1548,6 +1577,7 @@ impl RtpSession {
                                             }
                                             Err(e) => {
                                                 warn!("Transcode B→A error: {} (dropping packet)", e);
+                                                media_stats.note_drop(DropReason::Transcode);
                                                 continue;
                                             }
                                         }
@@ -1590,6 +1620,7 @@ impl RtpSession {
                                     // DROP the packet — sending plain RTP to a WebRTC browser
                                     // causes garbled audio (browser expects SRTP).
                                     debug!("RTP B→A: dropping packet (WebRTC mode, DTLS/SRTP not yet ready)");
+                                    media_stats.note_drop(DropReason::Srtp);
                                     continue;
                                 }
                             }
@@ -1637,12 +1668,12 @@ impl RtpSession {
                                 .lock()
                                 .await
                                 .is_none_or(|ep| ep.ip() == source.ip());
-                            if !known || !looks_like_rtp(&data) {
+                            if !known || !looks_like_rtcp(&data) {
                                 debug!(
                                     "RTCP A: dropping {} bytes from {} (known={})",
                                     len, source, known
                                 );
-                                media_stats.note_drop(DropReason::NotRtp);
+                                media_stats.note_drop(DropReason::Rtcp);
                                 continue;
                             }
                             let dest = *endpoint_b.lock().await;
@@ -1666,12 +1697,12 @@ impl RtpSession {
                                 .lock()
                                 .await
                                 .is_none_or(|ep| ep.ip() == source.ip());
-                            if !known || !looks_like_rtp(&data) {
+                            if !known || !looks_like_rtcp(&data) {
                                 debug!(
                                     "RTCP B: dropping {} bytes from {} (known={})",
                                     len, source, known
                                 );
-                                media_stats.note_drop(DropReason::NotRtp);
+                                media_stats.note_drop(DropReason::Rtcp);
                                 continue;
                             }
                             let dest = *endpoint_a.lock().await;
@@ -1897,30 +1928,45 @@ mod tests {
 
     #[test]
     fn media_input_classification_keeps_ice_and_dtls_but_drops_junk() {
-        // RTP: version 2, 12-byte header.
+        // RTP: version 2, 12-byte header, an audio payload type.
         let mut rtp = vec![0x80, 0x00, 0x00, 0x01];
         rtp.extend_from_slice(&[0u8; 8]);
-        assert_eq!(classify_media_input(&rtp), MediaInput::Rtp);
+        assert_eq!(classify_media_input(&rtp, false), MediaInput::Rtp);
         // …but not a truncated one.
-        assert_eq!(classify_media_input(&rtp[..8]), MediaInput::Junk);
+        assert_eq!(classify_media_input(&rtp[..8], false), MediaInput::Junk);
 
-        // STUN with its magic cookie (RFC 5389) passes through untouched.
+        // RTCP muxed on the RTP port (RFC 5761 §4: byte[1] 192..=223) is
+        // relayed but never accounted as audio.
+        let mut rtcp = rtp.clone();
+        rtcp[1] = 200; // Sender Report
+        assert_eq!(classify_media_input(&rtcp, false), MediaInput::Rtcp);
+        rtcp[1] = 205; // RTPFB, which used to classify as audio
+        assert_eq!(classify_media_input(&rtcp, false), MediaInput::Rtcp);
+
+        // STUN with its magic cookie (RFC 5389) passes through — but only
+        // on a leg that negotiated ICE/DTLS.
         let mut stun = vec![0x00, 0x01, 0x00, 0x00];
         stun.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
         stun.extend_from_slice(&[0u8; 12]);
-        assert_eq!(classify_media_input(&stun), MediaInput::Passthrough);
-        // A byte that only looks like STUN does not.
-        assert_eq!(classify_media_input(&[0x01]), MediaInput::Junk);
+        assert_eq!(classify_media_input(&stun, true), MediaInput::Passthrough);
+        assert_eq!(
+            classify_media_input(&stun, false),
+            MediaInput::Junk,
+            "a plain SIP/RTP leg has no business carrying STUN"
+        );
+        // A byte that only looks like STUN does not pass.
+        assert_eq!(classify_media_input(&[0x01], true), MediaInput::Junk);
         let mut fake = stun.clone();
         fake[4] = 0x00;
-        assert_eq!(classify_media_input(&fake), MediaInput::Junk);
+        assert_eq!(classify_media_input(&fake, true), MediaInput::Junk);
 
-        // A DTLS record header.
+        // A DTLS record header, same rule.
         let dtls = vec![0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(classify_media_input(&dtls), MediaInput::Passthrough);
-        assert_eq!(classify_media_input(&dtls[..5]), MediaInput::Junk);
+        assert_eq!(classify_media_input(&dtls, true), MediaInput::Passthrough);
+        assert_eq!(classify_media_input(&dtls, false), MediaInput::Junk);
+        assert_eq!(classify_media_input(&dtls[..5], true), MediaInput::Junk);
 
-        assert_eq!(classify_media_input(&[]), MediaInput::Junk);
+        assert_eq!(classify_media_input(&[], true), MediaInput::Junk);
     }
 
     /// Every endpoint decision the relay makes reaches the counters: this

@@ -100,13 +100,16 @@ groups:
           summary: "SBC config store unavailable (running from TOML seeds only)"
 
       - alert: SBCMediaOneWay
-        # One direction of a call stayed silent while the other was
-        # delivering: a NAT or firewall asymmetry, or a peer that never
-        # started sending. Reported by the relay, never a teardown.
-        expr: increase(sbc_media_one_way_calls_total[15m]) > 0
+        # One direction of a call stayed silent for 10 s while the other
+        # was delivering. A NAT or firewall asymmetry looks like this —
+        # but so does a call on hold and a leg with aggressive silence
+        # suppression, so this is informational: read it against the call
+        # rate, and never as proof of a fault.
+        expr: increase(sbc_media_one_way_calls_total[30m]) > 3
+        for: 10m
         labels: { severity: warning }
         annotations:
-          summary: "One-way audio on {{ $value }} call(s) ({{ $labels.leg }} silent)"
+          summary: "One-way audio reported on {{ $value }} call(s) in 30m ({{ $labels.leg }} silent) — holds and silence-suppressed legs count too"
 
       - alert: SBCMediaRelayFailures
         # Calls the SBC could not anchor media for: refused with 503 before

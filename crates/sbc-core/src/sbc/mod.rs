@@ -1436,7 +1436,8 @@ impl Sbc {
             self.metrics.clone(),
             config,
             Some(self.events.clone()),
-        );
+        )
+        .with_media(self.media.clone());
         self._maintenance = Some(maintenance.start());
         info!("Maintenance sweeper started");
 

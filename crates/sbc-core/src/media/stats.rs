@@ -8,7 +8,7 @@
 //! relay started**: a wall-clock base would tear every live call down as
 //! `rtp-timeout` the moment NTP stepped the clock forward.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Which side of the B2BUA a counter belongs to. `Caller` is leg A,
@@ -52,16 +52,20 @@ pub enum DropReason {
     Srtp,
     /// The socket send failed.
     SendFailed,
+    /// An RTCP datagram refused on the RTCP port (wrong source, or not
+    /// RTCP-shaped).
+    Rtcp,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 6] = [
+    pub const ALL: [DropReason; 7] = [
         Self::NotRtp,
         Self::NoEndpoint,
         Self::PayloadType,
         Self::Transcode,
         Self::Srtp,
         Self::SendFailed,
+        Self::Rtcp,
     ];
 
     pub fn label(self) -> &'static str {
@@ -72,6 +76,7 @@ impl DropReason {
             Self::Transcode => "transcode",
             Self::Srtp => "srtp",
             Self::SendFailed => "send-failed",
+            Self::Rtcp => "rtcp",
         }
     }
 
@@ -83,14 +88,20 @@ impl DropReason {
             Self::Transcode => 3,
             Self::Srtp => 4,
             Self::SendFailed => 5,
+            Self::Rtcp => 6,
         }
     }
 }
 
 /// One leg's counters. `rx` is what the peer on this leg sent us, `tx` what
 /// we delivered to it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LegStats {
+    /// RTCP datagrams relayed for this leg (not audio, counted apart).
+    pub rtcp_packets: AtomicU64,
+    /// ICE/DTLS datagrams relayed untouched (not audio: they do not keep
+    /// the inactivity watchdog alive).
+    pub passthrough_packets: AtomicU64,
     pub rx_packets: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub tx_packets: AtomicU64,
@@ -99,8 +110,9 @@ pub struct LegStats {
     pub last_rx_ms: AtomicU64,
     pub last_tx_ms: AtomicU64,
     /// Current SSRC and how many times it changed (a change is a new
-    /// stream: a transfer, a media server, or a hijack).
-    pub ssrc: AtomicU32,
+    /// stream: a transfer, a media server, or a hijack). Held as a u64 so
+    /// `UNSET` can mean "nothing seen yet" — SSRC 0 is a legal value.
+    pub ssrc: AtomicU64,
     pub ssrc_changes: AtomicU64,
     /// Sequence gaps seen from this peer (RFC 3550 §A.3, forward only).
     pub lost: AtomicU64,
@@ -109,8 +121,35 @@ pub struct LegStats {
     pub endpoint_moved: AtomicU64,
     /// Already reported as not sending, so the warning fires once.
     one_way_reported: AtomicU64,
-    /// Highest sequence number seen (loss detection state).
-    highest_seq: AtomicU32,
+    /// Highest sequence number seen (loss detection state), `UNSET`
+    /// before the first packet.
+    highest_seq: AtomicU64,
+}
+
+/// "Nothing seen yet" for the u64-held SSRC and sequence fields (both
+/// carry values that are legal at 0).
+const UNSET: u64 = u64::MAX;
+
+impl Default for LegStats {
+    fn default() -> Self {
+        Self {
+            rx_packets: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            rtcp_packets: AtomicU64::new(0),
+            passthrough_packets: AtomicU64::new(0),
+            last_rx_ms: AtomicU64::new(0),
+            last_tx_ms: AtomicU64::new(0),
+            ssrc: AtomicU64::new(UNSET),
+            ssrc_changes: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            endpoint_learned: AtomicU64::new(0),
+            endpoint_moved: AtomicU64::new(0),
+            one_way_reported: AtomicU64::new(0),
+            highest_seq: AtomicU64::new(UNSET),
+        }
+    }
 }
 
 impl LegStats {
@@ -119,23 +158,31 @@ impl LegStats {
         self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
         self.last_rx_ms.store(at_ms, Ordering::Relaxed);
 
-        let previous = self.ssrc.swap(ssrc, Ordering::Relaxed);
-        if previous == 0 || previous == ssrc {
+        let previous = self.ssrc.swap(u64::from(ssrc), Ordering::Relaxed);
+        if previous == UNSET || previous == u64::from(ssrc) {
             // Same stream: count forward gaps.
             let highest = self.highest_seq.load(Ordering::Relaxed);
-            if highest != 0 {
-                let expected = (highest as u16).wrapping_add(1);
-                let gap = seq.wrapping_sub(expected);
-                // A small forward gap is loss; a backward or huge jump is
-                // reordering or a new stream, not loss.
-                if gap > 0 && gap < 1000 {
-                    self.lost.fetch_add(u64::from(gap), Ordering::Relaxed);
+            if highest != UNSET {
+                let highest = highest as u16;
+                let ahead = seq.wrapping_sub(highest) < 0x8000;
+                if ahead {
+                    let gap = seq.wrapping_sub(highest.wrapping_add(1));
+                    // A small forward gap is loss; a huge jump is a
+                    // restart, not 30 000 lost packets.
+                    if gap > 0 && gap < 1000 {
+                        self.lost.fetch_add(u64::from(gap), Ordering::Relaxed);
+                    }
+                    // Only a forward packet moves the high-water mark:
+                    // storing a reordered one would make the next
+                    // in-order packet look like a gap.
+                    self.highest_seq.store(u64::from(seq), Ordering::Relaxed);
                 }
+            } else {
+                self.highest_seq.store(u64::from(seq), Ordering::Relaxed);
             }
-            self.highest_seq.store(u32::from(seq), Ordering::Relaxed);
         } else {
             self.ssrc_changes.fetch_add(1, Ordering::Relaxed);
-            self.highest_seq.store(u32::from(seq), Ordering::Relaxed);
+            self.highest_seq.store(u64::from(seq), Ordering::Relaxed);
         }
     }
 
@@ -165,7 +212,7 @@ pub struct CallMediaStats {
     started: Instant,
     pub caller: LegStats,
     pub callee: LegStats,
-    drops: [AtomicU64; 6],
+    drops: [AtomicU64; 7],
     /// Monotonic ms of the last packet actually **delivered** to a peer:
     /// the inactivity watchdog's input. A packet that arrives but dies at
     /// the transcoder or the SRTP layer must not keep a dead call alive.
@@ -220,6 +267,21 @@ impl CallMediaStats {
         let at = self.now_ms();
         self.leg(leg).note_tx(len, at);
         self.last_relay_ms.store(at, Ordering::Relaxed);
+    }
+
+    /// An RTCP datagram relayed for `leg` (not audio: it must not keep
+    /// the inactivity watchdog alive).
+    pub fn note_rtcp(&self, leg: Leg) {
+        self.leg(leg).rtcp_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An ICE/DTLS datagram relayed untouched. Same rule: not audio, so
+    /// it does not refresh the watchdog — otherwise a keepalive from a
+    /// dead call's far end would keep it billed for hours.
+    pub fn note_passthrough(&self, leg: Leg) {
+        self.leg(leg)
+            .passthrough_packets
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_drop(&self, reason: DropReason) {

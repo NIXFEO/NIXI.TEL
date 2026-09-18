@@ -1231,6 +1231,34 @@ impl B2buaManager {
         ))
     }
 
+    /// The ACK for the callee's 2xx on a call we are about to tear down.
+    /// RFC 3261 §13.2.2.4: a 2xx must be ACKed even when the SBC hangs the
+    /// call up immediately — otherwise the trunk retransmits its 200 OK
+    /// and keeps a billed ghost session (the OverMaxCall symptom).
+    pub async fn ack_for_answered_callee(
+        &self,
+        uuid: &CallUuid,
+        local_ip: &str,
+        local_port: u16,
+    ) -> Option<(
+        String,
+        SocketAddr,
+        rsip::Transport,
+        Option<mpsc::UnboundedSender<Vec<u8>>>,
+    )> {
+        let calls = self.calls.lock().await;
+        let call = calls.get(uuid)?;
+        let d = call.dialog_info_toward_callee(local_ip, local_port)?;
+        let cseq = d.cseq;
+        let ack = crate::sip_builder::build_ack_for_2xx(&d, cseq);
+        Some((
+            ack,
+            call.callee_dest?,
+            call.callee_transport,
+            call.callee_reply_tx.clone(),
+        ))
+    }
+
     /// Store the SDP as last sent to the caller (rewritten 200 OK body).
     pub async fn set_last_sdp_to_caller(&self, uuid: &CallUuid, sdp: String) {
         let mut calls = self.calls.lock().await;

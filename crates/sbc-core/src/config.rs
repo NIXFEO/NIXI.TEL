@@ -1108,6 +1108,7 @@ pub fn key_classes() -> serde_json::Value {
         "unused": ["general.name", "general.instance_id", "network.public_ipv6",
                    "security.rate_limit_global", "security.auth_challenge_timeout",
                    "media.rtcp_enabled", "media.transcoding_threads", "media.codecs",
+                   "media.webrtc.enabled", "media.webrtc.stun_servers",
                    "media.webrtc.turn_enabled", "metrics.*"],
     })
 }

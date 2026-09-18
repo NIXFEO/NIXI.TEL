@@ -58,6 +58,9 @@ codecs = ["PCMU", "PCMA", "Opus"]
 # public_ip key of its own)
 
 [media.webrtc]
+# This whole block is parsed and read by nothing: WebRTC is enabled by
+# adding a WS/WSS listener above, and STUN/TURN are the client's business
+# (see docs/WEBRTC.md).
 enabled = true
 stun_servers = ["stun:stun.l.google.com:19302"]
 # TURN is intentionally external (coturn) — this key is reserved:
@@ -113,7 +116,7 @@ max_call_duration = 14400      # answered call hard cap → BYE both legs (CDR "
 call_setup_timeout = 60        # unanswered INVITE → CANCEL + 408 to the caller (CDR "setup-timeout")
 rtp_timeout = 90               # no RTP *delivered* for this long → BYE both legs (CDR
                                # "rtp-timeout"), including a call whose media never flowed.
-                               # Checked on a 30 s sweep, so the teardown lands 90-120 s in.
+                               # Checked every 15 s, so the teardown lands 90-105 s in.
                                # One direction silent while the other talks is reported, not
                                # torn down (sbc_media_one_way_calls_total, a hold looks the same).
 invite_timeout = 5             # no >=180 within 5s → trunk failover (raise above the carrier's post-dial delay when a backup trunk exists; a trunk that answered nothing at all also takes a strike)

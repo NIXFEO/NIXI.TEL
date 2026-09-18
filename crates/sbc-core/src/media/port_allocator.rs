@@ -179,8 +179,16 @@ impl PortAllocator {
         }
     }
 
-    /// Pairs waiting out their hold.
+    /// Expire what is due. `allocate` does this itself; the 60 s sweeper
+    /// calls it too, so the pool's reported state decays even when no
+    /// call starts.
+    pub fn sweep(&self) {
+        let _ = self.sweep_quarantine(Instant::now());
+    }
+
+    /// Pairs waiting out their hold (swept first, so the count is live).
     pub fn quarantined_count(&self) -> usize {
+        self.sweep();
         self.quarantine.lock().map(|q| q.len()).unwrap_or(0)
     }
 

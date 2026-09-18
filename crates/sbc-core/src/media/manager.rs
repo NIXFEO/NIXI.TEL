@@ -43,6 +43,12 @@ pub struct WebRtcRtpInfoB {
     pub srtp_send_ctx_b: Arc<AsyncMutex<Option<SrtpContext>>>,
 }
 
+/// Most ended sessions whose counters are kept for their CDR, and how
+/// long: `finish_call` normally runs milliseconds later, so this is only
+/// a safety net against a teardown that never writes a record.
+const MAX_ENDED_STATS: usize = 256;
+const ENDED_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Media Manager
 pub struct MediaManager {
     /// Port allocator for RTP/RTCP
@@ -71,6 +77,13 @@ pub struct MediaManager {
     /// Per-call media counters, kept after `start_rtp_session` returns
     /// (the `RtpSession` itself is moved into its task).
     media_stats: dashmap::DashMap<String, Arc<crate::media::stats::CallMediaStats>>,
+
+    /// The counters of sessions that have just been released. The CDR is
+    /// written by `finish_call`, which on the BYE path runs *after* the
+    /// media session is gone: without this the headline media facts would
+    /// read "no relay, nothing delivered" for every normal call.
+    ended_stats:
+        dashmap::DashMap<String, (Arc<crate::media::stats::CallMediaStats>, std::time::Instant)>,
 
     /// Global transcoded packet counter (from SbcMetrics)
     global_transcode_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -186,6 +199,7 @@ impl MediaManager {
             global_rtp_timeout_counter: None,
             metrics: None,
             media_stats: dashmap::DashMap::new(),
+            ended_stats: dashmap::DashMap::new(),
             global_transcode_counter: None,
             rtp_timeout_secs: std::sync::atomic::AtomicU64::new(90),
             timed_out_tx,
@@ -242,12 +256,38 @@ impl MediaManager {
         self.metrics = Some(metrics);
     }
 
-    /// The per-leg counters of a live media session.
+    /// Expire quarantined RTP ports and stale ended-call counters (the
+    /// 60 s sweeper: without it the pool's reported state only decays
+    /// when a new call allocates).
+    pub fn sweep(&self) {
+        self.port_allocator.sweep();
+        let now = std::time::Instant::now();
+        self.ended_stats
+            .retain(|_, (_, at)| now.duration_since(*at) < ENDED_STATS_TTL);
+    }
+
+    /// The per-leg counters of a media session, live or just ended (the
+    /// CDR is written after the session is released).
     pub fn call_media_stats(
         &self,
         session_id: &str,
     ) -> Option<Arc<crate::media::stats::CallMediaStats>> {
-        self.media_stats.get(session_id).map(|e| e.clone())
+        if let Some(live) = self.media_stats.get(session_id) {
+            return Some(live.clone());
+        }
+        self.ended_stats
+            .get(session_id)
+            .map(|e| e.value().0.clone())
+    }
+
+    /// Drop the counters of a session whose CDR has been written.
+    pub fn forget_media_stats(&self, session_id: &str) {
+        self.ended_stats.remove(session_id);
+    }
+
+    /// How many ended sessions still hold their counters (tests).
+    pub fn ended_stats_len(&self) -> usize {
+        self.ended_stats.len()
     }
 
     pub fn set_global_rtp_timeout_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
@@ -306,21 +346,23 @@ impl MediaManager {
         // Allocate leg-A ports (appears in INVITE forwarded to callee)
         let ports = self.port_allocator.allocate()?;
 
-        // Allocate leg-B ports (appears in 200 OK forwarded to caller)
-        // If we can't get a second pair, fall back to single-leg mode
-        let ports_b = self.port_allocator.allocate().ok();
-
-        if let Some(pb) = ports_b {
-            info!(
-                "Created media session {} on A={}/{} B={}/{}",
-                session_id, ports.rtp, ports.rtcp, pb.rtp, pb.rtcp
-            );
-        } else {
-            info!(
-                "Created media session {} on ports {}/{} (single-leg fallback)",
-                session_id, ports.rtp, ports.rtcp
-            );
-        }
+        // Allocate leg-B ports (appears in the 200 OK forwarded to the
+        // caller). Both pairs are required: the relay binds four sockets,
+        // and the old "single-leg fallback" made it bind leg A's ports
+        // twice, which always failed with EADDRINUSE — after the callee
+        // had answered. Refusing here makes the pre-dial 503 fire instead.
+        let ports_b = match self.port_allocator.allocate() {
+            Ok(pb) => pb,
+            Err(e) => {
+                let _ = self.port_allocator.release(ports);
+                return Err(e);
+            }
+        };
+        info!(
+            "Created media session {} on A={}/{} B={}/{}",
+            session_id, ports.rtp, ports.rtcp, ports_b.rtp, ports_b.rtcp
+        );
+        let ports_b = Some(ports_b);
 
         // Parse and modify SDP if provided (rewrite to leg-A port)
         let modified_sdp = match sdp {
@@ -632,7 +674,12 @@ impl MediaManager {
             };
 
             if do_transcode {
-                // For WebRTC: force Opus as the WebRTC side's codec
+                // The codec comes from `a=rtpmap`, the payload *number*
+                // from the same SDP: they are peer-specific (Opus is 111
+                // in Chrome, 109 in Firefox), and the relay filters on
+                // what this peer sends and stamps what the other expects.
+                let caller_format = crate::transcoding::sdp_primary_format(caller_sdp);
+                let callee_format = crate::transcoding::sdp_primary_format(callee_sdp);
                 let caller_codec = if caller_is_webrtc_sdp {
                     Codec::Opus
                 } else {
@@ -643,6 +690,18 @@ impl MediaManager {
                 } else {
                     sdp_primary_codec(callee_sdp)
                 };
+                // A WebRTC leg's own Opus number when the SDP names it,
+                // else the codec's default.
+                let caller_pt = caller_format
+                    .as_ref()
+                    .filter(|f| f.codec() == caller_codec)
+                    .map(|f| f.pt)
+                    .unwrap_or_else(|| caller_codec.pt());
+                let callee_pt = callee_format
+                    .as_ref()
+                    .filter(|f| f.codec() == callee_codec)
+                    .map(|f| f.pt)
+                    .unwrap_or_else(|| callee_codec.pt());
 
                 let webrtc_label = if caller_is_webrtc_sdp {
                     " [caller WebRTC]"
@@ -653,12 +712,12 @@ impl MediaManager {
                 };
 
                 info!(
-                    "Session {} transcoding required: caller={} ({}) → callee={} ({}){}",
+                    "Session {} transcoding required: caller={} (PT {}) → callee={} (PT {}){}",
                     session_id,
                     caller_codec.name(),
-                    caller_codec.pt(),
+                    caller_pt,
                     callee_codec.name(),
-                    callee_codec.pt(),
+                    callee_pt,
                     webrtc_label
                 );
 
@@ -667,7 +726,12 @@ impl MediaManager {
                 // and nothing is installed: the stream is relayed
                 // untouched, which is audible but honest — relabelling its
                 // payload type would make the peer decode noise.
-                match Transcoder::new(caller_codec, callee_codec) {
+                match Transcoder::with_payload_types(
+                    caller_codec,
+                    caller_pt,
+                    callee_codec,
+                    callee_pt,
+                ) {
                     Ok(tc) => {
                         info!(
                             "Session {} transcoder A→B: {} → {}",
@@ -688,7 +752,12 @@ impl MediaManager {
                 }
 
                 // B→A: callee sends in callee_codec, caller expects caller_codec
-                match Transcoder::new(callee_codec, caller_codec) {
+                match Transcoder::with_payload_types(
+                    callee_codec,
+                    callee_pt,
+                    caller_codec,
+                    caller_pt,
+                ) {
                     Ok(tc) => {
                         info!(
                             "Session {} transcoder B→A: {} → {}",
@@ -853,7 +922,17 @@ impl MediaManager {
         if let Some((_, session)) = self.sessions.remove(session_id) {
             // Stop RTP relay task (dropping shutdown_tx signals the relay task to exit)
             drop(session.rtp_shutdown_tx);
-            self.media_stats.remove(session_id);
+            // Keep the counters for the CDR, which is written after this
+            // (BYE path): bounded, and swept by age.
+            if let Some((_, stats)) = self.media_stats.remove(session_id) {
+                let now = std::time::Instant::now();
+                self.ended_stats
+                    .insert(session_id.to_string(), (stats, now));
+                if self.ended_stats.len() > MAX_ENDED_STATS {
+                    self.ended_stats
+                        .retain(|_, (_, at)| now.duration_since(*at) < ENDED_STATS_TTL);
+                }
+            }
 
             // Release leg-A ports
             self.port_allocator.release(session.ports)?;
