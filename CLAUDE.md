@@ -293,9 +293,11 @@ the last value.
 ## Measured limits
 
 Numbers, not guesses (`cargo test --release -p sbc-core --lib
-one_frame_of_transcoding -- --nocapture`, and
-`the_per_packet_accounting_stays_cheap`). Measured on a developer machine:
-re-run them on the target box, whose cores are slower.
+one_frame_of_transcoding -- --nocapture`,
+`the_per_packet_accounting_stays_cheap`,
+`relay_carries_a_realistic_load` and
+`two_hundred_calls_fit_in_the_event_loop`). Measured on a developer
+machine: re-run them on the target box, whose cores are slower.
 
 | Path | Cost per 20 ms frame | At 50 pps |
 |---|---|---|
@@ -305,6 +307,15 @@ re-run them on the target box, whose cores are slower.
 | Per-packet accounting (`media/stats.rs` + the endpoint ladder) | 0.15 µs | negligible |
 | RTP relay, end to end through real sockets | — | 80 000 packets/s with no loss |
 
+The SIP side, with **200 answered calls live at once** (release build):
+
+| Control-plane step | Cost |
+|---|---|
+| Set a call up (INVITE state, media anchor, 200 OK, ACK) | 137 µs |
+| Tear it down (BYE relayed, media released, CDR written) | 32 µs |
+| Resolve the dialog of one message (linear scan of 200 calls) | 1.2 µs |
+
+
 A G.711 trunk ↔ Opus client call costs about 4.8 ms of CPU per second
 (0.5% of a core); a G.711 ↔ G.711 call costs nothing measurable. So on the
 2 vCPU box the codec saturates near **290 transcoded calls**, and the
@@ -312,7 +323,13 @@ relay itself carries **800 calls' worth of packets** without losing one:
 the 50-200 target is not constrained by either. `sbc_transcode_seconds`
 watches the real thing in production.
 
-Two consequences worth keeping in mind before optimising anything here:
+`handle_message` is awaited inline in the event loop, so those costs are
+serial: about **5 900 call setups per second** on one loop. At 200
+concurrent calls of three minutes each the real setup rate is close to
+**1 per second** — three orders of magnitude of headroom. The control
+plane is not what limits this box.
+
+Three consequences worth keeping in mind before optimising anything here:
 
 - **The relay's hot path is not the constraint.** The per-packet
   allocation and the two endpoint mutexes are known and deliberately left
@@ -324,13 +341,26 @@ Two consequences worth keeping in mind before optimising anything here:
   143 µs → 83 µs — for a difference nothing can hear on an 8 kHz G.711
   source. The curve, measured: 9 → 143 µs, 5 → 83 µs, 3 → 69 µs,
   1 → 48 µs. Lower it further only if capacity ever binds.
+- **The call map and its linear dialog lookup are not the constraint
+  either.** `B2buaManager.calls` is one `Mutex<HashMap>` and
+  `log_fields_for_call_id` scans it for every message, which sounds
+  alarming and measures at 1.2 µs with 200 calls in the map. The side
+  index, the `DashMap` migration and the `ArcSwap` config swap that the
+  scale plan listed are therefore **not** justified: re-measure with
+  `two_hundred_calls_fit_in_the_event_loop` before writing any of them.
+  The transcoding pool is in the same position — it saves an encoder
+  allocation per call, and the measured cost is per *packet*.
 
 ## Known minor issues
 
 - **Double 100 Trying** — the SBC sends two per INVITE (stateless, then after
   processing with Record-Route). Benign, could be optimized.
-- **B2BUA lock** — `B2buaManager.calls` is a `Mutex<HashMap>`; fine at current
-  volumes, migrate to DashMap if targeting 100+ concurrent calls.
+- **B2BUA lock** — `B2buaManager.calls` is one `Mutex<HashMap>`, and the
+  per-message dialog lookup is a linear scan of it. Measured at the
+  12-month target it costs 1.2 µs per message with 200 calls live (see
+  "Measured limits"), so it is not worth changing yet; revisit above a
+  few thousand concurrent calls, or if the scan ever shows up next to the
+  137 µs a setup costs.
 - **Dead connection-oriented binding** — a registrar binding made over
   TCP/TLS keeps its reply channel after the peer's connection closed (only
   WS/WSS teardown is detected), so an inbound INVITE for that user is

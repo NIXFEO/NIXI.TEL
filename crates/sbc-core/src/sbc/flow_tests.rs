@@ -3637,3 +3637,135 @@ async fn the_trunks_answer_to_a_bye_stops_the_retransmissions() {
         0
     );
 }
+
+// =============================================================================
+// Control-plane cost (lot 5: measure before touching anything)
+// =============================================================================
+
+/// What the SIP side of a call costs, and what that implies for the box.
+///
+/// `handle_message` is awaited **inline** in the event loop: one message at
+/// a time, whatever the core count. So the ceiling on call setup is not
+/// the trunk or the codec, it is how long the loop is busy per message.
+/// This holds 200 answered calls at once — the 12-month target — and
+/// reports the cost of setting one up, of a dialog lookup with all 200
+/// live, and of tearing one down (media released, CDR written).
+///
+/// It prints the numbers (`cargo test -- --nocapture`) and fails only on a
+/// pathological regression, so it stays a measurement and not a
+/// flaky timing assertion.
+#[tokio::test]
+async fn two_hundred_calls_fit_in_the_event_loop() {
+    const CALLS: usize = 200;
+    // A two-leg call anchors a pair on each leg: two pairs, four ports.
+    let mut sbc = SbcBuilder::new().media_pairs(CALLS as u16 * 2 + 8).build();
+
+    // ── Setup: INVITE state, media anchor, answer, ACK ──
+    let started = Instant::now();
+    let mut calls = Vec::with_capacity(CALLS);
+    for i in 0..CALLS {
+        let mut call = add_call(&mut sbc, CallSpec::numbered(i)).await;
+        connect(&mut sbc, &mut call).await;
+        calls.push(call);
+    }
+    let per_setup = started.elapsed() / CALLS as u32;
+
+    assert_eq!(
+        sbc.b2bua.stats().await.total_active,
+        CALLS,
+        "all {} calls are live at once",
+        CALLS
+    );
+    assert_eq!(
+        sbc.media.stats().allocated_ports,
+        CALLS * 2,
+        "each call holds a pair on each leg"
+    );
+
+    // ── A dialog lookup with 200 calls in the map ──
+    // Every inbound message pays this: `dispatch` resolves the call for
+    // the log span before the handler even runs. It is a linear scan, so
+    // measure both a hit and a miss — a miss scans the map twice (exact,
+    // then the Genesys suffix match) and is what a late BYE from a call
+    // torn down minutes ago hits.
+    let probe = calls[CALLS / 2].spec.call_id.clone();
+    let lookups = 2_000;
+    let started = Instant::now();
+    for _ in 0..lookups {
+        assert!(sbc.b2bua.log_fields_for_call_id(&probe).await.is_some());
+    }
+    let per_lookup = started.elapsed() / lookups;
+    let started = Instant::now();
+    for _ in 0..lookups {
+        assert!(sbc
+            .b2bua
+            .log_fields_for_call_id("no-such-call-id@nowhere.invalid")
+            .await
+            .is_none());
+    }
+    let per_miss = started.elapsed() / lookups;
+
+    // ── Teardown: BYE relayed, media released, CDR written ──
+    let started = Instant::now();
+    for call in &calls {
+        sbc.handle_bye(
+            bye_from_caller(&call.spec, 4),
+            caller_addr(),
+            rsip::Transport::Udp,
+            Some(&call.caller_tx),
+        )
+        .await
+        .unwrap();
+    }
+    let per_teardown = started.elapsed() / CALLS as u32;
+
+    assert_eq!(sbc.b2bua.stats().await.total_active, 0, "all released");
+    assert_eq!(sbc.media.stats().allocated_ports, 0, "every port returned");
+    assert_eq!(
+        sbc.cdr.get_recent(CALLS + 10).await.unwrap().len(),
+        CALLS,
+        "one CDR per call"
+    );
+
+    // The numbers, and what they mean for the box.
+    let setup_us = per_setup.as_secs_f64() * 1e6;
+    let teardown_us = per_teardown.as_secs_f64() * 1e6;
+    println!(
+        "control plane at {} live calls: setup {:.0} µs, teardown {:.0} µs, \
+         dialog lookup {:.2} µs (hit) / {:.2} µs (miss) \
+         → about {:.0} call setups/s on one event loop",
+        CALLS,
+        setup_us,
+        teardown_us,
+        per_lookup.as_secs_f64() * 1e6,
+        per_miss.as_secs_f64() * 1e6,
+        1e6 / (setup_us + teardown_us)
+    );
+
+    // A debug build is several times slower than a release one, so the
+    // bar is deliberately far away: it catches an accidental O(n²) or a
+    // lock held across an await, not a slow laptop.
+    assert!(
+        per_setup < Duration::from_millis(5),
+        "call setup costs {:?} with {} live calls",
+        per_setup,
+        CALLS
+    );
+    assert!(
+        per_lookup < Duration::from_micros(500),
+        "a dialog lookup costs {:?} with {} calls in the map",
+        per_lookup,
+        CALLS
+    );
+    assert!(
+        per_miss < Duration::from_micros(500),
+        "a missed dialog lookup costs {:?} with {} calls in the map",
+        per_miss,
+        CALLS
+    );
+    assert!(
+        per_teardown < Duration::from_millis(5),
+        "teardown costs {:?}",
+        per_teardown
+    );
+}

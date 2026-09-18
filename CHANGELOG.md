@@ -7,6 +7,17 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 ## [Unreleased]
 
 ### Added
+- **The control plane measured at the 12-month target**
+  (`two_hundred_calls_fit_in_the_event_loop`): 200 answered calls held at
+  once, then the real cost of a setup (137 µs), a teardown (32 µs) and
+  the per-message dialog lookup (1.2 µs) in a release build. The event
+  loop handles messages one at a time, so that is about 5 900 call setups
+  per second against a real rate near 1 — three orders of magnitude of
+  headroom. This is what says the remaining scale items from the plan
+  (a side index on the call map, the `DashMap` migration, `ArcSwap` for
+  trunk config, a bounded input channel, the transcoding pool) are **not**
+  justified: the constraint stays the Opus encoder, and the numbers are
+  in CLAUDE.md for whoever re-measures on the box.
 - **Client transactions (RFC 3261 §17.1): the requests the SBC sends over
   UDP are now retransmitted until they are answered.** Nothing resent them
   before, so a single lost datagram was a lost call — an INVITE the trunk

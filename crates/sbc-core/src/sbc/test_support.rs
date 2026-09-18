@@ -521,9 +521,15 @@ pub(crate) fn udp_loopback() -> NetworkConfig {
 /// Disjoint RTP port range per SBC instance so tests running in parallel
 /// never bind the same ports (Linux ephemeral ports start at 32768).
 fn next_port_range() -> std::ops::Range<u16> {
+    next_port_range_of(40)
+}
+
+/// A private RTP port range of `size` ports for one test SBC. Ranges never
+/// overlap: tests run in parallel in one process.
+fn next_port_range_of(size: u16) -> std::ops::Range<u16> {
     static NEXT: AtomicU16 = AtomicU16::new(22000);
-    let base = NEXT.fetch_add(40, Ordering::Relaxed);
-    base..base + 40
+    let base = NEXT.fetch_add(size, Ordering::Relaxed);
+    base..base + size
 }
 
 /// Builds an [`Sbc`] for handler tests: no sockets, one Genesys-style UDP
@@ -539,6 +545,7 @@ pub(crate) struct SbcBuilder {
     register_policy: crate::register::RegisterPolicy,
     cdr_store: Option<Arc<sbc_storage::ConfigStore>>,
     no_media_ports: bool,
+    media_pairs: Option<u16>,
 }
 
 impl SbcBuilder {
@@ -554,6 +561,7 @@ impl SbcBuilder {
             register_policy: crate::register::RegisterPolicy::default(),
             cdr_store: None,
             no_media_ports: false,
+            media_pairs: None,
         }
     }
 
@@ -625,13 +633,23 @@ impl SbcBuilder {
         self
     }
 
+    /// Room for `pairs` simultaneous anchored calls (default 20), for the
+    /// tests that hold many calls at once.
+    pub(crate) fn media_pairs(mut self, pairs: u16) -> Self {
+        self.media_pairs = Some(pairs);
+        self
+    }
+
     pub(crate) fn build(self) -> Sbc {
         let mut sbc = Sbc::new();
         let range = if self.no_media_ports {
             let base = next_port_range().start;
             base..base // empty: allocate() always fails
         } else {
-            next_port_range()
+            match self.media_pairs {
+                Some(pairs) => next_port_range_of(pairs.saturating_mul(2)),
+                None => next_port_range(),
+            }
         };
         let media = Arc::new(MediaManager::with_port_range(range, None));
         sbc.b2bua = Arc::new(B2buaManager::new(media.clone()));
