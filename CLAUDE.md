@@ -57,7 +57,7 @@ into the store, then ignored. Every API write goes to the store and is
 applied to the live runtime immediately — no reload needed. `SIGHUP` and
 `POST /api/v1/reload` re-hydrate the runtime from the store and apply the
 reload-class `[security]` keys (`config::classify_key`; table in
-docs/API.md "Reload vs restart"); listeners, media ports, TLS material,
+docs/API.md "Reload vs restart"); listeners, media ports, TLS *paths*,
 realm, `[management]`, `[trunk_health]` and `[logging]` need a restart.
 `GET /api/v1/config` shows the effective values (`sbc/runtime_config.rs`),
 what a reload loaded but could not apply, and what the file on disk would

@@ -335,13 +335,17 @@ worth fixing.
 - CDRs live in the SQLite store (migration 0003, table `cdrs` with indexes
   on `started_at`, `caller`, `callee`, `trunk_id`, `call_id` and a unique
   `uuid`). `finish_call` never does IO on the SIP loop any more: records go
-  to a bounded queue and a writer task commits batches (retrying with
-  backoff on a store error, never dropping a record), mirrors them into
-  `[cdr] jsonl_path` (falls back to `[general] cdr_file`) and purges rows
-  older than `[cdr] retention_days` daily. The legacy JSONL history (the
-  live file and its rotated `.N` siblings, `.gz` skipped) is imported once
-  at first boot, atomically with its settings marker; the writer is drained
-  on shutdown. `GET /api/v1/cdrs` gains filters (`from` / `to` as RFC 3339
+  to a bounded queue (8192) and a writer task mirrors each batch into
+  `[cdr] jsonl_path` (falls back to `[general] cdr_file`) and then commits
+  it, retrying with backoff while the store refuses, and purges rows older
+  than `[cdr] retention_days` daily. A record that cannot reach the queue
+  is counted (`sbc_cdr_write_errors_total{stage="queue"}`) and stays in the
+  in-memory cache only, so a queue that stays full does lose records — the
+  mirror is the durable trail. The legacy JSONL history (the live file and
+  its rotated `.N` siblings, `.gz` skipped) is imported once at first boot,
+  streamed in chunks with content-derived ids so it costs bounded memory
+  and resumes if interrupted; the writer is drained on shutdown within its
+  timeout. `GET /api/v1/cdrs` gains filters (`from` / `to` as RFC 3339
   or unix seconds on `started_at`, `direction`, `trunk`, `caller` /
   `callee` case-sensitive prefixes, `sip_code`, `answered`, `uuid`,
   `call_id`), a keyset `cursor` (`next_cursor` in every page) and a CSV
