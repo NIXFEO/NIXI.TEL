@@ -411,12 +411,12 @@ impl WebRtcSession {
         if let Some(fp) = self.remote_info.fingerprint.clone() {
             self.dtls_context.set_remote_fingerprint(fp);
         }
-        // Update DTLS role: if callee chose "active", SBC must be "passive"
-        // If callee chose "passive", SBC must be "active"
-        // The DtlsContext role was set to ActPass at creation, but for the actual
-        // handshake we need to determine the concrete role from the callee's answer.
-        // Note: the dtls_context role is already ActPass; the actual client/server
-        // determination happens in perform_handshake based on the role.
+        // And the concrete DTLS role the answer leaves us: an offer of
+        // `actpass` stayed `ActPass`, which the handshake reads as
+        // "server", so a callee answering `passive` left both ends
+        // waiting for a ClientHello (RFC 5763 §5).
+        self.dtls_context
+            .resolve_role_from_answer(self.remote_info.dtls_role);
     }
 
     /// Generate SDP offer for outbound INVITE to WebRTC callee.
@@ -768,5 +768,72 @@ mod payload_type_tests {
         assert!(parsed.is_webrtc);
         assert_eq!(parsed.opus_pt, Some(DEFAULT_OPUS_PT));
         assert_eq!(parsed.telephone_event, Some((DEFAULT_DTMF_PT, 48000)));
+    }
+}
+
+#[cfg(test)]
+mod dtls_role_tests {
+    use super::*;
+
+    fn answer_with_setup(setup: &str) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             m=audio 50000 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 127.0.0.1\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=ice-ufrag:abcd\r\na=ice-pwd:0123456789abcdef\r\n\
+             a=fingerprint:sha-256 AA:BB:CC:DD\r\na=setup:{}\r\n\
+             a=rtcp-mux\r\na=sendrecv\r\n",
+            setup
+        )
+    }
+
+    /// RFC 5763 §5: the answerer picks active or passive, and the offerer
+    /// takes the complement. The SBC offers `actpass` and kept that role,
+    /// which `perform_handshake` reads as "not active" — so a callee that
+    /// answered `passive` left both ends waiting for a ClientHello and
+    /// the call was silent until the watchdog.
+    #[test]
+    fn the_offerers_role_follows_the_answer() {
+        for (answer, expected) in [
+            ("passive", DtlsRole::Active),
+            ("active", DtlsRole::Passive),
+            ("actpass", DtlsRole::Passive),
+        ] {
+            let mut session = WebRtcSession::new_for_offer("c1".to_string()).unwrap();
+            assert_eq!(
+                session.dtls_context.role(),
+                DtlsRole::ActPass,
+                "the offer leaves the choice open"
+            );
+            session.set_remote_sdp(&answer_with_setup(answer));
+            assert_eq!(
+                session.dtls_context.role(),
+                expected,
+                "answer a=setup:{} must leave us {:?}",
+                answer,
+                expected
+            );
+        }
+        // An answer with no a=setup at all: we take the server role, the
+        // only safe assumption for a peer that will initiate.
+        let mut session = WebRtcSession::new_for_offer("c2".to_string()).unwrap();
+        let no_setup = answer_with_setup("passive").replace("a=setup:passive\r\n", "");
+        session.set_remote_sdp(&no_setup);
+        assert_eq!(session.dtls_context.role(), DtlsRole::Passive);
+    }
+
+    /// And the answer's fingerprint reaches the context, which is what
+    /// the handshake authenticates against.
+    #[test]
+    fn the_answers_fingerprint_reaches_the_context() {
+        let mut session = WebRtcSession::new_for_offer("c3".to_string()).unwrap();
+        assert!(session.dtls_context.remote_fingerprint().is_none());
+        session.set_remote_sdp(&answer_with_setup("active"));
+        let fp = session
+            .dtls_context
+            .remote_fingerprint()
+            .expect("installed from the answer");
+        assert_eq!(fp.algorithm, "sha-256");
+        assert_eq!(fp.fingerprint, "AA:BB:CC:DD");
     }
 }

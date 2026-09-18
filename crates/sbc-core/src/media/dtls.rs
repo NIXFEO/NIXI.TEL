@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{debug, info};
 
 /// DTLS Role
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -252,6 +252,13 @@ impl DtlsContext {
         &self.local_fingerprint
     }
 
+    /// The fingerprint the signalling promised for the peer, if any. It is
+    /// what `perform_handshake` authenticates the certificate against, so
+    /// it must be installed before the handshake runs.
+    pub fn remote_fingerprint(&self) -> Option<&CertificateFingerprint> {
+        self.remote_fingerprint.as_ref()
+    }
+
     /// Perform real DTLS-SRTP handshake via webrtc-dtls crate.
     ///
     /// The `bridge` routes DTLS packets from the RTP socket to webrtc-dtls
@@ -459,6 +466,25 @@ impl DtlsContext {
     /// Get DTLS role
     pub fn role(&self) -> DtlsRole {
         self.role
+    }
+
+    /// Take the concrete role the peer's `a=setup` leaves us (RFC 5763
+    /// §5: the answerer chooses, the offerer takes the complement).
+    /// Without this an `actpass` offer stayed `ActPass`, which
+    /// `perform_handshake` reads as "not active", so a callee that
+    /// answered `passive` left both ends waiting for a ClientHello.
+    pub fn resolve_role_from_answer(&mut self, answer: Option<DtlsRole>) {
+        self.role = match answer {
+            // The peer will not initiate, so we must.
+            Some(DtlsRole::Passive) => DtlsRole::Active,
+            // The peer initiates (`active`), or left the choice to us
+            // (`actpass`, or said nothing): we are the server.
+            _ => DtlsRole::Passive,
+        };
+        debug!(
+            "DTLS role resolved to {:?} from the peer's {:?}",
+            self.role, answer
+        );
     }
 }
 
@@ -830,8 +856,7 @@ mod peer_verification_tests {
             crate::media::webrtc_handler::WebRtcSession::new("c1".to_string(), offer).unwrap();
         let fp = session
             .dtls_context
-            .remote_fingerprint
-            .as_ref()
+            .remote_fingerprint()
             .expect("the offer's fingerprint reached the DTLS context");
         assert_eq!(fp.algorithm, "sha-256");
         assert!(fp.fingerprint.starts_with("11:22:33:44"));

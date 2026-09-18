@@ -243,9 +243,23 @@ impl Readiness {
 /// Administrative teardown requests (`DELETE /api/v1/calls/{uuid}`). The
 /// API has no SIP transport: it queues the uuid here and the event loop
 /// ends the call properly (BYE/CANCEL on both legs, CDR "admin-kick").
+/// Why a queued teardown was asked for. The engine turns it into the
+/// call's CDR cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KickReason {
+    /// `DELETE /api/v1/calls/{uuid}`.
+    #[default]
+    Admin,
+    /// The media path cannot carry audio — a DTLS handshake the peer
+    /// failed to authenticate, so no SRTP keys were ever installed. The
+    /// call is answered and billed while every packet is dropped, so it
+    /// must not be left to the inactivity watchdog.
+    MediaUnavailable,
+}
+
 #[derive(Default)]
 pub struct AdminKicks {
-    queue: std::sync::Mutex<Vec<String>>,
+    queue: std::sync::Mutex<Vec<(String, KickReason)>>,
     notify: tokio::sync::Notify,
 }
 
@@ -256,16 +270,22 @@ impl AdminKicks {
 
     /// Queue a call for teardown and wake the event loop.
     pub fn request(&self, uuid: String) {
+        self.request_with(uuid, KickReason::Admin)
+    }
+
+    /// Same, with the cause the CDR should carry. Callable from a spawned
+    /// task, which has no `&mut Sbc` to end a call with.
+    pub fn request_with(&self, uuid: String, reason: KickReason) {
         if let Ok(mut q) = self.queue.lock() {
-            if !q.contains(&uuid) {
-                q.push(uuid);
+            if !q.iter().any(|(queued, _)| queued == &uuid) {
+                q.push((uuid, reason));
             }
         }
         self.notify.notify_one();
     }
 
-    /// Take every queued uuid.
-    pub fn drain(&self) -> Vec<String> {
+    /// Take every queued teardown.
+    pub fn drain(&self) -> Vec<(String, KickReason)> {
         self.queue
             .lock()
             .map(|mut q| std::mem::take(&mut *q))
@@ -274,7 +294,10 @@ impl AdminKicks {
 
     /// Queued uuids (not yet processed by the engine).
     pub fn pending(&self) -> Vec<String> {
-        self.queue.lock().map(|q| q.clone()).unwrap_or_default()
+        self.queue
+            .lock()
+            .map(|q| q.iter().map(|(uuid, _)| uuid.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// Resolves when a request was queued (permit-based: never misses one).

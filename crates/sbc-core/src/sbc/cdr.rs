@@ -479,15 +479,23 @@ impl Sbc {
     /// `DELETE /api/v1/calls/{uuid}`: end the queued calls on the wire and
     /// write their CDR ("admin-kick").
     pub(crate) async fn process_admin_kicks(&mut self) {
-        for uuid in self.admin_kicks.drain() {
+        for (uuid, reason) in self.admin_kicks.drain() {
             let span = self.call_span_for_uuid(&uuid).await;
             async {
-                let outcome = CallOutcome::AdminKick;
+                let outcome = match reason {
+                    super::KickReason::Admin => CallOutcome::AdminKick,
+                    super::KickReason::MediaUnavailable => CallOutcome::MediaUnavailable,
+                };
+                let what = outcome.disconnect_reason();
                 self.hangup_both_legs(&uuid, &outcome).await;
                 if self.finish_call(&uuid, outcome).await {
-                    info!("Admin kick: call {} ended", &uuid[..8.min(uuid.len())]);
+                    info!(
+                        "Queued teardown ({}): call {} ended",
+                        what,
+                        &uuid[..8.min(uuid.len())]
+                    );
                 } else {
-                    debug!("Admin kick: call {} already gone", uuid);
+                    debug!("Queued teardown ({}): call {} already gone", what, uuid);
                 }
             }
             .instrument(span)

@@ -455,6 +455,8 @@ impl Sbc {
                                             self.b2bua.get_webrtc_session(&uuid).await;
                                         if let Some(ws) = webrtc_session {
                                             let media_id_dtls = media_id.clone();
+                                            let kicks_a = self.admin_kicks.clone();
+                                            let uuid_dtls_a = uuid.clone();
                                             let srtp_recv_shared = winfo.srtp_recv_ctx_a;
                                             let srtp_send_shared = winfo.srtp_send_ctx_a;
 
@@ -524,10 +526,39 @@ impl Sbc {
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        error!("DTLS handshake failed for media session {}: {}", media_id_dtls, e);
+                                                        // No SRTP keys means the relay drops
+                                                        // every packet: the call is answered
+                                                        // and billed while nobody can hear
+                                                        // anything. End it now with a real
+                                                        // cause instead of waiting 90 s for
+                                                        // the inactivity watchdog, the same
+                                                        // way a relay that fails to start is
+                                                        // handled.
+                                                        error!("DTLS handshake failed for media session {}: {} — ending the call", media_id_dtls, e);
+                                                        kicks_a.request_with(
+                                                            uuid_dtls_a.clone(),
+                                                            crate::sbc::KickReason::MediaUnavailable,
+                                                        );
                                                     }
                                                 }
                                             }.instrument(tracing::Span::current()));
+                                        }
+                                    }
+
+                                    // ── The callee's SDP must reach its session BEFORE the
+                                    //    handshake task can take its lock ──
+                                    // That task holds the session for the whole handshake (up
+                                    // to 15 s) and reads `remote_fingerprint`, which is what
+                                    // authenticates the peer: installing it afterwards is a
+                                    // race the spawned task usually wins, and losing it now
+                                    // means a refused handshake and a silent call. Leg A has
+                                    // had this ordering since it was written.
+                                    if let Some(ref csdp) = callee_sdp_str {
+                                        if let Some(ws_b) =
+                                            self.b2bua.get_webrtc_session_b(&uuid).await
+                                        {
+                                            ws_b.lock().await.set_remote_sdp(csdp);
+                                            debug!("WebRTC session B: remote SDP set before the DTLS handshake");
                                         }
                                     }
 
@@ -537,6 +568,8 @@ impl Sbc {
                                             self.b2bua.get_webrtc_session_b(&uuid).await;
                                         if let Some(ws_b) = webrtc_session_b {
                                             let media_id_dtls_b = media_id.clone();
+                                            let kicks_b = self.admin_kicks.clone();
+                                            let uuid_dtls_b = uuid.clone();
                                             let srtp_recv_shared_b = winfo_b.srtp_recv_ctx_b;
                                             let srtp_send_shared_b = winfo_b.srtp_send_ctx_b;
 
@@ -576,7 +609,11 @@ impl Sbc {
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        error!("DTLS handshake failed for leg-B media session {}: {}", media_id_dtls_b, e);
+                                                        error!("DTLS handshake failed for leg-B media session {}: {} — ending the call", media_id_dtls_b, e);
+                                                        kicks_b.request_with(
+                                                            uuid_dtls_b.clone(),
+                                                            crate::sbc::KickReason::MediaUnavailable,
+                                                        );
                                                     }
                                                 }
                                             }.instrument(tracing::Span::current()));
@@ -608,27 +645,10 @@ impl Sbc {
                         // Leg-B port is what the caller will send RTP to (callee side of the proxy).
                         let mut response_to_relay = response;
 
-                        // ── Phase 13: Process callee WebRTC INDEPENDENTLY of caller type ──
-                        // When callee is WebRTC, we MUST set_remote_sdp() on leg-B session
-                        // regardless of whether the caller is also WebRTC. Previously this
-                        // was inside an `else` branch and skipped for WebRTC→WebRTC calls.
+                        // The leg-B session already has the callee's SDP: it is
+                        // installed above, before the handshake task is spawned,
+                        // because that task reads the fingerprint it carries.
                         let callee_is_webrtc = self.b2bua.is_callee_webrtc(&uuid).await;
-                        if callee_is_webrtc && !response_to_relay.body.is_empty() {
-                            if let Ok(callee_webrtc_sdp) =
-                                std::str::from_utf8(&response_to_relay.body)
-                            {
-                                debug!("200 OK from WebRTC callee — SDP:\n{}", callee_webrtc_sdp);
-
-                                // Set remote SDP on the WebRTC session for leg-B (DTLS needs this)
-                                let ws_b = self.b2bua.get_webrtc_session_b(&uuid).await;
-                                if let Some(ws) = ws_b {
-                                    let mut sess = ws.lock().await;
-                                    sess.set_remote_sdp(callee_webrtc_sdp);
-                                    drop(sess);
-                                    debug!("WebRTC session B: remote SDP set from callee 200 OK");
-                                }
-                            }
-                        }
 
                         // ── Decide which SDP to send to the caller ──
                         let is_webrtc_call = self.b2bua.is_caller_webrtc(&uuid).await;

@@ -162,6 +162,34 @@ Two were critical, both in the work that had just been written.
   make progress. It also restores the leading-CRLF skip (RFC 3261 §7.5)
   that the shared version had dropped, so a softphone keepalive no longer
   swallows the message behind it.
+- **The callee's fingerprint reaches its DTLS context before the
+  handshake runs.** The leg-B handshake task takes the session lock and
+  holds it for the whole handshake, while the main path installed the
+  answer's fingerprint several `await`s later — a race the task usually
+  won, and which the new verification turned from harmless into a refused
+  handshake and a silent call. Leg A had that ordering from the start;
+  leg B now has it too.
+- **A refused DTLS handshake ends the call** instead of logging and
+  leaving it answered, billed and mute until the 90 s inactivity
+  watchdog. The handshake task has no way to end a call itself, so it
+  queues the teardown with its own cause on the queue
+  `DELETE /api/v1/calls/{uuid}` already uses, and the CDR says
+  `media-unavailable`.
+- **An `actpass` offer now takes the concrete role the answer leaves it**
+  (RFC 5763 §5). It stayed `ActPass`, which the handshake reads as
+  "server", so a callee answering `passive` left both ends waiting for a
+  ClientHello.
+- **A DTMF event crossing clock rates is rescaled.** The relay's DTMF
+  branch rewrote only the payload type, skipping the timestamp rewrite
+  the voice path gets — and an RFC 4733 duration is in the stream's own
+  clock units (§2.3.4), so between PCMA/8000 and Opus/48000 the far end
+  saw a digit six times too short. Harmless until this batch started
+  offering `telephone-event/48000`; now the timestamp and the duration
+  both go through the same map, saturating rather than wrapping.
+- SRTP failures on the callee leg are counted and no longer log per
+  packet: two decrypt paths dropped silently as far as the per-call
+  counters were concerned, and three logged at `warn` on a path the
+  logging rules reserve for `debug`.
 - **The SRTP rollover counter no longer trades a live stream for a new
   one, and no longer underflows.** Three defects in the counter added
   above, all found by the review:

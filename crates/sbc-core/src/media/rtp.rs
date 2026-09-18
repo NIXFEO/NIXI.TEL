@@ -326,6 +326,46 @@ impl TimestampMap {
         }
     }
 
+    /// Rewrite one RFC 4733 event for a leg whose clock runs at another
+    /// rate: the RTP timestamp through this same map, and the event's own
+    /// **duration**, which §2.3.4 expresses in the stream's clock units.
+    ///
+    /// Without it the DTMF branch skipped the rewrite the voice path
+    /// gets, so an event relayed between PCMA/8000 and Opus/48000 kept
+    /// the source leg's timestamp and a duration six times wrong — a
+    /// digit the far end plays for a sixth of its length, or six times
+    /// it. Harmless until the SBC started negotiating
+    /// `telephone-event/48000`, because nothing on the other side had a
+    /// payload type to send one on.
+    fn rescale_event(
+        &mut self,
+        packet: &mut [u8],
+        src_rate: u32,
+        dst_rate: u32,
+    ) -> Option<(u32, u16)> {
+        if src_rate == dst_rate || src_rate == 0 || dst_rate == 0 {
+            return None;
+        }
+        if packet.len() < 12 {
+            return None;
+        }
+        let old_ts = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let new_ts = self.map(old_ts, src_rate, dst_rate);
+        packet[4..8].copy_from_slice(&new_ts.to_be_bytes());
+
+        // The event payload is 4 bytes: event, E|R|volume, duration(16).
+        let header_len = rtp_header_length(packet);
+        let mut new_duration = 0u16;
+        if header_len > 0 && packet.len() >= header_len + 4 {
+            let at = header_len + 2;
+            let old = u16::from_be_bytes([packet[at], packet[at + 1]]);
+            let scaled = (u64::from(old) * u64::from(dst_rate)) / u64::from(src_rate);
+            new_duration = scaled.min(u64::from(u16::MAX)) as u16;
+            packet[at..at + 2].copy_from_slice(&new_duration.to_be_bytes());
+        }
+        Some((new_ts, new_duration))
+    }
+
     fn map(&mut self, ts: u32, src_rate: u32, dst_rate: u32) -> u32 {
         if src_rate == dst_rate || dst_rate == 0 || src_rate == 0 {
             return ts;
@@ -1167,6 +1207,19 @@ impl RtpSession {
                                                 }
                                             }
                                         }
+                                        // An event is not transcoded, but it is still on the
+                                        // far leg's clock: rewrite its timestamp and duration
+                                        // like the voice path does (RFC 4733 §2.3.4).
+                                        if is_dtmf {
+                                            if let Some((ts, dur)) = ts_map_a_to_b.rescale_event(
+                                                &mut data,
+                                                tc.src.clock_rate(),
+                                                tc.dst.clock_rate(),
+                                            ) {
+                                                debug!("RTP A→B: DTMF rescaled to TS {} duration {} (rate {}→{})",
+                                                    ts, dur, tc.src.clock_rate(), tc.dst.clock_rate());
+                                            }
+                                        }
                                         debug!("RTP A→B: relaying DTMF/CN PT {} ({} bytes)", data[1] & 0x7F, data.len());
                                         // Skip transcoding — packet goes straight to SRTP encrypt + send
                                     } else {
@@ -1270,7 +1323,7 @@ impl RtpSession {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SRTP B (DTLS) encrypt error: {} (dropping packet)", e);
+                                            debug!("SRTP B (DTLS) encrypt error: {} (dropping packet)", e);
                                             media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
@@ -1545,7 +1598,8 @@ impl RtpSession {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SRTP B (DTLS) decrypt error: {} (dropping packet)", e);
+                                            debug!("SRTP B (DTLS) decrypt error: {} (dropping packet)", e);
+                                            media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
                                     }
@@ -1568,7 +1622,8 @@ impl RtpSession {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SRTP B decrypt error: {} (dropping packet)", e);
+                                            debug!("SRTP B decrypt error: {} (dropping packet)", e);
+                                            media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
                                     }
@@ -1600,6 +1655,17 @@ impl RtpSession {
                                                     debug!("RTP B→A: DTMF PT re-map {} → {}", actual_pt_b, dst_pt);
                                                     data[1] = (data[1] & 0x80) | dst_pt;
                                                 }
+                                            }
+                                        }
+                                        // Same on the way back.
+                                        if is_dtmf_b {
+                                            if let Some((ts, dur)) = ts_map_b_to_a.rescale_event(
+                                                &mut data,
+                                                tc.src.clock_rate(),
+                                                tc.dst.clock_rate(),
+                                            ) {
+                                                debug!("RTP B→A: DTMF rescaled to TS {} duration {} (rate {}→{})",
+                                                    ts, dur, tc.src.clock_rate(), tc.dst.clock_rate());
                                             }
                                         }
                                         debug!("RTP B→A: relaying DTMF/CN PT {} ({} bytes)", data[1] & 0x7F, data.len());
@@ -2439,5 +2505,100 @@ mod ice_auth_tests {
             "the authenticated peer is the endpoint"
         );
         assert_eq!(stats.drops(DropReason::IceAuth), 2, "no new refusal");
+    }
+}
+
+#[cfg(test)]
+mod dtmf_rescale_tests {
+    use super::*;
+
+    /// One RFC 4733 event packet: 12-byte header plus event, flags and a
+    /// 16-bit duration.
+    fn event(pt: u8, ts: u32, duration: u16) -> Vec<u8> {
+        let mut p = vec![0x80, pt, 0x00, 0x01];
+        p.extend_from_slice(&ts.to_be_bytes());
+        p.extend_from_slice(&0x1234_5678u32.to_be_bytes()); // ssrc
+        p.push(5); // event: digit "5"
+        p.push(10); // volume, E=0
+        p.extend_from_slice(&duration.to_be_bytes());
+        p
+    }
+
+    fn duration_of(packet: &[u8]) -> u16 {
+        u16::from_be_bytes([packet[14], packet[15]])
+    }
+
+    /// The DTMF branch relayed an event with only its payload type
+    /// rewritten, skipping the timestamp rewrite the voice path gets. Its
+    /// duration is in the *stream's* clock units (RFC 4733 §2.3.4), so
+    /// between PCMA/8000 and Opus/48000 the far end saw a digit six times
+    /// too short — and it started to matter the moment the SBC began
+    /// offering `telephone-event/48000`.
+    #[test]
+    fn an_event_crossing_clock_rates_is_rescaled() {
+        let mut map = TimestampMap::new();
+        // 160 ms at 8 kHz = 1280 units.
+        let mut packet = event(101, 8000, 1280);
+        let (ts, duration) = map
+            .rescale_event(&mut packet, 8000, 48000)
+            .expect("rates differ");
+        assert_eq!(duration, 1280 * 6, "160 ms is 7680 units at 48 kHz");
+        assert_eq!(duration_of(&packet), duration, "written into the payload");
+        assert_eq!(
+            u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+            ts,
+            "and the timestamp too"
+        );
+
+        // A later event in the same stream advances by the scaled delta.
+        let mut next = event(101, 8000 + 800, 1280); // 100 ms later
+        let (ts2, _) = map.rescale_event(&mut next, 8000, 48000).unwrap();
+        assert_eq!(
+            ts2.wrapping_sub(ts),
+            800 * 6,
+            "the delta is scaled, not the absolute value"
+        );
+    }
+
+    #[test]
+    fn an_event_between_equal_rates_is_left_alone() {
+        let mut map = TimestampMap::new();
+        let original = event(101, 4242, 640);
+        let mut packet = original.clone();
+        assert!(
+            map.rescale_event(&mut packet, 8000, 8000).is_none(),
+            "nothing to do"
+        );
+        assert_eq!(packet, original, "not one byte changed");
+        // And an unknown rate is left alone rather than divided by zero.
+        let mut packet = original.clone();
+        assert!(map.rescale_event(&mut packet, 8000, 0).is_none());
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn a_duration_that_would_overflow_saturates() {
+        let mut map = TimestampMap::new();
+        let mut packet = event(101, 0, u16::MAX);
+        let (_, duration) = map.rescale_event(&mut packet, 8000, 48000).unwrap();
+        assert_eq!(duration, u16::MAX, "clamped, not wrapped");
+        assert_eq!(duration_of(&packet), u16::MAX);
+    }
+
+    #[test]
+    fn a_truncated_event_keeps_its_timestamp_rewrite_and_nothing_else() {
+        let mut map = TimestampMap::new();
+        // Header only: no event payload to rescale.
+        let mut packet = event(101, 8000, 1280);
+        packet.truncate(12);
+        let (ts, duration) = map.rescale_event(&mut packet, 8000, 48000).unwrap();
+        assert_eq!(duration, 0, "no payload, no duration");
+        assert_eq!(
+            u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+            ts
+        );
+        // Shorter than an RTP header: refused outright.
+        let mut stub = vec![0x80u8, 101, 0, 1];
+        assert!(map.rescale_event(&mut stub, 8000, 48000).is_none());
     }
 }

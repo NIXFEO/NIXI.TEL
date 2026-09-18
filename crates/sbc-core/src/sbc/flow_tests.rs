@@ -3834,3 +3834,44 @@ async fn two_hundred_calls_fit_in_the_event_loop() {
         per_parse
     );
 }
+
+/// A DTLS handshake the peer cannot authenticate leaves no SRTP keys, so
+/// the relay drops every packet: the call is answered and billed while
+/// nobody hears anything. It used to sit there until the 90 s inactivity
+/// watchdog, with only an `error!` line. The handshake task has no
+/// `&mut Sbc`, so it queues the teardown with its own cause, the same
+/// queue `DELETE /api/v1/calls/{uuid}` uses.
+#[tokio::test]
+async fn a_media_unavailable_teardown_ends_the_call_with_its_own_cause() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+
+    let kicks = sbc.admin_kicks();
+    kicks.request_with(call.uuid.clone(), crate::sbc::KickReason::MediaUnavailable);
+    assert_eq!(kicks.pending().len(), 1);
+    sbc.process_admin_kicks().await;
+    assert!(kicks.pending().is_empty());
+
+    // Both legs get a BYE, as with any other teardown.
+    let to_caller = drain(&mut call.caller_rx);
+    assert_eq!(to_caller.len(), 1, "{:?}", to_caller);
+    assert!(to_caller[0].starts_with("BYE "), "{}", to_caller[0]);
+    assert!(drain(&mut call.callee_rx)
+        .iter()
+        .any(|m| m.starts_with("BYE ")));
+
+    // And the CDR says why, rather than blaming the administrator or the
+    // media timeout.
+    let cdr = sbc.cdr.get_recent(1).await.unwrap().pop().expect("one CDR");
+    assert_eq!(cdr.disconnect_reason, "media-unavailable");
+    // The call *was* answered, so the caller's INVITE really did get a
+    // 200: the reason is what says the media never worked.
+    assert_eq!(cdr.sip_code, Some(200));
+    assert!(cdr.answered_at.is_some());
+    assert!(
+        sbc.b2bua.calls_locked().await.is_empty(),
+        "the call is released"
+    );
+    assert_eq!(sbc.media.stats().allocated_ports, 0, "and its ports too");
+}
