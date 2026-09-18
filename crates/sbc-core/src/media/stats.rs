@@ -217,6 +217,11 @@ pub struct CallMediaStats {
     /// the inactivity watchdog's input. A packet that arrives but dies at
     /// the transcoder or the SRTP layer must not keep a dead call alive.
     last_relay_ms: AtomicU64,
+    /// Audio packets delivered, either direction. Only this decides
+    /// whether the call ever carried media: RTCP and ICE keepalives are
+    /// delivered too, and a call kept "alive" by them is a silent call
+    /// being billed.
+    audio_delivered: AtomicU64,
 }
 
 impl Default for CallMediaStats {
@@ -233,6 +238,7 @@ impl CallMediaStats {
             callee: LegStats::default(),
             drops: Default::default(),
             last_relay_ms: AtomicU64::new(0),
+            audio_delivered: AtomicU64::new(0),
         }
     }
 
@@ -262,11 +268,24 @@ impl CallMediaStats {
         self.leg(leg).note_rx(data.len(), at, ssrc, seq);
     }
 
-    /// A packet was delivered to `leg`'s peer.
+    /// An **audio** packet was delivered to `leg`'s peer. This is the
+    /// only thing that refreshes the inactivity watchdog.
     pub fn note_tx(&self, leg: Leg, len: usize) {
         let at = self.now_ms();
         self.leg(leg).note_tx(len, at);
         self.last_relay_ms.store(at, Ordering::Relaxed);
+        self.audio_delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A non-audio datagram (RTCP, ICE, DTLS) was relayed to `leg`'s peer:
+    /// counted, but it must not keep a silent call alive — a keepalive
+    /// from a dead call's far end would otherwise hold it to
+    /// `max_call_duration`, billed.
+    pub fn note_tx_non_audio(&self, leg: Leg, len: usize) {
+        self.leg(leg).tx_packets.fetch_add(1, Ordering::Relaxed);
+        self.leg(leg)
+            .tx_bytes
+            .fetch_add(len as u64, Ordering::Relaxed);
     }
 
     /// An RTCP datagram relayed for `leg` (not audio: it must not keep
@@ -318,14 +337,15 @@ impl CallMediaStats {
     /// before the first one (the caller decides what to do with a session
     /// that never carried anything).
     pub fn since_last_relay_ms(&self) -> Option<u64> {
-        let last = self.last_relay_ms.load(Ordering::Relaxed);
-        if last == 0
-            && self.caller.tx_packets.load(Ordering::Relaxed) == 0
-            && self.callee.tx_packets.load(Ordering::Relaxed) == 0
-        {
+        // Audio only: RTCP and ICE keepalives are delivered too, and a
+        // call kept "alive" by them is a silent call being billed.
+        if self.audio_delivered.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        Some(self.now_ms().saturating_sub(last))
+        Some(
+            self.now_ms()
+                .saturating_sub(self.last_relay_ms.load(Ordering::Relaxed)),
+        )
     }
 
     /// Idle time for the inactivity watchdog: since the last delivered
@@ -495,6 +515,32 @@ mod tests {
         s.note_rx(Leg::Callee, &packet(2, 1));
         s.note_tx(Leg::Caller, 172);
         assert_eq!(s.one_way_leg(10_000), None);
+    }
+
+    /// RTCP, ICE and DTLS are relayed but must not hold a silent call
+    /// open: a keepalive from a dead call's far end would otherwise keep
+    /// it billed to `max_call_duration`.
+    #[test]
+    fn a_non_audio_datagram_does_not_refresh_the_watchdog() {
+        let s = CallMediaStats::new();
+        s.note_rtcp(Leg::Caller);
+        s.note_tx_non_audio(Leg::Callee, 60);
+        s.note_passthrough(Leg::Caller);
+        s.note_tx_non_audio(Leg::Callee, 20);
+        assert!(
+            s.since_last_relay_ms().is_none(),
+            "no audio has been delivered yet"
+        );
+        assert_eq!(
+            s.callee.tx_packets.load(Ordering::Relaxed),
+            2,
+            "still counted"
+        );
+        assert_eq!(s.caller.rtcp_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(s.caller.passthrough_packets.load(Ordering::Relaxed), 1);
+
+        s.note_tx(Leg::Callee, 172);
+        assert!(s.since_last_relay_ms().is_some(), "audio does refresh it");
     }
 
     #[test]

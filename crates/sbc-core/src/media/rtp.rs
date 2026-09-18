@@ -949,7 +949,8 @@ impl RtpSession {
                                 .ssrc
                                 .load(Ordering::Relaxed);
                             let quiet_for = media_stats.quiet_for(Leg::Caller);
-                            match classify_media_input(&data, webrtc_mode_a) {
+                            let input_class = classify_media_input(&data, webrtc_mode_a);
+                            match input_class {
                                 MediaInput::Rtp => media_stats.note_rx(Leg::Caller, &data),
                                 MediaInput::Rtcp => media_stats.note_rtcp(Leg::Caller),
                                 MediaInput::Passthrough => media_stats.note_passthrough(Leg::Caller),
@@ -1251,7 +1252,12 @@ impl RtpSession {
                                 } else {
                                     stats.packets_a_to_b.fetch_add(1, Ordering::Relaxed);
                                     stats.bytes_a_to_b.fetch_add(out_len as u64, Ordering::Relaxed);
-                                    media_stats.note_tx(Leg::Callee, out_len);
+                                    // Only audio refreshes the watchdog.
+                                    if input_class == MediaInput::Rtp {
+                                        media_stats.note_tx(Leg::Callee, out_len);
+                                    } else {
+                                        media_stats.note_tx_non_audio(Leg::Callee, out_len);
+                                    }
                                     if let Some(ref c) = global_rtp_counter {
                                         c.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -1355,7 +1361,8 @@ impl RtpSession {
                                 .ssrc
                                 .load(Ordering::Relaxed);
                             let quiet_for = media_stats.quiet_for(Leg::Callee);
-                            match classify_media_input(&data, webrtc_mode_b) {
+                            let input_class = classify_media_input(&data, webrtc_mode_b);
+                            match input_class {
                                 MediaInput::Rtp => media_stats.note_rx(Leg::Callee, &data),
                                 MediaInput::Rtcp => media_stats.note_rtcp(Leg::Callee),
                                 MediaInput::Passthrough => media_stats.note_passthrough(Leg::Callee),
@@ -1639,7 +1646,12 @@ impl RtpSession {
                                 } else {
                                     stats.packets_b_to_a.fetch_add(1, Ordering::Relaxed);
                                     stats.bytes_b_to_a.fetch_add(out_len as u64, Ordering::Relaxed);
-                                    media_stats.note_tx(Leg::Caller, out_len);
+                                    // Only audio refreshes the watchdog.
+                                    if input_class == MediaInput::Rtp {
+                                        media_stats.note_tx(Leg::Caller, out_len);
+                                    } else {
+                                        media_stats.note_tx_non_audio(Leg::Caller, out_len);
+                                    }
                                     if let Some(ref c) = global_rtp_counter {
                                         c.fetch_add(1, Ordering::Relaxed);
                                     }
