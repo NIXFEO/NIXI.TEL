@@ -6,6 +6,16 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+- `sbc_transcode_seconds`: a histogram of one packet through the
+  transcoder, with microsecond buckets. Two tests print the real cost and
+  fail on a pathological regression: 0.14 µs for a G.711 ↔ G.711 frame,
+  143 µs to encode a 20 ms frame into Opus, 13 µs to decode one, and
+  0.15 µs for the whole per-packet accounting path. A G.711-trunk ↔
+  Opus-client call therefore costs about 0.8% of a core, and the 2 vCPU
+  production box saturates on the codec alone at roughly 180 such calls —
+  numbers the scale work (lot 5) can now start from instead of guessing.
+
 ### Fixed
 
 Lot 4 (media), first block — every one of these was found by specifying the

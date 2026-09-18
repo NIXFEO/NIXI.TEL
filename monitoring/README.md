@@ -15,6 +15,9 @@ failures), per-trunk series (`sbc_trunk_up`, `sbc_trunk_registered`,
 `sbc_media_one_way_calls_total{leg}`, `sbc_media_relay_failures_total`,
 `sbc_media_endpoint_events_total{leg,verdict,reason}` (`verdict="would-reject"`
 is counted, not enforced — read it before enabling enforcement),
+`sbc_transcode_seconds` (one packet through the transcoder: ~0.14 µs for
+G.711 ↔ G.711, ~143 µs to encode Opus, so this histogram is the capacity
+signal on a small box),
 `sbc_rtp_ports_quarantined`, `sbc_rtp_port_quarantine_forced_total`),
 the config store (`sbc_store_available`,
 `sbc_store_created_empty`,

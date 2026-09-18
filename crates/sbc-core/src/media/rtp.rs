@@ -1102,7 +1102,14 @@ impl RtpSession {
                                             debug!("Transcode A→B #{}: src_pt={} payload={} bytes hdr={} total={}",
                                                 ab_debug + 1, actual_pt, payload_len, header_len, data.len());
                                         }
-                                        match tc.transcode(&payload_vec) {
+                                        let transcode_started = std::time::Instant::now();
+                                        let transcoded = tc.transcode(&payload_vec);
+                                        if let Some(ref m) = metrics {
+                                            m.transcode_seconds.observe_secs(
+                                                transcode_started.elapsed().as_secs_f64(),
+                                            );
+                                        }
+                                        match transcoded {
                                             Ok(transcoded) => {
                                                 if ab_debug < 5 {
                                                     debug!("Transcode A→B #{}: {} → {} ({} → {} bytes)",
@@ -1502,7 +1509,14 @@ impl RtpSession {
                                             continue;
                                         }
                                         let payload_vec = data[header_len..].to_vec();
-                                        match tc.transcode(&payload_vec) {
+                                        let transcode_started = std::time::Instant::now();
+                                        let transcoded = tc.transcode(&payload_vec);
+                                        if let Some(ref m) = metrics {
+                                            m.transcode_seconds.observe_secs(
+                                                transcode_started.elapsed().as_secs_f64(),
+                                            );
+                                        }
+                                        match transcoded {
                                             Ok(transcoded) => {
                                                 // Rebuild RTP with 12-byte header (strip any extensions)
                                                 let mut new_pkt = Vec::with_capacity(12 + transcoded.len());

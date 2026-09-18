@@ -28,6 +28,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const SETUP_BUCKETS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 180.0,
 ];
+/// Upper bounds (seconds) of `sbc_transcode_seconds`: one packet through
+/// the transcoder. A 20 ms frame must cost far less than 20 ms or the
+/// relay falls behind, so the buckets live in the microsecond range.
+pub const TRANSCODE_BUCKETS: &[f64] = &[
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05,
+];
 /// Upper bounds (seconds) of `sbc_call_duration_seconds`: answer → end.
 pub const DURATION_BUCKETS: &[f64] = &[
     1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0,
@@ -289,6 +295,8 @@ pub struct SbcMetrics {
     pub store_backup_failures_total: Arc<AtomicU64>,
     /// INVITE forwarded → final answer, answered calls only.
     pub call_setup_seconds: Histogram,
+    /// One packet through the transcoder (the hot path's own cost).
+    pub transcode_seconds: Histogram,
     /// Answer → end (the billable window).
     pub call_duration_seconds: Histogram,
     /// Uptime start timestamp (Unix seconds)
@@ -362,6 +370,7 @@ impl SbcMetrics {
             store_backup_last_bytes: Arc::new(AtomicU64::new(0)),
             store_backup_failures_total: Arc::new(AtomicU64::new(0)),
             call_setup_seconds: Histogram::new(SETUP_BUCKETS),
+            transcode_seconds: Histogram::new(TRANSCODE_BUCKETS),
             call_duration_seconds: Histogram::new(DURATION_BUCKETS),
             start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1223,6 +1232,11 @@ impl SbcMetrics {
             &mut out,
             "sbc_call_duration_seconds",
             "Answer to end of call (billable window)",
+        );
+        self.transcode_seconds.render(
+            &mut out,
+            "sbc_transcode_seconds",
+            "One packet through the transcoder (Opus <-> G.711)",
         );
 
         // ── Media counters ────────────────────────────────────────────────────

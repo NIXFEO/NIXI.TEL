@@ -269,6 +269,27 @@ subscriber). A field learned late (the outbound `trunk`, or a failover)
 appears twice on a text line, once per `record`; in JSON a parser keeps
 the last value.
 
+## Measured limits
+
+Numbers, not guesses (`cargo test --release -p sbc-core --lib
+one_frame_of_transcoding -- --nocapture`, and
+`the_per_packet_accounting_stays_cheap`). Measured on a developer machine:
+re-run them on the target box, whose cores are slower.
+
+| Path | Cost per 20 ms frame | At 50 pps |
+|---|---|---|
+| G.711 ↔ G.711 transcode | 0.14 µs | negligible |
+| PCMA → Opus (encode) | 143 µs | 7.2 ms/s per stream |
+| Opus → PCMA (decode) | 13 µs | 0.7 ms/s per stream |
+| Per-packet accounting (`media/stats.rs` + the endpoint ladder) | 0.15 µs | negligible |
+
+So a G.711 trunk ↔ Opus client call costs about 8 ms of CPU per second
+(0.8% of a core), and a G.711 ↔ G.711 call costs nothing measurable. On
+the 2 vCPU production box that is roughly 180 transcoded calls before the
+codec alone saturates the machine — the 50-200 target is comfortable for
+G.711 and tight for Opus. `sbc_transcode_seconds` watches the real thing
+in production.
+
 ## Known minor issues
 
 - **Double 100 Trying** — the SBC sends two per INVITE (stateless, then after

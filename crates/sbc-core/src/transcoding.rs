@@ -904,6 +904,55 @@ pub fn build_opus_sdp(local_ip: &str, rtp_port: u16) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    /// What a transcoded call actually costs on the relay task. A 20 ms
+    /// frame must cost far less than 20 ms of CPU or the relay falls
+    /// behind; this prints the real numbers (the ones lot 5 needs before
+    /// touching any hot path) and fails only on a pathological
+    /// regression.
+    #[test]
+    fn one_frame_of_transcoding_is_far_cheaper_than_its_own_duration() {
+        const N: u32 = 2_000;
+        let g711 = vec![0xd5u8; 160]; // 20 ms of PCMA
+                                      // A real Opus frame to feed the decode direction.
+        let opus_frame = Transcoder::new(Codec::Pcma, Codec::Opus)
+            .expect("encoder")
+            .transcode(&g711)
+            .expect("encodes");
+        for (label, src, dst, input) in [
+            ("pcma→pcmu", Codec::Pcma, Codec::Pcmu, &g711),
+            ("pcma→opus (encode)", Codec::Pcma, Codec::Opus, &g711),
+            ("opus→pcma (decode)", Codec::Opus, Codec::Pcma, &opus_frame),
+        ] {
+            let tc = match Transcoder::new(src, dst) {
+                Ok(tc) => tc,
+                Err(e) => panic!("{}: {}", label, e),
+            };
+            let started = std::time::Instant::now();
+            let mut out = 0usize;
+            for _ in 0..N {
+                out += tc.transcode(input).expect("transcodes").len();
+            }
+            let per_frame = started.elapsed() / N;
+            println!(
+                "{}: {:?} per 20 ms frame ({} bytes out)",
+                label,
+                per_frame,
+                out / N as usize
+            );
+            assert!(
+                per_frame < std::time::Duration::from_millis(20),
+                "{} costs {:?} per 20 ms frame: the relay cannot keep up",
+                label,
+                per_frame
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod codec_identity_tests {
     use super::*;
 
