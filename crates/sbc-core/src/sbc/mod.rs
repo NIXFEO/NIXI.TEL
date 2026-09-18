@@ -1825,9 +1825,9 @@ impl Sbc {
         self.metrics.inc_sip_response(200);
         let response = self.router.handle_local_request(request)?;
         let data = response.to_string().into_bytes();
-        self.transport
-            .reply(&data, source, transport, reply_tx)
-            .await
+        self.send_sip("200 → OPTIONS", &data, source, transport, reply_tx)
+            .await;
+        Ok(())
     }
 
     /// Handle REGISTER with optional Digest 401 challenge
@@ -1857,10 +1857,9 @@ impl Sbc {
                         let challenge = auth.generate_challenge().await;
                         let response_401 = build_register_401(request, &challenge)?;
                         let data = response_401.to_string().into_bytes();
-                        return self
-                            .transport
-                            .reply(&data, source, transport, reply_tx)
+                        self.send_sip("401 → REGISTER", &data, source, transport, reply_tx)
                             .await;
+                        return Ok(());
                     }
                     Some(ref auth_value) => {
                         // Verify the credentials. The fingerprint lets a
@@ -1990,10 +1989,9 @@ impl Sbc {
                     self.metrics.inc_sip_response(400);
                     let r400 = build_plain_response_for_request(request, 400, "Bad Request")?;
                     let data = r400.to_string().into_bytes();
-                    return self
-                        .transport
-                        .reply(&data, source, transport, reply_tx)
+                    self.send_sip("400 → REGISTER", &data, source, transport, reply_tx)
                         .await;
+                    return Ok(());
                 }
             }
         }
@@ -2085,9 +2083,9 @@ impl Sbc {
                 self.metrics.inc_sip_response(200);
                 let response_200 = build_register_200(request, &bindings, granted)?;
                 let data = response_200.to_string().into_bytes();
-                self.transport
-                    .reply(&data, source, transport, reply_tx)
-                    .await
+                self.send_sip("200 → REGISTER", &data, source, transport, reply_tx)
+                    .await;
+                Ok(())
             }
             Ok(crate::register::RegisterResult::IntervalTooBrief { min_expires }) => {
                 info!(
@@ -2106,18 +2104,18 @@ impl Sbc {
                         )));
                 }
                 let data = r423.to_string().into_bytes();
-                self.transport
-                    .reply(&data, source, transport, reply_tx)
-                    .await
+                self.send_sip("423 → REGISTER", &data, source, transport, reply_tx)
+                    .await;
+                Ok(())
             }
             Ok(crate::register::RegisterResult::BadRequest(why)) => {
                 warn!("REGISTER {} from {}: {} — 400", aor, source.ip(), why);
                 self.metrics.inc_sip_response(400);
                 let r400 = build_plain_response_for_request(request, 400, "Bad Request")?;
                 let data = r400.to_string().into_bytes();
-                self.transport
-                    .reply(&data, source, transport, reply_tx)
-                    .await
+                self.send_sip("400 → REGISTER", &data, source, transport, reply_tx)
+                    .await;
+                Ok(())
             }
             Err(e) => {
                 warn!("Registration failed for {}: {}", aor, e);

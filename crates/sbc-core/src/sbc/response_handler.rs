@@ -1140,19 +1140,25 @@ impl Sbc {
             );
             return;
         };
-        match self
-            .transport
-            .reply(ack.as_bytes(), attempt.dest, attempt.transport, tx.as_ref())
+        // Through `send_sip` like every other send: an ACK the trunk
+        // never gets leaves it retransmitting its final, and the failure
+        // belongs in `sbc_sip_send_failures_total` with the rest. (An ACK
+        // is never tracked for retransmission — it has no response of its
+        // own, and a resent final triggers a fresh one.)
+        if self
+            .send_sip(
+                "ACK (non-2xx) → trunk",
+                ack.as_bytes(),
+                attempt.dest,
+                attempt.transport,
+                tx.as_ref(),
+            )
             .await
         {
-            Ok(()) => debug!(
+            debug!(
                 "ACK (non-2xx) → {} for call {} (CSeq {})",
                 attempt.dest, uuid, attempt.cseq
-            ),
-            Err(e) => warn!(
-                "ACK (non-2xx) → {} failed for call {}: {}",
-                attempt.dest, uuid, e
-            ),
+            );
         }
     }
 

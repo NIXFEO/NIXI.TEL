@@ -430,7 +430,10 @@ impl Sbc {
                 .reply(&data, dest, transport, reply_tx.as_ref())
                 .await
             {
+                // Counted like any other send failure: a peer we cannot
+                // reach any more is the interesting part, not the resend.
                 debug!("Timer G retransmission → {} failed: {}", dest, e);
+                self.metrics.inc_sip_send_failure(transport);
             }
         }
     }

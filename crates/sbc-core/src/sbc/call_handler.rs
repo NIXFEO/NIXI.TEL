@@ -430,9 +430,9 @@ impl Sbc {
             Ok(r) => r.to_string().into_bytes(),
             Err(_) => build_plain_response(200, "OK").into_bytes(),
         };
-        self.transport
-            .reply(&response_200, source, transport, reply_tx)
-            .await
+        self.send_sip("200 → BYE", &response_200, source, transport, reply_tx)
+            .await;
+        Ok(())
     }
 
     /// Handle CANCEL (RFC 3261 §9.2).
@@ -830,9 +830,9 @@ impl Sbc {
         let data = rsip::SipMessage::Response(response)
             .to_string()
             .into_bytes();
-        self.transport
-            .reply(&data, source, transport, reply_tx)
-            .await
+        self.send_sip("200 → re-INVITE", &data, source, transport, reply_tx)
+            .await;
+        Ok(())
     }
 
     /// Send due RFC 4028 refresh re-INVITEs (30s tick). No-op when session
@@ -939,9 +939,9 @@ impl Sbc {
             Ok(r) => r.to_string().into_bytes(),
             Err(_) => build_plain_response(200, "OK").into_bytes(),
         };
-        self.transport
-            .reply(&response_200, source, transport, reply_tx)
-            .await
+        self.send_sip("200 → INFO", &response_200, source, transport, reply_tx)
+            .await;
+        Ok(())
     }
 
     pub(crate) async fn handle_refer(
@@ -978,10 +978,9 @@ impl Sbc {
             self.metrics.inc_sip_response(400);
             let r400 = build_plain_response_for_request(&request, 400, "Missing Refer-To")?;
             let data = r400.to_string().into_bytes();
-            return self
-                .transport
-                .reply(&data, source, transport, reply_tx)
+            self.send_sip("400 → REFER", &data, source, transport, reply_tx)
                 .await;
+            return Ok(());
         }
         let refer_target = refer_to.unwrap();
         info!("REFER: transfer to '{}'", refer_target);
@@ -994,10 +993,9 @@ impl Sbc {
             let r481 =
                 build_plain_response_for_request(&request, 481, "Call/Transaction Does Not Exist")?;
             let data = r481.to_string().into_bytes();
-            return self
-                .transport
-                .reply(&data, source, transport, reply_tx)
+            self.send_sip("481 → REFER", &data, source, transport, reply_tx)
                 .await;
+            return Ok(());
         }
 
         let (uuid, is_from_caller) = found.unwrap();
@@ -1016,9 +1014,8 @@ impl Sbc {
         self.metrics.inc_sip_response(202);
         let response_202 = build_plain_response_for_request(&request, 202, "Accepted")?;
         let data = response_202.to_string().into_bytes();
-        self.transport
-            .reply(&data, source, transport, reply_tx)
-            .await?;
+        self.send_sip("202 → REFER", &data, source, transport, reply_tx)
+            .await;
 
         // Relay REFER to the other leg (the transferee)
         // In a full implementation, the SBC would:
