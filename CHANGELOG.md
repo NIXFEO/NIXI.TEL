@@ -76,6 +76,10 @@ broke its headline feature. Both rounds are folded in below.
 - An INVITE refused for want of ports counts in `sbc_calls_failed_total`
   (it can produce no CDR: the call never existed), and docs/API.md says so
   next to the "exactly one record per call" rule.
+- `sbc_media_packets_relayed_total` / `sbc_media_bytes_relayed_total` are
+  plain atomics instead of a labelled map behind a process-wide mutex:
+  they are written on every relayed packet of every call, which is the one
+  place this design cannot afford a lock.
 - A transcoded packet's timestamp is rewritten as a delta from a latched
   base: scaling the absolute value was not wrap-continuous when the clock
   rate goes down, so an Opus→G.711 call jumped ~715 million ticks

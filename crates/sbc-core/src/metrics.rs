@@ -267,9 +267,15 @@ pub struct SbcMetrics {
     /// users, trunks or DIDs to serve — a lost or unmounted store looks
     /// exactly like this.
     pub store_created_empty: Arc<AtomicU64>,
-    /// Media packets and bytes delivered, by the leg they went to.
-    pub media_tx_packets: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
-    pub media_tx_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Media packets and bytes delivered, by the leg they went to. Plain
+    /// atomics, not a labelled map: this is written on **every relayed
+    /// packet** of every call, and a process-wide mutex there would be
+    /// the one thing the media path cannot afford (see the "Measured
+    /// limits" table in CLAUDE.md). The label set is closed — two legs.
+    pub media_tx_packets_caller: Arc<AtomicU64>,
+    pub media_tx_packets_callee: Arc<AtomicU64>,
+    pub media_tx_bytes_caller: Arc<AtomicU64>,
+    pub media_tx_bytes_callee: Arc<AtomicU64>,
     /// Calls reported as one-way, by the leg that went silent.
     pub media_one_way: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Endpoint decisions: (leg, verdict, reason) → count. `verdict` is
@@ -357,8 +363,10 @@ impl SbcMetrics {
             config_last_reload_time: Arc::new(AtomicU64::new(0)),
             store_available: Arc::new(AtomicU64::new(0)),
             store_created_empty: Arc::new(AtomicU64::new(0)),
-            media_tx_packets: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            media_tx_bytes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            media_tx_packets_caller: Arc::new(AtomicU64::new(0)),
+            media_tx_packets_callee: Arc::new(AtomicU64::new(0)),
+            media_tx_bytes_caller: Arc::new(AtomicU64::new(0)),
+            media_tx_bytes_callee: Arc::new(AtomicU64::new(0)),
             media_one_way: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_endpoint: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_relay_failures: Arc::new(AtomicU64::new(0)),
@@ -620,14 +628,16 @@ impl SbcMetrics {
         self.last_cdr_written_time.store(now, Ordering::Relaxed);
     }
 
-    /// One relayed packet toward `leg` ("caller" / "callee").
+    /// One relayed packet toward `leg` ("caller" / "callee"). Two relaxed
+    /// atomic adds, no lock: this runs per packet on every call.
     pub fn note_media_relayed(&self, leg: &'static str, bytes: u64) {
-        if let Ok(mut m) = self.media_tx_packets.lock() {
-            *m.entry(leg).or_insert(0) += 1;
-        }
-        if let Ok(mut m) = self.media_tx_bytes.lock() {
-            *m.entry(leg).or_insert(0) += bytes;
-        }
+        let (packets, byte_counter) = if leg == "caller" {
+            (&self.media_tx_packets_caller, &self.media_tx_bytes_caller)
+        } else {
+            (&self.media_tx_packets_callee, &self.media_tx_bytes_callee)
+        };
+        packets.fetch_add(1, Ordering::Relaxed);
+        byte_counter.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// One endpoint decision on `leg`: what was decided and why.
@@ -799,23 +809,39 @@ impl SbcMetrics {
             self.allocated_ports.load(Ordering::Relaxed)
         );
 
-        for (name, help, map) in [
+        for (name, help, caller, callee) in [
             (
                 "sbc_media_packets_relayed",
                 "RTP packets delivered, by the leg they were sent to",
-                &self.media_tx_packets,
+                &self.media_tx_packets_caller,
+                &self.media_tx_packets_callee,
             ),
             (
                 "sbc_media_bytes_relayed",
                 "RTP bytes delivered, by the leg they were sent to",
-                &self.media_tx_bytes,
-            ),
-            (
-                "sbc_media_one_way_calls",
-                "Calls where one direction stayed silent while the other was delivering",
-                &self.media_one_way,
+                &self.media_tx_bytes_caller,
+                &self.media_tx_bytes_callee,
             ),
         ] {
+            out.push_str(&format!(
+                "# HELP {} {}\n# TYPE {} counter\n",
+                name, help, name
+            ));
+            for (leg, counter) in [("caller", caller), ("callee", callee)] {
+                out.push_str(&format!(
+                    "{}_total{{leg=\"{}\"}} {}\n",
+                    name,
+                    leg,
+                    counter.load(Ordering::Relaxed)
+                ));
+            }
+        }
+
+        for (name, help, map) in [(
+            "sbc_media_one_way_calls",
+            "Calls where one direction stayed silent while the other was delivering",
+            &self.media_one_way,
+        )] {
             out.push_str(&format!(
                 "# HELP {} {}\n# TYPE {} counter\n",
                 name, help, name
