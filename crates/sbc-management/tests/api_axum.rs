@@ -1622,6 +1622,47 @@ async fn trunk_health_alerts_and_metrics_reflect_availability() {
     state.trunk_tasks.shutdown().await;
 }
 
+/// The labelled media families must render as valid Prometheus text: one
+/// HELP/TYPE per family, a `_total` suffix and the labels the dashboard
+/// and the alert rules query.
+#[tokio::test]
+async fn the_media_metrics_render_as_prometheus_text() {
+    let state = make_state().await;
+    state.metrics.note_media_relayed("caller", 172);
+    state.metrics.note_media_relayed("callee", 172);
+    state.metrics.inc_media_one_way("callee");
+    state
+        .metrics
+        .note_endpoint_verdict("caller", "would-reject", "foreign");
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(req("GET", "/metrics", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for line in [
+        "# TYPE sbc_media_packets_relayed counter",
+        "sbc_media_packets_relayed_total{leg=\"callee\"} 1",
+        "sbc_media_bytes_relayed_total{leg=\"caller\"} 172",
+        "sbc_media_one_way_calls_total{leg=\"callee\"} 1",
+        "sbc_media_endpoint_events_total{leg=\"caller\",verdict=\"would-reject\",reason=\"foreign\"} 1",
+        "# TYPE sbc_transcode_seconds histogram",
+        "sbc_rtp_ports_quarantined ",
+    ] {
+        assert!(text.contains(line), "missing {:?}", line);
+    }
+    // One HELP per family, not one per series.
+    assert_eq!(text.matches("# HELP sbc_media_packets_relayed ").count(), 1);
+}
+
 /// An ACL rule the runtime could not parse must never reach the store:
 /// hydration would drop it and the deny would not be enforced.
 #[tokio::test]
@@ -1721,6 +1762,12 @@ async fn csv_export_neutralises_spreadsheet_formulas() {
     assert!(
         csv.contains(",+33123456789,"),
         "an E.164 number keeps its exact value: {}",
+        csv
+    );
+    // The media columns close every row (v3 schema).
+    assert!(
+        csv.lines().any(|l| l.trim_end().ends_with(",1500,1490,")),
+        "the media columns are exported: {}",
         csv
     );
 }

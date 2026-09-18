@@ -305,6 +305,48 @@ fn looks_like_rtp(data: &[u8]) -> bool {
     data.len() >= 12 && (data[0] >> 6) == 2
 }
 
+/// Rewrite a transcoded packet's timestamp for the destination clock.
+///
+/// Scaling the absolute 32-bit value is not wrap-continuous when the rate
+/// goes *down*: when the sender's 48 kHz timestamp wraps, a divided 8 kHz
+/// timestamp jumps backwards by ~715 million instead of advancing by 160,
+/// and the peer's jitter buffer discards the stream. Rewriting the
+/// *delta* from a latched base keeps the arithmetic inside one wrap.
+struct TimestampMap {
+    base_in: Option<u32>,
+    base_out: u32,
+}
+
+impl TimestampMap {
+    fn new() -> Self {
+        Self {
+            base_in: None,
+            base_out: 0,
+        }
+    }
+
+    fn map(&mut self, ts: u32, src_rate: u32, dst_rate: u32) -> u32 {
+        if src_rate == dst_rate || dst_rate == 0 || src_rate == 0 {
+            return ts;
+        }
+        let base_in = match self.base_in {
+            Some(base) => base,
+            None => {
+                // Start the output clock where the naive scaling would
+                // have put it, so a peer comparing both sees similar
+                // numbers; from here on only deltas are scaled.
+                self.base_out =
+                    ((u64::from(ts) * u64::from(dst_rate)) / u64::from(src_rate)) as u32;
+                self.base_in = Some(ts);
+                ts
+            }
+        };
+        let delta = ts.wrapping_sub(base_in);
+        let scaled = ((u64::from(delta) * u64::from(dst_rate)) / u64::from(src_rate)) as u32;
+        self.base_out.wrapping_add(scaled)
+    }
+}
+
 /// An RTCP packet on its own port: 8 bytes is the shortest valid one (an
 /// empty Receiver Report), version 2, and a payload type in the RFC 5761
 /// range. `looks_like_rtp`'s 12-byte floor would drop those.
@@ -685,6 +727,8 @@ impl RtpSession {
         let media_stats = self.media_stats.clone();
         // What the SDP said, before any packet moved it: the endpoint
         // ladder's strongest evidence.
+        let mut ts_map_a_to_b = TimestampMap::new();
+        let mut ts_map_b_to_a = TimestampMap::new();
         let signalled_a = *self.endpoint_a_shared.lock().await;
         let signalled_b = *self.endpoint_b_shared.lock().await;
         let endpoint_policy = self.endpoint_policy;
@@ -1162,7 +1206,7 @@ impl RtpSession {
                                                     let dst_rate = tc.dst.clock_rate();
                                                     if src_rate != dst_rate && dst_rate > 0 {
                                                         let old_ts = u32::from_be_bytes([new_pkt[4], new_pkt[5], new_pkt[6], new_pkt[7]]);
-                                                        let new_ts = ((old_ts as u64) * dst_rate as u64 / src_rate as u64) as u32;
+                                                        let new_ts = ts_map_a_to_b.map(old_ts, src_rate, dst_rate);
                                                         new_pkt[4..8].copy_from_slice(&new_ts.to_be_bytes());
                                                         if ab_debug < 5 {
                                                             debug!("Transcode A→B #{}: TS {} → {} (rate {}→{})",
@@ -1569,7 +1613,7 @@ impl RtpSession {
                                                     let dst_rate = tc.dst.clock_rate();
                                                     if src_rate != dst_rate && dst_rate > 0 {
                                                         let old_ts = u32::from_be_bytes([new_pkt[4], new_pkt[5], new_pkt[6], new_pkt[7]]);
-                                                        let new_ts = ((old_ts as u64) * dst_rate as u64 / src_rate as u64) as u32;
+                                                        let new_ts = ts_map_b_to_a.map(old_ts, src_rate, dst_rate);
                                                         new_pkt[4..8].copy_from_slice(&new_ts.to_be_bytes());
                                                     }
                                                 }
@@ -1936,6 +1980,33 @@ mod tests {
         assert_eq!(stats.packets_b_to_a, 0);
         assert_eq!(stats.bytes_a_to_b, 0);
         assert_eq!(stats.bytes_b_to_a, 0);
+    }
+
+    /// Downscaling a timestamp across the 32-bit wrap must stay
+    /// continuous: the naive `ts * dst / src` jumps backwards by ~715
+    /// million and the peer's jitter buffer throws the stream away.
+    #[test]
+    fn the_timestamp_rewrite_survives_the_wrap() {
+        // Opus 48 kHz → G.711 8 kHz, starting just before the wrap.
+        let mut map = TimestampMap::new();
+        let start = u32::MAX - 960; // one 20 ms frame before wrapping
+        let first = map.map(start, 48_000, 8_000);
+        let second = map.map(start.wrapping_add(960), 48_000, 8_000);
+        assert_eq!(
+            second.wrapping_sub(first),
+            160,
+            "one 20 ms frame is 160 ticks at 8 kHz, wrap or no wrap"
+        );
+        let third = map.map(start.wrapping_add(1920), 48_000, 8_000);
+        assert_eq!(third.wrapping_sub(second), 160);
+
+        // Upscaling still works, and an equal rate is left alone.
+        let mut up = TimestampMap::new();
+        let a = up.map(1000, 8_000, 48_000);
+        let b = up.map(1160, 8_000, 48_000);
+        assert_eq!(b.wrapping_sub(a), 960);
+        let mut same = TimestampMap::new();
+        assert_eq!(same.map(42, 8_000, 8_000), 42);
     }
 
     #[test]

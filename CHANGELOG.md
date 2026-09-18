@@ -76,6 +76,11 @@ broke its headline feature. Both rounds are folded in below.
 - An INVITE refused for want of ports counts in `sbc_calls_failed_total`
   (it can produce no CDR: the call never existed), and docs/API.md says so
   next to the "exactly one record per call" rule.
+- A transcoded packet's timestamp is rewritten as a delta from a latched
+  base: scaling the absolute value was not wrap-continuous when the clock
+  rate goes down, so an Opus→G.711 call jumped ~715 million ticks
+  backwards when the sender's 48 kHz timestamp wrapped and the peer's
+  jitter buffer discarded the stream.
 - Migration 0004's rollback note was wrong in a way that would have
   bricked the next upgrade: SQLite cannot add a column twice, so the
   version-4 row must be kept. Also fixed: the documented watchdog cadence
