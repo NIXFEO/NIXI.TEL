@@ -41,6 +41,23 @@ media plane against the code and having the specs adversarially reviewed:
   `Media session … ended:` line per call carries the lot, and
   `sbc_media_packets_relayed_total{leg}` / `sbc_media_bytes_relayed_total{leg}`
   aggregate it. The five per-packet warnings are now `debug!`.
+- **Codecs are identified by their `a=rtpmap` name, not by payload-type
+  number**, which fixes three ways a call could be given corrupted audio:
+  a codec the SBC knew nothing about (everything except PT 0, 8 and 111)
+  was treated as "unknown" and then relabelled on the wire as the other
+  leg's codec, so a G.722 or G.729 payload reached the peer announced as
+  PCMA; a payload type shared only by `telephone-event` counted as a
+  shared codec, so Opus could be relayed to a G.711 trunk untranscoded;
+  and the same codec on two different dynamic numbers (Opus is 111 in
+  Chrome, 109 in Firefox) looked like two different codecs. Formats now
+  come from `a=rtpmap` with the RFC 3551 static table as the fallback,
+  `telephone-event`, `CN` and `red` are not voice codecs, and a pair the
+  SBC cannot actually convert is refused with a warning naming both sides
+  instead of being installed as a "passthrough" whose payload type the
+  relay would rewrite.
+- The Opus decoder's output buffer was fixed at one 20 ms frame, so a
+  40 ms or 60 ms packet failed to decode; it is now sized for the largest
+  frame Opus can carry.
 - **The media session is keyed by the call's uuid, not its Call-ID.**
   Genesys truncates Call-IDs (see the interop notes), so two concurrent
   calls can carry the same one — and they then shared one media session,

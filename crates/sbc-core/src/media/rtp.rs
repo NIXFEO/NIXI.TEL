@@ -964,7 +964,11 @@ impl RtpSession {
                             }
 
                             // ── Transcode A→B (caller codec → callee codec) ─────
-                            if let Some(ref tc) = transcoder_a_to_b {
+                            // A transcoder that converts nothing must not
+                            // touch the packet: the block below rewrites the
+                            // payload type, which would mislabel a stream it
+                            // did not convert.
+                            if let Some(tc) = transcoder_a_to_b.as_ref().filter(|t| !t.is_passthrough()) {
                                 // Parse RTP header to get payload, transcode, rebuild
                                 if data.len() >= 12 {
                                     let actual_pt = data[1] & 0x7F;
@@ -1315,7 +1319,7 @@ impl RtpSession {
                             } // end SRTP decrypt B (webrtc_mode_b / SDES)
 
                             // ── Transcode B→A (callee codec → caller codec) ─────
-                            if let Some(ref tc) = transcoder_b_to_a {
+                            if let Some(tc) = transcoder_b_to_a.as_ref().filter(|t| !t.is_passthrough()) {
                                 if data.len() >= 12 {
                                     let actual_pt_b = data[1] & 0x7F;
 

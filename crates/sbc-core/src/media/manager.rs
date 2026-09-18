@@ -662,7 +662,11 @@ impl MediaManager {
                     webrtc_label
                 );
 
-                // A→B: caller sends in caller_codec, callee expects callee_codec
+                // A→B: caller sends in caller_codec, callee expects callee_codec.
+                // A pair we cannot convert is refused by `Transcoder::new`
+                // and nothing is installed: the stream is relayed
+                // untouched, which is audible but honest — relabelling its
+                // payload type would make the peer decode noise.
                 match Transcoder::new(caller_codec, callee_codec) {
                     Ok(tc) => {
                         info!(
@@ -674,8 +678,12 @@ impl MediaManager {
                         rtp_session.set_transcoder_a_to_b(Arc::new(tc));
                     }
                     Err(e) => warn!(
-                        "Session {} failed to create A→B transcoder: {}",
-                        session_id, e
+                        "Session {} cannot transcode {} → {} ({}) — relaying untouched, \
+                         audio may fail on the callee",
+                        session_id,
+                        caller_codec.name(),
+                        callee_codec.name(),
+                        e
                     ),
                 }
 
@@ -691,8 +699,12 @@ impl MediaManager {
                         rtp_session.set_transcoder_b_to_a(Arc::new(tc));
                     }
                     Err(e) => warn!(
-                        "Session {} failed to create B→A transcoder: {}",
-                        session_id, e
+                        "Session {} cannot transcode {} → {} ({}) — relaying untouched, \
+                         audio may fail on the caller",
+                        session_id,
+                        callee_codec.name(),
+                        caller_codec.name(),
+                        e
                     ),
                 }
             } else {

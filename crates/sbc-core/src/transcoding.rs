@@ -37,6 +37,8 @@ pub const OPUS_RATE: u32 = 48_000;
 pub const G711_FRAME_SAMPLES: usize = 160;
 /// Opus frame size in samples (20ms at 48 kHz)
 pub const OPUS_FRAME_SAMPLES: usize = 960;
+/// Largest Opus frame at 48 kHz mono: 60 ms.
+pub const OPUS_MAX_FRAME_SAMPLES: usize = 2880;
 
 /// Maximum encoded Opus frame size (bytes)
 const OPUS_MAX_FRAME_SIZE: usize = 4000;
@@ -329,11 +331,13 @@ impl OpusDecoder {
         })
     }
 
-    /// Decode Opus frame to PCM samples (i16, 48 kHz, mono)
+    /// Decode an Opus packet to PCM samples (i16, 48 kHz, mono).
     ///
-    /// Returns up to `OPUS_FRAME_SAMPLES` (960) samples for a 20ms frame.
+    /// The buffer is sized for the largest frame Opus can carry (60 ms at
+    /// 48 kHz): a 960-sample buffer silently failed on the 40 ms and 60 ms
+    /// packets some endpoints send.
     pub fn decode(&self, opus_data: &[u8]) -> Result<Vec<i16>> {
-        let mut output = vec![0i16; OPUS_FRAME_SAMPLES];
+        let mut output = vec![0i16; OPUS_MAX_FRAME_SAMPLES];
         let mut dec = self
             .inner
             .lock()
@@ -449,6 +453,28 @@ impl Transcoder {
     ///
     /// Automatically initializes Opus encoder/decoder if needed.
     pub fn new(src: Codec, dst: Codec) -> Result<Self> {
+        // An unknown codec has no decoder and no encoder here. Installing
+        // a "passthrough" transcoder for it would be worse than nothing:
+        // the relay relabels the payload type of everything a transcoder
+        // touches, so a G.722 or G.729 payload would go out labelled PCMA
+        // and the peer would play noise. Refuse, and let the relay pass
+        // the stream through untouched.
+        if src != dst {
+            if let Codec::Unknown(pt) = src {
+                return Err(Error::Other(format!(
+                    "no decoder for payload type {} (cannot convert to {})",
+                    pt,
+                    dst.name()
+                )));
+            }
+            if let Codec::Unknown(pt) = dst {
+                return Err(Error::Other(format!(
+                    "no encoder for payload type {} (cannot convert from {})",
+                    pt,
+                    src.name()
+                )));
+            }
+        }
         let opus_encoder = if dst == Codec::Opus && src != Codec::Opus {
             Some(OpusEncoder::new()?)
         } else {
@@ -721,23 +747,138 @@ pub fn sdp_has_pcmu(sdp: &str) -> bool {
     pts.contains(&PT_PCMU)
 }
 
-/// Determine the primary codec from SDP (first in m= line)
-pub fn sdp_primary_codec(sdp: &str) -> Codec {
+/// One audio format of an `m=audio` line: its payload type and its
+/// identity. A dynamic payload type (96-127) means nothing on its own —
+/// only the `a=rtpmap` name does, and two peers routinely pick different
+/// numbers for the same codec (Opus is 111 in Chrome, 109 in Firefox).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioFormat {
+    pub pt: u8,
+    /// Lower-case encoding name (`pcmu`, `opus`, `telephone-event`…),
+    /// from `a=rtpmap` when present, else the RFC 3551 static table.
+    pub name: String,
+    pub clock_rate: u32,
+}
+
+impl AudioFormat {
+    /// Is this a voice codec, as opposed to DTMF events, comfort noise or
+    /// redundancy? Only voice formats decide whether transcoding is
+    /// needed: two peers sharing only `telephone-event` share nothing.
+    pub fn is_voice(&self) -> bool {
+        !matches!(self.name.as_str(), "telephone-event" | "cn" | "red")
+    }
+
+    /// The transcoder's view of this format.
+    pub fn codec(&self) -> Codec {
+        match (self.name.as_str(), self.clock_rate) {
+            ("pcmu", _) => Codec::Pcmu,
+            ("pcma", _) => Codec::Pcma,
+            ("opus", _) => Codec::Opus,
+            _ => Codec::Unknown(self.pt),
+        }
+    }
+}
+
+/// RFC 3551 §6: the static payload types this SBC may meet on a trunk.
+fn static_format(pt: u8) -> Option<(&'static str, u32)> {
+    match pt {
+        0 => Some(("pcmu", 8000)),
+        3 => Some(("gsm", 8000)),
+        4 => Some(("g723", 8000)),
+        5 => Some(("dvi4", 8000)),
+        8 => Some(("pcma", 8000)),
+        9 => Some(("g722", 8000)),
+        10 => Some(("l16", 44100)),
+        11 => Some(("l16", 44100)),
+        18 => Some(("g729", 8000)),
+        _ => None,
+    }
+}
+
+/// The audio formats of the first `m=audio` section, in the order the peer
+/// offered them (its own preference).
+pub fn sdp_audio_formats(sdp: &str) -> Vec<AudioFormat> {
     let pts = sdp_audio_pts(sdp);
-    pts.first()
-        .map(|&pt| Codec::from_pt(pt))
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    // `a=rtpmap:<pt> <name>/<rate>[/<channels>]`
+    let mut mapped: std::collections::HashMap<u8, (String, u32)> = std::collections::HashMap::new();
+    for line in sdp.lines() {
+        let Some(rest) = line
+            .strip_prefix("a=rtpmap:")
+            .or_else(|| line.strip_prefix("A=rtpmap:"))
+        else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(pt) = parts.next().and_then(|p| p.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(spec) = parts.next() else { continue };
+        let mut fields = spec.split('/');
+        let Some(name) = fields.next().filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        let rate = fields
+            .next()
+            .and_then(|r| r.parse::<u32>().ok())
+            .unwrap_or(8000);
+        mapped.insert(pt, (name.to_ascii_lowercase(), rate));
+    }
+    pts.into_iter()
+        .map(|pt| match mapped.get(&pt) {
+            Some((name, rate)) => AudioFormat {
+                pt,
+                name: name.clone(),
+                clock_rate: *rate,
+            },
+            None => {
+                let (name, rate) = static_format(pt).unwrap_or(("unknown", 8000));
+                AudioFormat {
+                    pt,
+                    name: name.to_string(),
+                    clock_rate: rate,
+                }
+            }
+        })
+        .collect()
+}
+
+/// The peer's preferred **voice** format (DTMF and comfort noise skipped).
+pub fn sdp_primary_format(sdp: &str) -> Option<AudioFormat> {
+    sdp_audio_formats(sdp).into_iter().find(|f| f.is_voice())
+}
+
+/// Determine the primary codec from SDP: the first *voice* format of the
+/// first `m=audio` line, identified by its rtpmap name.
+pub fn sdp_primary_codec(sdp: &str) -> Codec {
+    sdp_primary_format(sdp)
+        .map(|f| f.codec())
         .unwrap_or(Codec::Unknown(0))
 }
 
-/// Check if transcoding is needed between two SDPs
+/// Check if transcoding is needed between two SDPs.
+///
+/// Compared by codec **identity** (name and clock rate), not by payload
+/// type: a shared dynamic number can mean two different codecs, and a
+/// shared `telephone-event` is not a shared codec at all.
 pub fn needs_transcoding(caller_sdp: &str, callee_sdp: &str) -> bool {
-    // Find common codec between the two SDPs
-    let caller_pts = sdp_audio_pts(caller_sdp);
-    let callee_pts = sdp_audio_pts(callee_sdp);
-
-    // If they share at least one codec, no transcoding needed
-    let has_common = caller_pts.iter().any(|pt| callee_pts.contains(pt));
-    !has_common
+    let voice = |sdp: &str| -> Vec<(String, u32)> {
+        sdp_audio_formats(sdp)
+            .into_iter()
+            .filter(|f| f.is_voice())
+            .map(|f| (f.name, f.clock_rate))
+            .collect()
+    };
+    let caller = voice(caller_sdp);
+    let callee = voice(callee_sdp);
+    if caller.is_empty() || callee.is_empty() {
+        // Nothing identifiable on one side: relay untouched rather than
+        // invent a conversion.
+        return false;
+    }
+    !caller.iter().any(|c| callee.contains(c))
 }
 
 /// Build a minimal SDP offering only G.711 PCMU (for legacy trunks)
@@ -761,6 +902,96 @@ pub fn build_opus_sdp(local_ip: &str, rtp_port: u16) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod codec_identity_tests {
+    use super::*;
+
+    const CHROME: &str = "v=0\r\nm=audio 50000 UDP/TLS/RTP/SAVPF 111 103 9 0 8 13 110 126\r\n\
+        a=rtpmap:111 opus/48000/2\r\na=rtpmap:103 ISAC/16000\r\na=rtpmap:9 G722/8000\r\n\
+        a=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:13 CN/8000\r\n\
+        a=rtpmap:110 telephone-event/48000\r\na=rtpmap:126 telephone-event/8000\r\n";
+    const FIREFOX: &str = "v=0\r\nm=audio 50002 UDP/TLS/RTP/SAVPF 109 9 0 8 101\r\n\
+        a=rtpmap:109 opus/48000/2\r\na=rtpmap:9 G722/8000\r\na=rtpmap:0 PCMU/8000\r\n\
+        a=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+    const TRUNK: &str = "v=0\r\nm=audio 6004 RTP/AVP 8 0 101\r\n\
+        a=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+    /// A PBX that names nothing: static payload types only (RFC 3551).
+    const STATIC_ONLY: &str = "v=0\r\nm=audio 40000 RTP/AVP 9 8\r\n";
+
+    #[test]
+    fn formats_come_from_rtpmap_then_the_static_table() {
+        let f = sdp_audio_formats(CHROME);
+        assert_eq!(f[0].name, "opus");
+        assert_eq!(f[0].clock_rate, 48000);
+        assert_eq!(f[0].codec(), Codec::Opus);
+        assert!(!f
+            .iter()
+            .filter(|f| f.name == "telephone-event")
+            .any(|f| f.is_voice()));
+
+        // No rtpmap at all: the static table names them.
+        let s = sdp_audio_formats(STATIC_ONLY);
+        assert_eq!(s[0].name, "g722");
+        assert_eq!(s[1].codec(), Codec::Pcma);
+    }
+
+    /// The same codec with different dynamic numbers is the same codec.
+    #[test]
+    fn opus_at_111_and_at_109_is_one_codec() {
+        assert_eq!(sdp_primary_codec(CHROME), Codec::Opus);
+        assert_eq!(sdp_primary_codec(FIREFOX), Codec::Opus);
+        assert!(
+            !needs_transcoding(CHROME, FIREFOX),
+            "two browsers share Opus, whatever number they picked"
+        );
+    }
+
+    /// A shared `telephone-event` is not a shared codec: this is the
+    /// mistake that sent raw Opus to a G.711 trunk.
+    #[test]
+    fn a_shared_dtmf_format_is_not_a_shared_codec() {
+        let opus_only = "v=0\r\nm=audio 50000 RTP/AVP 111 101\r\n\
+            a=rtpmap:111 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n";
+        assert!(
+            needs_transcoding(opus_only, TRUNK),
+            "Opus vs G.711 needs transcoding even with a common DTMF PT"
+        );
+        assert_eq!(sdp_primary_codec(opus_only), Codec::Opus);
+        assert_eq!(sdp_primary_codec(TRUNK), Codec::Pcma);
+    }
+
+    /// A browser offering G.711 alongside Opus really does share a codec
+    /// with the trunk, so the plain rule is enough there.
+    #[test]
+    fn a_browser_offering_g711_shares_a_codec_with_the_trunk() {
+        assert!(!needs_transcoding(CHROME, TRUNK));
+    }
+
+    /// A pair with no decoder must be refused, not installed as a
+    /// "passthrough" whose payload type the relay would rewrite.
+    #[test]
+    fn an_unconvertible_pair_is_refused() {
+        let err = match Transcoder::new(Codec::Unknown(9), Codec::Pcma) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a G.722 → PCMA transcoder must not exist"),
+        };
+        assert!(err.contains("no decoder for payload type 9"), "{}", err);
+        let err = match Transcoder::new(Codec::Pcmu, Codec::Unknown(18)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a PCMU → G.729 transcoder must not exist"),
+        };
+        assert!(err.contains("no encoder for payload type 18"), "{}", err);
+        // Same unknown codec on both sides is a passthrough, which is fine.
+        assert!(Transcoder::new(Codec::Unknown(9), Codec::Unknown(9)).is_ok());
+    }
+
+    #[test]
+    fn an_sdp_without_audio_needs_no_transcoding() {
+        assert!(!needs_transcoding("v=0\r\n", TRUNK));
+        assert_eq!(sdp_primary_codec("v=0\r\n"), Codec::Unknown(0));
+    }
+}
 
 #[cfg(test)]
 mod tests {
