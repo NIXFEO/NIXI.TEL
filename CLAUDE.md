@@ -311,9 +311,10 @@ The SIP side, with **200 answered calls live at once** (release build):
 
 | Control-plane step | Cost |
 |---|---|
-| Set a call up (INVITE state, media anchor, 200 OK, ACK) | 137 µs |
-| Tear it down (BYE relayed, media released, CDR written) | 32 µs |
-| Resolve the dialog of one message (linear scan of 200 calls) | 1.2 µs |
+| Parse one INVITE with SDP off the wire | 2 µs |
+| Set a call up (INVITE state, media anchor, 200 OK, ACK) | 100-140 µs |
+| Tear it down (BYE relayed, media released, CDR written) | 26-32 µs |
+| Resolve the dialog of one message (linear scan of 200 calls) | 0.4-1.2 µs |
 
 
 A G.711 trunk ↔ Opus client call costs about 4.8 ms of CPU per second
@@ -324,7 +325,8 @@ the 50-200 target is not constrained by either. `sbc_transcode_seconds`
 watches the real thing in production.
 
 `handle_message` is awaited inline in the event loop, so those costs are
-serial: about **5 900 call setups per second** on one loop. At 200
+serial. Counting the five messages a call exchanges plus its setup and
+teardown, that is about **6 000 call setups per second** on one loop. At 200
 concurrent calls of three minutes each the real setup rate is close to
 **1 per second** — three orders of magnitude of headroom. The control
 plane is not what limits this box.

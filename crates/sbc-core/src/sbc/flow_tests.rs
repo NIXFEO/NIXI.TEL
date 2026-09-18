@@ -3705,6 +3705,20 @@ async fn two_hundred_calls_fit_in_the_event_loop() {
     }
     let per_miss = started.elapsed() / lookups;
 
+    // ── Parsing one datagram off the wire ──
+    // The setup and teardown figures above start at the handler, so they
+    // leave out what every message pays first: the parse. Measure it on a
+    // realistic INVITE with SDP, or the call-setup ceiling below is a
+    // flattering number.
+    let raw = invite_for(&CallSpec::default(), "z9hG4bKparse", 1);
+    let parses = 2_000;
+    let started = Instant::now();
+    for _ in 0..parses {
+        let msg = rsip::SipMessage::try_from(raw.as_bytes().to_vec()).expect("parses");
+        assert!(matches!(msg, rsip::SipMessage::Request(_)));
+    }
+    let per_parse = started.elapsed() / parses;
+
     // ── Teardown: BYE relayed, media released, CDR written ──
     let started = Instant::now();
     for call in &calls {
@@ -3730,16 +3744,20 @@ async fn two_hundred_calls_fit_in_the_event_loop() {
     // The numbers, and what they mean for the box.
     let setup_us = per_setup.as_secs_f64() * 1e6;
     let teardown_us = per_teardown.as_secs_f64() * 1e6;
+    let parse_us = per_parse.as_secs_f64() * 1e6;
     println!(
-        "control plane at {} live calls: setup {:.0} µs, teardown {:.0} µs, \
-         dialog lookup {:.2} µs (hit) / {:.2} µs (miss) \
+        "control plane at {} live calls: parse {:.0} µs, setup {:.0} µs, \
+         teardown {:.0} µs, dialog lookup {:.2} µs (hit) / {:.2} µs (miss) \
          → about {:.0} call setups/s on one event loop",
         CALLS,
+        parse_us,
         setup_us,
         teardown_us,
         per_lookup.as_secs_f64() * 1e6,
         per_miss.as_secs_f64() * 1e6,
-        1e6 / (setup_us + teardown_us)
+        // A call is at least INVITE + 200 + ACK + BYE + 200 inbound, so
+        // five parses, plus the setup and teardown work.
+        1e6 / (5.0 * parse_us + setup_us + teardown_us)
     );
 
     // A debug build is several times slower than a release one, so the
@@ -3767,5 +3785,10 @@ async fn two_hundred_calls_fit_in_the_event_loop() {
         per_teardown < Duration::from_millis(5),
         "teardown costs {:?}",
         per_teardown
+    );
+    assert!(
+        per_parse < Duration::from_millis(1),
+        "parsing one INVITE costs {:?}",
+        per_parse
     );
 }
