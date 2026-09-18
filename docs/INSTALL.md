@@ -490,3 +490,31 @@ sudo swapoff /swapfile.build && sudo rm /swapfile.build
 Changing the `[security]` session-timer values (`session_expires`,
 `min_se`) does not need a restart: `kill -HUP` or `POST /api/v1/reload`
 applies them to new calls.
+
+### What to watch after this upgrade
+
+Nothing here needs a configuration change, but four things behave
+differently on the wire:
+
+- **Requests are retransmitted over UDP** (RFC 3261 Timer A/E). A request
+  the peer never received used to fail the call; it is now resent until
+  answered. Expect `sbc_sip_request_retransmissions_total` to be small but
+  non-zero on any real network — that is the SBC covering for packet loss,
+  not a fault. `sbc_sip_transaction_timeouts_total` rising is the real
+  signal: a request that got no answer at all in 32 seconds.
+- **`sbc_sip_send_failures_total` will report more than it used to.**
+  Eleven sends (the 200s to BYE/INFO/re-INVITE, the REFER and REGISTER
+  answers, the 200 to OPTIONS, the non-2xx ACK) previously logged their
+  failures without counting them. A first non-zero reading after the
+  upgrade may be a pre-existing problem finally visible, not a new one.
+- **Prometheus and Grafana have new series.** Re-load
+  `monitoring/prometheus/alert_rules.yml` (26 rules: `SBCTransactionTimeouts`,
+  `SBCRequestRetransmissionsHigh` and `SBCIceChecksRefused` are new) and
+  re-import the dashboard (version 6, two new Health panels).
+- **WebRTC is stricter, and is refused rather than left unauthenticated.**
+  A DTLS peer whose certificate does not match the SDP `a=fingerprint`, or
+  an offer carrying no fingerprint at all, now fails the handshake; an ICE
+  Binding Request without a verifying MESSAGE-INTEGRITY is dropped instead
+  of answered. Production runs no WebRTC, so this changes nothing there —
+  but a WebRTC deployment must check `sbc_media_packets_dropped_total{reason="ice-auth"}`
+  after the upgrade.
