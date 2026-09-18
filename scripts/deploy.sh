@@ -7,7 +7,7 @@
 # files), back up binary/config/sources, add a temporary swapfile and build
 # the release binary under a memory cap (a 2 GB box OOM-kills otherwise),
 # refuse to restart while calls are active, stop gracefully (BYEs), swap the
-# binary, start, check /health, run the API smoke test, remove the swap.
+# binary, start, wait for /ready, run the API smoke test, remove the swap.
 # The SQLite store (database.sqlite_path of the remote config) is copied
 # with the backups: the binary migrates it forward at startup and an older
 # binary may refuse the migrated store. (At runtime the SBC keeps its own
@@ -106,8 +106,18 @@ ssh "$HOST" "set -e
   done
   [ \"\$A\" = 0 ] || { echo 'ABORT: calls still active — not restarting'; exit 3; }
   echo \"restart at \$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-  systemctl stop sbc; cp $SRC/target/release/sbc $BIN; systemctl start sbc; sleep 4
-  systemctl is-active sbc; curl -s -m 3 http://127.0.0.1:8080/health; echo
+  systemctl stop sbc; cp $SRC/target/release/sbc $BIN; systemctl start sbc
+  # /ready (not /health) is the real gate: it stays 503 until the
+  # SQLite store is open and hydrated and the SIP listeners are bound, and a
+  # store that cannot be opened aborts the boot.
+  for i in \$(seq 1 20); do
+    R=\$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ready)
+    [ \"\$R\" = 200 ] && break; sleep 1
+  done
+  systemctl is-active sbc
+  echo \"ready=\$R\"; curl -s -m 3 http://127.0.0.1:8080/ready; echo
+  [ \"\$R\" = 200 ] || { echo 'ABORT: /ready never turned 200 — check journalctl -u sbc (store? listeners?)'; exit 4; }
+  curl -s -m 3 http://127.0.0.1:8080/health; echo
   . /etc/sbc/sbc.env; SBC_API_TOKEN=\$SBC_API_TOKEN bash $SRC/scripts/api_smoke.sh | grep -c '^OK' | xargs echo 'smoke OK:'
   swapoff /swapfile.build && rm -f /swapfile.build
   journalctl -u sbc --since '-1min' --no-pager | grep -i -E 'version|error|panic' | tail -5"

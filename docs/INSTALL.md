@@ -383,7 +383,9 @@ against your WSS listener (see [WEBRTC.md](WEBRTC.md)).
 that builds locally: rsync of the sources, timestamped backups, a temporary
 swapfile and a memory-capped release build (see the small-VPS note), a
 refusal to restart while calls are active, graceful stop, binary swap,
-start, `/health`, the API smoke test and swap removal. `--dry-run` shows what
+start, `/ready` (it aborts if readiness never turns 200 — a store that
+cannot be opened or hydrated fails the boot), the API smoke test and swap
+removal. `--dry-run` shows what
 would change; `--rollback` restores the most recent binary and config
 backups (never the store — see below). The binary reports the deployed
 commit in `sbc --version` and at startup.
