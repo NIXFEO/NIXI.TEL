@@ -1162,7 +1162,7 @@ async fn cdrs_expose_the_billing_window_newest_first() {
     let items = page["items"].as_array().expect("items");
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["call_id"], "cid-2", "newest first");
-    assert_eq!(items[0]["v"], 2);
+    assert_eq!(items[0]["v"], sbc_core::storage::CDR_SCHEMA_VERSION);
     assert_eq!(items[0]["sip_code"], 487);
     assert!(items[0]["answered_at"].is_null());
     assert_eq!(items[0]["billable_secs"], 0);
@@ -1694,6 +1694,9 @@ async fn csv_export_neutralises_spreadsheet_formulas() {
         disconnect_reason: "-normal".into(),
         reason: None,
         hangup_by: "caller".into(),
+        rtp_tx_caller: 1500,
+        rtp_tx_callee: 1490,
+        media_flags: String::new(),
     };
     store.insert_cdrs(std::slice::from_ref(&row)).await.unwrap();
     row.id = "c2".into();
@@ -2483,7 +2486,14 @@ async fn cdrs_export_csv_streams_every_matching_row() {
     )
     .unwrap();
     let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
-    assert_eq!(lines[0], "id,call_id,caller,callee,trunk_id,duration_secs,codec,is_webrtc,disconnect_reason,started_at,ended_at,v,uuid,direction,sip_code,answered_at,billable_secs,source_ip,reason,hangup_by");
+    assert_eq!(
+        lines[0],
+        "id,call_id,caller,callee,trunk_id,duration_secs,codec,is_webrtc,\
+         disconnect_reason,started_at,ended_at,v,uuid,direction,sip_code,\
+         answered_at,billable_secs,source_ip,reason,hangup_by,rtp_tx_caller,\
+         rtp_tx_callee,media_flags"
+            .replace(' ', "")
+    );
     assert_eq!(lines.len(), 5, "header + 4 outbound rows: {}", text);
     assert!(
         lines[1].starts_with(&format!(

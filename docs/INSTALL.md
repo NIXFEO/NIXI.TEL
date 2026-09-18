@@ -462,7 +462,7 @@ service down until you either
 ```bash
 # keep the data (the new tables stay, the old binary ignores them):
 sudo systemctl stop sbc
-sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version IN (2, 3)"   # 2 = security persistence, 3 = cdrs
+sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version IN (2, 3, 4)"   # 2 = security persistence, 3 = cdrs, 4 = cdr media columns
 sudo systemctl start sbc
 # — or — restore the pre-upgrade copy (loses every change made since):
 sudo systemctl stop sbc && sudo cp -p /opt/sbc/backups/sbc-db-<timestamp>.db /var/lib/sbc/sbc.db && sudo systemctl start sbc

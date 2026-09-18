@@ -129,6 +129,11 @@ async fn an_answered_call_without_a_relay_is_ended_as_media_unavailable() {
     assert_eq!(cdr.disconnect_reason, "media-unavailable");
     assert_eq!(cdr.hangup_by, "sbc");
     assert_eq!(
+        cdr.media_flags, "no-relay",
+        "billing can see this call had no media anchor"
+    );
+    assert_eq!((cdr.rtp_tx_caller, cdr.rtp_tx_callee), (0, 0));
+    assert_eq!(
         sbc.metrics
             .media_relay_failures
             .load(std::sync::atomic::Ordering::Relaxed),

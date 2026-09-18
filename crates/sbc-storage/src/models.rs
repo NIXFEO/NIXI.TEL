@@ -167,6 +167,16 @@ pub struct CdrRow {
     pub disconnect_reason: String,
     pub reason: Option<String>,
     pub hangup_by: String,
+    /// RTP packets the SBC delivered to the caller / to the callee. Zero
+    /// on both sides means the call carried no audio at all.
+    #[serde(default)]
+    pub rtp_tx_caller: i64,
+    #[serde(default)]
+    pub rtp_tx_callee: i64,
+    /// Comma-separated media flags: `no-relay`, `one-way-caller`,
+    /// `one-way-callee`, `no-media` (empty when nothing notable).
+    #[serde(default)]
+    pub media_flags: String,
 }
 
 /// `GET /api/v1/cdrs` filters; every field optional. Prefixes are

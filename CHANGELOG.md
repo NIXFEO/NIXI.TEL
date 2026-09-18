@@ -41,6 +41,14 @@ media plane against the code and having the specs adversarially reviewed:
   `Media session … ended:` line per call carries the lot, and
   `sbc_media_packets_relayed_total{leg}` / `sbc_media_bytes_relayed_total{leg}`
   aggregate it. The five per-packet warnings are now `debug!`.
+- **Media facts on every CDR** (schema `v` 3, migration `0004`):
+  `rtp_tx_caller` and `rtp_tx_callee` (RTP packets actually **delivered**
+  to each side) and `media_flags` (`no-relay`, `no-media`,
+  `one-way-caller`, `one-way-callee`, empty on a healthy call). Billing can
+  now tell an answered call that carried audio from an answered silent one
+  without correlating logs; the CSV export gains the three columns at the
+  end. Rolling back to a pre-0.20 binary now needs
+  `DELETE FROM _sqlx_migrations WHERE version IN (2, 3, 4)`.
 - **One-way audio is detected and reported**: when the SBC keeps
   delivering to a peer that has said nothing for 10 s while the other peer
   is talking, the relay logs it once per leg inside the call span and

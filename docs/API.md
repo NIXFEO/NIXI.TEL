@@ -61,7 +61,9 @@ Every call gets exactly one record when it ends, whatever the cause
 | `started_at`, `answered_at`, `ended_at` | unix seconds: INVITE, 200 OK toward the caller (`null` if never answered), end |
 | `duration_secs`, `billable_secs` | setup → end; answer → end (0 when unanswered) |
 | `sip_code` | final status the caller's INVITE got: 200 once answered, 487 cancelled, 408 setup timeout, the relayed/generated code otherwise, `null` when none was sent |
-| `disconnect_reason` | `normal-clearing`, `cancelled`, `rejected-<code>`, `timeout` (max duration), `setup-timeout`, `rtp-timeout`, `shutdown`, `ws-closed`, `admin-kick`, `dialog-lost` |
+| `disconnect_reason` | `normal-clearing`, `cancelled`, `rejected-<code>`, `timeout` (max duration), `setup-timeout`, `rtp-timeout`, `shutdown`, `ws-closed`, `admin-kick`, `dialog-lost`, `media-unavailable` (the SBC could not anchor the media) |
+| `rtp_tx_caller`, `rtp_tx_callee` | RTP packets the SBC **delivered** to each side. Both 0 on an answered call means it carried no audio |
+| `media_flags` | comma-separated, empty on a healthy call: `no-relay` (no media anchor at all), `no-media` (nothing delivered either way), `one-way-caller` / `one-way-callee` (that side never sent a packet) |
 | `reason` | SIP `Reason` header: the peer's on its BYE/CANCEL, the SBC's own on the BYEs it sends |
 | `hangup_by` | who ended the call: `caller`, `callee` (the far end, or its rejection), `sbc` |
 

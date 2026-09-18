@@ -61,13 +61,25 @@ pub struct CdrRecord {
     /// Who ended the call: caller | callee | sbc ("" on legacy rows).
     #[serde(default)]
     pub hangup_by: String,
+    /// RTP packets the SBC delivered toward the caller / the callee.
+    /// Both zero on an answered call means it carried no audio.
+    #[serde(default)]
+    pub rtp_tx_caller: u64,
+    #[serde(default)]
+    pub rtp_tx_callee: u64,
+    /// Comma-separated media flags: `no-relay` (no media anchor at all),
+    /// `one-way-caller` / `one-way-callee` (that side never sent), or
+    /// `no-media` (nothing delivered either way). Empty when the call
+    /// carried audio both ways.
+    #[serde(default)]
+    pub media_flags: String,
 }
 
 fn legacy_version() -> u8 {
     1
 }
 
-pub const CDR_SCHEMA_VERSION: u8 = 2;
+pub const CDR_SCHEMA_VERSION: u8 = 3;
 
 fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -97,6 +109,9 @@ impl CdrRecord {
             source_ip: String::new(),
             reason: None,
             hangup_by: String::new(),
+            rtp_tx_caller: 0,
+            rtp_tx_callee: 0,
+            media_flags: String::new(),
         }
     }
 
@@ -170,6 +185,9 @@ impl CdrRecord {
             disconnect_reason: self.disconnect_reason.clone(),
             reason: self.reason.clone(),
             hangup_by: self.hangup_by.clone(),
+            rtp_tx_caller: self.rtp_tx_caller as i64,
+            rtp_tx_callee: self.rtp_tx_callee as i64,
+            media_flags: self.media_flags.clone(),
         }
     }
 
@@ -211,6 +229,9 @@ impl From<sbc_storage::CdrRow> for CdrRecord {
             source_ip: r.source_ip,
             reason: r.reason,
             hangup_by: r.hangup_by,
+            rtp_tx_caller: r.rtp_tx_caller.max(0) as u64,
+            rtp_tx_callee: r.rtp_tx_callee.max(0) as u64,
+            media_flags: r.media_flags,
         }
     }
 }
@@ -491,6 +512,9 @@ fn parse_cdr_json_legacy(json: &str) -> Option<CdrRecord> {
         source_ip: String::new(),
         reason: None,
         hangup_by: String::new(),
+        rtp_tx_caller: get_u64("rtp_tx_caller"),
+        rtp_tx_callee: get_u64("rtp_tx_callee"),
+        media_flags: get_str("media_flags").unwrap_or_default(),
     })
 }
 
@@ -829,7 +853,10 @@ mod tests {
         assert_eq!(back.call_id, "c1");
         assert_eq!(back.reason.as_deref(), Some("Q.850;cause=16;text=\"x\""));
         assert_eq!(back.sip_code, Some(200));
-        assert_eq!(back.v, 2);
+        assert_eq!(back.v, CDR_SCHEMA_VERSION);
+        // v3 adds the media facts; they round-trip and default to 0.
+        assert_eq!(back.rtp_tx_caller, 0);
+        assert_eq!(back.media_flags, "");
 
         // A row written before 0.20: legacy keys only.
         let legacy = r#"{"id":"x","call_id":"c","caller":"a","callee":"b","trunk_id":null,"duration_secs":5,"codec":null,"is_webrtc":false,"disconnect_reason":"normal-clearing","started_at":1,"ended_at":6}"#;

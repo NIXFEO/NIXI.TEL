@@ -175,6 +175,7 @@ struct CallSnapshot {
     direction: &'static str,
     source_ip: String,
     peer_reason: Option<String>,
+    media_session_id: Option<String>,
 }
 
 impl Sbc {
@@ -205,6 +206,7 @@ impl Sbc {
                 direction: c.direction(),
                 source_ip: c.caller_source.ip().to_string(),
                 peer_reason: c.peer_reason.clone(),
+                media_session_id: c.media_session_id.clone(),
             })
         };
         let Some(s) = snapshot else {
@@ -231,6 +233,48 @@ impl Sbc {
         record.source_ip = s.source_ip;
         record.reason = s.peer_reason.or_else(|| outcome.reason_header());
         record.hangup_by = outcome.hangup_by().to_string();
+
+        // What the media plane actually carried, so billing can tell an
+        // answered call that had audio from an answered silent one.
+        let media = s
+            .media_session_id
+            .as_deref()
+            .and_then(|id| self.media.call_media_stats(id));
+        let mut flags: Vec<&str> = Vec::new();
+        match &media {
+            None => flags.push("no-relay"),
+            Some(stats) => {
+                record.rtp_tx_caller = stats
+                    .caller
+                    .tx_packets
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                record.rtp_tx_callee = stats
+                    .callee
+                    .tx_packets
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if record.rtp_tx_caller == 0 && record.rtp_tx_callee == 0 {
+                    flags.push("no-media");
+                } else {
+                    if stats
+                        .caller
+                        .rx_packets
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 0
+                    {
+                        flags.push("one-way-callee");
+                    }
+                    if stats
+                        .callee
+                        .rx_packets
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 0
+                    {
+                        flags.push("one-way-caller");
+                    }
+                }
+            }
+        }
+        record.media_flags = flags.join(",");
 
         match self.cdr.insert(&record).await {
             Ok(outcome) => {

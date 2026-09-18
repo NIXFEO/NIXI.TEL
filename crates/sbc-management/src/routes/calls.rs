@@ -234,7 +234,7 @@ fn parse_query(q: &CdrQuery, accept: Option<&str>) -> ApiResult<ParsedQuery> {
     })
 }
 
-const CSV_HEADER: &str = "id,call_id,caller,callee,trunk_id,duration_secs,codec,is_webrtc,disconnect_reason,started_at,ended_at,v,uuid,direction,sip_code,answered_at,billable_secs,source_ip,reason,hangup_by";
+const CSV_HEADER: &str = "id,call_id,caller,callee,trunk_id,duration_secs,codec,is_webrtc,disconnect_reason,started_at,ended_at,v,uuid,direction,sip_code,answered_at,billable_secs,source_ip,reason,hangup_by,rtp_tx_caller,rtp_tx_callee,media_flags";
 
 /// RFC 4180 quoting, plus a guard against spreadsheet formula injection:
 /// a field a caller can influence (`caller`, `callee`, `reason`, …) that
@@ -264,7 +264,7 @@ fn csv_line(r: &sbc_storage::CdrRow) -> String {
     let opt = |o: &Option<String>| o.as_deref().map(csv_field).unwrap_or_default();
     let num = |o: Option<i64>| o.map(|n| n.to_string()).unwrap_or_default();
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
         csv_field(&r.id),
         csv_field(&r.call_id),
         csv_field(&r.caller),
@@ -285,6 +285,9 @@ fn csv_line(r: &sbc_storage::CdrRow) -> String {
         csv_field(&r.source_ip),
         opt(&r.reason),
         csv_field(&r.hangup_by),
+        r.rtp_tx_caller,
+        r.rtp_tx_callee,
+        csv_field(&r.media_flags),
     )
 }
 

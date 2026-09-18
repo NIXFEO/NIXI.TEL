@@ -4,7 +4,7 @@ use crate::store::ConfigStore;
 use crate::{Error, Result};
 use sqlx::QueryBuilder;
 
-const COLUMNS: &str = "id, v, uuid, call_id, direction, caller, callee, source_ip, trunk_id, codec, is_webrtc, started_at, answered_at, ended_at, duration_secs, billable_secs, sip_code, disconnect_reason, reason, hangup_by";
+const COLUMNS: &str = "id, v, uuid, call_id, direction, caller, callee, source_ip, trunk_id, codec, is_webrtc, started_at, answered_at, ended_at, duration_secs, billable_secs, sip_code, disconnect_reason, reason, hangup_by, rtp_tx_caller, rtp_tx_callee, media_flags";
 
 /// `INSERT OR IGNORE` every row on an open transaction; returns how many
 /// were actually stored.
@@ -51,7 +51,10 @@ fn push_row<'a>(qb: &mut QueryBuilder<'a, sqlx::Sqlite>, r: &'a CdrRow) {
         .push_bind(r.sip_code)
         .push_bind(&r.disconnect_reason)
         .push_bind(&r.reason)
-        .push_bind(&r.hangup_by);
+        .push_bind(&r.hangup_by)
+        .push_bind(r.rtp_tx_caller)
+        .push_bind(r.rtp_tx_callee)
+        .push_bind(&r.media_flags);
     qb.push(")");
 }
 
@@ -252,6 +255,9 @@ mod tests {
             disconnect_reason: "normal-clearing".into(),
             reason: None,
             hangup_by: "caller".into(),
+            rtp_tx_caller: 1500,
+            rtp_tx_callee: 1500,
+            media_flags: String::new(),
         }
     }
 
