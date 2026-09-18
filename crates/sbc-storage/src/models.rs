@@ -5,6 +5,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Keys of the `settings` table shared by the SBC core, the API and the
+/// import, so every crate spells them the same way.
+pub mod keys {
+    /// `allow` | `deny` — the ACL default when no rule matches.
+    pub const ACL_DEFAULT_ACTION: &str = "acl_default_action";
+    /// API-set global per-user limits (decimal strings, both or neither).
+    pub const USER_LIMITS_DEFAULT_CONCURRENT: &str = "user_limits.default_max_concurrent_calls";
+    pub const USER_LIMITS_DEFAULT_CPM: &str = "user_limits.default_max_calls_per_minute";
+    /// First-boot seed markers (RFC 3339). Once set, the store is the truth
+    /// for that section and the TOML seeds are never applied again.
+    pub const DESTINATION_RULES_SEEDED_AT: &str = "destination_rules_seeded_at";
+    pub const USER_LIMITS_SEEDED_AT: &str = "user_limits_seeded_at";
+}
+
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow, Serialize, Deserialize)]
 pub struct UserRow {
     pub username: String,

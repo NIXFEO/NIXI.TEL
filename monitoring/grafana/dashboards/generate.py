@@ -137,6 +137,6 @@ P += [stat("Session-timer 422 retries (total)","sbc_session_timer_422_retries_to
 y+=4
 
 dash={"uid":"nixi-sbc-overview","title":"NIXI SBC — Overview","tags":["sbc","nixi"],
-    "timezone":"browser","schemaVersion":39,"version":3,"refresh":"30s",
+    "timezone":"browser","schemaVersion":39,"version":4,"refresh":"30s",
     "time":{"from":"now-6h","to":"now"},"editable":True,"panels":P}
 print(json.dumps(dash,indent=2))

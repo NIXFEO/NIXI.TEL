@@ -2344,3 +2344,485 @@ async fn cdrs_without_store_serve_the_cache_and_refuse_filters() {
     assert_eq!(json["cdr"]["backend"], "memory");
     assert!(json["cdr"]["queue"].is_u64());
 }
+
+// ── POST /api/v1/import ───────────────────────────────────────────────────────
+
+async fn post_ok(app: &axum::Router, path: &str, body: &str) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(req("POST", path, Some(body), true))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json = body_json(resp).await;
+    assert!(status.is_success(), "POST {} → {} {}", path, status, json);
+    json
+}
+
+async fn put_ok(app: &axum::Router, path: &str, body: &str) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(req("PUT", path, Some(body), true))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json = body_json(resp).await;
+    assert!(status.is_success(), "PUT {} → {} {}", path, status, json);
+    json
+}
+
+async fn get_json(app: &axum::Router, path: &str) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(req("GET", path, None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {}", path);
+    body_json(resp).await
+}
+
+/// An export without the volatile bits (`exported_at`, route ids).
+fn comparable(mut export: serde_json::Value) -> serde_json::Value {
+    export.as_object_mut().unwrap().remove("exported_at");
+    if let Some(routes) = export["routes"].as_array_mut() {
+        for r in routes {
+            r.as_object_mut().unwrap().remove("id");
+        }
+    }
+    export
+}
+
+#[tokio::test]
+async fn import_replace_round_trips_an_export_into_a_fresh_store() {
+    let source = make_state().await;
+    let source_app = build_router(source, &[]);
+    post_ok(
+        &source_app,
+        "/api/v1/users",
+        r#"{"username":"alice","password":"s3cret","max_concurrent_calls":2}"#,
+    )
+    .await;
+    post_ok(
+        &source_app,
+        "/api/v1/trunks",
+        r#"{"name":"pstn","host":"192.0.2.10","port":5080,"transport":"tcp",
+            "auth_required":true,"username":"u","password":"real-password",
+            "prefix_patterns":["+33"],"allowed_codecs":["PCMU"],"max_concurrent_calls":7}"#,
+    )
+    .await;
+    post_ok(
+        &source_app,
+        "/api/v1/routes",
+        r#"{"prefix":"+33","trunk_name":"pstn","priority":5}"#,
+    )
+    .await;
+    post_ok(
+        &source_app,
+        "/api/v1/dids",
+        r#"{"number":"+33123","sip_user":"alice"}"#,
+    )
+    .await;
+    post_ok(
+        &source_app,
+        "/api/v1/acl/rules",
+        r#"{"cidr":"203.0.113.0/24","action":"allow","comment":"office"}"#,
+    )
+    .await;
+    put_ok(&source_app, "/api/v1/acl/default", r#"{"action":"deny"}"#).await;
+    post_ok(
+        &source_app,
+        "/api/v1/security/destination-rules",
+        r#"{"id":"irsf-882","prefix":"+882","action":"deny","description":"satellite"}"#,
+    )
+    .await;
+    put_ok(
+        &source_app,
+        "/api/v1/security/user-limits",
+        r#"{"default_max_concurrent_calls":5,"default_max_calls_per_minute":50}"#,
+    )
+    .await;
+    let export = get_json(&source_app, "/api/v1/export").await;
+    assert_eq!(export["trunks"][0]["password"], "real-password");
+
+    // Fresh box: replace-import the document.
+    let target = make_state().await;
+    let trunks = target.trunks.clone();
+    let acl = target.acl.clone();
+    let security = target.security.clone();
+    let mut events = target.events.subscribe();
+    let target_app = build_router(target, &[]);
+    let report = post_ok(
+        &target_app,
+        "/api/v1/import?mode=replace",
+        &export.to_string(),
+    )
+    .await;
+    assert_eq!(report["mode"], "replace");
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["hydrated"], true);
+    assert_eq!(
+        report["users"],
+        serde_json::json!({"inserted": 1, "updated": 0, "deleted": 0})
+    );
+    assert_eq!(report["trunks"]["inserted"], 1);
+    assert_eq!(report["routes"]["inserted"], 1);
+    assert_eq!(report["dids"]["inserted"], 1);
+    assert_eq!(report["acl_rules"]["inserted"], 1);
+    assert_eq!(report["destination_rules"]["inserted"], 1);
+    assert_eq!(report["settings"]["set"]["acl_default_action"], "deny");
+    assert_eq!(report["deleted_trunks"], serde_json::json!([]));
+    assert_eq!(report["warnings"], serde_json::json!([]));
+
+    // Same export on both sides.
+    let reexport = get_json(&target_app, "/api/v1/export").await;
+    assert_eq!(comparable(reexport), comparable(export.clone()));
+
+    // …and the runtime follows the store.
+    let t = trunks.find_by_name("pstn").expect("trunk hydrated");
+    assert_eq!(t.port, 5080);
+    assert_eq!(t.max_concurrent_calls, 7);
+    assert!(t.prefix_patterns.contains(&"+33".to_string()));
+    assert_eq!(acl.default_action().await, sbc_core::acl::AclAction::Deny);
+    assert_eq!(security.user_limits.defaults(), (5, 50));
+    assert_eq!(security.user_limits.limits_for("alice").0, 2);
+    assert_eq!(security.destinations.list_rules().len(), 1);
+    let users = get_json(&target_app, "/api/v1/users").await;
+    assert_eq!(users[0]["username"], "alice");
+    assert_eq!(
+        get_json(&target_app, "/api/v1/registrations").await,
+        serde_json::json!([])
+    );
+
+    // One config event summarising the import.
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        .await
+        .expect("event")
+        .unwrap();
+    match ev {
+        sbc_core::events::SbcEvent::ConfigChanged {
+            entity, action, id, ..
+        } => {
+            assert_eq!(entity, "import");
+            assert_eq!(action, "replace");
+            assert!(id.starts_with("users +1/~0/-0"), "{}", id);
+        }
+        other => panic!("unexpected event {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn import_validates_the_document_before_touching_the_store() {
+    let app = build_router(make_state().await, &[]);
+    let post = |path: &'static str, body: String| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(req("POST", path, Some(&body), true))
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, body_json(resp).await)
+        }
+    };
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "/api/v1/import",
+            r#"{"version": 2, "bogus": []}"#.into(),
+            "unknown key 'bogus'",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"version": 7}"#.into(),
+            "unsupported version 7",
+        ),
+        ("/api/v1/import", r#"[]"#.into(), "must be a JSON object"),
+        (
+            "/api/v1/import?mode=upsert",
+            r#"{}"#.into(),
+            "mode must be 'merge' or 'replace'",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"users": [{"username": "x", "password": "p", "realm": "sip.example.com", "enabled": true}]}"#.into(),
+            "users[0]: 'password' is not accepted",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"users": [{"username": "x", "ha1": "zz", "realm": "sip.example.com", "enabled": true}]}"#.into(),
+            "users[0] 'x': ha1 must be 32 hex",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"users": [{"username": "x", "ha1": "0123456789abcdef0123456789abcdef", "realm": "other.example", "enabled": true}]}"#.into(),
+            "realm 'other.example' is not this SBC's realm",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"trunks": [{"name": "t", "host": "h"}]}"#.into(),
+            "trunks[0]: missing field",
+        ),
+        (
+            "/api/v1/import",
+            format!(
+                r#"{{"trunks": [{}]}}"#,
+                trunk_doc("t", "***", "UDP")
+            ),
+            "trunks[0] 't': password is masked",
+        ),
+        (
+            "/api/v1/import",
+            format!(
+                r#"{{"trunks": [{}]}}"#,
+                trunk_doc("t", "p", "SCTP")
+            ),
+            "transport must be UDP, TCP, TLS, WS or WSS",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"routes": [{"prefix": "+1", "trunk_name": "ghost", "priority": 1, "enabled": true}]}"#.into(),
+            "trunk 'ghost' is neither in the document nor in the store",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"acl_rules": [{"id": "a", "cidr": "not-an-ip", "action": "allow", "direction": "both", "priority": 1, "enabled": true}]}"#.into(),
+            "invalid CIDR or IP",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"acl_default_action": "maybe"}"#.into(),
+            "acl_default_action must be",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"user_limits": {"default_max_concurrent_calls": 1, "extra": 2}}"#.into(),
+            "user_limits: unknown field",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"destination_rules": [{"id": "d", "prefix": "+1", "action": "deny", "description": "", "enabled": true}, {"id": "d", "prefix": "+2", "action": "deny", "description": "", "enabled": true}]}"#.into(),
+            "destination_rules[1] 'd': duplicate",
+        ),
+    ];
+    for (path, body, expected) in cases {
+        let (status, json) = post(path, body.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{} {} → {}",
+            path,
+            body,
+            json
+        );
+        assert_eq!(json["code"], "invalid_import", "{}", json);
+        let msg = json["error"].as_str().unwrap();
+        assert!(
+            msg.contains(expected),
+            "expected '{}' in '{}'",
+            expected,
+            msg
+        );
+    }
+    // Nothing was written by any of them.
+    assert_eq!(get_json(&app, "/api/v1/users").await, serde_json::json!([]));
+    assert_eq!(
+        get_json(&app, "/api/v1/trunks").await,
+        serde_json::json!([])
+    );
+    assert_eq!(
+        get_json(&app, "/api/v1/acl/default").await["action"],
+        "allow"
+    );
+}
+
+/// A full trunk row as the export writes it.
+fn trunk_doc(name: &str, password: &str, transport: &str) -> String {
+    format!(
+        r#"{{"name":"{}","enabled":true,"host":"192.0.2.10","port":5060,"transport":"{}",
+        "auth_required":true,"username":"u","password":"{}","realm":null,
+        "register_with_trunk":false,"registration_interval":300,"prefix_patterns":"[\"+33\"]",
+        "priority":100,"weight":100,"cost_per_minute":0,"number_format":"e164",
+        "country_code":null,"national_prefix":null,"caller_number_format":null,
+        "caller_number_override":null,"caller_display_name":null,"allowed_codecs":"[\"PCMU\"]",
+        "max_concurrent_calls":100,"tls_sni":null,"tls_ca_cert":null,"tls_verify":true,
+        "tls_client_cert":null,"tls_client_key":null}}"#,
+        name, transport, password
+    )
+}
+
+#[tokio::test]
+async fn import_replace_refuses_to_drop_a_trunk_with_active_calls() {
+    let state = make_state().await;
+    let trunks = state.trunks.clone();
+    let app = build_router(state, &[]);
+    post_ok(
+        &app,
+        "/api/v1/trunks",
+        r#"{"name":"busy","host":"192.0.2.10"}"#,
+    )
+    .await;
+    post_ok(
+        &app,
+        "/api/v1/trunks",
+        r#"{"name":"idle","host":"192.0.2.11"}"#,
+    )
+    .await;
+    assert!(trunks.update_state_by_name("busy", |s| s.increment_calls()));
+
+    // Replace without "busy" → 409, nothing changes.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/import?mode=replace",
+            Some(r#"{"trunks": []}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "trunk_busy");
+    assert!(json["error"].as_str().unwrap().contains("busy"), "{}", json);
+    assert_eq!(
+        get_json(&app, "/api/v1/trunks")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Merge never deletes: fine.
+    let report = post_ok(&app, "/api/v1/import?mode=merge", r#"{"trunks": []}"#).await;
+    assert_eq!(
+        report["trunks"],
+        serde_json::json!({"inserted": 0, "updated": 0, "deleted": 0})
+    );
+
+    // Replace keeping the busy trunk drops the idle one from the store and the runtime.
+    let doc = format!(r#"{{"trunks": [{}]}}"#, trunk_doc("busy", "p", "udp"));
+    let report = post_ok(&app, "/api/v1/import?mode=replace", &doc).await;
+    assert_eq!(report["deleted_trunks"], serde_json::json!(["idle"]));
+    assert_eq!(
+        report["trunks"],
+        serde_json::json!({"inserted": 0, "updated": 1, "deleted": 1})
+    );
+    assert!(trunks.find_by_name("idle").is_none());
+    let busy = trunks.find_by_name("busy").unwrap();
+    assert!(busy.auth_required, "trunk row updated from the document");
+    assert_eq!(
+        get_json(&app, "/api/v1/trunks")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn import_dry_run_reports_without_writing_and_merge_applies_settings_live() {
+    let state = make_state().await;
+    let acl = state.acl.clone();
+    let security = state.security.clone();
+    let app = build_router(state, &[]);
+    let doc = r#"{"version": 2, "exported_at": 1,
+        "users": [{"username": "bob", "ha1": "0123456789ABCDEF0123456789abcdef", "realm": "sip.example.com", "enabled": true}],
+        "acl_default_action": "deny",
+        "user_limits": {"default_max_concurrent_calls": 9, "default_max_calls_per_minute": 90}}"#;
+
+    let report = post_ok(&app, "/api/v1/import?dry_run=true", doc).await;
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["hydrated"], false);
+    assert_eq!(report["users"]["inserted"], 1);
+    assert_eq!(
+        report["settings"]["set"]["user_limits.default_max_calls_per_minute"],
+        "90"
+    );
+    assert_eq!(get_json(&app, "/api/v1/users").await, serde_json::json!([]));
+    assert_eq!(
+        get_json(&app, "/api/v1/acl/default").await["action"],
+        "allow"
+    );
+    assert_eq!(
+        security.user_limits.defaults(),
+        (4, 10),
+        "TOML defaults untouched"
+    );
+
+    let report = post_ok(&app, "/api/v1/import", doc).await;
+    assert_eq!(report["mode"], "merge");
+    assert_eq!(report["hydrated"], true);
+    assert_eq!(get_json(&app, "/api/v1/users").await[0]["username"], "bob");
+    assert_eq!(
+        get_json(&app, "/api/v1/acl/default").await["action"],
+        "deny"
+    );
+    assert_eq!(acl.default_action().await, sbc_core::acl::AclAction::Deny);
+    assert_eq!(security.user_limits.defaults(), (9, 90));
+
+    // A replace with null limits removes the API-set defaults: the TOML
+    // defaults are back in force, live.
+    let report = post_ok(
+        &app,
+        "/api/v1/import?mode=replace",
+        r#"{"user_limits": {"default_max_concurrent_calls": null, "default_max_calls_per_minute": null}}"#,
+    )
+    .await;
+    assert_eq!(
+        report["settings"]["removed"],
+        serde_json::json!([
+            "user_limits.default_max_concurrent_calls",
+            "user_limits.default_max_calls_per_minute"
+        ])
+    );
+    assert_eq!(security.user_limits.defaults(), (4, 10));
+    assert_eq!(
+        get_json(&app, "/api/v1/users")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "absent section untouched"
+    );
+}
+
+#[tokio::test]
+async fn import_accepts_documents_up_to_8_mib() {
+    let app = build_router(make_state().await, &[]);
+    // 3 MB is over axum's 2 MB default and under the import limit.
+    let big_name = "n".repeat(3 * 1024 * 1024);
+    let doc = format!(
+        r#"{{"users": [{{"username": "big", "ha1": "0123456789abcdef0123456789abcdef", "realm": "sip.example.com", "display_name": "{}", "enabled": true}}]}}"#,
+        big_name
+    );
+    let report = post_ok(&app, "/api/v1/import", &doc).await;
+    assert_eq!(report["users"]["inserted"], 1);
+
+    let too_big = format!(
+        r#"{{"users": [{{"username": "huge", "ha1": "0123456789abcdef0123456789abcdef", "realm": "sip.example.com", "display_name": "{}", "enabled": true}}]}}"#,
+        "n".repeat(9 * 1024 * 1024)
+    );
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/import", Some(&too_big), true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The other routes keep their small limit.
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/users", Some(&doc), true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // No token → 401 before anything is read.
+    let resp = app
+        .oneshot(req("POST", "/api/v1/import", Some("{}"), false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

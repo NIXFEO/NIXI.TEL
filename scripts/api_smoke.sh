@@ -43,6 +43,7 @@ check "acl rules"                  200 "${AUTH[@]}" "$BASE/api/v1/acl/rules"
 check "cdrs"                       200 "${AUTH[@]}" "$BASE/api/v1/cdrs?limit=5"
 check "alerts"                     200 "${AUTH[@]}" "$BASE/api/v1/alerts"
 check "export"                     200 "${AUTH[@]}" "$BASE/api/v1/export"
+check "import dry-run (no-op)"     200 -X POST -H "Content-Type: application/json" -d '{"version":2}' "${AUTH[@]}" "$BASE/api/v1/import?dry_run=true"
 check "legacy /api/status"         200 "${AUTH[@]}" "$BASE/api/status"
 
 # SSE: expect a 200 and the event-stream content type within 2s

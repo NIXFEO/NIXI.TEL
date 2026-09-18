@@ -106,6 +106,10 @@ impl SecurityManager {
         self.destinations
             .set_default_country_code(&f.destinations.default_country_code);
         self.user_limits.set_enabled(f.user_limits.enabled);
+        self.user_limits.set_config_defaults(
+            f.user_limits.default_max_concurrent_calls,
+            f.user_limits.default_max_calls_per_minute,
+        );
         if apply_limit_defaults {
             self.user_limits.set_defaults(
                 f.user_limits.default_max_concurrent_calls,

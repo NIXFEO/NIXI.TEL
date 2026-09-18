@@ -74,6 +74,10 @@ pub enum LimitDecision {
 pub struct UserLimitsManager {
     enabled: RwLock<bool>,
     defaults: RwLock<(u32, u32)>, // (max_concurrent, max_cpm); 0 = unlimited
+    /// The TOML `[security.user_limits] default_*` pair — what
+    /// `reset_defaults` restores when the store carries no API-set
+    /// defaults (never set, or removed by an import).
+    config_defaults: RwLock<(u32, u32)>,
     overrides: DashMap<String, UserLimits>,
     rate_windows: DashMap<String, VecDeque<Instant>>,
 }
@@ -83,6 +87,10 @@ impl UserLimitsManager {
         let mgr = Self {
             enabled: RwLock::new(config.enabled),
             defaults: RwLock::new((
+                config.default_max_concurrent_calls,
+                config.default_max_calls_per_minute,
+            )),
+            config_defaults: RwLock::new((
                 config.default_max_concurrent_calls,
                 config.default_max_calls_per_minute,
             )),
@@ -144,6 +152,17 @@ impl UserLimitsManager {
 
     pub fn defaults(&self) -> (u32, u32) {
         *self.defaults.read().unwrap()
+    }
+
+    /// Record the TOML defaults (boot and every reload).
+    pub fn set_config_defaults(&self, max_concurrent: u32, max_cpm: u32) {
+        *self.config_defaults.write().unwrap() = (max_concurrent, max_cpm);
+    }
+
+    /// Put the TOML defaults back in force.
+    pub fn reset_defaults(&self) {
+        let defaults = *self.config_defaults.read().unwrap();
+        *self.defaults.write().unwrap() = defaults;
     }
 
     pub fn overrides(&self) -> Vec<(String, UserLimits)> {

@@ -7,10 +7,13 @@
 
 pub mod cdr;
 pub mod error;
+pub mod import;
 pub mod models;
 pub mod store;
 
 pub use error::{Error, Result};
+pub use import::{ImportDoc, ImportMode, ImportReport, ImportUserLimits, SectionReport};
+pub use models::keys;
 pub use models::{
     AclRuleRow, BackupInfo, BanRow, CdrFilter, CdrRow, DestinationRuleRow, DidRow, RouteRow,
     TrunkRow, UserRow,

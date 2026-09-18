@@ -5,7 +5,7 @@
 //! - configurable CORS
 //! - SSE event stream at /api/v1/events
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -145,11 +145,23 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
         .route("/api/registrations", get(routes::calls::list_registrations))
         .route("/api/status", get(routes::system::stats))
         .route("/api/trunks", get(routes::trunks::list_trunks))
+        .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
+        // The import takes a whole export document: its own, larger limit
+        // (axum's 2 MB default on `Json` must be raised too).
+        .merge(
+            Router::new()
+                .route("/api/v1/import", post(routes::store::import))
+                .layer(DefaultBodyLimit::max(
+                    routes::store::IMPORT_BODY_LIMIT_BYTES,
+                ))
+                .layer(RequestBodyLimitLayer::new(
+                    routes::store::IMPORT_BODY_LIMIT_BYTES,
+                )),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
-        .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
         // Rate-limit is outermost so it runs first, before auth and handlers.
         .layer(middleware::from_fn_with_state(
             rate_limiter,

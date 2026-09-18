@@ -172,9 +172,9 @@ pub fn now_rfc3339() -> String {
 /// Settings marker: the TOML destination rules (and IRSF seeds) were
 /// imported. Written only once every row was stored, so an incomplete
 /// seed is retried at the next boot (the upsert is idempotent).
-pub const DESTINATION_RULES_SEEDED_KEY: &str = "destination_rules_seeded_at";
+pub const DESTINATION_RULES_SEEDED_KEY: &str = sbc_storage::keys::DESTINATION_RULES_SEEDED_AT;
 /// Settings marker: the TOML per-user limit overrides were imported.
-pub const USER_LIMITS_SEEDED_KEY: &str = "user_limits_seeded_at";
+pub const USER_LIMITS_SEEDED_KEY: &str = sbc_storage::keys::USER_LIMITS_SEEDED_AT;
 
 pub async fn seed_security(store: &ConfigStore, config: &SbcConfig) {
     let features = &config.security.features;

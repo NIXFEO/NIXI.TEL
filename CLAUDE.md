@@ -29,7 +29,7 @@ MIT licensed. Runs in production; contributions welcome — see
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # ~485 tests
+cargo test --workspace          # ~570 tests
 cargo clippy --workspace
 ```
 
@@ -65,7 +65,10 @@ change; `POST /reload` returns the engine's report.
 
 Key modules: `sbc/import.rs` (first-boot seed), `sbc/hydrate.rs`
 (store → live managers), `config.rs` (TOML schema), `sbc/backup.rs`
-(`VACUUM INTO` copies: `POST /api/v1/backup` + timer).
+(`VACUUM INTO` copies: `POST /api/v1/backup` + timer),
+`sbc-storage/src/import.rs` (`POST /api/v1/import`: an export document
+applied in one transaction, merge or replace, then hydrate). The settings
+keys shared by the crates live in `sbc_storage::keys`.
 
 CDRs are store data too (table `cdrs`, migration 0003, `cdr_writer.rs`):
 never seeded from TOML, not part of `/export` (use `GET /api/v1/cdrs?format=csv`).
@@ -143,8 +146,9 @@ the sweeper.
 Full reference in [docs/API.md](docs/API.md). All dynamic config is
 SQLite-backed and applied to the runtime immediately. Highlights: CRUD for
 users/DIDs/trunks/routes/ACL; `/api/v1/security/*` (bans, destination rules,
-user limits); `GET /api/v1/events` (SSE); `GET /api/v1/export` (backup);
-`DELETE /api/v1/calls/{uuid}`. `/health` and `/ready` are public; everything
+user limits); `GET /api/v1/events` (SSE); `GET /api/v1/export` /
+`POST /api/v1/import` (config backup and live restore); `POST /api/v1/backup`
+(store file copy); `DELETE /api/v1/calls/{uuid}`. `/health` and `/ready` are public; everything
 else needs the bearer token (constant-time comparison).
 
 ## Deployment
@@ -255,7 +259,11 @@ re-mapping, SIP message builder (true-B2BUA BYEs), SQLite-backed full API +
 SSE, WebRTC WS lifecycle, anti-fraud (fail2ban / IRSF / per-user limits),
 real outbound TLS + mTLS, enriched CDRs (negotiated codec + inbound trunk),
 RTP-timeout / last-CDR metrics, per-call log spans with text/JSON output
-(`[logging]`, `RUST_LOG`).
+(`[logging]`, `RUST_LOG`), per-trunk metrics and state fed by real calls,
+trunk OPTIONS/REGISTER tasks that follow the trunk table, fail-closed
+store with real `/ready`, store backups and config import, TLS certificate
+reload, registrar bindings by Contact/instance, CDRs in SQLite with
+filters and CSV.
 
 Ideas welcome (open an issue / PR):
 

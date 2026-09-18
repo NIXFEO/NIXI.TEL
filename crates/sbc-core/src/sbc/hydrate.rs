@@ -256,7 +256,10 @@ pub async fn apply_acl(acl: &AclManager, store: &ConfigStore) -> crate::Result<u
 
     let count = acl.replace_rules(rules).await;
 
-    if let Ok(Some(action)) = store.get_setting("acl_default_action").await {
+    if let Ok(Some(action)) = store
+        .get_setting(sbc_storage::keys::ACL_DEFAULT_ACTION)
+        .await
+    {
         let action = match action.as_str() {
             "deny" => AclAction::Deny,
             _ => AclAction::Allow,
@@ -363,16 +366,19 @@ pub async fn apply_user_limits(
         .ok()
         .flatten()
         .and_then(|v| v.parse::<u32>().ok());
-    if let (Some(c), Some(m)) = (concurrent, cpm) {
-        security.user_limits.set_defaults(c, m);
+    match (concurrent, cpm) {
+        (Some(c), Some(m)) => security.user_limits.set_defaults(c, m),
+        // No API-set defaults (never set, or removed by an import): the
+        // TOML `[security.user_limits]` defaults apply again.
+        _ => security.user_limits.reset_defaults(),
     }
     info!("Hydrate: user limit overrides — {}", count);
     Ok(count)
 }
 
 /// Settings keys holding the API-set global user limits.
-pub const SETTING_DEFAULT_CONCURRENT: &str = "user_limits.default_max_concurrent_calls";
-pub const SETTING_DEFAULT_CPM: &str = "user_limits.default_max_calls_per_minute";
+pub const SETTING_DEFAULT_CONCURRENT: &str = sbc_storage::keys::USER_LIMITS_DEFAULT_CONCURRENT;
+pub const SETTING_DEFAULT_CPM: &str = sbc_storage::keys::USER_LIMITS_DEFAULT_CPM;
 
 /// Shared handles the API layer needs to re-hydrate the runtime after writes.
 #[derive(Clone)]

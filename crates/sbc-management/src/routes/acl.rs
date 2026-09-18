@@ -139,7 +139,7 @@ pub struct DefaultActionBody {
 pub async fn get_default(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let store = store(&state)?;
     let action = store
-        .get_setting("acl_default_action")
+        .get_setting(sbc_storage::keys::ACL_DEFAULT_ACTION)
         .await
         .map_err(ApiError::internal)?
         .unwrap_or_else(|| "allow".to_string());
@@ -155,7 +155,7 @@ pub async fn set_default(
         return Err(ApiError::bad_request("action must be 'allow' or 'deny'"));
     }
     store
-        .set_setting("acl_default_action", &body.action)
+        .set_setting(sbc_storage::keys::ACL_DEFAULT_ACTION, &body.action)
         .await
         .map_err(ApiError::internal)?;
     apply_and_notify(&state, &store, "set_default", &body.action).await;

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use tracing::info;
 
 use crate::models::{
@@ -95,6 +95,13 @@ impl ConfigStore {
         &self.pool
     }
 
+    /// One pooled connection for the `*_on` variants below. The pool-based
+    /// wrappers acquire it once, so they also work on a one-connection
+    /// pool (`open_memory`).
+    async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
+        self.pool.acquire().await.map_err(db_err)
+    }
+
     // ── users ────────────────────────────────────────────────────────────
 
     pub async fn list_users(&self) -> Result<Vec<UserRow>> {
@@ -122,7 +129,19 @@ impl ConfigStore {
 
     /// Returns `true` if the user was created (vs updated).
     pub async fn upsert_user(&self, row: &UserRow) -> Result<bool> {
-        let existing = self.get_user(&row.username).await?;
+        let mut conn = self.conn().await?;
+        Self::upsert_user_on(&mut conn, row).await
+    }
+
+    /// `upsert_user` on a caller-held connection (an open transaction's).
+    /// Returns `true` when the row was inserted, `false` when updated.
+    pub async fn upsert_user_on(conn: &mut SqliteConnection, row: &UserRow) -> Result<bool> {
+        let existing = exists(
+            conn,
+            "SELECT 1 FROM users WHERE username = ?",
+            &row.username,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO users (username, ha1, realm, display_name, enabled,
                                 max_concurrent_calls, max_calls_per_minute)
@@ -141,10 +160,10 @@ impl ConfigStore {
         .bind(row.enabled)
         .bind(row.max_concurrent_calls)
         .bind(row.max_calls_per_minute)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(existing.is_none())
+        Ok(!existing)
     }
 
     pub async fn delete_user(&self, username: &str) -> Result<bool> {
@@ -178,7 +197,13 @@ impl ConfigStore {
     }
 
     pub async fn upsert_did(&self, row: &DidRow) -> Result<bool> {
-        let existing = self.get_did(&row.number).await?;
+        let mut conn = self.conn().await?;
+        Self::upsert_did_on(&mut conn, row).await
+    }
+
+    /// `upsert_did` on a caller-held connection; `true` when inserted.
+    pub async fn upsert_did_on(conn: &mut SqliteConnection, row: &DidRow) -> Result<bool> {
+        let existing = exists(conn, "SELECT 1 FROM dids WHERE number = ?", &row.number).await?;
         sqlx::query(
             "INSERT INTO dids (number, sip_user, display_name, enabled)
              VALUES (?, ?, ?, ?)
@@ -190,10 +215,10 @@ impl ConfigStore {
         .bind(&row.sip_user)
         .bind(&row.display_name)
         .bind(row.enabled)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(existing.is_none())
+        Ok(!existing)
     }
 
     pub async fn delete_did(&self, number: &str) -> Result<bool> {
@@ -223,7 +248,13 @@ impl ConfigStore {
     }
 
     pub async fn upsert_trunk(&self, row: &TrunkRow) -> Result<bool> {
-        let existing = self.get_trunk(&row.name).await?;
+        let mut conn = self.conn().await?;
+        Self::upsert_trunk_on(&mut conn, row).await
+    }
+
+    /// `upsert_trunk` on a caller-held connection; `true` when inserted.
+    pub async fn upsert_trunk_on(conn: &mut SqliteConnection, row: &TrunkRow) -> Result<bool> {
+        let existing = exists(conn, "SELECT 1 FROM trunks WHERE name = ?", &row.name).await?;
         sqlx::query(
             "INSERT INTO trunks (name, enabled, host, port, transport, auth_required,
                 username, password, realm, register_with_trunk, registration_interval,
@@ -281,10 +312,10 @@ impl ConfigStore {
         .bind(row.tls_verify)
         .bind(&row.tls_client_cert)
         .bind(&row.tls_client_key)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(existing.is_none())
+        Ok(!existing)
     }
 
     pub async fn delete_trunk(&self, name: &str) -> Result<bool> {
@@ -353,6 +384,35 @@ impl ConfigStore {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Insert or update the route identified by (`prefix`, `trunk_name`)
+    /// — the natural key the `UNIQUE(prefix, trunk_name)` constraint
+    /// enforces; `row.id` is ignored. `true` when inserted.
+    pub async fn upsert_route_on(conn: &mut SqliteConnection, row: &RouteRow) -> Result<bool> {
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM routes WHERE prefix = ? AND trunk_name = ?")
+                .bind(&row.prefix)
+                .bind(&row.trunk_name)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        sqlx::query(
+            "INSERT INTO routes (prefix, trunk_name, priority, enabled, description)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(prefix, trunk_name) DO UPDATE SET
+                priority = excluded.priority, enabled = excluded.enabled,
+                description = excluded.description",
+        )
+        .bind(&row.prefix)
+        .bind(&row.trunk_name)
+        .bind(row.priority)
+        .bind(row.enabled)
+        .bind(&row.description)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        Ok(existing.is_none())
+    }
+
     pub async fn delete_route(&self, id: i64) -> Result<bool> {
         let res = sqlx::query("DELETE FROM routes WHERE id = ?")
             .bind(id)
@@ -375,11 +435,13 @@ impl ConfigStore {
     }
 
     pub async fn upsert_acl_rule(&self, row: &AclRuleRow) -> Result<bool> {
-        let existing = sqlx::query("SELECT id FROM acl_rules WHERE id = ?")
-            .bind(&row.id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let mut conn = self.conn().await?;
+        Self::upsert_acl_rule_on(&mut conn, row).await
+    }
+
+    /// `upsert_acl_rule` on a caller-held connection; `true` when inserted.
+    pub async fn upsert_acl_rule_on(conn: &mut SqliteConnection, row: &AclRuleRow) -> Result<bool> {
+        let existing = exists(conn, "SELECT 1 FROM acl_rules WHERE id = ?", &row.id).await?;
         sqlx::query(
             "INSERT INTO acl_rules (id, cidr, action, direction, priority, enabled, comment)
              VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -395,10 +457,10 @@ impl ConfigStore {
         .bind(row.priority)
         .bind(row.enabled)
         .bind(&row.comment)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(existing.is_none())
+        Ok(!existing)
     }
 
     pub async fn delete_acl_rule(&self, id: &str) -> Result<bool> {
@@ -444,11 +506,22 @@ impl ConfigStore {
     /// Insert or replace a rule (seeding, import); true when it did not
     /// exist yet.
     pub async fn upsert_destination_rule(&self, row: &DestinationRuleRow) -> Result<bool> {
-        let existing = sqlx::query("SELECT id FROM destination_rules WHERE id = ?")
-            .bind(&row.id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let mut conn = self.conn().await?;
+        Self::upsert_destination_rule_on(&mut conn, row).await
+    }
+
+    /// `upsert_destination_rule` on a caller-held connection; `true` when
+    /// inserted.
+    pub async fn upsert_destination_rule_on(
+        conn: &mut SqliteConnection,
+        row: &DestinationRuleRow,
+    ) -> Result<bool> {
+        let existing = exists(
+            conn,
+            "SELECT 1 FROM destination_rules WHERE id = ?",
+            &row.id,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO destination_rules (id, prefix, action, user, description, enabled)
              VALUES (?, ?, ?, ?, ?, ?)
@@ -462,10 +535,10 @@ impl ConfigStore {
         .bind(&row.user)
         .bind(&row.description)
         .bind(row.enabled)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-        Ok(existing.is_none())
+        Ok(!existing)
     }
 
     pub async fn delete_destination_rule(&self, id: &str) -> Result<bool> {
@@ -549,25 +622,50 @@ impl ConfigStore {
     // ── settings / misc ──────────────────────────────────────────────────
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.conn().await?;
+        Self::get_setting_on(&mut conn, key).await
+    }
+
+    pub async fn get_setting_on(conn: &mut SqliteConnection, key: &str) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(db_err)?;
         Ok(row.map(|(v,)| v))
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        Self::set_setting_on(&mut conn, key, value).await
+    }
+
+    pub async fn set_setting_on(conn: &mut SqliteConnection, key: &str, value: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(key)
         .bind(value)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Remove a setting; `true` when it existed.
+    pub async fn delete_setting(&self, key: &str) -> Result<bool> {
+        let mut conn = self.conn().await?;
+        Self::delete_setting_on(&mut conn, key).await
+    }
+
+    pub async fn delete_setting_on(conn: &mut SqliteConnection, key: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn table_is_empty(&self, table: Table) -> Result<bool> {
@@ -749,8 +847,36 @@ pub fn newest_backup(dir: &Path) -> Option<(std::path::PathBuf, std::time::Syste
         .map(|(_, path, mtime)| (path, mtime))
 }
 
-fn db_err(e: sqlx::Error) -> Error {
+/// Map a driver error, telling schema-constraint violations (the caller's
+/// data) apart from everything else (the database).
+pub(crate) fn db_err(e: sqlx::Error) -> Error {
+    if let sqlx::Error::Database(db) = &e {
+        use sqlx::error::ErrorKind;
+        if matches!(
+            db.kind(),
+            ErrorKind::UniqueViolation
+                | ErrorKind::ForeignKeyViolation
+                | ErrorKind::NotNullViolation
+                | ErrorKind::CheckViolation
+        ) {
+            return Error::Constraint {
+                table: String::new(),
+                key: String::new(),
+                detail: db.message().to_string(),
+            };
+        }
+    }
     Error::Database(e.to_string())
+}
+
+/// `true` when `sql` (one `?` bound to `key`) returns a row.
+async fn exists(conn: &mut SqliteConnection, sql: &str, key: &str) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(sql)
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    Ok(row.is_some())
 }
 
 #[cfg(test)]

@@ -327,7 +327,7 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Json<serde_json:
     let routes = store.list_routes().await.map_err(ApiError::internal)?;
     let acl = store.list_acl_rules().await.map_err(ApiError::internal)?;
     let acl_default = store
-        .get_setting("acl_default_action")
+        .get_setting(sbc_storage::keys::ACL_DEFAULT_ACTION)
         .await
         .map_err(ApiError::internal)?
         .unwrap_or_else(|| "allow".to_string());
@@ -361,7 +361,7 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Json<serde_json:
         "trunks": trunks,
         "routes": routes,
         "acl_rules": acl,
-        "acl_default_action": acl_default,
+        sbc_storage::keys::ACL_DEFAULT_ACTION: acl_default,
         "destination_rules": destination_rules,
         "user_limits": {
             "default_max_concurrent_calls": default_concurrent,

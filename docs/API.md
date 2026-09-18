@@ -19,8 +19,10 @@ Errors are uniform: `{"error": "<message>", "code": "<machine_code>"}`.
 
 Every write goes to the SQLite store first, is applied to the live runtime
 immediately (no reload needed), and emits a `config` event on the SSE bus.
-`GET /api/v1/export` returns the full dynamic config for backup; restoring
-is replaying it through the CRUD endpoints.
+`GET /api/v1/export` returns the full dynamic config for backup;
+`POST /api/v1/import` loads such a document back in one transaction
+(`?mode=merge` upserts what it carries, `?mode=replace` makes each section
+it carries the whole truth; `?dry_run=true` only reports).
 
 ## Endpoints
 
@@ -130,6 +132,7 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 | POST | `/api/v1/tls/reload` | re-read every listener's cert/key (what a certbot deploy hook calls): 200 `{"status":"ok","listeners":[{listener,bind,changed,…}]}`; 422 `tls_reload_failed` with the same `listeners` detail when one could not reload (its previous certificate stays in use) |
 | GET | `/api/v1/export` | full dynamic-config dump (includes auth material — admin only) |
 | POST | `/api/v1/backup` | `VACUUM INTO` copy of the store into `[database] backup_dir` as `sbc-<timestamp>.db`, pruned to `backup_keep`: 200 `{"path","bytes","took_ms","pruned":[…]}`, 409 `backup already in progress`, 503 without a store. The copy holds trunk passwords and user HA1s. |
+| POST | `/api/v1/import?mode=merge\|replace&dry_run=true` | load an export document (version 1 or 2; body up to 8 MiB) into the store in **one transaction**, then re-hydrate the runtime. Sections: `users` (with `ha1`, `realm` must be this SBC's), `dids`, `trunks` (real passwords, never the masked GET shape), `routes` (keyed by `prefix` + `trunk_name`, `id` ignored), `acl_rules`, `acl_default_action`, `destination_rules`, `user_limits`. A section absent from the document is untouched in both modes; `merge` (default) upserts its rows, `replace` also deletes the rows it does not list (a deleted trunk takes its routes along; a `null` user limit removes the API-set default so the TOML one applies again). 200 `{"mode","dry_run","users":{"inserted","updated","deleted"},…,"settings":{"set","removed"},"deleted_trunks","hydrated","warnings"}`; 400 `invalid_import` naming the spot (`trunks[2] 'pstn': …` — unknown key, unsupported version, malformed row, route to an unknown trunk) with nothing written; 409 `trunk_busy` when a replace would delete a trunk carrying calls; 413 over 8 MiB; 503 without a store. A document that carries `users` or `destination_rules` marks that section as seeded (the TOML seeds never come back). TLS/WSS trunks still need `POST /api/v1/reload` for their outbound TLS material (as after `PUT /trunks`). |
 
 ### Legacy aliases
 

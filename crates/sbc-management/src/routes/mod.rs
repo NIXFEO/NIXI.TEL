@@ -60,6 +60,13 @@ impl ApiError {
             message: message.to_string(),
         }
     }
+    /// Same status, a more specific machine code (`invalid_import`,
+    /// `trunk_busy`…).
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
+
     /// Config store unavailable — mutating endpoints cannot work.
     pub fn store_unavailable() -> Self {
         Self {

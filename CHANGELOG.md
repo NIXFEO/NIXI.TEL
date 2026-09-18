@@ -304,6 +304,19 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   rules `SBCStoreUnavailable`, `SBCStoreBackupStale`, `SBCStoreBackupFailed`;
   SSE `alert` kind `backup_failed`. Restore stays "stop, copy the file
   over `sqlite_path` (delete `-wal`/`-shm`), start" (INSTALL.md §10).
+- Config import: `POST /api/v1/import?mode=merge|replace&dry_run=true`
+  loads a `GET /api/v1/export` document (version 1 or 2, up to 8 MiB) into
+  the store in one transaction and re-hydrates the runtime — a live
+  restore, or a way to carry a config to another box. `merge` upserts the
+  rows the document carries, `replace` also deletes the rows a section
+  does not list (trunk routes cascade, a `null` user limit puts the TOML
+  default back); absent sections are untouched. Every row is validated
+  first (400 `invalid_import` naming the spot, nothing written), a replace
+  that would drop a trunk with calls is 409 `trunk_busy`, the report
+  counts inserted/updated/deleted per section. Routes are now upserted by
+  (`prefix`, `trunk_name`); constraint violations surface as a typed
+  storage error instead of a bare "Database error". The nginx block in
+  INSTALL.md gains `client_max_body_size 16m`.
 - Trunk tasks: `[trunk_health]` section (`options_interval`,
   `options_timeout`, `register_backoff_max`), SSE events
   `trunk_registered` / `trunk_unregistered`, `registered` on

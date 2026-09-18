@@ -34,7 +34,7 @@ database required.
 - axum REST API: CRUD for users, DIDs, trunks (full field set), routes, ACLs
 - Writes hit SQLite then apply to the live runtime instantly — no reloads
 - **Server-Sent Events** stream: calls, registrations, trunk health, alerts, config changes
-- Prometheus `/metrics`, enriched JSON-lines CDRs with pagination, config export and scheduled store backups (`POST /api/v1/backup`)
+- Prometheus `/metrics`, CDRs in SQLite with filters and CSV export, config export/import (`GET /api/v1/export`, `POST /api/v1/import`) and scheduled store backups (`POST /api/v1/backup`)
 - Constant-time bearer auth, configurable CORS, public health probes
 
 **Security & anti-fraud**

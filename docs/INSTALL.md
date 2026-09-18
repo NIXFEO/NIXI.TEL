@@ -289,6 +289,8 @@ server {
         # SSE (/api/v1/events) and CSV exports (/api/v1/cdrs?format=csv) stream:
         proxy_buffering    off;
         proxy_read_timeout 600s;
+        # POST /api/v1/import takes a whole export document (up to 8 MiB):
+        client_max_body_size 16m;
         # The caller supplies its own bearer token; nginx does NOT inject one.
         # (Do not set proxy_set_header Authorization here.) Query-string
         # tokens (?token=) end up in the access log: prefer the header.
@@ -423,7 +425,16 @@ A store that cannot be opened or read at boot is fatal (the SBC would run
 with no users, trunks or DIDs): the unit ends failed, `journalctl -u sbc`
 names the path. `[database] allow_missing_store = true` is the escape
 hatch (TOML seeds only, `/ready` stays 503). Grab a config snapshot via
-`GET /api/v1/export` as well before major upgrades.
+`GET /api/v1/export` as well before major upgrades: unlike the file copy
+it restores **live**, without a stop and without touching the CDRs
+(`?dry_run=true` first shows what would change; `mode=replace` deletes
+what the document does not list):
+
+```bash
+curl -s -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/export > sbc-config.json
+curl -s -X POST -H "Authorization: Bearer $SBC_API_TOKEN" -H "Content-Type: application/json" \
+     --data-binary @sbc-config.json "http://127.0.0.1:8080/api/v1/import?mode=replace&dry_run=true"
+```
 
 **Rolling back across a migration.** A binary older than 0.20 refuses to
 open a store that carries a migration it does not know (0.20 added
