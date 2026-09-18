@@ -67,7 +67,7 @@ curl -N "localhost:8080/api/v1/events?token=$TOKEN"
 ```
 
 Build needs `cmake` (for the bundled Opus codec). Run the tests with
-`cargo test --workspace` (~580 tests).
+`cargo test --workspace` (~585 tests).
 
 ## Architecture
 
