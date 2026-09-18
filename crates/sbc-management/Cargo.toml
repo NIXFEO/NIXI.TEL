@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 http-body-util = "0.1"

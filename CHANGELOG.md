@@ -217,6 +217,18 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
   `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- TLS / WSS listener certificates reload without a restart:
+  `POST /api/v1/tls/reload` re-reads every listener's cert/key files off
+  the event loop, proves the key signs for the certificate (an in-memory
+  handshake — rustls 0.22 does not check the pair) and swaps atomically
+  for the next accepted socket; a broken file keeps the previous
+  certificate (422 `tls_reload_failed`, SSE `alert` `tls_reload_failed`).
+  SIGHUP / `POST /api/v1/reload` do the same. `GET /api/v1/tls/certificates`
+  lists subject, validity, SHA-256 fingerprint and files; gauge
+  `sbc_tls_cert_expiry_timestamp_seconds{listener,bind}`, alerts
+  `SBCCertExpiringSoon` / `SBCCertExpired`, `/api/v1/alerts`
+  `tls_cert_expiring` / `tls_cert_expired`. The certbot hook in INSTALL.md
+  §6 calls the reload route (restart only when the API is unreachable).
 - `GET /api/v1/config`: the effective configuration (secrets `"***"`),
   what a reload already loaded but could not apply (`restart_required`),
   what the on-disk file would change (`file.reload_pending`,
@@ -275,6 +287,10 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Dependabot watches cargo and actions.
 
 ### Changed
+- A TLS / WSS listener whose private key does not match its certificate
+  refuses to start (it used to start and fail every handshake). The
+  SIP-over-TLS listener now accepts SEC1 `EC PRIVATE KEY` files like the
+  WSS listener always did (both go through one loader).
 - A reload applies whatever `[security]` reload-class values are on disk,
   including `[security.ban] whitelist` (an emptied list un-whitelists;
   loopback stays whitelisted) and `rate_limit_per_ip`: check

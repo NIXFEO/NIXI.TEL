@@ -51,6 +51,8 @@ pub struct TransportManager {
     tls_params: Arc<dashmap::DashMap<SocketAddr, TlsDestination>>,
     tls_connections:
         Arc<dashmap::DashMap<SocketAddr, Arc<crate::transport::tls_connect::TlsClientConnection>>>,
+    /// The TLS / WSS listeners' certificates (reloadable).
+    tls_identities: Arc<crate::transport::tls_identity::TlsIdentityRegistry>,
 }
 
 impl TransportManager {
@@ -68,7 +70,12 @@ impl TransportManager {
             event_tx,
             tls_params: Arc::new(dashmap::DashMap::new()),
             tls_connections: Arc::new(dashmap::DashMap::new()),
+            tls_identities: Arc::new(crate::transport::tls_identity::TlsIdentityRegistry::new()),
         }
+    }
+
+    pub fn tls_identities(&self) -> Arc<crate::transport::tls_identity::TlsIdentityRegistry> {
+        self.tls_identities.clone()
     }
 
     /// Start all listeners defined in config
@@ -159,6 +166,9 @@ impl TransportManager {
 
         let proto = if secure { "WSS" } else { "WS" };
         info!("Started {} listener on {}", proto, listener.local_addr());
+        if let Some(id) = listener.identity() {
+            self.tls_identities.register(id);
+        }
 
         let tx = self.message_tx.clone();
         let event_tx = self.event_tx.clone();
@@ -185,8 +195,8 @@ impl TransportManager {
 
         let bind_addr = SocketAddr::new(config.bind_address, config.bind_port);
         let listener = TlsListenerServer::new(bind_addr, cert_file, key_file).await?;
-
         info!("Started TLS listener on {}", listener.local_addr());
+        self.tls_identities.register(listener.identity());
 
         // Start listening in background
         let tx = self.message_tx.clone();
@@ -490,5 +500,72 @@ mod outbound_pool_tests {
             !tm.tls_params.contains_key(&bad_dest),
             "a destination whose config cannot be built is not registered"
         );
+    }
+}
+
+#[cfg(test)]
+mod tls_reload_tests {
+    use super::*;
+    use crate::config::{ListenerConfig, NetworkConfig, TransportType as CfgTransport};
+    use crate::transport::tls_identity::test_pem::{self_signed, write_pair};
+
+    /// The leaf certificate a TLS server presents, via a raw rustls client.
+    async fn peer_leaf_der(addr: SocketAddr) -> Vec<u8> {
+        let cfg = tokio_rustls::rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                crate::transport::tls_connect::danger::NoVerifier,
+            ))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let stream = connector.connect(name, tcp).await.unwrap();
+        stream.get_ref().1.peer_certificates().unwrap()[0].to_vec()
+    }
+
+    #[tokio::test]
+    async fn tls_and_wss_listeners_serve_the_swapped_certificate_on_the_next_accept() {
+        for transport in [CfgTransport::TLS, CfgTransport::WSS] {
+            let (cert_a, key_a, der_a) = self_signed("a.test", 2031);
+            let (c, k) = write_pair(&cert_a, &key_a);
+            let mut tm = TransportManager::new();
+            let config = NetworkConfig {
+                listeners: vec![ListenerConfig {
+                    transport,
+                    bind_address: "127.0.0.1".parse().unwrap(),
+                    bind_port: 0,
+                    cert_file: Some(c.clone()),
+                    key_file: Some(k.clone()),
+                }],
+                public_ipv4: None,
+                public_ipv6: None,
+            };
+            tm.start_listeners(&config).await.unwrap();
+            let registry = tm.tls_identities();
+            let bound: SocketAddr = registry.statuses()[0].bind.parse().unwrap();
+            assert_eq!(peer_leaf_der(bound).await, der_a, "{:?}", transport);
+
+            let (cert_b, key_b, der_b) = self_signed("b.test", 2032);
+            std::fs::write(&c, cert_b).unwrap();
+            std::fs::write(&k, key_b).unwrap();
+            let out = registry.reload_all().await;
+            assert!(out[0].error.is_none() && out[0].changed, "{:?}", out);
+            assert_eq!(
+                peer_leaf_der(bound).await,
+                der_b,
+                "swapped for the next accept"
+            );
+
+            std::fs::write(&k, "broken").unwrap();
+            let out = registry.reload_all().await;
+            assert!(out[0].error.is_some());
+            assert_eq!(
+                peer_leaf_der(bound).await,
+                der_b,
+                "previous certificate kept"
+            );
+            let _ = std::fs::remove_dir_all(c.parent().unwrap());
+        }
     }
 }

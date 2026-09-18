@@ -108,6 +108,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `media/rtp.rs` | Bidirectional RTP relay, STUN/DTLS demux, DTMF PT re-mapping, inactivity timeout |
 | `media/{sdp,srtp_crypto,ice,dtls,stun}.rs` | SDP rewriting, SRTP, ICE, DTLS, STUN |
 | `transport/{udp,tcp,tls,ws}.rs` · `transport/tls_connect.rs` | Listeners + real outbound TLS |
+| `transport/tls_identity.rs` | Reloadable listener certificates (load + key/cert check, atomic swap, registry, expiry gauge) behind `/api/v1/tls/*` and reload |
 | `transcoding.rs` | Opus ↔ G.711 (PCMU/PCMA) with resampling |
 | `topology.rs` | Via/Contact/Record-Route rewriting (RFC 3261) |
 | `auth.rs` · `register.rs` | Digest auth (401/407, nonce); SIP registrar |

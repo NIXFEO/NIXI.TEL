@@ -773,6 +773,10 @@ impl Sbc {
         self.runtime_config.clone()
     }
 
+    pub fn tls_identities(&self) -> Arc<crate::transport::TlsIdentityRegistry> {
+        self.transport.tls_identities()
+    }
+
     /// The DoS limiter's config from `[security]` (per-IP rate, burst ×2).
     fn dos_config(sec: &crate::config::SecurityConfig) -> RateLimitConfig {
         RateLimitConfig {
@@ -986,7 +990,25 @@ impl Sbc {
             self.reload_legacy_toml(&config).await;
         }
 
-        let applied = self.apply_runtime_settings(&config, apply_limit_defaults);
+        let mut applied = self.apply_runtime_settings(&config, apply_limit_defaults);
+        // Listener certificates: re-read the same files (renewed by certbot).
+        let registry = self.transport.tls_identities();
+        if !registry.is_empty() {
+            let outcomes = registry.reload_all().await;
+            registry.publish_expiry(&self.metrics);
+            for o in &outcomes {
+                match &o.error {
+                    Some(e) => self.events.publish(crate::events::SbcEvent::Alert {
+                        level: "warning".into(),
+                        kind: "tls_reload_failed".into(),
+                        detail: format!("{} {}: {}", o.listener, o.bind, e),
+                        ts,
+                    }),
+                    None if o.changed => applied.push(format!("tls:{}:{}", o.listener, o.bind)),
+                    None => {}
+                }
+            }
+        }
         let restart_required =
             crate::config::config_diff(&self.runtime_config.effective(), &config).restart_required;
         let report = runtime_config::ReloadReport {
@@ -1277,6 +1299,9 @@ impl Sbc {
         self.transport.start_listeners(network_config).await?;
         info!("Transport listeners started");
         self.readiness.set_listening();
+        self.transport
+            .tls_identities()
+            .publish_expiry(&self.metrics);
 
         // Periodic store backups (only with a store; the policy decides).
         if let Some(store) = self.config_store.clone() {

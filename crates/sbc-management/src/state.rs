@@ -48,6 +48,8 @@ pub struct AppState {
     pub ready: Arc<sbc_core::sbc::Readiness>,
     /// The running configuration and reload outcomes (`GET /api/v1/config`).
     pub runtime_config: Arc<sbc_core::sbc::runtime_config::RuntimeConfig>,
+    /// The TLS / WSS listeners' certificates (`/api/v1/tls/*`).
+    pub tls: Arc<sbc_core::transport::TlsIdentityRegistry>,
     /// Store backup policy and the lock the API shares with the timer.
     pub backup: Arc<sbc_core::sbc::backup::BackupPolicy>,
     pub backup_lock: Arc<tokio::sync::Mutex<()>>,

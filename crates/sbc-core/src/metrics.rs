@@ -239,6 +239,8 @@ pub struct SbcMetrics {
     /// Lines the non-blocking log writer dropped because stdout/journald
     /// did not keep up (sampled from the writer's counter).
     pub log_dropped_lines: Arc<AtomicU64>,
+    /// notAfter of each TLS/WSS listener's certificate, by (listener, bind).
+    pub tls_cert_expiry: Arc<std::sync::Mutex<HashMap<(String, String), u64>>>,
     /// Config reloads by result ("ok" / "error"). Pre-seeded to 0 so both
     /// series exist before the first reload (an `increase()` alert needs
     /// them), unlike the lazily populated `sip_send_failures`.
@@ -305,6 +307,7 @@ impl SbcMetrics {
             last_cdr_written_time: Arc::new(AtomicU64::new(0)),
             trunks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             log_dropped_lines: Arc::new(AtomicU64::new(0)),
+            tls_cert_expiry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config_reloads: Arc::new(std::sync::Mutex::new(HashMap::from([
                 ("ok", 0u64),
                 ("error", 0u64),
@@ -474,6 +477,12 @@ impl SbcMetrics {
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
+    pub fn set_tls_cert_expiry(&self, listener: &str, bind: &str, not_after: u64) {
+        if let Ok(mut map) = self.tls_cert_expiry.lock() {
+            map.insert((listener.to_string(), bind.to_string()), not_after);
+        }
+    }
+
     pub fn inc_config_reload(&self, ok: bool) {
         if let Ok(mut map) = self.config_reloads.lock() {
             *map.entry(if ok { "ok" } else { "error" }).or_insert(0) += 1;
@@ -683,6 +692,20 @@ impl SbcMetrics {
             "Unix time of the last CDR written (0 = none since start)",
             self.last_cdr_written_time.load(Ordering::Relaxed)
         );
+
+        out.push_str("# HELP sbc_tls_cert_expiry_timestamp_seconds notAfter of the TLS/WSS listener certificate (0 = not parsed)\n# TYPE sbc_tls_cert_expiry_timestamp_seconds gauge\n");
+        if let Ok(map) = self.tls_cert_expiry.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort();
+            for ((listener, bind), t) in entries {
+                out.push_str(&format!(
+                    "sbc_tls_cert_expiry_timestamp_seconds{{listener=\"{}\",bind=\"{}\"}} {}\n",
+                    escape_label(listener),
+                    escape_label(bind),
+                    t
+                ));
+            }
+        }
 
         out.push_str("# HELP sbc_config_reloads_total Configuration reloads (SIGHUP / POST /api/v1/reload) by result\n# TYPE sbc_config_reloads_total counter\n");
         if let Ok(map) = self.config_reloads.lock() {

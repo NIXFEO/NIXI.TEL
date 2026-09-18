@@ -92,6 +92,35 @@ pub async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
+    // Listener certificates: expired, or expiring within 14 days.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for cert in state.tls.statuses() {
+        if let Some(not_after) = cert.info.not_after {
+            let left = not_after as i64 - now_secs as i64;
+            if left < 0 {
+                alerts.push(json!({
+                    "level": "critical",
+                    "type": "tls_cert_expired",
+                    "listener": cert.listener,
+                    "bind": cert.bind,
+                    "subject": cert.info.subject,
+                }));
+            } else if left < 14 * 86_400 {
+                alerts.push(json!({
+                    "level": "warning",
+                    "type": "tls_cert_expiring",
+                    "listener": cert.listener,
+                    "bind": cert.bind,
+                    "subject": cert.info.subject,
+                    "days_left": left / 86_400,
+                }));
+            }
+        }
+    }
+
     let auth_failures = state.metrics.auth_failures_total.load(Ordering::Relaxed);
     let auth_challenges = state.metrics.auth_challenges_total.load(Ordering::Relaxed);
     if auth_challenges > 10 && auth_failures as f64 / auth_challenges as f64 > 0.5 {

@@ -184,18 +184,24 @@ sudo certbot certonly --standalone -d sip.example.com -d webrtc.example.com
 
 Point the listener `cert_file`/`key_file` at
 `/etc/letsencrypt/live/<host>/fullchain.pem` and `privkey.pem`. A renewal
-hook must **restart** the SBC after renewal: listener certificates are
-loaded at start and a reload does not re-read them. Restart gracefully
-when no call is up (the SBC BYEs active calls on stop):
+hook asks the SBC to re-read the files; the new certificate serves the
+next connection, existing sessions are untouched. A file that does not
+load (permissions, key/cert mismatch) keeps the previous certificate: the
+route answers 422, `SBCCertExpiringSoon` keeps firing — never restart on
+an HTTP error, restart only when the API itself is unreachable (curl exit
+7):
 
 ```bash
-# /etc/letsencrypt/renewal-hooks/deploy/restart-sbc.sh
-if curl -s -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/calls | grep -q '"total": *0'; then
-  systemctl restart sbc
-else
-  echo "sbc: calls in progress, restart later" | systemd-cat -t certbot
-fi
+# /etc/letsencrypt/renewal-hooks/deploy/reload-sbc-tls.sh
+. /etc/sbc/sbc.env
+curl -fsS -X POST -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/tls/reload
+rc=$?
+[ $rc -eq 7 ] && systemctl restart sbc     # API down: the graceful restart reloads everything
+exit 0
 ```
+
+Check with `GET /api/v1/tls/certificates` (`not_after`, `fingerprint_sha256`).
+Note: a key that does not match its certificate is refused at boot too.
 
 For remote access to the management API, read [§7](#7-securing-the-management-api)
 carefully before exposing it — a naive reverse proxy is how the API ends up
@@ -375,6 +381,7 @@ sudo cp target/release/sbc /usr/local/bin/sbc
 sudo systemctl start sbc
 curl -i http://127.0.0.1:8080/ready                     # 200 once store + listeners are up
 curl -s -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/config | jq '.file'   # what a reload would change
+curl -s -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/tls/certificates    # listener certificates and expiry
 bash scripts/api_smoke.sh                               # verify
 
 # Rollback if needed

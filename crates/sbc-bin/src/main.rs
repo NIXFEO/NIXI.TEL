@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
             trunk_tasks: sbc.trunk_tasks(),
             ready: sbc.readiness(),
             runtime_config: sbc.runtime_config(),
+            tls: sbc.tls_identities(),
             backup: sbc.backup_policy(),
             backup_lock: sbc.backup_lock(),
             trusted_proxies: std::sync::Arc::new(config.management.trusted_proxies.clone()),

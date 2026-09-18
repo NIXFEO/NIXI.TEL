@@ -5,16 +5,12 @@
 use crate::transport::udp::ReceivedMessage;
 use crate::{Error, Result};
 use rsip::SipMessage;
-use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 /// Maximum size for a single SIP message over TLS
@@ -23,84 +19,35 @@ const MAX_MESSAGE_SIZE: usize = 65535;
 /// TLS listener for SIP messages
 pub struct TlsListenerServer {
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    identity: Arc<crate::transport::tls_identity::TlsListenerIdentity>,
     local_addr: SocketAddr,
 }
 
 impl TlsListenerServer {
-    /// Create a new TLS listener
+    /// Bind, then load the certificate (a key that does not match the
+    /// certificate is refused here rather than at every handshake).
     pub async fn new(bind_addr: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<Self> {
-        // Load TLS certificates
-        let certs = Self::load_certs(cert_path)?;
-        let key = Self::load_private_key(key_path)?;
-
-        // Create TLS config
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| Error::Transport(format!("Failed to create TLS config: {}", e)))?;
-
-        let acceptor = TlsAcceptor::from(Arc::new(config));
-
-        // Bind TCP listener
         let listener = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| Error::Transport(format!("Failed to bind TLS socket: {}", e)))?;
-
         let local_addr = listener
             .local_addr()
             .map_err(|e| Error::Transport(format!("Failed to get local address: {}", e)))?;
-
+        let identity = crate::transport::tls_identity::TlsListenerIdentity::load(
+            "tls", local_addr, cert_path, key_path,
+        )?;
         info!("TLS listener bound to {}", local_addr);
-
         Ok(Self {
             listener,
-            acceptor,
+            identity,
             local_addr,
         })
     }
 
-    /// Load TLS certificates from file
-    fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-        let cert_data = fs::read(path)
-            .map_err(|e| Error::Config(format!("Failed to read cert file: {}", e)))?;
-
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_data.as_slice())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| Error::Config(format!("Failed to parse certificates: {}", e)))?;
-
-        Ok(certs)
+    pub fn identity(&self) -> Arc<crate::transport::tls_identity::TlsListenerIdentity> {
+        self.identity.clone()
     }
 
-    /// Load private key from file
-    fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let key_data =
-            fs::read(path).map_err(|e| Error::Config(format!("Failed to read key file: {}", e)))?;
-
-        // Try PKCS8 format first
-        let mut key_slice = key_data.as_slice();
-        let mut pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut key_slice);
-        if let Some(key_result) = pkcs8_keys.next() {
-            let key = key_result
-                .map_err(|e| Error::Config(format!("Failed to parse PKCS8 key: {}", e)))?;
-            return Ok(PrivateKeyDer::Pkcs8(key));
-        }
-
-        // Try RSA format
-        let mut key_slice = key_data.as_slice();
-        let mut rsa_keys = rustls_pemfile::rsa_private_keys(&mut key_slice);
-        if let Some(key_result) = rsa_keys.next() {
-            let key =
-                key_result.map_err(|e| Error::Config(format!("Failed to parse RSA key: {}", e)))?;
-            return Ok(PrivateKeyDer::Pkcs1(key));
-        }
-
-        Err(Error::Config(
-            "No private keys found in key file".to_string(),
-        ))
-    }
-
-    /// Get the local address this listener is bound to
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -125,7 +72,7 @@ impl TlsListenerServer {
             );
 
             // Perform TLS handshake
-            let acceptor = self.acceptor.clone();
+            let acceptor = self.identity.acceptor();
             let tx = message_tx.clone();
 
             tokio::spawn(async move {

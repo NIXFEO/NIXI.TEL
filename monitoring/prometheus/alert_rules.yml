@@ -115,6 +115,24 @@ groups:
         annotations:
           summary: "An SBC store backup failed in the last 24 h (disk full? permissions?)"
 
+      - alert: SBCCertExpiringSoon
+        # A TLS/WSS listener certificate expires within 14 days: the certbot
+        # deploy hook (POST /api/v1/tls/reload) did not run or failed.
+        expr: sbc_tls_cert_expiry_timestamp_seconds > 0
+              and (sbc_tls_cert_expiry_timestamp_seconds - time()) < 14 * 86400
+              and sbc_tls_cert_expiry_timestamp_seconds > time()
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "Certificate of the {{ $labels.listener }} listener ({{ $labels.bind }}) expires within 14 days"
+
+      - alert: SBCCertExpired
+        expr: sbc_tls_cert_expiry_timestamp_seconds > 0
+              and sbc_tls_cert_expiry_timestamp_seconds < time()
+        labels: { severity: critical }
+        annotations:
+          summary: "Certificate of the {{ $labels.listener }} listener ({{ $labels.bind }}) has expired"
+
       - alert: SBCConfigReloadFailed
         # SIGHUP / POST /api/v1/reload could not read, parse or hydrate: the
         # runtime kept its previous values (GET /api/v1/config.last_reload).

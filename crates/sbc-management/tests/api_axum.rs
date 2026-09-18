@@ -62,6 +62,7 @@ async fn make_state() -> AppState {
             sbc_core::config::SbcConfig::default(),
             None,
         )),
+        tls: Arc::new(sbc_core::transport::TlsIdentityRegistry::new()),
         backup: Arc::new(sbc_core::sbc::backup::BackupPolicy {
             dir: std::env::temp_dir().join(format!("sbc-api-backups-{}", uuid::Uuid::new_v4())),
             interval: None,
@@ -1890,4 +1891,125 @@ async fn reload_without_an_engine_answers_202() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(body_json(resp).await["status"], "reload_triggered");
+}
+
+// ── TLS certificates ─────────────────────────────────────────────────────────
+
+fn self_signed_pair(cn: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.not_after = rcgen::date_time_ymd(2031, 1, 1);
+    let cert = rcgen::Certificate::from_params(params).unwrap();
+    let dir = std::env::temp_dir().join(format!("sbc-api-tls-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = dir.join("cert.pem");
+    let k = dir.join("key.pem");
+    std::fs::write(&c, cert.serialize_pem().unwrap()).unwrap();
+    std::fs::write(&k, cert.serialize_private_key_pem()).unwrap();
+    (c, k)
+}
+
+#[tokio::test]
+async fn tls_routes_need_the_token_and_are_empty_without_secure_listeners() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+    for (m, p) in [
+        ("GET", "/api/v1/tls/certificates"),
+        ("POST", "/api/v1/tls/reload"),
+    ] {
+        let resp = app.clone().oneshot(req(m, p, None, false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{} {}", m, p);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/tls/certificates", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await, serde_json::json!([]));
+    let resp = app
+        .oneshot(req("POST", "/api/v1/tls/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["listeners"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn tls_reload_answers_422_when_a_listener_cannot_reload_and_keeps_the_old_certificate() {
+    let state = make_state().await;
+    let (c, k) = self_signed_pair("a.test");
+    let id = sbc_core::transport::TlsListenerIdentity::load(
+        "wss",
+        "127.0.0.1:8443".parse().unwrap(),
+        &c,
+        &k,
+    )
+    .unwrap();
+    state.tls.register(id);
+    let app = build_router(state.clone(), &[]);
+
+    let json = body_json(
+        app.clone()
+            .oneshot(req("GET", "/api/v1/tls/certificates", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let first = json[0]["fingerprint_sha256"].as_str().unwrap().to_string();
+    assert!(json[0]["subject"].as_str().unwrap().contains("CN=a.test"));
+
+    let good_key = std::fs::read_to_string(&k).unwrap();
+    std::fs::write(&k, "broken").unwrap();
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/tls/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "tls_reload_failed");
+    assert!(json["listeners"][0]["error"].is_string());
+    let json = body_json(
+        app.clone()
+            .oneshot(req("GET", "/api/v1/tls/certificates", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json[0]["fingerprint_sha256"], first, "old certificate kept");
+
+    std::fs::write(&k, good_key).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/tls/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["listeners"][0]["changed"], false);
+
+    let (c2, k2) = self_signed_pair("b.test");
+    std::fs::copy(&c2, &c).unwrap();
+    std::fs::copy(&k2, &k).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/tls/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["listeners"][0]["changed"], true);
+    let json = body_json(
+        app.oneshot(req("GET", "/api/v1/tls/certificates", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(json[0]["fingerprint_sha256"], first);
+    assert!(json[0]["subject"].as_str().unwrap().contains("CN=b.test"));
+    let _ = std::fs::remove_dir_all(c.parent().unwrap());
+    let _ = std::fs::remove_dir_all(c2.parent().unwrap());
 }

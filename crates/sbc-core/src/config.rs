@@ -808,7 +808,7 @@ mod example_config_tests {
     fn logging_section_is_optional_and_strict() {
         let raw = include_str!("../../../config/sbc.toml.example");
         let without: String = {
-            let start = raw.find("[logging]").unwrap();
+            let start = raw.find("\n[logging]\n").unwrap() + 1;
             let end = raw[start + 1..]
                 .find("\n[")
                 .map(|i| start + 1 + i)

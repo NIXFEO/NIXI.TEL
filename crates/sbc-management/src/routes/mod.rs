@@ -7,6 +7,7 @@ pub mod events;
 pub mod security;
 pub mod store;
 pub mod system;
+pub mod tls;
 pub mod trunks;
 
 use axum::http::StatusCode;

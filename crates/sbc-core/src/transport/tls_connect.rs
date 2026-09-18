@@ -253,7 +253,7 @@ fn frame_sip_message(buffer: &[u8]) -> Option<(usize, usize)> {
     (buffer.len() >= message_end).then_some((message_end, message_end))
 }
 
-mod danger {
+pub(crate) mod danger {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
     };

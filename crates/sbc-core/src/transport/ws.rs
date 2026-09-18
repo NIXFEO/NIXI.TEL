@@ -14,8 +14,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -26,7 +24,7 @@ use tracing::{debug, error, info, warn};
 pub struct WsListenerServer {
     listener: TcpListener,
     local_addr: SocketAddr,
-    tls_acceptor: Option<TlsAcceptor>,
+    identity: Option<Arc<crate::transport::tls_identity::TlsListenerIdentity>>,
 }
 
 impl WsListenerServer {
@@ -45,37 +43,31 @@ impl WsListenerServer {
         Ok(Self {
             listener,
             local_addr,
-            tls_acceptor: None,
+            identity: None,
         })
     }
 
     /// Create a secure WebSocket (WSS) listener with TLS
     pub async fn new_wss(bind_addr: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<Self> {
-        let certs = Self::load_certs(cert_path)?;
-        let key = Self::load_private_key(key_path)?;
-
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| Error::Transport(format!("Failed to create WSS TLS config: {}", e)))?;
-
-        let tls_acceptor = TlsAcceptor::from(Arc::new(config));
-
         let listener = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| Error::Transport(format!("Failed to bind WSS socket: {}", e)))?;
-
         let local_addr = listener
             .local_addr()
             .map_err(|e| Error::Transport(format!("Failed to get local WSS address: {}", e)))?;
-
+        let identity = crate::transport::tls_identity::TlsListenerIdentity::load(
+            "wss", local_addr, cert_path, key_path,
+        )?;
         info!("WSS listener bound to {}", local_addr);
-
         Ok(Self {
             listener,
             local_addr,
-            tls_acceptor: Some(tls_acceptor),
+            identity: Some(identity),
         })
+    }
+
+    pub fn identity(&self) -> Option<Arc<crate::transport::tls_identity::TlsListenerIdentity>> {
+        self.identity.clone()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -83,35 +75,15 @@ impl WsListenerServer {
     }
 
     pub fn is_secure(&self) -> bool {
-        self.tls_acceptor.is_some()
+        self.identity.is_some()
     }
 
-    /// Load TLS certificates from PEM file
-    fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-        let data = std::fs::read(path)
-            .map_err(|e| Error::Config(format!("Failed to read cert: {}", e)))?;
-        rustls_pemfile::certs(&mut data.as_slice())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| Error::Config(format!("Failed to parse cert: {}", e)))
-    }
-
-    /// Load private key from PEM file
-    fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let data =
-            std::fs::read(path).map_err(|e| Error::Config(format!("Failed to read key: {}", e)))?;
-        let mut cursor = std::io::Cursor::new(data);
-        rustls_pemfile::private_key(&mut cursor)
-            .map_err(|e| Error::Config(format!("Failed to parse key: {}", e)))?
-            .ok_or_else(|| Error::Config("No private key found in file".to_string()))
-    }
-
-    /// Start listening for WebSocket connections
     pub async fn listen(
         self,
         message_tx: mpsc::UnboundedSender<ReceivedMessage>,
         event_tx: mpsc::UnboundedSender<crate::transport::manager::TransportEvent>,
     ) -> Result<()> {
-        let proto = if self.tls_acceptor.is_some() {
+        let proto = if self.identity.is_some() {
             "WSS"
         } else {
             "WS"
@@ -131,7 +103,7 @@ impl WsListenerServer {
 
             let tx = message_tx.clone();
             let ev_tx = event_tx.clone();
-            let acceptor = self.tls_acceptor.clone();
+            let acceptor = self.identity.as_ref().map(|i| i.acceptor());
             let is_wss = acceptor.is_some();
 
             tokio::spawn(async move {

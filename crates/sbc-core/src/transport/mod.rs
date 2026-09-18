@@ -12,11 +12,13 @@ pub mod manager;
 pub mod tcp;
 pub mod tls;
 pub mod tls_connect;
+pub mod tls_identity;
 pub mod udp;
 pub mod ws;
 
 pub use manager::{TransportManager, TransportStats};
 pub use tcp::{TcpConnection, TcpListenerServer};
 pub use tls::TlsListenerServer;
+pub use tls_identity::{TlsIdentityRegistry, TlsListenerIdentity, TlsReloadOutcome};
 pub use udp::{ReceivedMessage, UdpListener};
 pub use ws::WsListenerServer;

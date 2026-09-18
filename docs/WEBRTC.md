@@ -55,10 +55,9 @@ currently unused.
 ## Certificates
 
 WSS requires a certificate the browser trusts (e.g. Let's Encrypt).
-Configure `cert_file`/`key_file` on the WSS listener. Certificates are
-loaded at start: a certbot renewal hook must `systemctl restart sbc`
-(gracefully, when no call is up — see INSTALL.md §6); a reload does not
-re-read them.
+Configure `cert_file`/`key_file` on the WSS listener. A certbot deploy
+hook calls `POST /api/v1/tls/reload` after renewal (INSTALL.md §6): the
+renewed certificate serves the next WSS connection, no restart.
 
 ## Demo client
 

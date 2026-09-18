@@ -32,7 +32,7 @@ is replaying it through the CRUD endpoints.
 | GET | `/ready` | 200 `{"status":"ready","store":true,"hydrated":true,"listening":true}` once the SQLite store is open, hydrated and the SIP listeners are bound; 503 `{"status":"not_ready",…}` otherwise (a TOML-only box with `allow_missing_store` is never ready). Public. |
 | GET | `/metrics` | Prometheus text exposition (`sbc_*`): calls, SIP traffic, auth, anti-fraud, media, per-trunk series (`sbc_trunk_up/registered/active_calls/calls_total{trunk,direction,outcome}`, `sbc_trunk_enabled/available/unavailable_seconds/consecutive_failures`), `sbc_call_setup_seconds` / `sbc_call_duration_seconds` histograms — see `monitoring/README.md` |
 | GET | `/api/v1/stats` | active calls, totals, uptime |
-| GET | `/api/v1/alerts` | current conditions: `trunk_down` (failure cooldown running) / `trunk_parked` (503 Retry-After) with `unavailable_for_secs`, `trunk_unregistered`, `high_auth_failure_rate`… |
+| GET | `/api/v1/alerts` | current conditions: `trunk_down` (failure cooldown running) / `trunk_parked` (503 Retry-After) with `unavailable_for_secs`, `trunk_unregistered`, `tls_cert_expiring` (< 14 days) / `tls_cert_expired`, `high_auth_failure_rate`… |
 | GET | `/api/v1/events?types=call,registration,trunk,alert,config` | **SSE** stream |
 
 ### Calls & registrations
@@ -126,6 +126,8 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 |---|---|---|
 | POST | `/api/v1/reload` (alias `/api/v1/config/reload`) | re-reads the TOML (reload-class keys, table below) and re-hydrates from the store; 200 `{"status":"reloaded","applied":[…],"restart_required":[…],"hydrated":bool}`, 422 `reload_failed` (unusable file, nothing changed), 202 `reload_triggered` when the engine did not answer within 5 s (check `GET /api/v1/config`). Concurrent SIGHUP/API triggers coalesce. |
 | GET | `/api/v1/config` | effective configuration with secrets masked (`running`), `restart_required` (loaded by a reload but needs a restart), `file` = the on-disk TOML's `reload_pending` / `restart_required` or `parse_error` / `readable:false`, `last_reload`, `key_classes`, `store`. Exposes usernames, trunk hosts and file paths like `/users`, `/trunks` and `/export`: admin only. |
+| GET | `/api/v1/tls/certificates` | one entry per TLS/WSS listener: `listener`, `bind`, `cert_file`, `key_file`, `subject`, `not_before`, `not_after`, `fingerprint_sha256`, `chain_len`, `loaded_at` (`[]` without secure listeners) |
+| POST | `/api/v1/tls/reload` | re-read every listener's cert/key (what a certbot deploy hook calls): 200 `{"status":"ok","listeners":[{listener,bind,changed,…}]}`; 422 `tls_reload_failed` with the same `listeners` detail when one could not reload (its previous certificate stays in use) |
 | GET | `/api/v1/export` | full dynamic-config dump (includes auth material — admin only) |
 | POST | `/api/v1/backup` | `VACUUM INTO` copy of the store into `[database] backup_dir` as `sbc-<timestamp>.db`, pruned to `backup_keep`: 200 `{"path","bytes","took_ms","pruned":[…]}`, 409 `backup already in progress`, 503 without a store. The copy holds trunk passwords and user HA1s. |
 

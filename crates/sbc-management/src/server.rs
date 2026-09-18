@@ -136,6 +136,8 @@ pub fn build_router(state: AppState, cors_allowed_origins: &[String]) -> Router 
         .route("/api/v1/reload", post(routes::system::reload))
         .route("/api/v1/config/reload", post(routes::system::reload))
         .route("/api/v1/config", get(routes::system::get_config))
+        .route("/api/v1/tls/certificates", get(routes::tls::certificates))
+        .route("/api/v1/tls/reload", post(routes::tls::reload))
         .route("/api/v1/export", get(routes::config_api::export))
         .route("/api/v1/backup", post(routes::store::backup))
         // Legacy aliases
