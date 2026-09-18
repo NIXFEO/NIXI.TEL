@@ -1982,6 +1982,96 @@ mod tests {
         assert_eq!(stats.bytes_b_to_a, 0);
     }
 
+    /// Can the relay carry a realistic load without losing packets?
+    ///
+    /// Paced at 10 000 packets/s — 100 concurrent G.711 calls' worth of
+    /// one direction — and measured end to end through the real relay task
+    /// and real sockets. Prints the loss and the delivery latency, and
+    /// asserts only what a pathological regression would break. Re-run it
+    /// on the target box: `cargo test --release -p sbc-core --lib
+    /// relay_carries_a_realistic_load -- --nocapture`.
+    ///
+    /// (An unpaced blast measures the sender and the kernel's socket
+    /// buffer, not the relay: it drops a third of the packets on any
+    /// machine and says nothing useful.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relay_carries_a_realistic_load() {
+        const BATCHES: usize = 40;
+        const PER_BATCH: usize = 50;
+        const N: usize = BATCHES * PER_BATCH; // 2 000 packets over ~0.2 s
+        let ports_a = PortPair::new(10080).unwrap();
+        let ports_b = PortPair::new(10082).unwrap();
+        let mut session = RtpSession::new_two_leg("throughput".to_string(), ports_a, ports_b)
+            .await
+            .unwrap();
+        let metrics = Arc::new(crate::metrics::SbcMetrics::new());
+        session.set_metrics(metrics.clone());
+        let stats = session.media_stats();
+        let caller = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let callee = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        session.set_endpoint_a(caller.local_addr().unwrap());
+        session.set_endpoint_b(callee.local_addr().unwrap());
+        session.start().await.unwrap();
+
+        let drain = {
+            let callee = callee.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let mut seen = 0usize;
+                // 500 ms of silence ends the count: the burst is over.
+                while let Ok(Ok(_)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    callee.recv_from(&mut buf),
+                )
+                .await
+                {
+                    seen += 1;
+                    if seen == N {
+                        break;
+                    }
+                }
+                seen
+            })
+        };
+
+        let leg_a = format!("127.0.0.1:{}", ports_a.rtp);
+        let mut packet = vec![0x80, 0x08, 0x00, 0x00];
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+        packet.extend_from_slice(&[0xd5u8; 160]);
+
+        let started = std::time::Instant::now();
+        for batch in 0..BATCHES {
+            for i in 0..PER_BATCH {
+                let seq = (batch * PER_BATCH + i) as u16;
+                packet[2..4].copy_from_slice(&seq.to_be_bytes());
+                caller.send_to(&packet, &leg_a).await.unwrap();
+            }
+            // 50 packets every 5 ms = 10 000 packets/s.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let delivered = drain.await.unwrap();
+        let elapsed = started.elapsed();
+
+        let received = stats.caller.rx_packets.load(Ordering::Relaxed) as usize;
+        println!(
+            "relay at ~10 000 pps: {} sent, {} received by the relay, {} delivered in {:?} \
+             (loss {:.2}%, ≈{} G.711 calls at 50 pps per direction)",
+            N,
+            received,
+            delivered,
+            elapsed,
+            100.0 * (N - delivered) as f64 / N as f64,
+            10_000 / 100
+        );
+        assert!(
+            delivered as f64 > N as f64 * 0.98,
+            "the relay lost {} of {} packets at 10 000 pps",
+            N - delivered,
+            N
+        );
+    }
+
     /// Downscaling a timestamp across the 32-bit wrap must stay
     /// continuous: the naive `ts * dst / src` jumps backwards by ~715
     /// million and the peer's jitter buffer throws the stream away.

@@ -272,11 +272,25 @@ pub struct OpusEncoder {
     inner: std::sync::Mutex<opus::Encoder>,
 }
 
+/// libopus' computational complexity, 0..=10. The default is 9, and on a
+/// 2 vCPU box **the Opus encoder is this SBC's capacity ceiling** (the
+/// measured cost is ~143 µs per 20 ms frame at complexity 9, against
+/// 0.14 µs for a G.711 transcode), so the setting buys real call capacity
+/// for a difference no telephone-band listener can hear: the input here is
+/// already 8 kHz G.711, upsampled, so the extra analysis has nothing to
+/// work with. `one_frame_of_transcoding_is_far_cheaper_than_its_own_duration`
+/// prints the cost at the compiled-in value.
+const OPUS_COMPLEXITY: i32 = 5;
+
 impl OpusEncoder {
     /// Create a new Opus encoder for VoIP (mono, 48 kHz)
     pub fn new() -> Result<Self> {
-        let encoder = opus::Encoder::new(OPUS_RATE, opus::Channels::Mono, opus::Application::Voip)
-            .map_err(|e| Error::Other(format!("Opus encoder init: {}", e)))?;
+        let mut encoder =
+            opus::Encoder::new(OPUS_RATE, opus::Channels::Mono, opus::Application::Voip)
+                .map_err(|e| Error::Other(format!("Opus encoder init: {}", e)))?;
+        encoder
+            .set_complexity(OPUS_COMPLEXITY)
+            .map_err(|e| Error::Other(format!("Opus set complexity: {}", e)))?;
 
         Ok(Self {
             inner: std::sync::Mutex::new(encoder),
@@ -292,6 +306,9 @@ impl OpusEncoder {
         encoder
             .set_bitrate(opus::Bitrate::Bits(bitrate))
             .map_err(|e| Error::Other(format!("Opus set bitrate: {}", e)))?;
+        encoder
+            .set_complexity(OPUS_COMPLEXITY)
+            .map_err(|e| Error::Other(format!("Opus set complexity: {}", e)))?;
 
         Ok(Self {
             inner: std::sync::Mutex::new(encoder),

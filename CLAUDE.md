@@ -281,17 +281,31 @@ re-run them on the target box, whose cores are slower.
 
 | Path | Cost per 20 ms frame | At 50 pps |
 |---|---|---|
-| G.711 ↔ G.711 transcode | 0.14 µs | negligible |
-| PCMA → Opus (encode) | 143 µs | 7.2 ms/s per stream |
-| Opus → PCMA (decode) | 13 µs | 0.7 ms/s per stream |
+| G.711 ↔ G.711 transcode | 0.15 µs | negligible |
+| PCMA → Opus (encode, complexity 5) | 83 µs | 4.2 ms/s per stream |
+| Opus → PCMA (decode) | 13 µs | 0.6 ms/s per stream |
 | Per-packet accounting (`media/stats.rs` + the endpoint ladder) | 0.15 µs | negligible |
+| RTP relay, end to end through real sockets | — | 80 000 packets/s with no loss |
 
-So a G.711 trunk ↔ Opus client call costs about 8 ms of CPU per second
-(0.8% of a core), and a G.711 ↔ G.711 call costs nothing measurable. On
-the 2 vCPU production box that is roughly 180 transcoded calls before the
-codec alone saturates the machine — the 50-200 target is comfortable for
-G.711 and tight for Opus. `sbc_transcode_seconds` watches the real thing
-in production.
+A G.711 trunk ↔ Opus client call costs about 4.8 ms of CPU per second
+(0.5% of a core); a G.711 ↔ G.711 call costs nothing measurable. So on the
+2 vCPU box the codec saturates near **290 transcoded calls**, and the
+relay itself carries **800 calls' worth of packets** without losing one:
+the 50-200 target is not constrained by either. `sbc_transcode_seconds`
+watches the real thing in production.
+
+Two consequences worth keeping in mind before optimising anything here:
+
+- **The relay's hot path is not the constraint.** The per-packet
+  allocation and the two endpoint mutexes are known and deliberately left
+  alone: at 80 000 packets/s loss-free they buy nothing, and the media
+  path is where a mistake is audible. Re-measure with
+  `relay_carries_a_realistic_load` before touching them.
+- **Opus encoding is the constraint, and it is tuned.**
+  `OPUS_COMPLEXITY = 5` (libopus' default is 9) halves the encode cost —
+  143 µs → 83 µs — for a difference nothing can hear on an 8 kHz G.711
+  source. The curve, measured: 9 → 143 µs, 5 → 83 µs, 3 → 69 µs,
+  1 → 48 µs. Lower it further only if capacity ever binds.
 
 ## Known minor issues
 

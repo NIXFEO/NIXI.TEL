@@ -7,6 +7,18 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 ## [Unreleased]
 
 ### Added
+- The Opus encoder runs at libopus complexity 5 instead of the default 9,
+  which halves the cost of the SBC's one real capacity constraint
+  (143 µs → 83 µs per 20 ms frame) for a difference nothing can hear on an
+  8 kHz G.711 source: the 2 vCPU box now saturates near 290 transcoded
+  calls instead of 180. The measured curve is in CLAUDE.md, and the
+  constant is one line if it ever needs to go lower.
+- A paced load test of the relay (`relay_carries_a_realistic_load`):
+  10 000 packets/s end to end through the real relay task and real
+  sockets, with no loss — and no loss at 80 000 either, i.e. 800 G.711
+  calls' worth. That is the number that says the relay's hot path (the
+  per-packet allocation, the two endpoint mutexes) is **not** the
+  constraint and should be left alone for now.
 - `sbc_transcode_seconds`: a histogram of one packet through the
   transcoder, with microsecond buckets. Two tests print the real cost and
   fail on a pathological regression: 0.14 µs for a G.711 ↔ G.711 frame,
