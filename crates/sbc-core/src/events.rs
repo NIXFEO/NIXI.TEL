@@ -32,8 +32,12 @@ pub enum SbcEvent {
         expires: u32,
         ts: u64,
     },
+    /// One binding gone: `reason` = `client` (expires 0), `wildcard`
+    /// (`Contact: *`), `expired` (sweeper), `ws-closed`.
     Unregistered {
         aor: String,
+        contact: String,
+        reason: String,
         ts: u64,
     },
     TrunkHealth {

@@ -636,8 +636,20 @@ impl Sbc {
                     && matches!(r.transport.as_str(), "WS" | "WSS")
             }) {
                 info!("WS closed: unregistering {} ({})", reg.aor, reg.contact);
-                let _ = registrar.unregister(&reg.aor, &reg.contact).await;
+                if let Ok(Some(gone)) = registrar
+                    .unregister_binding(&reg.aor, &reg.binding_key(), None)
+                    .await
+                {
+                    self.events.publish(crate::events::SbcEvent::Unregistered {
+                        aor: gone.aor,
+                        contact: gone.contact,
+                        reason: "ws-closed".into(),
+                        ts: crate::events::event_ts(),
+                    });
+                }
             }
+            self.metrics
+                .set_active_registrations(registrar.count().await);
         }
 
         // ── 2. Tear down active calls bound to this connection ───────────

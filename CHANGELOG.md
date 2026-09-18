@@ -187,6 +187,19 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `restart_required`, 422 `reload_failed` when the file is unusable, 202
   when the engine did not answer within 5 s). docs/INSTALL.md and
   docs/WEBRTC.md no longer claim a reload picks up renewed certificates.
+- Registrar (RFC 3261 §10.3). A phone re-registering from a new NAT port or
+  with a new Contact URI no longer piles up stale bindings, and two phones
+  behind one NAT no longer unregister each other: a binding is identified
+  by its Contact URI, or by `+sip.instance` (and `reg-id`) when the phone
+  sends one (the instance id alone identifying the binding is an extension
+  of RFC 5626), and the source address follows the newest REGISTER so an
+  inbound call reaches the phone's current port. Every Contact of a
+  REGISTER is bound (or removed with `;expires=0`), `Contact: *` needs
+  `Expires: 0` (400 otherwise), an unparsable Contact is 400, a REGISTER
+  without Contact lists the bindings. The 200 OK carries every Via, every
+  current binding with its remaining `expires` (and instance/reg-id), and
+  an `Expires` header only when something was registered.
+  `sbc_active_registrations` no longer counts expired bindings.
 
 ### Added
 - Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
@@ -217,6 +230,14 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
   `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- `[security] register_min_expires` (60), `register_max_expires` (3600),
+  `register_default_expires` (3600), reload-class: a REGISTER asking less
+  than the minimum is answered `423 Interval Too Brief` + `Min-Expires`
+  (it used to be silently clamped up); more than the maximum is granted
+  the maximum. `GET /api/v1/registrations` gains `instance_id`, `reg_id`,
+  `registered_at`, and `user_agent` is filled; SSE `unregistered` carries
+  `contact` and `reason` (`client`, `wildcard`, `expired`, `ws-closed`);
+  the sweeper and a WS close publish it too.
 - TLS / WSS listener certificates reload without a restart:
   `POST /api/v1/tls/reload` re-reads every listener's cert/key files off
   the event loop, proves the key signs for the certificate (an in-memory
@@ -287,6 +308,12 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Dependabot watches cargo and actions.
 
 ### Changed
+- Registrations: the maximum granted interval drops from 86400 s to
+  3600 s (phones re-REGISTER hourly, as the 200's Contact tells them) and
+  a REGISTER asking under 60 s gets 423 instead of a silent clamp
+  (`register_min_expires = 1` disables the check). `contact` in
+  `GET /api/v1/registrations` and in the `registered` / `unregistered`
+  events is the bare URI (no `<>`, no header parameters).
 - A TLS / WSS listener whose private key does not match its certificate
   refuses to start (it used to start and fail every handshake). The
   SIP-over-TLS listener now accepts SEC1 `EC PRIVATE KEY` files like the

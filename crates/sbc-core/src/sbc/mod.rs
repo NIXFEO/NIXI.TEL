@@ -34,7 +34,7 @@ use crate::media::sdp::transform_webrtc_to_trunk;
 use crate::media::webrtc_handler::WebRtcSession;
 use crate::media::MediaManager;
 use crate::metrics::SbcMetrics;
-use crate::register::{InMemoryRegistrar, RegisterHandler, RegisterResult};
+use crate::register::{InMemoryRegistrar, RegisterHandler};
 use crate::routing::router::Router;
 use crate::routing::trunk::NumberFormat;
 use crate::routing::{TrunkConfig, TrunkManager};
@@ -385,6 +385,8 @@ pub struct Sbc {
 
     /// RFC 4028 session timers (None = disabled): (session_expires, min_se).
     session_timer: Option<(u32, u32)>,
+    /// `[security] register_*_expires` (reload-class).
+    register_policy: crate::register::RegisterPolicy,
 
     /// Anti-fraud: bans, destination blocking, per-user limits.
     security: Arc<crate::security::SecurityManager>,
@@ -708,6 +710,7 @@ impl Sbc {
                     config.security.min_se as u32,
                 )
             }),
+            register_policy: crate::register::RegisterPolicy::from_config(&config.security),
         })
     }
 
@@ -841,6 +844,15 @@ impl Sbc {
             );
             self.invite_timeout = invite_timeout;
             applied.push("security.invite_timeout".to_string());
+        }
+        let register_policy = crate::register::RegisterPolicy::from_config(sec);
+        if register_policy != self.register_policy {
+            info!(
+                "Reload: register expiry {:?} → {:?}",
+                self.register_policy, register_policy
+            );
+            self.register_policy = register_policy;
+            applied.push("security.register_expires".to_string());
         }
         let identity_policy = IdentityPolicy::from_config(sec);
         if identity_policy != self.identity_policy {
@@ -1246,6 +1258,7 @@ impl Sbc {
             invite_tx: invite_tx::InviteTxCache::new(),
             max_call_duration: Duration::from_secs(14400),
             session_timer: None,
+            register_policy: crate::register::RegisterPolicy::default(),
             security: Arc::new(crate::security::SecurityManager::new(Default::default())),
         }
     }
@@ -1326,6 +1339,7 @@ impl Sbc {
             self.security.clone(),
             self.metrics.clone(),
             config,
+            Some(self.events.clone()),
         );
         self._maintenance = Some(maintenance.start());
         info!("Maintenance sweeper started");
@@ -1830,35 +1844,42 @@ impl Sbc {
             }
         }
 
-        let contact = request
-            .contact_header()
-            .map(|h| h.value().to_string())
-            .unwrap_or_default();
-
-        // RFC 3261 §10.2.1: expires can be in the Contact header params (;expires=N)
-        // OR in the top-level Expires header. Contact-level expires takes priority.
-        // Linphone often sends ;expires=0 in the Contact param to unregister a specific binding.
-        let contact_expires: Option<u32> = {
-            let raw = contact.to_lowercase();
-            // Look for ";expires=NNN" in the contact string
-            raw.split(';')
-                .skip(1) // skip the URI part
-                .find_map(|p| {
-                    let p = p.trim();
-                    if let Some(val) = p.strip_prefix("expires=") {
-                        val.trim_matches('>').parse::<u32>().ok()
-                    } else {
-                        None
-                    }
-                })
-        };
-        let expires: u32 = contact_expires
-            .or_else(|| {
-                request
-                    .expires_header()
-                    .and_then(|h| h.value().parse().ok())
-            })
-            .unwrap_or(3600);
+        // Every Contact header (RFC 3261 §10.3 step 6), the wildcard, the
+        // Expires header and the User-Agent.
+        let mut contacts: Vec<crate::register::ContactBinding> = Vec::new();
+        let mut wildcard = false;
+        for h in request.headers.iter() {
+            let line = h.to_string();
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if !(name.eq_ignore_ascii_case("contact") || name == "m") {
+                continue;
+            }
+            match crate::register::parse_contact_header(value.trim()) {
+                Ok(None) => wildcard = true,
+                Ok(Some(mut parsed)) => contacts.append(&mut parsed),
+                Err(e) => {
+                    warn!(
+                        "REGISTER from {} for {}: bad Contact: {}",
+                        source.ip(),
+                        aor,
+                        e
+                    );
+                    self.metrics.inc_sip_response(400);
+                    let r400 = build_plain_response_for_request(request, 400, "Bad Request")?;
+                    let data = r400.to_string().into_bytes();
+                    return self
+                        .transport
+                        .reply(&data, source, transport, reply_tx)
+                        .await;
+                }
+            }
+        }
+        let expires_header: Option<u32> = request
+            .expires_header()
+            .and_then(|h| h.value().trim().parse().ok());
+        let user_agent = cdr::header_value(request, "User-Agent");
 
         let call_id = request
             .call_id_header()
@@ -1887,58 +1908,92 @@ impl Sbc {
             _ => None,
         };
 
-        // Process registration
+        let req = crate::register::RegisterRequest {
+            aor: aor.clone(),
+            contacts,
+            wildcard,
+            expires_header,
+            call_id,
+            cseq,
+            source,
+            transport: transport_str,
+            user_agent,
+            reply_tx: ws_reply_tx,
+        };
+        let ts = crate::events::event_ts();
         match self
             .register_handler
-            .handle_with_tx(
-                &aor,
-                &contact,
-                expires,
-                &call_id,
-                cseq,
-                source,
-                &transport_str,
-                ws_reply_tx,
-            )
+            .process(self.register_policy, req)
             .await
         {
-            Ok(RegisterResult::Ok {
-                expires: exp,
+            Ok(crate::register::RegisterResult::Ok {
                 bindings,
+                registered,
+                removed,
+                granted,
             }) => {
-                info!(
-                    "Registered {} with {} binding(s), expires={}s",
-                    aor,
-                    bindings.len(),
-                    exp
-                );
-                self.metrics.inc_registration();
+                if !registered.is_empty() || !removed.is_empty() {
+                    info!(
+                        "REGISTER {}: {} registered, {} removed, {} binding(s), granted {:?}",
+                        aor,
+                        registered.len(),
+                        removed.len(),
+                        bindings.len(),
+                        granted
+                    );
+                }
+                for r in &registered {
+                    self.metrics.inc_registration();
+                    self.events.publish(crate::events::SbcEvent::Registered {
+                        aor: aor.clone(),
+                        contact: r.contact.clone(),
+                        expires: r.expires,
+                        ts,
+                    });
+                }
+                for r in &removed {
+                    self.events.publish(crate::events::SbcEvent::Unregistered {
+                        aor: aor.clone(),
+                        contact: r.contact.clone(),
+                        reason: if wildcard { "wildcard" } else { "client" }.into(),
+                        ts,
+                    });
+                }
                 self.metrics
                     .set_active_registrations(self.register_handler.count().await);
-                self.events.publish(crate::events::SbcEvent::Registered {
-                    aor: aor.clone(),
-                    contact: contact.clone(),
-                    expires: exp,
-                    ts: crate::events::event_ts(),
-                });
                 self.metrics.inc_sip_response(200);
-                let response_200 = build_register_200(request, &bindings, &call_id, cseq)?;
+                let response_200 = build_register_200(request, &bindings, granted)?;
                 let data = response_200.to_string().into_bytes();
                 self.transport
                     .reply(&data, source, transport, reply_tx)
                     .await
             }
-            Ok(RegisterResult::Removed { count }) => {
-                info!("Unregistered {} contact(s) for {}", count, aor);
-                self.metrics
-                    .set_active_registrations(self.register_handler.count().await);
-                self.events.publish(crate::events::SbcEvent::Unregistered {
-                    aor: aor.clone(),
-                    ts: crate::events::event_ts(),
-                });
-                self.metrics.inc_sip_response(200);
-                let response_200 = build_plain_response_for_request(request, 200, "OK")?;
-                let data = response_200.to_string().into_bytes();
+            Ok(crate::register::RegisterResult::IntervalTooBrief { min_expires }) => {
+                info!(
+                    "REGISTER {} from {}: interval too brief — 423 Min-Expires {}",
+                    aor,
+                    source.ip(),
+                    min_expires
+                );
+                self.metrics.inc_sip_response(423);
+                let mut r423 =
+                    build_plain_response_for_request(request, 423, "Interval Too Brief")?;
+                if let SipMessage::Response(resp) = &mut r423 {
+                    resp.headers
+                        .push(rsip::Header::MinExpires(rsip::headers::MinExpires::new(
+                            min_expires.to_string(),
+                        )));
+                }
+                let data = r423.to_string().into_bytes();
+                self.transport
+                    .reply(&data, source, transport, reply_tx)
+                    .await
+            }
+            Ok(crate::register::RegisterResult::BadRequest(why)) => {
+                warn!("REGISTER {} from {}: {} — 400", aor, source.ip(), why);
+                self.metrics.inc_sip_response(400);
+                let r400 = build_plain_response_for_request(request, 400, "Bad Request")?;
+                let data = r400.to_string().into_bytes();
                 self.transport
                     .reply(&data, source, transport, reply_tx)
                     .await
@@ -2613,57 +2668,41 @@ fn build_register_401(request: &Request, challenge: &str) -> Result<SipMessage> 
 }
 
 /// Build 200 OK for successful REGISTER with Contact bindings
+/// 200 OK to a REGISTER: every current binding of the AOR as a Contact
+/// with its remaining `expires` (and its `+sip.instance` / `reg-id`), on
+/// every Via of the request; an `Expires` header only when the request
+/// registered something.
 fn build_register_200(
     request: &Request,
     bindings: &[crate::register::Registration],
-    _call_id: &str,
-    _cseq: u32,
+    granted: Option<u32>,
 ) -> Result<SipMessage> {
-    let mut headers: rsip::Headers = Default::default();
-
-    headers.push(request.via_header()?.clone().into());
-    headers.push(request.from_header()?.clone().into());
-
-    let mut to = request.to_header()?.typed()?;
-    if to.params.iter().all(|p| !matches!(p, rsip::Param::Tag(_))) {
-        to.params.push(rsip::Param::Tag(rsip::param::Tag::new(
-            &uuid::Uuid::new_v4().to_string()[..8],
-        )));
-    }
-    headers.push(to.into());
-
-    headers.push(request.call_id_header()?.clone().into());
-    headers.push(request.cseq_header()?.clone().into());
-
-    // Echo back Contact bindings with expires
-    for binding in bindings {
-        let contact_value = format!("{};expires={}", binding.contact, binding.expires);
-        headers.push(rsip::Header::Contact(rsip::headers::Contact::new(
-            &contact_value,
-        )));
-    }
-
-    // If no bindings, echo the request contact
-    if bindings.is_empty() {
-        if let Ok(contact) = request.contact_header() {
-            headers.push(contact.clone().into());
+    let mut response = build_plain_response_for_request(request, 200, "OK")?;
+    if let SipMessage::Response(resp) = &mut response {
+        // Contacts and Expires go before Content-Length.
+        resp.headers
+            .retain(|h| !matches!(h, rsip::Header::ContentLength(_)));
+        let mut extra: Vec<rsip::Header> = Vec::new();
+        for b in bindings {
+            let mut v = format!("<{}>;expires={}", b.contact, b.remaining_secs());
+            if let Some(id) = &b.instance_id {
+                v.push_str(&format!(";+sip.instance=\"{}\"", id));
+            }
+            if let Some(r) = b.reg_id {
+                v.push_str(&format!(";reg-id={}", r));
+            }
+            extra.push(rsip::Header::Contact(rsip::headers::Contact::new(&v)));
         }
+        if let Some(g) = granted {
+            extra.push(rsip::Header::Expires(rsip::headers::Expires::new(
+                g.to_string(),
+            )));
+        }
+        resp.headers.extend(extra);
+        resp.headers
+            .push(rsip::Header::ContentLength(Default::default()));
     }
-
-    // Expires header
-    let expires_val = bindings.first().map(|b| b.expires).unwrap_or(3600);
-    headers.push(rsip::Header::Expires(rsip::headers::Expires::new(
-        expires_val.to_string(),
-    )));
-
-    headers.push(rsip::Header::ContentLength(Default::default()));
-
-    Ok(SipMessage::Response(rsip::Response {
-        status_code: 200.into(),
-        version: rsip::Version::V2,
-        headers,
-        body: Vec::new(),
-    }))
+    Ok(response)
 }
 
 /// Extract the user part from a SIP URI.

@@ -90,6 +90,14 @@ enable_digest_auth = true
 # refused ("reject").
 register_aor_check = "enforce"
 served_domains = []            # when set, AOR hosts are restricted to these (+ realm/public IP); empty = foreign hosts only reported
+# Registrar (RFC 3261 §10.3): a REGISTER asking less than register_min_expires
+# is answered 423 Interval Too Brief + Min-Expires (1 disables the check:
+# short intervals are then granted as asked); more than register_max_expires
+# is granted register_max_expires (phones read it back in the 200's Contact
+# and re-register accordingly); no interval at all gets register_default_expires.
+register_min_expires = 60
+register_max_expires = 3600
+register_default_expires = 3600
 trunk_local_from = "allow"
 
 # Call guards

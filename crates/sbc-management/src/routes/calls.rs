@@ -67,6 +67,9 @@ pub async fn list_registrations(
                 "received_ip": r.received_ip,
                 "received_port": r.received_port,
                 "user_agent": r.user_agent,
+                "instance_id": r.instance_id,
+                "reg_id": r.reg_id,
+                "registered_at": r.registered_at,
             })
         })
         .collect();

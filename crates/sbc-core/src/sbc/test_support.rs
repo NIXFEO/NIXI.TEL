@@ -368,17 +368,38 @@ pub(crate) fn register_request_for(
     cseq: u32,
     extra: &str,
 ) -> rsip::Request {
+    register_request_with(
+        aor,
+        realm,
+        cseq,
+        "cid-reg-1",
+        &format!("Contact: <sip:{}@127.0.0.1:5080>\r\n", user),
+        "Expires: 3600\r\n",
+        extra,
+    )
+}
+
+/// REGISTER with explicit Call-ID, Contact line(s) and Expires line (both
+/// may be empty: a query REGISTER), plus `extra` header lines.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn register_request_with(
+    aor: &str,
+    realm: &str,
+    cseq: u32,
+    call_id: &str,
+    contact_lines: &str,
+    expires_line: &str,
+    extra: &str,
+) -> rsip::Request {
     request(format!(
         "REGISTER sip:{realm} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKreg{cseq}\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bKreg{cseq}{call_id}\r\n\
          Max-Forwards: 70\r\n\
          From: <{aor}>;tag=r1\r\n\
          To: <{aor}>\r\n\
-         Call-ID: cid-reg-1\r\n\
+         Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{user}@127.0.0.1:5080>\r\n\
-         Expires: 3600\r\n\
-         {extra}Content-Length: 0\r\n\r\n"
+         {contact_lines}{expires_line}{extra}Content-Length: 0\r\n\r\n"
     ))
 }
 
@@ -515,6 +536,7 @@ pub(crate) struct SbcBuilder {
     max_call_duration: Duration,
     digest: Option<(String, std::collections::HashMap<String, String>)>,
     identity_policy: IdentityPolicy,
+    register_policy: crate::register::RegisterPolicy,
 }
 
 impl SbcBuilder {
@@ -527,7 +549,13 @@ impl SbcBuilder {
             max_call_duration: Duration::from_secs(14400),
             digest: None,
             identity_policy: IdentityPolicy::default(),
+            register_policy: crate::register::RegisterPolicy::default(),
         }
+    }
+
+    pub(crate) fn register_policy(mut self, policy: crate::register::RegisterPolicy) -> Self {
+        self.register_policy = policy;
+        self
     }
 
     pub(crate) fn identity_policy(mut self, policy: IdentityPolicy) -> Self {
@@ -595,6 +623,7 @@ impl SbcBuilder {
             sbc.enable_digest_auth = true;
         }
         sbc.identity_policy = self.identity_policy;
+        sbc.register_policy = self.register_policy;
         let mut trunk = TrunkConfig::new(TRUNK_NAME.to_string());
         trunk.host = trunk_addr().ip().to_string();
         trunk.port = trunk_addr().port();

@@ -2013,3 +2013,33 @@ async fn tls_reload_answers_422_when_a_listener_cannot_reload_and_keeps_the_old_
     let _ = std::fs::remove_dir_all(c.parent().unwrap());
     let _ = std::fs::remove_dir_all(c2.parent().unwrap());
 }
+
+#[tokio::test]
+async fn registrations_expose_instance_fields() {
+    let state = make_state().await;
+    let mut reg = sbc_core::register::Registration::new(
+        "sip:alice@sip.example.com".into(),
+        "sip:alice@10.0.0.9:5060".into(),
+        600,
+        "c-1".into(),
+        1,
+        "10.0.0.9:5060".parse().unwrap(),
+        "UDP",
+    );
+    reg.instance_id = Some("<urn:uuid:x>".into());
+    reg.reg_id = Some(1);
+    reg.user_agent = Some("Linphone/5".into());
+    state.registrar.register(reg).await.unwrap();
+    let app = build_router(state, &[]);
+    let json = body_json(
+        app.oneshot(req("GET", "/api/v1/registrations", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json[0]["instance_id"], "<urn:uuid:x>");
+    assert_eq!(json[0]["reg_id"], 1);
+    assert_eq!(json[0]["user_agent"], "Linphone/5");
+    assert!(json[0]["expires_in"].as_u64().unwrap() > 0);
+    assert!(json[0]["registered_at"].as_u64().unwrap() > 0);
+}

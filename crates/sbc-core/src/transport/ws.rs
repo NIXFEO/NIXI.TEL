@@ -83,11 +83,7 @@ impl WsListenerServer {
         message_tx: mpsc::UnboundedSender<ReceivedMessage>,
         event_tx: mpsc::UnboundedSender<crate::transport::manager::TransportEvent>,
     ) -> Result<()> {
-        let proto = if self.identity.is_some() {
-            "WSS"
-        } else {
-            "WS"
-        };
+        let proto = if self.identity.is_some() { "WSS" } else { "WS" };
         info!("Starting {} listener on {}", proto, self.local_addr);
 
         loop {

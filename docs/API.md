@@ -41,7 +41,7 @@ is replaying it through the CRUD endpoints.
 |---|---|---|
 | GET | `/api/v1/calls` | active calls |
 | DELETE | `/api/v1/calls/{uuid}` | administrative teardown: `202`, the SIP engine BYEs/CANCELs both legs within a second and writes a CDR `admin-kick` |
-| GET | `/api/v1/registrations` | registered contacts |
+| GET | `/api/v1/registrations` | current bindings: `aor`, `contact` (bare URI), `expires_in`, `registered_at`, `transport`, `received_ip` / `received_port` (where an inbound call is sent), `user_agent`, `instance_id` / `reg_id` (RFC 5626) — expired bindings are not listed |
 | GET | `/api/v1/cdrs?limit=&offset=` | paginated CDRs, newest first (`has_more` flag); the API serves the last 10 000 records, the CDR file is the source of truth |
 
 #### CDR record
@@ -151,7 +151,9 @@ TOML-only box the seed keys are re-applied by a reload).
 
 `GET /api/v1/events` streams JSON events with the SSE `event:` field set to
 the category: `call` (`call_started`/`call_answered`/`call_ended`),
-`registration`, `trunk` (`trunk_health` up/down transitions,
+`registration` (`registered` per contact with its granted `expires`,
+`unregistered` with `contact` and `reason` = `client` / `wildcard` /
+`expired` / `ws-closed`), `trunk` (`trunk_health` up/down transitions,
 `trunk_registered` once per accepted outbound REGISTER, `trunk_unregistered`
 with the reason once per failure transition), `alert` (incl. security:
 bans, destination blocks, limit hits), `config` (CRUD changes, plus

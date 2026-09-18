@@ -59,6 +59,8 @@ pub struct MaintenanceTask {
     registrar: Arc<dyn Registrar>,
     security: Arc<SecurityManager>,
     metrics: Arc<SbcMetrics>,
+    /// Expired bindings are published as `Unregistered { reason: "expired" }`.
+    events: Option<crate::events::EventBus>,
     config: MaintenanceConfig,
 }
 
@@ -70,6 +72,7 @@ impl MaintenanceTask {
         security: Arc<SecurityManager>,
         metrics: Arc<SbcMetrics>,
         config: MaintenanceConfig,
+        events: Option<crate::events::EventBus>,
     ) -> Self {
         Self {
             dos,
@@ -78,6 +81,7 @@ impl MaintenanceTask {
             security,
             metrics,
             config,
+            events,
         }
     }
 
@@ -107,7 +111,20 @@ impl MaintenanceTask {
                 Some(auth) => auth.cleanup_nonces().await,
                 None => 0,
             },
-            registrations: self.registrar.cleanup_expired().await.unwrap_or(0) as usize,
+            registrations: {
+                let expired = self.registrar.cleanup_expired().await.unwrap_or_default();
+                if let Some(bus) = &self.events {
+                    for r in &expired {
+                        bus.publish(crate::events::SbcEvent::Unregistered {
+                            aor: r.aor.clone(),
+                            contact: r.contact.clone(),
+                            reason: "expired".into(),
+                            ts: crate::events::event_ts(),
+                        });
+                    }
+                }
+                expired.len()
+            },
             bans: self.security.bans.cleanup_expired(),
             ban_windows: self.security.bans.prune_stale_windows(),
             rate_windows: self.security.user_limits.prune_idle_windows(),
@@ -165,6 +182,7 @@ mod tests {
             Arc::new(SecurityManager::new(Default::default())),
             Arc::new(SbcMetrics::new()),
             MaintenanceConfig::default(),
+            None,
         )
     }
 
@@ -192,6 +210,41 @@ mod tests {
         assert_eq!(report.nonces, 0, "fresh nonces are kept");
         assert_eq!(t.metrics.auth_nonces.load(Ordering::Relaxed), 3);
         assert_eq!(t.metrics.dos_tracked_ips.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn sweep_evicts_expired_bindings_and_publishes_events() {
+        let registrar: Arc<dyn Registrar> = Arc::new(crate::register::InMemoryRegistrar::new());
+        let events = crate::events::EventBus::new();
+        let mut rx = events.subscribe();
+        let task = MaintenanceTask::new(
+            Arc::new(DosProtector::new(Default::default())),
+            None,
+            registrar.clone(),
+            Arc::new(SecurityManager::new(Default::default())),
+            Arc::new(SbcMetrics::new()),
+            MaintenanceConfig::default(),
+            Some(events),
+        );
+        let mut reg = crate::register::Registration::new(
+            "sip:alice@example.com".into(),
+            "sip:alice@10.0.0.9:5060".into(),
+            60,
+            "c-1".into(),
+            1,
+            "10.0.0.9:5060".parse().unwrap(),
+            "UDP",
+        );
+        reg.expires_at = 1; // long expired
+        registrar.register(reg).await.unwrap();
+        let report = task.sweep().await;
+        assert_eq!(report.registrations, 1);
+        assert_eq!(registrar.count().await, 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::events::SbcEvent::Unregistered { ref reason, ref contact, .. })
+                if reason == "expired" && contact == "sip:alice@10.0.0.9:5060"
+        ));
     }
 
     #[tokio::test]

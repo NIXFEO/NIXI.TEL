@@ -2595,3 +2595,456 @@ async fn reload_keeps_api_set_user_limit_defaults_over_the_toml() {
     assert!(!report.applied.iter().any(|k| k == "security.user_limits"));
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+// ── Registrar ────────────────────────────────────────────────────────────────
+
+/// Send `req` from `source`, return what the SBC answered.
+async fn register_raw(sbc: &mut Sbc, req: rsip::Request, source: SocketAddr) -> Vec<String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_request(req, source, rsip::Transport::Udp, Some(&tx))
+        .await
+        .unwrap();
+    drain(&mut rx)
+}
+
+fn registrations(sbc: &Sbc) -> u64 {
+    sbc.metrics
+        .active_registrations
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn register_below_min_expires_is_423_with_min_expires() {
+    let mut sbc = SbcBuilder::new().build();
+    let aor = "sip:alice@sip.example.com";
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            1,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>\r\n",
+            "Expires: 10\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(
+        out[0].starts_with("SIP/2.0 423 Interval Too Brief\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("Min-Expires: 60\r\n"), "{}", out[0]);
+    assert!(out[0].contains("CSeq: 1 REGISTER\r\n"));
+    assert!(sbc.register_handler.lookup(aor).await.unwrap().is_empty());
+    assert_eq!(registrations(&sbc), 0);
+    // The contact parameter form too.
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            2,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>;expires=10\r\n",
+            "",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 423 "), "{}", out[0]);
+    // Retry at the minimum.
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            3,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>\r\n",
+            "Expires: 60\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 200 OK"), "{}", out[0]);
+    assert!(
+        out[0].contains("<sip:alice@127.0.0.1:5080>;expires=60\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("Expires: 60\r\n"));
+    assert_eq!(registrations(&sbc), 1);
+}
+
+#[tokio::test]
+async fn register_above_max_expires_is_clamped_and_a_query_lists_bindings() {
+    let mut sbc = SbcBuilder::new()
+        .register_policy(crate::register::RegisterPolicy {
+            max_expires: 1800,
+            ..Default::default()
+        })
+        .build();
+    let aor = "sip:alice@sip.example.com";
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            1,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>\r\n",
+            "Expires: 86400\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(
+        out[0].contains("<sip:alice@127.0.0.1:5080>;expires=1800\r\n"),
+        "{}",
+        out[0]
+    );
+    assert!(out[0].contains("Expires: 1800\r\n"));
+    // Query: no Contact, no Expires → the bindings, no Expires header.
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(aor, "sip.example.com", 2, "c-1", "", "", ""),
+        local_addr(),
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 200 OK"), "{}", out[0]);
+    assert!(
+        out[0].contains("Contact: <sip:alice@127.0.0.1:5080>;expires="),
+        "{}",
+        out[0]
+    );
+    assert!(!out[0].contains("\r\nExpires:"), "{}", out[0]);
+    assert_eq!(registrations(&sbc), 1);
+}
+
+#[tokio::test]
+async fn two_phones_behind_one_nat_keep_their_own_bindings() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut events = sbc.events().subscribe();
+    let aor = "sip:bob@sip.example.com";
+    let nat_a: SocketAddr = "10.0.0.9:5080".parse().unwrap();
+    let nat_b: SocketAddr = "10.0.0.9:5081".parse().unwrap();
+    register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            1,
+            "c-a",
+            "Contact: <sip:bob@192.168.1.10:5060>\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        nat_a,
+    )
+    .await;
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            1,
+            "c-b",
+            "Contact: <sip:bob@192.168.1.11:5060>\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        nat_b,
+    )
+    .await;
+    assert!(
+        out[0].contains("<sip:bob@192.168.1.10:5060>;expires="),
+        "{}",
+        out[0]
+    );
+    assert!(
+        out[0].contains("<sip:bob@192.168.1.11:5060>;expires="),
+        "{}",
+        out[0]
+    );
+    assert_eq!(sbc.register_handler.lookup(aor).await.unwrap().len(), 2);
+    assert_eq!(registrations(&sbc), 2);
+    assert_eq!(
+        sbc.metrics
+            .registrations_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+
+    // Phone A unregisters its own contact only.
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            2,
+            "c-a",
+            "Contact: <sip:bob@192.168.1.10:5060>;expires=0\r\n",
+            "",
+            "",
+        ),
+        nat_a,
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 200 OK"), "{}", out[0]);
+    assert!(!out[0].contains("192.168.1.10"), "{}", out[0]);
+    assert!(out[0].contains("<sip:bob@192.168.1.11:5060>;expires="));
+    assert_eq!(registrations(&sbc), 1);
+    let mut seen_unregistered = false;
+    while let Ok(e) = events.try_recv() {
+        if let crate::events::SbcEvent::Unregistered {
+            contact, reason, ..
+        } = e
+        {
+            assert_eq!(contact, "sip:bob@192.168.1.10:5060");
+            assert_eq!(reason, "client");
+            seen_unregistered = true;
+        }
+    }
+    assert!(seen_unregistered);
+}
+
+#[tokio::test]
+async fn nat_rebinding_moves_the_inbound_call_to_the_new_port() {
+    let mut sbc = SbcBuilder::new().build();
+    sbc.start(&udp_loopback(), None).await.unwrap();
+    let phone = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let phone_addr = phone.local_addr().unwrap();
+    // The harness trunk INVITE targets sip:bob@127.0.0.1:5060 — the AOR bob registers.
+    let aor = "sip:bob@127.0.0.1:5060";
+    let old: SocketAddr = "127.0.0.1:5099".parse().unwrap();
+    register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "127.0.0.1",
+            1,
+            "c-1",
+            "Contact: <sip:bob@192.168.1.10:5060>\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        old,
+    )
+    .await;
+    register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "127.0.0.1",
+            2,
+            "c-1",
+            "Contact: <sip:bob@192.168.1.10:5060>\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        phone_addr,
+    )
+    .await;
+    let bindings = sbc.register_handler.lookup(aor).await.unwrap();
+    assert_eq!(bindings.len(), 1, "same contact = one binding");
+    assert_eq!(
+        bindings[0].received_port,
+        phone_addr.port(),
+        "source follows the newest REGISTER"
+    );
+
+    register_trunk_ip(&sbc).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_invite(
+        invite_from_trunk("bob", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    let mut buf = vec![0u8; 4096];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), phone.recv_from(&mut buf))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the INVITE never reached the phone; trunk got {:?}",
+                drain(&mut rx)
+            )
+        })
+        .unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("INVITE "));
+}
+
+#[tokio::test]
+async fn contact_params_and_sip_instance_do_not_fork_the_binding() {
+    let mut sbc = SbcBuilder::new().build();
+    let aor = "sip:alice@sip.example.com";
+    register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            1,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>;expires=1800\r\n",
+            "",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            2,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>;expires=3600\r\n",
+            "",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert_eq!(sbc.register_handler.lookup(aor).await.unwrap().len(), 1);
+    assert_eq!(out[0].matches("expires=").count(), 1, "{}", out[0]);
+
+    // +sip.instance: a new URI from a new port refreshes the one binding.
+    let inst = "Contact: <sip:carol@10.0.0.9:5060>;+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-00000000abcd>\";reg-id=1\r\n";
+    let carol = "sip:carol@sip.example.com";
+    register_raw(
+        &mut sbc,
+        register_request_with(
+            carol,
+            "sip.example.com",
+            1,
+            "c-c",
+            inst,
+            "Expires: 3600\r\n",
+            "",
+        ),
+        "10.0.0.9:5060".parse().unwrap(),
+    )
+    .await;
+    let inst2 = "Contact: <sip:carol@10.0.0.9:6100>;+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-00000000abcd>\";reg-id=1\r\n";
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            carol,
+            "sip.example.com",
+            2,
+            "c-c",
+            inst2,
+            "Expires: 3600\r\n",
+            "",
+        ),
+        "10.0.0.9:6100".parse().unwrap(),
+    )
+    .await;
+    let bindings = sbc.register_handler.lookup(carol).await.unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].contact, "sip:carol@10.0.0.9:6100");
+    assert!(
+        out[0].contains(
+            ";+sip.instance=\"<urn:uuid:00000000-0000-1000-8000-00000000abcd>\";reg-id=1"
+        ),
+        "{}",
+        out[0]
+    );
+}
+
+#[tokio::test]
+async fn wildcard_register_rules_and_unparsable_contact() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut events = sbc.events().subscribe();
+    let aor = "sip:alice@sip.example.com";
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            1,
+            "c-1",
+            "Contact: <sip:alice@127.0.0.1:5080>\r\nContact: <sip:alice@127.0.0.1:5090>\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(
+        out[0].contains("5080>;expires=") && out[0].contains("5090>;expires="),
+        "{}",
+        out[0]
+    );
+    assert_eq!(registrations(&sbc), 2);
+
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            2,
+            "c-1",
+            "Contact: *\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 400 Bad Request"), "{}", out[0]);
+    assert_eq!(registrations(&sbc), 2);
+
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            3,
+            "c-1",
+            "Contact: *\r\n",
+            "Expires: 0\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 200 OK"), "{}", out[0]);
+    assert!(!out[0].contains("Contact:"), "{}", out[0]);
+    assert_eq!(registrations(&sbc), 0);
+    let mut wildcard = 0;
+    while let Ok(e) = events.try_recv() {
+        if let crate::events::SbcEvent::Unregistered { reason, .. } = e {
+            if reason == "wildcard" {
+                wildcard += 1;
+            }
+        }
+    }
+    assert_eq!(wildcard, 2);
+
+    let out = register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "sip.example.com",
+            4,
+            "c-1",
+            "Contact: garbage<<\r\n",
+            "Expires: 3600\r\n",
+            "",
+        ),
+        local_addr(),
+    )
+    .await;
+    assert!(out[0].starts_with("SIP/2.0 400 Bad Request"), "{}", out[0]);
+    assert_eq!(registrations(&sbc), 0);
+}

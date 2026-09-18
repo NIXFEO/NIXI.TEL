@@ -380,6 +380,17 @@ pub struct SecurityConfig {
     #[serde(default = "default_trunk_local_from")]
     pub trunk_local_from: String,
 
+    /// Registrar (RFC 3261 §10.3): a REGISTER asking less than this is
+    /// answered 423 Interval Too Brief + Min-Expires.
+    #[serde(default = "default_register_min_expires")]
+    pub register_min_expires: u32,
+    /// Granted interval cap (the phone reads it back in the 200's Contact).
+    #[serde(default = "default_register_max_expires")]
+    pub register_max_expires: u32,
+    /// Granted when the REGISTER names no interval.
+    #[serde(default = "default_register_default_expires")]
+    pub register_default_expires: u32,
+
     /// Maximum call duration in seconds (0 = unlimited, default 14400 = 4 hours)
     #[serde(default = "default_max_call_duration")]
     pub max_call_duration: u64,
@@ -421,6 +432,15 @@ pub struct SecurityConfig {
 
 fn default_max_call_duration() -> u64 {
     14400
+}
+fn default_register_min_expires() -> u32 {
+    60
+}
+fn default_register_max_expires() -> u32 {
+    3600
+}
+fn default_register_default_expires() -> u32 {
+    3600
 }
 fn default_register_aor_check() -> String {
     "enforce".to_string()
@@ -631,6 +651,9 @@ impl Default for SbcConfig {
                 register_aor_check: "enforce".to_string(),
                 served_domains: Vec::new(),
                 trunk_local_from: "allow".to_string(),
+                register_min_expires: 60,
+                register_max_expires: 3600,
+                register_default_expires: 3600,
                 max_call_duration: 14400,
                 call_setup_timeout: 60,
                 rtp_timeout: 90,
@@ -791,6 +814,14 @@ mod example_config_tests {
             ),
             (30, 5, 900)
         );
+        assert_eq!(
+            (
+                cfg.security.register_min_expires,
+                cfg.security.register_max_expires,
+                cfg.security.register_default_expires
+            ),
+            (60, 3600, 3600)
+        );
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.logging.format, LogFormat::Json);
         assert!(!cfg.database.allow_missing_store);
@@ -877,6 +908,9 @@ const RELOAD_KEYS: &[&str] = &[
     "security.register_aor_check",
     "security.served_domains",
     "security.trunk_local_from",
+    "security.register_min_expires",
+    "security.register_max_expires",
+    "security.register_default_expires",
     "security.rate_limit_per_ip",
     "security.ban.",
     "security.destinations.enabled",
