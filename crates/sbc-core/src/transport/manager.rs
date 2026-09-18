@@ -295,10 +295,22 @@ impl TransportManager {
     /// whose send fails is dropped from the pool so the next send
     /// reconnects instead of failing on a dead socket until restart.
     pub async fn send_tcp(&self, data: &[u8], dest: SocketAddr) -> Result<()> {
-        let conn = match self.tcp_connections.get(&dest) {
-            Some(existing) => existing.clone(),
+        // A connection the peer has closed is replaced, not written to.
+        // The lookup is scoped: holding a DashMap guard across the insert
+        // below would deadlock on the same shard.
+        let live = {
+            let entry = self.tcp_connections.get(&dest);
+            match entry {
+                Some(existing) if !existing.is_closed() => Some(existing.clone()),
+                _ => None,
+            }
+        };
+        let conn = match live {
+            Some(existing) => existing,
             None => {
-                let new_conn = Arc::new(TcpConnection::connect(dest).await?);
+                self.tcp_connections.remove(&dest);
+                let new_conn =
+                    Arc::new(TcpConnection::connect(dest, self.message_tx.clone()).await?);
                 self.tcp_connections.insert(dest, new_conn.clone());
                 new_conn
             }
@@ -473,6 +485,72 @@ mod outbound_pool_tests {
             !tm.tcp_connections.contains_key(&dest),
             "the dead connection is evicted from the pool"
         );
+    }
+
+    /// A peer that closed one connection and still listens must get a
+    /// fresh one — and the replacement must not deadlock on the pool's
+    /// own shard lock, which is why the lookup is scoped. A deadlock here
+    /// would hang the whole SIP event loop, so the send is time-boxed.
+    #[tokio::test]
+    async fn a_closed_pooled_connection_is_replaced_by_a_fresh_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest = listener.local_addr().unwrap();
+        // Accepts for ever; the first connection is dropped at once, later
+        // ones are kept open.
+        tokio::spawn(async move {
+            let mut kept = Vec::new();
+            let mut first = true;
+            while let Ok((sock, _)) = listener.accept().await {
+                if first {
+                    first = false;
+                    drop(sock);
+                } else {
+                    kept.push(sock);
+                }
+            }
+        });
+
+        let tm = TransportManager::new();
+        let probe = b"OPTIONS sip:probe SIP/2.0\r\nContent-Length: 0\r\n\r\n";
+        tm.send_tcp(probe, dest).await.expect("first connection");
+        // A live clone, not a raw pointer: once the pool drops the old
+        // connection the allocator may hand its address straight back.
+        let first_conn = tm
+            .tcp_connections
+            .get(&dest)
+            .map(|c| c.clone())
+            .expect("pooled");
+
+        // Wait for the reader to notice the close.
+        let mut saw_closed = false;
+        for _ in 0..100 {
+            let closed = tm
+                .tcp_connections
+                .get(&dest)
+                .map(|c| c.is_closed())
+                .unwrap_or(false);
+            if closed {
+                saw_closed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_closed, "the reader never saw the peer close");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), tm.send_tcp(probe, dest))
+            .await
+            .expect("replacing a closed pooled connection must not block")
+            .expect("reconnect");
+        let second_conn = tm
+            .tcp_connections
+            .get(&dest)
+            .map(|c| c.clone())
+            .expect("pooled again");
+        assert!(
+            !Arc::ptr_eq(&first_conn, &second_conn),
+            "the pool handed out a new connection"
+        );
+        assert!(first_conn.is_closed() && !second_conn.is_closed());
     }
 
     #[test]

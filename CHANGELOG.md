@@ -23,6 +23,17 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `sbc_sip_transaction_timeouts_total` (requests nobody ever answered),
   with the alert rules `SBCTransactionTimeouts` and
   `SBCRequestRetransmissionsHigh`.
+- **An outbound TCP connection now reads.** RFC 3261 §18.2.2 has a UAS
+  answer on the connection the request arrived on, and nothing read the
+  connections the SBC opens: every response to a request sent over TCP
+  was dropped by the kernel, so a TCP trunk could not complete a single
+  call and the only symptom was the setup timeout. The connection now
+  spawns the same reader the TLS path has had (Content-Length framing,
+  CRLF keepalives ignored, `reply_tx` bound to the connection), notices
+  the peer closing, and the pool replaces a closed connection instead of
+  writing into a dead socket. The framing is now one shared function for
+  both stream transports. Production runs a UDP trunk, so this fixes a
+  path nothing exercised — it does not change UDP behaviour.
 - All six paths that originate a request now go through the accounted
   send. The INVITE paths (initial forward, failover, 407 retry, 422
   retry, the failover CANCEL) and the session-refresh re-INVITE called

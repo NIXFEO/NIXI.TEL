@@ -285,16 +285,36 @@ impl TcpListenerServer {
     }
 }
 
-/// TCP connection for sending messages
+/// One outbound TCP connection to a peer (trunk or phone).
+///
+/// **It reads.** RFC 3261 §18.2.2: a UAS sends its responses back on the
+/// connection the request arrived on. Without a reader on the connections
+/// *we* open, every response to a request the SBC sent over TCP was
+/// dropped on the floor by the kernel — a TCP trunk could not complete a
+/// single call, and the only symptom was the setup timeout. The reader
+/// task frames by `Content-Length` and pushes into the same pipeline the
+/// listeners feed, with `reply_tx` bound to this connection so the answer
+/// goes back the way it came.
+///
+/// Writes stay synchronous (a `Mutex` over the write half, awaited by the
+/// sender) so a failing send is still reported to the caller that must
+/// fail over, unlike the TLS path where the writer is a task.
 pub struct TcpConnection {
-    stream: Arc<tokio::sync::Mutex<TcpStream>>,
+    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     peer_addr: SocketAddr,
+    /// Set by the reader task on EOF or read error: the pool must not
+    /// hand this connection out again.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TcpConnection {
-    /// Create a new TCP connection to a destination, bounded by
-    /// [`OUTBOUND_CONNECT_TIMEOUT`](crate::transport::OUTBOUND_CONNECT_TIMEOUT).
-    pub async fn connect(dest: SocketAddr) -> Result<Self> {
+    /// Connect to a destination — bounded by
+    /// [`OUTBOUND_CONNECT_TIMEOUT`](crate::transport::OUTBOUND_CONNECT_TIMEOUT)
+    /// — and spawn the reader task that feeds `message_tx`.
+    pub async fn connect(
+        dest: SocketAddr,
+        message_tx: mpsc::UnboundedSender<ReceivedMessage>,
+    ) -> Result<Self> {
         let timeout = crate::transport::OUTBOUND_CONNECT_TIMEOUT;
         let stream = tokio::time::timeout(timeout, TcpStream::connect(dest))
             .await
@@ -308,28 +328,107 @@ impl TcpConnection {
 
         debug!("Established TCP connection to {}", dest);
 
+        let (mut read_half, write_half) = stream.into_split();
+        let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Anything we write back on this connection: the reply channel the
+        // handlers receive with each message.
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let reply_writer = writer.clone();
+        tokio::spawn(async move {
+            while let Some(data) = reply_rx.recv().await {
+                let mut w = reply_writer.lock().await;
+                if let Err(e) = w.write_all(&data).await {
+                    debug!("TCP write to {} failed: {}", dest, e);
+                    break;
+                }
+                let _ = w.flush().await;
+            }
+        });
+
+        // Reader task: Content-Length framing → the SBC pipeline.
+        let closed_flag = closed.clone();
+        tokio::spawn(async move {
+            let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match read_half.read(&mut chunk).await {
+                    Ok(0) => {
+                        debug!("Outbound TCP connection to {} closed by peer", dest);
+                        break;
+                    }
+                    Ok(n) => {
+                        buffer.extend_from_slice(&chunk[..n]);
+                        while let Some((msg_end, remaining_start)) =
+                            crate::transport::frame_sip_message(&buffer)
+                        {
+                            let raw = buffer[..msg_end].to_vec();
+                            buffer.drain(..remaining_start);
+                            if crate::transport::is_keepalive(&raw) {
+                                continue;
+                            }
+                            match rsip::SipMessage::try_from(raw) {
+                                Ok(message) => {
+                                    let _ = message_tx.send(ReceivedMessage {
+                                        message,
+                                        source: dest,
+                                        transport: rsip::Transport::Tcp,
+                                        reply_tx: Some(reply_tx.clone()),
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!("TCP: unparseable SIP from {}: {}", dest, e)
+                                }
+                            }
+                        }
+                        if buffer.len() > MAX_MESSAGE_SIZE {
+                            warn!("TCP read buffer overflow from {}, resetting", dest);
+                            buffer.clear();
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Outbound TCP read from {} failed: {}", dest, e);
+                        break;
+                    }
+                }
+            }
+            closed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
         Ok(Self {
-            stream: Arc::new(tokio::sync::Mutex::new(stream)),
+            writer,
             peer_addr: dest,
+            closed,
         })
     }
 
-    /// Send SIP message over this connection
+    /// Send a SIP message on this connection.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         debug!("Sending {} bytes to {} via TCP", data.len(), self.peer_addr);
 
-        let mut stream = self.stream.lock().await;
-        stream
+        let mut writer = self.writer.lock().await;
+        writer
             .write_all(data)
             .await
             .map_err(|e| Error::Transport(format!("Failed to write to TCP stream: {}", e)))?;
 
-        stream
+        writer
             .flush()
             .await
             .map_err(|e| Error::Transport(format!("Failed to flush TCP stream: {}", e)))?;
 
         Ok(())
+    }
+
+    /// Whether the peer has closed the connection (or the read failed):
+    /// the pool reconnects instead of writing into a dead socket.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
     }
 }
 
@@ -411,7 +510,8 @@ mod connect_timeout_tests {
     async fn connect_to_a_black_hole_fails_within_the_timeout() {
         let dest: SocketAddr = "203.0.113.1:5060".parse().unwrap();
         let started = Instant::now();
-        let result = TcpConnection::connect(dest).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = TcpConnection::connect(dest, tx).await;
         assert!(result.is_err());
         let budget = crate::transport::OUTBOUND_CONNECT_TIMEOUT + Duration::from_secs(1);
         assert!(
@@ -419,5 +519,105 @@ mod connect_timeout_tests {
             "connect took {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod outbound_reader_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// RFC 3261 §18.2.2: the peer answers on the connection our request
+    /// arrived on. Nothing read those connections, so every response to a
+    /// request the SBC sent over TCP was dropped by the kernel and the
+    /// call died at the setup timeout with no diagnostic at all.
+    #[tokio::test]
+    async fn a_response_on_our_own_connection_reaches_the_pipeline() {
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // The far end: read whatever arrives, answer 100 Trying then 200 OK
+        // in a single write (two messages in one segment, so the framing is
+        // exercised too).
+        tokio::spawn(async move {
+            let (mut sock, _) = peer.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("INVITE "));
+            let answers =
+                "SIP/2.0 100 Trying\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK1\r\n\
+                 From: <sip:a@x>;tag=1\r\nTo: <sip:b@y>\r\nCall-ID: c1\r\n\
+                 CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n\
+                 SIP/2.0 200 OK\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK1\r\n\
+                 From: <sip:a@x>;tag=1\r\nTo: <sip:b@y>;tag=2\r\nCall-ID: c1\r\n\
+                 CSeq: 1 INVITE\r\nContent-Length: 4\r\n\r\nbody";
+            sock.write_all(answers.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Keep the socket open so the reader is not torn down.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let conn = TcpConnection::connect(peer_addr, tx)
+            .await
+            .expect("connect");
+        conn.send(
+            b"INVITE sip:b@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK1\r\n\
+              CSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .expect("send");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the 100 Trying reached the pipeline")
+            .unwrap();
+        assert_eq!(first.transport, rsip::Transport::Tcp);
+        assert_eq!(first.source, peer_addr);
+        assert!(
+            first.reply_tx.is_some(),
+            "the answer must go back on this very connection"
+        );
+        match first.message {
+            SipMessage::Response(r) => assert_eq!(u16::from(r.status_code), 100),
+            other => panic!("expected a response, got {:?}", other),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the 200 OK was framed after it")
+            .unwrap();
+        match second.message {
+            SipMessage::Response(r) => {
+                assert_eq!(u16::from(r.status_code), 200);
+                assert_eq!(r.body, b"body", "the body was framed by Content-Length");
+            }
+            other => panic!("expected a response, got {:?}", other),
+        }
+        assert!(!conn.is_closed());
+    }
+
+    /// The peer hanging up marks the connection unusable, so the pool
+    /// reconnects instead of writing into a dead socket until restart.
+    #[tokio::test]
+    async fn a_closed_connection_is_marked_closed() {
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = peer.accept().await.unwrap();
+            drop(sock);
+        });
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let conn = TcpConnection::connect(peer_addr, tx)
+            .await
+            .expect("connect");
+        for _ in 0..50 {
+            if conn.is_closed() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the reader never noticed the peer closing");
     }
 }

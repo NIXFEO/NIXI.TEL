@@ -19,6 +19,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
 use crate::transport::udp::ReceivedMessage;
+use crate::transport::{frame_sip_message, is_keepalive};
 use crate::{Error, Result};
 
 /// Per-destination TLS parameters (from trunk config).
@@ -126,6 +127,9 @@ impl TlsClientConnection {
                         while let Some((msg_end, remaining_start)) = frame_sip_message(&buffer) {
                             let raw = buffer[..msg_end].to_vec();
                             buffer.drain(..remaining_start);
+                            if is_keepalive(&raw) {
+                                continue;
+                            }
                             match rsip::SipMessage::try_from(raw) {
                                 Ok(message) => {
                                     let _ = message_tx.send(ReceivedMessage {
@@ -235,24 +239,6 @@ pub fn build_client_config(params: &TlsClientParams) -> Result<ClientConfig> {
 /// Find one complete SIP message in `buffer` using Content-Length framing.
 /// Returns (message_end, remaining_start) — identical here, kept as a pair
 /// for clarity at the call site.
-fn frame_sip_message(buffer: &[u8]) -> Option<(usize, usize)> {
-    let header_end = buffer.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let headers = std::str::from_utf8(&buffer[..header_end]).ok()?;
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") || lower.starts_with("l:") {
-                line.split(':').nth(1)?.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    let message_end = header_end + 4 + content_length;
-    (buffer.len() >= message_end).then_some((message_end, message_end))
-}
-
 pub(crate) mod danger {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
