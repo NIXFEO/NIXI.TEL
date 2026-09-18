@@ -284,6 +284,12 @@ pub struct SbcMetrics {
     #[allow(clippy::type_complexity)]
     pub media_endpoint:
         Arc<std::sync::Mutex<HashMap<(&'static str, &'static str, &'static str), u64>>>,
+    /// Requests this SBC resent over UDP because nothing answered them
+    /// (RFC 3261 Timer A/E). A steady rate means datagram loss toward a
+    /// peer — the SBC now covers it instead of failing the call.
+    pub request_retransmissions: Arc<AtomicU64>,
+    /// Requests that got no answer at all within 32 s (Timer B/F).
+    pub transaction_timeouts: Arc<AtomicU64>,
     /// Calls the SBC could not anchor media for (no ports, relay start
     /// failed): refused before dialling, or ended right after the answer.
     pub media_relay_failures: Arc<AtomicU64>,
@@ -369,6 +375,8 @@ impl SbcMetrics {
             media_tx_bytes_callee: Arc::new(AtomicU64::new(0)),
             media_one_way: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_endpoint: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            request_retransmissions: Arc::new(AtomicU64::new(0)),
+            transaction_timeouts: Arc::new(AtomicU64::new(0)),
             media_relay_failures: Arc::new(AtomicU64::new(0)),
             quarantined_ports: Arc::new(AtomicU64::new(0)),
             forced_port_reuse: Arc::new(AtomicU64::new(0)),
@@ -659,6 +667,14 @@ impl SbcMetrics {
         }
     }
 
+    pub fn inc_request_retransmission(&self) {
+        self.request_retransmissions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_transaction_timeout(&self) {
+        self.transaction_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inc_media_relay_failure(&self) {
         self.media_relay_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -873,6 +889,16 @@ impl SbcMetrics {
             }
         }
 
+        counter!(
+            "sbc_sip_request_retransmissions",
+            "Requests resent over UDP because nothing answered them (Timer A/E)",
+            self.request_retransmissions.load(Ordering::Relaxed)
+        );
+        counter!(
+            "sbc_sip_transaction_timeouts",
+            "Requests with no answer within 32 s (Timer B/F)",
+            self.transaction_timeouts.load(Ordering::Relaxed)
+        );
         counter!(
             "sbc_media_relay_failures",
             "Calls with no media anchor: refused before dialling, or ended just after the answer",

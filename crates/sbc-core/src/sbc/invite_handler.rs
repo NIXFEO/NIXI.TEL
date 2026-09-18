@@ -1059,8 +1059,8 @@ impl Sbc {
             .await;
 
         if let Err(e) = self
-            .transport
-            .reply(
+            .send_request_tracked(
+                "INVITE → callee",
                 outbound_raw.as_bytes(),
                 dest,
                 outbound_transport,
@@ -1224,9 +1224,11 @@ impl Sbc {
             (crate::sip_builder::build_cancel(&stored_invite), prev_dest)
         {
             info!("Failover: CANCEL previous attempt → {}", dest);
+            // Tracked: this also stops retransmitting the INVITE it
+            // cancels (client_tx keys both by the same Via branch).
             let _ = self
-                .transport
-                .reply(
+                .send_request_tracked(
+                    "CANCEL (failover) → previous attempt",
                     cancel.as_bytes(),
                     dest,
                     prev_transport,
@@ -1250,8 +1252,13 @@ impl Sbc {
             trunk.name, trunk.host, trunk.port
         );
         if let Err(e) = self
-            .transport
-            .reply(new_invite.as_bytes(), new_dest, new_transport, None)
+            .send_request_tracked(
+                "INVITE (failover) → trunk",
+                new_invite.as_bytes(),
+                new_dest,
+                new_transport,
+                None,
+            )
             .await
         {
             warn!("Failover: send to trunk '{}' failed: {}", trunk.name, e);
@@ -1361,8 +1368,8 @@ impl Sbc {
             attempt.dest
         };
         if let Err(e) = self
-            .transport
-            .reply(
+            .send_request_tracked(
+                "INVITE (422 retry) → trunk",
                 new_invite.as_bytes(),
                 dest,
                 attempt.transport,
@@ -1516,8 +1523,8 @@ impl Sbc {
         };
 
         if let Err(e) = self
-            .transport
-            .reply(
+            .send_request_tracked(
+                "INVITE (407 retry) → trunk",
                 new_invite.as_bytes(),
                 dest,
                 outbound_transport,

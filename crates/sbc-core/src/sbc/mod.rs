@@ -11,6 +11,7 @@ pub(crate) use response_handler::parse_session_expires as response_handler_sessi
 pub mod backup;
 mod call_handler;
 mod cdr;
+mod client_tx;
 mod invite_tx;
 pub mod runtime_config;
 mod trunk_state;
@@ -377,6 +378,8 @@ pub struct Sbc {
     /// INVITE server transactions in flight or just completed: a
     /// retransmission replays the last response (RFC 3261 §17.2.1).
     invite_tx: invite_tx::InviteTxCache,
+    /// Requests this SBC sent over UDP, resent until answered (§17.1).
+    client_tx: client_tx::ClientTxCache,
 
     /// Hard cap on a connected call (`security.max_call_duration`): past it
     /// the SBC BYEs both legs, so a callee that vanished without BYE cannot
@@ -790,6 +793,7 @@ impl Sbc {
             admin_kicks: Arc::new(AdminKicks::new()),
             identity_policy: IdentityPolicy::from_config(&config.security),
             invite_tx: invite_tx::InviteTxCache::new(),
+            client_tx: client_tx::ClientTxCache::default(),
             max_call_duration: max_call_duration_of(&config.security),
             security,
             session_timer: config.security.session_timer_enabled.then(|| {
@@ -1352,6 +1356,7 @@ impl Sbc {
             admin_kicks: Arc::new(AdminKicks::new()),
             identity_policy: IdentityPolicy::default(),
             invite_tx: invite_tx::InviteTxCache::new(),
+            client_tx: client_tx::ClientTxCache::default(),
             max_call_duration: Duration::from_secs(14400),
             session_timer: None,
             register_policy: crate::register::RegisterPolicy::default(),
@@ -1514,6 +1519,7 @@ impl Sbc {
                 }
                 _ = retransmit_interval.tick() => {
                     self.retransmit_finals().await;
+                    self.retransmit_requests().await;
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration");
@@ -1636,6 +1642,22 @@ impl Sbc {
         transport: rsip::Transport,
         reply_tx: Option<UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
+        // A response ends the client transaction it answers: stop
+        // retransmitting that request (§17.1.1.2 — a provisional is
+        // enough). Read from the parsed headers, and only when something
+        // is actually in flight: this runs on every response.
+        if let SipMessage::Response(ref response) = message {
+            if !self.client_tx.is_empty() {
+                if let (Ok(via), Ok(cseq)) = (response.via_header(), response.cseq_header()) {
+                    let branch = client_tx::branch_param(via.value());
+                    let method = cseq.value().split_whitespace().nth(1);
+                    if let (Some(branch), Some(method)) = (branch, method) {
+                        self.client_tx
+                            .answered_parts(&branch, &method.to_ascii_uppercase());
+                    }
+                }
+            }
+        }
         let span = self.call_span(&message).await;
         let result = match message {
             SipMessage::Request(request) => {
@@ -2240,7 +2262,17 @@ impl Sbc {
             }
         }
         match self.transport.reply(data, dest, transport, reply_tx).await {
-            Ok(()) => true,
+            Ok(()) => {
+                // A request we originate over UDP is retransmitted until it
+                // is answered (§17.1): nothing else resends it, and a single
+                // lost datagram costs a call or leaves a ghost session on
+                // the trunk.
+                if !data.starts_with(b"SIP/2.0 ") {
+                    self.client_tx
+                        .record_sent(what, data, dest, transport, reply_tx.cloned());
+                }
+                true
+            }
             Err(e) => {
                 warn!(
                     "SIP send failed: {} → {} via {:?}: {}",
@@ -2248,6 +2280,35 @@ impl Sbc {
                 );
                 self.metrics.inc_sip_send_failure(transport);
                 false
+            }
+        }
+    }
+
+    /// Send a request this SBC originates, keeping the transport's own
+    /// error for the caller's failover logic, and remember it for
+    /// retransmission (§17.1) exactly like `send_sip` does.
+    ///
+    /// The INVITE paths need this: they branch on the send error (next
+    /// trunk, 503 to the caller), so they cannot use `send_sip`'s bool —
+    /// but without the tracking a lost INVITE is never resent, which is
+    /// the whole point of the client transaction layer.
+    pub(crate) async fn send_request_tracked(
+        &self,
+        what: &str,
+        data: &[u8],
+        dest: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+    ) -> Result<()> {
+        match self.transport.reply(data, dest, transport, reply_tx).await {
+            Ok(()) => {
+                self.client_tx
+                    .record_sent(what, data, dest, transport, reply_tx.cloned());
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.inc_sip_send_failure(transport);
+                Err(e)
             }
         }
     }

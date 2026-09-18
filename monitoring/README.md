@@ -7,7 +7,9 @@ The SBC exposes Prometheus metrics at `GET /metrics` on its management API
 series are prefixed `sbc_` — calls, SIP traffic (by method / by response
 code), auth, anti-fraud (bans, IRSF destination blocks, per-user limits),
 media (RTP/SRTP/transcoding), health (last-CDR age, RTP timeouts, send
-failures), per-trunk series (`sbc_trunk_up`, `sbc_trunk_registered`,
+failures, `sbc_sip_request_retransmissions_total` and
+`sbc_sip_transaction_timeouts_total` — UDP loss the SBC covers, and the
+requests it never got an answer to), per-trunk series (`sbc_trunk_up`, `sbc_trunk_registered`,
 `sbc_trunk_active_calls`, `sbc_trunk_calls_total{trunk,direction,outcome}`,
 `sbc_trunk_enabled`, `sbc_trunk_available`, `sbc_trunk_unavailable_seconds`,
 `sbc_trunk_consecutive_failures`), the media plane
@@ -51,7 +53,8 @@ Optional alerting rules are in `prometheus/alert_rules.yml`: `SBCDown`,
 `SBCTrunkAsrLow`, `SBCTrunkUnavailable`, `SBCStoreUnavailable`,
 `SBCStoreBackupStale`, `SBCStoreBackupFailed`, `SBCCertExpiringSoon`,
 `SBCCertExpired`, `SBCConfigReloadFailed`, `SBCCdrWriteErrors`,
-`SBCCdrQueueBacklog`, `SBCLogLinesDropped`, `SBCAuthFailureSpike`.
+`SBCCdrQueueBacklog`, `SBCLogLinesDropped`, `SBCAuthFailureSpike`,
+`SBCTransactionTimeouts`, `SBCRequestRetransmissionsHigh`.
 Validate with `promtool check rules prometheus/alert_rules.yml`.
 
 ## Grafana

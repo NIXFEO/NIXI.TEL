@@ -29,7 +29,7 @@ MIT licensed. Runs in production; contributions welcome — see
 
 ```bash
 cargo build --workspace
-cargo test --workspace          # ~585 tests
+cargo test --workspace          # ~645 tests
 cargo clippy --workspace
 ```
 
@@ -100,6 +100,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `sbc/call_handler.rs` | BYE/CANCEL/ACK/INFO, re-INVITE, timeouts, graceful shutdown |
 | `sbc/cdr.rs` | `CallOutcome`, `finish_call` (single CDR/metrics/release path), `hangup_both_legs`, RTP/setup timeouts, admin kicks |
 | `sbc/invite_tx.rs` | INVITE server-transaction memory: retransmissions replay the last response (RFC 3261 §17.2.1) |
+| `sbc/client_tx.rs` | Client transactions: every request the SBC sends over UDP is resent until answered (Timer A/E), then given up on (Timer B/F, §17.1) |
 | `sbc/trunk_state.rs` | Trunk state fed by real calls: per-trunk active-call counting, failure ladder / `503 Retry-After` park, success reset, per-trunk metrics labels |
 | `trunk_tasks.rs` | Per-trunk OPTIONS health check + outbound REGISTER loops (423 Min-Expires, backoff) as a registry that follows the trunk table (API writes, reload) with cancellation |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
@@ -217,6 +218,23 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   the caller's own CSeq back. A 481/408 to the SBC's refresh re-INVITE (or
   three failed refreshes in a row) tears the call down with a BYE to the
   caller instead of refreshing a dead dialog forever.
+
+- **Our own requests are retransmitted over UDP** — a datagram the peer
+  never received used to cost a call (an INVITE answered by nothing, the
+  setup timeout the only trace) or leave a ghost session (a lost BYE, the
+  OverMaxCall symptom above). `sbc/client_tx.rs` keys every request the
+  SBC sends by `branch|METHOD` and resends the **same bytes**: an INVITE
+  at 500 ms then doubling, anything else capped at T2 = 4 s, until the
+  first response — a 100 Trying is enough — or Timer B/F at 32 s
+  (`sbc_sip_request_retransmissions_total`,
+  `sbc_sip_transaction_timeouts_total`). Sending a CANCEL stops its
+  INVITE. ACKs and responses are never tracked (an ACK has no response of
+  its own; a response is replayed by `invite_tx.rs` instead), and TCP/TLS
+  retransmit in the transport. **Every request the SBC originates must go
+  out through `send_sip` or `send_request_tracked`** — the INVITE paths
+  need the latter because they branch on the send error, and a direct
+  `transport.reply` is invisible to both the timers and
+  `sbc_sip_send_failures_total`.
 
 - **Trunk capacity and cooldown are real** — a call counts on its trunk
   from the forwarded INVITE (or from the inbound INVITE's source trunk) to

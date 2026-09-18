@@ -47,6 +47,28 @@ groups:
         annotations:
           summary: "SIP messages are failing to send ({{ $labels.transport }})"
 
+      - alert: SBCTransactionTimeouts
+        # A request the SBC sent over UDP got no answer at all in 32 s
+        # (RFC 3261 Timer B/F), even after the Timer A/E retransmissions:
+        # the peer is unreachable or dropping our datagrams, not merely
+        # slow. A lost BYE here leaves the peer a session it thinks is
+        # live. Check `sbc_sip_request_retransmissions_total` next to it:
+        # retransmissions without timeouts is loss the SBC is covering.
+        expr: rate(sbc_sip_transaction_timeouts_total[10m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "SIP requests are going unanswered (Timer B/F)"
+
+      - alert: SBCRequestRetransmissionsHigh
+        # Sustained UDP loss toward a peer: every call now costs extra
+        # round trips and post-dial delay grows. Harmless in bursts.
+        expr: rate(sbc_sip_request_retransmissions_total[15m]) > 0.5
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "SIP requests are being retransmitted steadily (UDP loss)"
+
       - alert: SBCTrunkDown
         # The trunk used to answer OPTIONS and stopped (sbc_trunk_up is only
         # exported for trunks that answered at least once). The router

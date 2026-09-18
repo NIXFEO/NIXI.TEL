@@ -7,6 +7,29 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 ## [Unreleased]
 
 ### Added
+- **Client transactions (RFC 3261 §17.1): the requests the SBC sends over
+  UDP are now retransmitted until they are answered.** Nothing resent them
+  before, so a single lost datagram was a lost call — an INVITE the trunk
+  never received failed at `call_setup_timeout` with no trace but the
+  timeout itself, and a lost BYE left the trunk a session it believed was
+  live, the documented OverMaxCall cause. `sbc/client_tx.rs` keys every
+  originated request by `branch|METHOD` and resends the same bytes: an
+  INVITE at 500 ms then doubling (Timer A), anything else doubling up to
+  T2 = 4 s (Timer E), until the first response — a 100 Trying suffices —
+  or Timer B/F at 32 s. Sending a CANCEL stops its INVITE; ACKs,
+  responses and reliable transports are not tracked; the table is capped
+  at 4096 entries so a flood cannot grow it. Two new counters,
+  `sbc_sip_request_retransmissions_total` (loss the SBC is covering) and
+  `sbc_sip_transaction_timeouts_total` (requests nobody ever answered),
+  with the alert rules `SBCTransactionTimeouts` and
+  `SBCRequestRetransmissionsHigh`.
+- All six paths that originate a request now go through the accounted
+  send. The INVITE paths (initial forward, failover, 407 retry, 422
+  retry, the failover CANCEL) and the session-refresh re-INVITE called
+  `transport.reply` directly because they branch on the send error, which
+  left them invisible to the new timers *and* to
+  `sbc_sip_send_failures_total`; `send_request_tracked` keeps their error
+  and does the accounting.
 - The Opus encoder runs at libopus complexity 5 instead of the default 9,
   which halves the cost of the SBC's one real capacity constraint
   (143 µs → 83 µs per 20 ms frame) for a difference nothing can hear on an

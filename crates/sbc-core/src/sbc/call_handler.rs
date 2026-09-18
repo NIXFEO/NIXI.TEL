@@ -858,8 +858,13 @@ impl Sbc {
                     &uuid[..8.min(uuid.len())]
                 );
                 if let Err(e) = self
-                    .transport
-                    .reply(reinvite.as_bytes(), dest, transport, reply_tx.as_ref())
+                    .send_request_tracked(
+                        "re-INVITE (session refresh) → peer",
+                        reinvite.as_bytes(),
+                        dest,
+                        transport,
+                        reply_tx.as_ref(),
+                    )
                     .await
                 {
                     warn!("Session refresh send failed for call {}: {}", uuid, e);

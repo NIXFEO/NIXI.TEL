@@ -435,6 +435,44 @@ impl Sbc {
         }
     }
 
+    /// Requests we sent over UDP and have had no answer to (§17.1): resend
+    /// them until Timer B/F. A lost INVITE otherwise fails a call on a
+    /// healthy trunk, and a lost BYE leaves the trunk a session it thinks
+    /// is live.
+    pub(crate) async fn retransmit_requests(&self) {
+        self.retransmit_requests_at(std::time::Instant::now()).await
+    }
+
+    /// Same, at an explicit instant — the tests advance the clock instead
+    /// of sleeping for T1.
+    pub(crate) async fn retransmit_requests_at(&self, now: std::time::Instant) {
+        let (due, expired) = self.client_tx.due(now);
+        for r in due {
+            debug!(
+                "Timer A/E: resending {} → {} (attempt {})",
+                r.what, r.dest, r.attempt
+            );
+            if let Err(e) = self
+                .transport
+                .reply(&r.raw, r.dest, r.transport, r.reply_tx.as_ref())
+                .await
+            {
+                debug!("Retransmission of {} → {} failed: {}", r.what, r.dest, e);
+                self.metrics.inc_sip_send_failure(r.transport);
+            } else {
+                self.metrics.inc_request_retransmission();
+            }
+        }
+        for what in expired {
+            warn!(
+                "Timer B/F: no answer to {} after {:?} — giving up on that request",
+                what,
+                crate::sbc::client_tx::TRANSACTION_TIMEOUT
+            );
+            self.metrics.inc_transaction_timeout();
+        }
+    }
+
     /// `DELETE /api/v1/calls/{uuid}`: end the queued calls on the wire and
     /// write their CDR ("admin-kick").
     pub(crate) async fn process_admin_kicks(&mut self) {

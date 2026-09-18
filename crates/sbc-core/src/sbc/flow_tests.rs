@@ -3397,3 +3397,243 @@ async fn full_call_with_a_store_writes_the_cdr_to_sqlite() {
     );
     sbc.cdr.close(Duration::from_secs(2)).await;
 }
+
+// =============================================================================
+// Client transactions (RFC 3261 §17.1): the requests the SBC originates
+// =============================================================================
+
+use std::time::Instant;
+
+/// The `100 Trying` a UAS would send back, built from the request's own
+/// identity headers (every Via copied, as a real UAS echoes them).
+fn provisional_for(request: &str, status_line: &str) -> rsip::SipMessage {
+    let mut out = format!("SIP/2.0 {}\r\n", status_line);
+    for line in request.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("via:")
+            || lower.starts_with("from:")
+            || lower.starts_with("to:")
+            || lower.starts_with("call-id:")
+            || lower.starts_with("cseq:")
+        {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("Content-Length: 0\r\n\r\n");
+    rsip::SipMessage::try_from(out.as_str()).expect("response parses")
+}
+
+/// One datagram, or a panic naming what was expected.
+async fn one_datagram(sock: &tokio::net::UdpSocket, what: &str) -> String {
+    let mut buf = vec![0u8; 8192];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .unwrap_or_else(|_| panic!("no datagram: expected {}", what))
+        .expect("recv");
+    String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
+/// Nothing in this SBC used to resend a request it originated. A single
+/// lost INVITE therefore failed a call on a perfectly healthy peer, with
+/// no trace but the setup timeout. Timer A now resends it (500 ms, then
+/// doubling), and the first response — even a provisional — stops it.
+#[tokio::test]
+async fn an_unanswered_invite_is_resent_until_a_response_arrives() {
+    let mut sbc = SbcBuilder::new().build();
+    sbc.start(&udp_loopback(), None).await.unwrap();
+    // A real phone socket that receives the forwarded INVITE and stays mute.
+    let phone = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let phone_addr = phone.local_addr().unwrap();
+    let aor = "sip:bob@127.0.0.1:5060";
+    register_raw(
+        &mut sbc,
+        register_request_with(
+            aor,
+            "127.0.0.1",
+            1,
+            "c-1",
+            &format!("Contact: <sip:bob@127.0.0.1:{}>\r\n", phone_addr.port()),
+            "Expires: 3600\r\n",
+            "",
+        ),
+        phone_addr,
+    )
+    .await;
+
+    register_trunk_ip(&sbc).await;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    sbc.handle_invite(
+        invite_from_trunk("bob", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+
+    let first = one_datagram(&phone, "the forwarded INVITE").await;
+    assert!(first.starts_with("INVITE "), "{}", first);
+    let start = Instant::now();
+
+    // Before T1 nothing moves.
+    sbc.retransmit_requests_at(start + Duration::from_millis(400))
+        .await;
+    assert_eq!(
+        sbc.metrics
+            .request_retransmissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no retransmission before Timer A fires"
+    );
+
+    // At T1 the very same bytes go out again: same branch, so the peer
+    // treats it as a retransmission and not as a second call.
+    sbc.retransmit_requests_at(start + Duration::from_millis(600))
+        .await;
+    let again = one_datagram(&phone, "the Timer A retransmission").await;
+    assert_eq!(again, first, "byte-identical retransmission");
+    assert_eq!(
+        sbc.metrics
+            .request_retransmissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // The phone finally answers 100 Trying — Timer A stops (§17.1.1.2).
+    sbc.dispatch(
+        provisional_for(&first, "100 Trying"),
+        phone_addr,
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .unwrap();
+    sbc.retransmit_requests_at(start + Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        sbc.metrics
+            .request_retransmissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a provisional response ends the retransmissions"
+    );
+    assert_eq!(
+        sbc.metrics
+            .transaction_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "and the transaction is not reported as timed out"
+    );
+}
+
+/// A BYE lost on the way to the trunk is the documented OverMaxCall cause:
+/// the trunk keeps a session it believes is live and eventually answers
+/// `486 Busy Here` to new calls. Timer E resends it; with no answer at all
+/// Timer F reports the failure instead of hiding it.
+#[tokio::test]
+async fn a_lost_bye_is_resent_and_its_silence_is_reported() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+
+    sbc.handle_bye(
+        bye_from_caller(&call.spec, 4),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    let to_trunk = drain(&mut call.callee_rx);
+    let bye = to_trunk
+        .iter()
+        .find(|m| m.starts_with("BYE "))
+        .expect("a BYE went to the trunk")
+        .clone();
+    let start = Instant::now();
+
+    // 500 ms, 1 s, 2 s, then capped at T2 = 4 s (§17.1.2.2).
+    let mut sent = Vec::new();
+    for at in [500u64, 1500, 3500, 7500, 11500] {
+        sbc.retransmit_requests_at(start + Duration::from_millis(at + 100))
+            .await;
+        let out = drain(&mut call.callee_rx);
+        assert_eq!(out.len(), 1, "one resend at {} ms: {:?}", at, out);
+        assert_eq!(out[0], bye, "byte-identical retransmission");
+        sent.push(at);
+    }
+    assert_eq!(
+        sbc.metrics
+            .request_retransmissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        sent.len() as u64
+    );
+
+    // Timer F: 32 s without any answer is a real failure, and it is
+    // counted rather than logged into the void.
+    sbc.retransmit_requests_at(start + Duration::from_secs(33))
+        .await;
+    assert!(
+        drain(&mut call.callee_rx).is_empty(),
+        "no resend past Timer F"
+    );
+    assert_eq!(
+        sbc.metrics
+            .transaction_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    // Reported once, then forgotten.
+    sbc.retransmit_requests_at(start + Duration::from_secs(40))
+        .await;
+    assert_eq!(
+        sbc.metrics
+            .transaction_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+/// The trunk's answer to the BYE stops it, whatever the code.
+#[tokio::test]
+async fn the_trunks_answer_to_a_bye_stops_the_retransmissions() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+
+    sbc.handle_bye(
+        bye_from_caller(&call.spec, 4),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    let bye = drain(&mut call.callee_rx)
+        .into_iter()
+        .find(|m| m.starts_with("BYE "))
+        .expect("a BYE went to the trunk");
+
+    sbc.dispatch(
+        provisional_for(&bye, "200 OK"),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .unwrap();
+
+    sbc.retransmit_requests_at(Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(
+        drain(&mut call.callee_rx).is_empty(),
+        "an answered BYE is not resent"
+    );
+    assert_eq!(
+        sbc.metrics
+            .request_retransmissions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
