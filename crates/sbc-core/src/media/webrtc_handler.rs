@@ -42,7 +42,24 @@ pub struct WebRtcSdpInfo {
 
     /// Media stream identifier (a=mid:X) — required by Chrome for BUNDLE
     pub mid: Option<String>,
+
+    /// The payload type the peer gave Opus. An answer must reuse the
+    /// offer's numbering (RFC 3264 §6.1): Chrome says 111, Firefox 109,
+    /// and answering 111 to Firefox's 109 is a different codec as far as
+    /// the browser is concerned.
+    pub opus_pt: Option<u8>,
+
+    /// The peer's `telephone-event` payload type and clock rate, when it
+    /// offered DTMF (RFC 4733).
+    pub telephone_event: Option<(u8, u32)>,
 }
+
+/// What the SBC numbers Opus as in an **offer** it makes. In an answer
+/// the offer's own number is reused instead (RFC 3264 §6.1).
+pub const DEFAULT_OPUS_PT: u8 = 111;
+
+/// What the SBC numbers `telephone-event` as in an offer it makes.
+pub const DEFAULT_DTMF_PT: u8 = 110;
 
 impl WebRtcSdpInfo {
     /// Parse WebRTC-relevant fields from raw SDP text
@@ -57,6 +74,8 @@ impl WebRtcSdpInfo {
             is_webrtc: false,
             media_port: None,
             mid: None,
+            opus_pt: None,
+            telephone_event: None,
         };
 
         for line in sdp.lines() {
@@ -123,6 +142,18 @@ impl WebRtcSdpInfo {
                         info.crypto_suites.push(suite);
                     }
                 }
+            }
+        }
+
+        // The audio section's payload types, read the same way the
+        // transcoder reads them (by `a=rtpmap` name, audio section only).
+        for f in crate::transcoding::sdp_audio_formats(sdp) {
+            match f.name.as_str() {
+                "opus" if info.opus_pt.is_none() => info.opus_pt = Some(f.pt),
+                "telephone-event" if info.telephone_event.is_none() => {
+                    info.telephone_event = Some((f.pt, f.clock_rate))
+                }
+                _ => {}
             }
         }
 
@@ -244,8 +275,11 @@ impl WebRtcSession {
 
     /// Generate local SDP answer with our ICE credentials and DTLS fingerprint
     ///
-    /// This produces the WebRTC-compatible SDP answer to include in the 200 OK.
-    /// The SBC offers Opus (PT 111) to the browser and acts as ICE-lite.
+    /// This produces the WebRTC-compatible SDP answer to include in the
+    /// 200 OK. The SBC answers Opus, **at the payload type the offer used**
+    /// (RFC 3264 §6.1 — Chrome numbers it 111, Firefox 109), and echoes
+    /// `telephone-event` when the browser offered it, without which
+    /// `RTCDTMFSender` has no payload type to send DTMF on (RFC 4733).
     pub fn generate_sdp_answer(&self, local_rtp_port: u16, sbc_public_ip: &str) -> String {
         let (ufrag, pwd) = self.ice_agent.credentials();
         let fingerprint = self.dtls_context.local_fingerprint();
@@ -253,6 +287,14 @@ impl WebRtcSession {
 
         // Extract remote mid from the offer, default to "0"
         let mid = self.remote_info.mid.as_deref().unwrap_or("0");
+        // The offer's numbering, or the common default when it named none.
+        let opus_pt = self.remote_info.opus_pt.unwrap_or(DEFAULT_OPUS_PT);
+        // Only echo DTMF the peer actually offered, and never on the
+        // codec's own payload type.
+        let dtmf = self
+            .remote_info
+            .telephone_event
+            .filter(|(pt, _)| *pt != opus_pt);
 
         let mut sdp = String::new();
         // ── Session-level ──
@@ -266,8 +308,13 @@ impl WebRtcSession {
 
         // ── Media-level ──
         sdp.push_str(&format!(
-            "m=audio {} UDP/TLS/RTP/SAVPF 111\r\n",
-            local_rtp_port
+            "m=audio {} UDP/TLS/RTP/SAVPF {}{}\r\n",
+            local_rtp_port,
+            opus_pt,
+            match dtmf {
+                Some((pt, _)) => format!(" {}", pt),
+                None => String::new(),
+            }
         ));
         sdp.push_str(&format!("c=IN IP4 {}\r\n", sbc_public_ip));
         sdp.push_str(&format!("a=mid:{}\r\n", mid));
@@ -275,8 +322,15 @@ impl WebRtcSession {
         sdp.push_str(&format!("a=ice-pwd:{}\r\n", pwd));
         sdp.push_str(&format!("a=fingerprint:{}\r\n", fingerprint.to_sdp()));
         sdp.push_str(&format!("a=setup:{}\r\n", role_str));
-        sdp.push_str("a=rtpmap:111 opus/48000/2\r\n");
-        sdp.push_str("a=fmtp:111 minptime=10;useinbandfec=1\r\n");
+        sdp.push_str(&format!("a=rtpmap:{} opus/48000/2\r\n", opus_pt));
+        sdp.push_str(&format!(
+            "a=fmtp:{} minptime=10;useinbandfec=1\r\n",
+            opus_pt
+        ));
+        if let Some((pt, rate)) = dtmf {
+            sdp.push_str(&format!("a=rtpmap:{} telephone-event/{}\r\n", pt, rate));
+            sdp.push_str(&format!("a=fmtp:{} 0-16\r\n", pt));
+        }
         sdp.push_str("a=rtcp-mux\r\n");
         sdp.push_str("a=sendrecv\r\n");
         sdp.push_str(&format!("a=rtcp:{}\r\n", local_rtp_port));
@@ -382,9 +436,12 @@ impl WebRtcSession {
         sdp.push_str("a=group:BUNDLE 0\r\n");
 
         // ── Media-level ──
+        // We choose the numbering here, and offer DTMF: without a
+        // `telephone-event` payload type the browser's `RTCDTMFSender`
+        // has nothing to send on (RFC 4733).
         sdp.push_str(&format!(
-            "m=audio {} UDP/TLS/RTP/SAVPF 111\r\n",
-            local_rtp_port
+            "m=audio {} UDP/TLS/RTP/SAVPF {} {}\r\n",
+            local_rtp_port, DEFAULT_OPUS_PT, DEFAULT_DTMF_PT
         ));
         sdp.push_str(&format!("c=IN IP4 {}\r\n", sbc_public_ip));
         sdp.push_str("a=mid:0\r\n");
@@ -392,8 +449,16 @@ impl WebRtcSession {
         sdp.push_str(&format!("a=ice-pwd:{}\r\n", pwd));
         sdp.push_str(&format!("a=fingerprint:{}\r\n", fingerprint.to_sdp()));
         sdp.push_str("a=setup:actpass\r\n"); // offerer uses actpass
-        sdp.push_str("a=rtpmap:111 opus/48000/2\r\n");
-        sdp.push_str("a=fmtp:111 minptime=10;useinbandfec=1\r\n");
+        sdp.push_str(&format!("a=rtpmap:{} opus/48000/2\r\n", DEFAULT_OPUS_PT));
+        sdp.push_str(&format!(
+            "a=fmtp:{} minptime=10;useinbandfec=1\r\n",
+            DEFAULT_OPUS_PT
+        ));
+        sdp.push_str(&format!(
+            "a=rtpmap:{} telephone-event/48000\r\n",
+            DEFAULT_DTMF_PT
+        ));
+        sdp.push_str(&format!("a=fmtp:{} 0-16\r\n", DEFAULT_DTMF_PT));
         sdp.push_str("a=rtcp-mux\r\n");
         sdp.push_str("a=sendrecv\r\n");
         sdp.push_str(&format!("a=rtcp:{}\r\n", local_rtp_port));
@@ -585,5 +650,123 @@ a=rtpmap:0 PCMU/8000\r\n\
     async fn test_webrtc_session_not_established_initially() {
         let session = WebRtcSession::new("call-3".to_string(), WEBRTC_SDP).unwrap();
         assert!(!session.is_ice_established().await);
+    }
+}
+
+#[cfg(test)]
+mod payload_type_tests {
+    use super::*;
+
+    fn offer_with(pts: &str, extra_rtpmap: &str) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             m=audio 50000 UDP/TLS/RTP/SAVPF {}\r\n\
+             c=IN IP4 127.0.0.1\r\n\
+             a=ice-ufrag:abcd\r\na=ice-pwd:0123456789abcdef\r\n\
+             a=fingerprint:sha-256 AA:BB:CC:DD\r\na=setup:actpass\r\n\
+             {}a=rtcp-mux\r\na=sendrecv\r\n",
+            pts, extra_rtpmap
+        )
+    }
+
+    /// RFC 3264 §6.1: an answer reuses the offer's numbering. Chrome calls
+    /// Opus 111 and Firefox calls it 109, and the answer used to say 111
+    /// whatever the offer said — so a Firefox caller was answered with a
+    /// payload type that, to it, meant something else entirely.
+    #[test]
+    fn the_answer_reuses_the_offers_opus_payload_type() {
+        for (pt, dtmf_pt) in [(111u8, 110u8), (109, 101), (96, 127)] {
+            let offer = offer_with(
+                &format!("{} {}", pt, dtmf_pt),
+                &format!(
+                    "a=rtpmap:{} opus/48000/2\r\na=rtpmap:{} telephone-event/48000\r\n",
+                    pt, dtmf_pt
+                ),
+            );
+            let info = WebRtcSdpInfo::from_sdp(&offer);
+            assert_eq!(info.opus_pt, Some(pt), "read the offer's Opus PT");
+            assert_eq!(info.telephone_event, Some((dtmf_pt, 48000)));
+
+            let session = WebRtcSession::new("c1".to_string(), &offer).unwrap();
+            let answer = session.generate_sdp_answer(40000, "203.0.113.1");
+            assert!(
+                answer.contains(&format!(
+                    "m=audio 40000 UDP/TLS/RTP/SAVPF {} {}\r\n",
+                    pt, dtmf_pt
+                )),
+                "answer m= line for offer PT {}: {}",
+                pt,
+                answer
+            );
+            assert!(answer.contains(&format!("a=rtpmap:{} opus/48000/2\r\n", pt)));
+            assert!(answer.contains(&format!("a=fmtp:{} minptime=10", pt)));
+            // DTMF echoed at the offer's own payload type (RFC 4733).
+            assert!(
+                answer.contains(&format!("a=rtpmap:{} telephone-event/48000\r\n", dtmf_pt)),
+                "{}",
+                answer
+            );
+            assert!(answer.contains(&format!("a=fmtp:{} 0-16\r\n", dtmf_pt)));
+        }
+    }
+
+    /// A browser that offers no DTMF gets no DTMF back: an answer may not
+    /// add a format the offer did not list (RFC 3264 §6).
+    #[test]
+    fn dtmf_is_only_echoed_when_it_was_offered() {
+        let offer = offer_with("111", "a=rtpmap:111 opus/48000/2\r\n");
+        let info = WebRtcSdpInfo::from_sdp(&offer);
+        assert_eq!(info.telephone_event, None);
+        let session = WebRtcSession::new("c1".to_string(), &offer).unwrap();
+        let answer = session.generate_sdp_answer(40000, "203.0.113.1");
+        assert!(
+            answer.contains("m=audio 40000 UDP/TLS/RTP/SAVPF 111\r\n"),
+            "{}",
+            answer
+        );
+        assert!(
+            !answer.contains("telephone-event"),
+            "nothing the offer did not list: {}",
+            answer
+        );
+    }
+
+    /// An offer with no rtpmap for Opus at all still gets a usable answer.
+    #[test]
+    fn a_nameless_offer_falls_back_to_the_common_numbering() {
+        let offer = offer_with("111", "");
+        let session = WebRtcSession::new("c1".to_string(), &offer).unwrap();
+        let answer = session.generate_sdp_answer(40000, "203.0.113.1");
+        assert!(
+            answer.contains(&format!("a=rtpmap:{} opus/48000/2\r\n", DEFAULT_OPUS_PT)),
+            "{}",
+            answer
+        );
+    }
+
+    /// The offer the SBC makes to a browser callee carries DTMF, or the
+    /// browser's `RTCDTMFSender` has no payload type to send on.
+    #[test]
+    fn the_offer_we_make_carries_dtmf() {
+        let session = WebRtcSession::new_for_offer("c2".to_string()).unwrap();
+        let offer = session.generate_sdp_offer(40002, "203.0.113.1");
+        assert!(
+            offer.contains(&format!(
+                "m=audio 40002 UDP/TLS/RTP/SAVPF {} {}\r\n",
+                DEFAULT_OPUS_PT, DEFAULT_DTMF_PT
+            )),
+            "{}",
+            offer
+        );
+        assert!(offer.contains(&format!(
+            "a=rtpmap:{} telephone-event/48000\r\n",
+            DEFAULT_DTMF_PT
+        )));
+        assert!(offer.contains(&format!("a=fmtp:{} 0-16\r\n", DEFAULT_DTMF_PT)));
+        // And it is still a parseable WebRTC SDP.
+        let parsed = WebRtcSdpInfo::from_sdp(&offer);
+        assert!(parsed.is_webrtc);
+        assert_eq!(parsed.opus_pt, Some(DEFAULT_OPUS_PT));
+        assert_eq!(parsed.telephone_event, Some((DEFAULT_DTMF_PT, 48000)));
     }
 }

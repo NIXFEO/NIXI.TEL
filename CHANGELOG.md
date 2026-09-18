@@ -23,6 +23,16 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `sbc_sip_transaction_timeouts_total` (requests nobody ever answered),
   with the alert rules `SBCTransactionTimeouts` and
   `SBCRequestRetransmissionsHigh`.
+- **A WebRTC answer reuses the offer's payload types, and DTMF is
+  offered.** The answer hardcoded Opus as 111: Chrome numbers it 111 but
+  Firefox numbers it 109, so a Firefox caller was answered with a payload
+  type that meant something else to it (RFC 3264 §6.1 wants the offer's
+  numbering). And neither the answer nor the offer listed
+  `telephone-event`, so a browser's `RTCDTMFSender` had no payload type
+  to send DTMF on (RFC 4733). The answer now echoes the offer's Opus
+  number and its DTMF format when it offered one — and only when it did,
+  since an answer may not add a format the offer left out — while the
+  offer the SBC makes carries Opus 111 and `telephone-event` 110.
 - **The DTLS peer's certificate is verified against the SDP
   fingerprint.** A DTLS-SRTP certificate is self-signed, so the handshake
   runs with `insecure_skip_verify` and the X.509 chain proves nothing:
