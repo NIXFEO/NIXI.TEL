@@ -4,9 +4,12 @@
 //!
 //! Deliberately dependency-light: a `DashMap<IpAddr, VecDeque<Instant>>` keyed
 //! by client IP, pruning timestamps older than the window on each hit. Memory
-//! per active IP is bounded by the limit. This is enough to blunt brute-force
-//! and scraping against the management surface without pulling in a heavier
-//! governor stack.
+//! per active IP is bounded by the limit, and the number of tracked IPs by
+//! [`MAX_TRACKED_CLIENTS`] (idle entries are swept, then the least recently
+//! seen is evicted) — the same discipline as the SIP-side tables, so a spray
+//! from many sources cannot grow the map without bound. This is enough to
+//! blunt brute-force and scraping against the management surface without
+//! pulling in a heavier governor stack.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -20,6 +23,11 @@ use dashmap::DashMap;
 /// Fallback key used when no source IP can be derived (e.g. unit tests driving
 /// the router via `oneshot`, which sets no `ConnectInfo`).
 const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// Most client IPs tracked at once. Past it, idle entries are dropped and
+/// then the least recently seen one is evicted: the operator keeps working
+/// during a spray from many addresses.
+pub const MAX_TRACKED_CLIENTS: usize = 4096;
 
 /// Sliding-window request limiter, cheaply cloneable (shares one map).
 #[derive(Clone)]
@@ -52,6 +60,9 @@ impl RateLimiter {
             return true;
         }
         let now = Instant::now();
+        if !self.inner.contains_key(&ip) && self.inner.len() >= MAX_TRACKED_CLIENTS {
+            self.make_room(now);
+        }
         let mut entry = self.inner.entry(ip).or_default();
         while let Some(&front) = entry.front() {
             if now.duration_since(front) >= self.window {
@@ -66,6 +77,32 @@ impl RateLimiter {
             entry.push_back(now);
             true
         }
+    }
+
+    /// Drop the entries whose window has fully elapsed; if that frees
+    /// nothing, evict the least recently seen client.
+    fn make_room(&self, now: Instant) {
+        let window = self.window;
+        self.inner.retain(|_, hits| {
+            hits.back()
+                .is_some_and(|last| now.duration_since(*last) < window)
+        });
+        if self.inner.len() < MAX_TRACKED_CLIENTS {
+            return;
+        }
+        let oldest = self
+            .inner
+            .iter()
+            .min_by_key(|e| e.value().back().copied().unwrap_or(now))
+            .map(|e| *e.key());
+        if let Some(ip) = oldest {
+            self.inner.remove(&ip);
+        }
+    }
+
+    /// Tracked client IPs (tests and diagnostics).
+    pub fn tracked(&self) -> usize {
+        self.inner.len()
     }
 }
 
@@ -160,6 +197,20 @@ mod tests {
         assert!(rl.check(a));
         assert!(!rl.check(a));
         assert!(rl.check(b), "a separate IP has its own budget");
+    }
+
+    #[test]
+    fn the_tracked_table_is_capped() {
+        let rl = RateLimiter::new(5, Duration::from_secs(60));
+        for n in 0..(MAX_TRACKED_CLIENTS as u32 + 200) {
+            let ip = IpAddr::V4(Ipv4Addr::from(n.to_be_bytes()));
+            assert!(rl.check(ip), "a fresh client must be allowed: {}", ip);
+        }
+        assert!(
+            rl.tracked() <= MAX_TRACKED_CLIENTS,
+            "tracked {} clients",
+            rl.tracked()
+        );
     }
 
     #[test]

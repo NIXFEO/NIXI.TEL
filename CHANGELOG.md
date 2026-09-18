@@ -104,6 +104,9 @@ worth fixing.
   `instance_id`, `security.rate_limit_global` / `auth_challenge_timeout`)
   can now really be deleted from the file, and `[media] public_ip` — a key
   that never existed — is gone from the example.
+- The management API's rate-limit table is capped at 4096 client IPs (idle
+  entries swept, then the least recently seen evicted), like the SIP-side
+  tables — a spray from many addresses could grow it without bound.
 - An outbound trunk registration being replaced no longer has its
   `registered` flag cleared by the loop it replaced, and the shutdown
   un-REGISTER carries credentials when the trunk challenged us before.
