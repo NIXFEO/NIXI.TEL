@@ -41,6 +41,10 @@ media plane against the code and having the specs adversarially reviewed:
   `Media session … ended:` line per call carries the lot, and
   `sbc_media_packets_relayed_total{leg}` / `sbc_media_bytes_relayed_total{leg}`
   aggregate it. The five per-packet warnings are now `debug!`.
+- **The media session is keyed by the call's uuid, not its Call-ID.**
+  Genesys truncates Call-IDs (see the interop notes), so two concurrent
+  calls can carry the same one — and they then shared one media session,
+  its two port pairs and its counters.
 - **Media facts on every CDR** (schema `v` 3, migration `0004`):
   `rtp_tx_caller` and `rtp_tx_callee` (RTP packets actually **delivered**
   to each side) and `media_flags` (`no-relay`, `no-media`,

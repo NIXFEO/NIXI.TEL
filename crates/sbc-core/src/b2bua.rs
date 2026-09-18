@@ -718,11 +718,14 @@ impl B2buaManager {
             caller_transport,
         );
 
-        // Allocate media session for RTP proxying
+        // Allocate media session for RTP proxying. Keyed by the call's own
+        // uuid, never by the Call-ID: Genesys truncates Call-IDs (see the
+        // interop notes), so two concurrent calls can carry the same one
+        // and would then share a media session, its ports and its counters.
         if let Some(sdp) = caller_sdp {
             match self
                 .media
-                .create_session(inbound_call_id.clone(), Some(sdp))
+                .create_session(call.uuid.clone(), Some(sdp))
                 .await
             {
                 Ok(session) => {

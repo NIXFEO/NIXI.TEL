@@ -7,6 +7,40 @@
 use super::test_support::*;
 use super::*;
 
+/// Genesys truncates Call-IDs, so two live calls can share one: their
+/// media sessions, ports and counters must still be separate.
+#[tokio::test]
+async fn two_calls_with_the_same_call_id_get_their_own_media_session() {
+    let mut sbc = SbcBuilder::new().build();
+    let first = add_call(&mut sbc, CallSpec::default()).await;
+    let second = add_call(
+        &mut sbc,
+        CallSpec {
+            from_tag: "al-2".into(),
+            branch: "z9hG4bKtrunk2".into(),
+            ..CallSpec::default()
+        },
+    )
+    .await;
+    assert_ne!(first.uuid, second.uuid);
+
+    let a = sbc
+        .b2bua
+        .get_media_session_id(&first.uuid)
+        .await
+        .expect("first media session");
+    let b = sbc
+        .b2bua
+        .get_media_session_id(&second.uuid)
+        .await
+        .expect("second media session");
+    assert_ne!(a, b, "the two calls share the Call-ID, not the session");
+    let ports_a = sbc.media.get_session(&a).unwrap().ports.rtp;
+    let ports_b = sbc.media.get_session(&b).unwrap().ports.rtp;
+    assert_ne!(ports_a, ports_b, "and not the ports either");
+    assert_eq!(sbc.media.stats().active_sessions, 2);
+}
+
 /// A call the SBC cannot anchor media for is refused before it is dialled
 /// out: the SDP would already point at this SBC, so the alternative is a
 /// silent call billed for its whole life.
