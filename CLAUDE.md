@@ -182,7 +182,11 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   local user is challenged (407); a stranger reaches a registered user only
   from a trunk's /24; a trunk presenting a local user is flagged
   (`trunk_local_from`). Stale nonces are re-challenged with `stale=true`,
-  never banned.
+  never banned. Registrar bindings are keyed by Contact URI or
+  `+sip.instance` (`register.rs`): a phone re-registering from a new port
+  refreshes its one binding (inbound calls follow the newest source), two
+  phones behind one NAT keep theirs; `register_min_expires` → 423,
+  `register_max_expires` clamps (both reload-class).
 - **Non-2xx finals are ACKed and attributed by Via branch** — every INVITE
   attempt toward a trunk (initial, 407/422 retry, failover) is remembered;
   a late 487/422 from a superseded attempt is ACKed and dropped instead of
