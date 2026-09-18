@@ -23,6 +23,23 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `sbc_sip_transaction_timeouts_total` (requests nobody ever answered),
   with the alert rules `SBCTransactionTimeouts` and
   `SBCRequestRetransmissionsHigh`.
+- **SRTP keeps a rollover counter per SSRC and per direction, and a
+  replay window.** RFC 3711 §3.3.1 builds the 48-bit packet index from
+  `2^16 · ROC + SEQ`, and the ROC is not on the wire: both ends derive it
+  from the sequence numbers they see. Ours never moved off zero — the
+  setter had no caller — so as soon as the sequence number wrapped
+  (65 536 packets, about 22 minutes of a 50 pps stream) our index was
+  65 536 short of a conforming peer's and every packet after that failed
+  authentication, mid-call and in silence. The counter now advances with
+  the nearest-index estimation of §3.3.1, per SSRC (which also unmixes
+  the two directions on the SDES path, where one context relays both),
+  with the §3.3.2 replay list refusing a duplicate or a packet older than
+  64 indices, and the encryptor refusing to reuse an index at all — AES-CM
+  is a stream cipher, so two packets sharing a keystream give up their
+  plaintext. Bounded at 8 SSRCs per direction. Seven tests, including
+  70 000 packets through the real cipher across two wraps, reordering
+  inside the window, and a straggler from before a wrap. WebRTC is not in
+  production, so this fixes a path no live call takes today.
 - **An outbound TCP connection now reads.** RFC 3261 §18.2.2 has a UAS
   answer on the connection the request arrived on, and nothing read the
   connections the SBC opens: every response to a request sent over TCP
