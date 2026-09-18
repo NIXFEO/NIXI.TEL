@@ -2030,7 +2030,7 @@
     {
       "id": 43,
       "type": "stat",
-      "title": "Config store available",
+      "title": "CDR write errors",
       "datasource": {
         "type": "prometheus",
         "uid": "efdqq22ymisqod"
@@ -2040,6 +2040,222 @@
         "w": 6,
         "x": 0,
         "y": 92
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sum(sbc_cdr_write_errors_total) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 44,
+      "type": "stat",
+      "title": "CDR queue",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 92
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_cdr_queue_length",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 45,
+      "type": "stat",
+      "title": "CDRs written (total)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 92
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_cdrs_written_total",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 46,
+      "type": "stat",
+      "title": "CDRs purged (total)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 92
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_cdrs_purged_total",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 47,
+      "type": "stat",
+      "title": "Config store available",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 96
       },
       "targets": [
         {
@@ -2082,7 +2298,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 48,
       "type": "stat",
       "title": "Last store backup age",
       "datasource": {
@@ -2093,7 +2309,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 92
+        "y": 96
       },
       "targets": [
         {
@@ -2136,7 +2352,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 49,
       "type": "stat",
       "title": "Store backup failures (24h)",
       "datasource": {
@@ -2147,7 +2363,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 92
+        "y": 96
       },
       "targets": [
         {
@@ -2190,7 +2406,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 50,
       "type": "stat",
       "title": "Last backup size",
       "datasource": {
@@ -2201,7 +2417,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 92
+        "y": 96
       },
       "targets": [
         {
@@ -2244,7 +2460,7 @@
       }
     },
     {
-      "id": 47,
+      "id": 51,
       "type": "stat",
       "title": "Session-timer 422 retries (total)",
       "datasource": {
@@ -2255,7 +2471,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 96
+        "y": 100
       },
       "targets": [
         {

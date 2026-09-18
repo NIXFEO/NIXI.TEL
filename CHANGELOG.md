@@ -63,7 +63,8 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   rejected finals (`rejected-<code>`), max duration (`timeout`), shutdown,
   WS close, admin kick, RTP timeout and setup timeout are all recorded;
   `sbc_active_calls` no longer drifts after an API kick. `GET /api/v1/cdrs`
-  pages are newest first; the API keeps the last 10 000 records in memory.
+  pages are newest first (from the SQLite store since lot 3; the in-memory
+  cache of the last 10 000 records only serves a box without a store).
 - `security.rtp_timeout` was never read and the RTP relay only stopped
   itself on inactivity, leaving the SIP dialog and the ports allocated
   until a peer BYE or the max-duration BYE. The SBC now BYEs both legs
@@ -230,6 +231,27 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
   `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- CDRs live in the SQLite store (migration 0003, table `cdrs` with indexes
+  on `started_at`, `caller`, `callee`, `trunk_id`, `call_id` and a unique
+  `uuid`). `finish_call` never does IO on the SIP loop any more: records go
+  to a bounded queue and a writer task commits batches (retrying with
+  backoff on a store error, never dropping a record), mirrors them into
+  `[cdr] jsonl_path` (falls back to `[general] cdr_file`) and purges rows
+  older than `[cdr] retention_days` daily. The legacy JSONL history (the
+  live file and its rotated `.N` siblings, `.gz` skipped) is imported once
+  at first boot, atomically with its settings marker; the writer is drained
+  on shutdown. `GET /api/v1/cdrs` gains filters (`from` / `to` as RFC 3339
+  or unix seconds on `started_at`, `direction`, `trunk`, `caller` /
+  `callee` case-sensitive prefixes, `sip_code`, `answered`, `uuid`,
+  `call_id`), a keyset `cursor` (`next_cursor` in every page) and a CSV
+  export (`?format=csv` or `Accept: text/csv`, streamed, RFC 4180 quoting);
+  every bad parameter is a `bad_request` naming it; `limit=0` is 400.
+  Record ids are real UUIDs (they were derived from the sub-second clock
+  and could collide). `GET /api/v1/stats` gains a `cdr` block; metrics
+  `sbc_cdr_write_errors_total{stage}`, `sbc_cdr_queue_length`,
+  `sbc_cdrs_written_total`, `sbc_cdrs_purged_total`; alerts
+  `SBCCdrWriteErrors`, `SBCCdrQueueBacklog`. `sbc_last_cdr_written_timestamp_seconds`
+  now means "committed to the store".
 - `[security] register_min_expires` (60), `register_max_expires` (3600),
   `register_default_expires` (3600), reload-class: a REGISTER asking less
   than the minimum is answered `423 Interval Too Brief` + `Min-Expires`
@@ -308,6 +330,12 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Dependabot watches cargo and actions.
 
 ### Changed
+- CDR pages are ordered by `started_at` then insertion (durable, indexed)
+  instead of end-of-call order, so two overlapping calls may swap places;
+  `has_more` is exact. Restoring a pre-upgrade store copy also rewinds the
+  CDR table (export CSV first); the `sbc-db-*` deploy backups grow with the
+  CDR retention. Rolling back from this release to a 0.19 binary needs
+  `DELETE FROM _sqlx_migrations WHERE version IN (2, 3)`.
 - Registrations: the maximum granted interval drops from 86400 s to
   3600 s (phones re-REGISTER hourly, as the 200's Contact tells them) and
   a REGISTER asking under 60 s gets 423 instead of a silent clamp

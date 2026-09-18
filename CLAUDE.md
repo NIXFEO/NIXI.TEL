@@ -67,6 +67,9 @@ Key modules: `sbc/import.rs` (first-boot seed), `sbc/hydrate.rs`
 (store → live managers), `config.rs` (TOML schema), `sbc/backup.rs`
 (`VACUUM INTO` copies: `POST /api/v1/backup` + timer).
 
+CDRs are store data too (table `cdrs`, migration 0003, `cdr_writer.rs`):
+never seeded from TOML, not part of `/export` (use `GET /api/v1/cdrs?format=csv`).
+
 The store is **fail-closed**: a store that cannot be opened or hydrated at
 boot aborts startup (`[database] allow_missing_store = true` for the old
 warn-and-run-from-TOML behaviour). `/ready` answers 503 until the store is
@@ -112,7 +115,8 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `transcoding.rs` | Opus ↔ G.711 (PCMU/PCMA) with resampling |
 | `topology.rs` | Via/Contact/Record-Route rewriting (RFC 3261) |
 | `auth.rs` · `register.rs` | Digest auth (401/407, nonce); SIP registrar |
-| `metrics.rs` · `storage.rs` · `dos.rs` · `acl.rs` | Prometheus, CDR, rate limiting, IP ACLs |
+| `metrics.rs` · `storage.rs` · `dos.rs` · `acl.rs` | Prometheus, CDR records/manager (cache + store mode), rate limiting, IP ACLs |
+| `cdr_writer.rs` | CDR writer task: bounded queue → batched SQLite commits (retry, duplicates counted), JSONL mirror, one-time history import, retention purge |
 | `maintenance.rs` | 60 s sweeper: bounded in-memory tables + size gauges |
 | `crates/sbc-management/src/{server,state,routes/}` | axum API server |
 

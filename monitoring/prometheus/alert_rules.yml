@@ -141,6 +141,25 @@ groups:
         annotations:
           summary: "An SBC configuration reload failed (see /api/v1/config.last_reload)"
 
+      - alert: SBCCdrWriteErrors
+        # The CDR writer could not commit (stage="sqlite": store error, retried
+        # with backoff), the queue was full (stage="queue": records live in the
+        # memory cache only), the JSONL mirror failed, or duplicates were found.
+        expr: increase(sbc_cdr_write_errors_total[15m]) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "CDRs are failing to persist (stage {{ $labels.stage }})"
+
+      - alert: SBCCdrQueueBacklog
+        # Records queued for the store writer keep piling up: the store is
+        # slow or stuck (a writer in retry backoff also fires SBCCdrsStale).
+        expr: sbc_cdr_queue_length > 1000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CDR writer backlog above 1000 records"
+
       - alert: SBCLogLinesDropped
         # The non-blocking log writer discarded lines (journald/stdout
         # back-pressure): call forensics for that window are incomplete.

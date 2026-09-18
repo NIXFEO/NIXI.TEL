@@ -665,15 +665,17 @@ impl CdrManager {
 
     /// A filtered page from the store (newest first) and whether more
     /// rows exist. Errors without a store.
-    pub async fn page(&self, filter: &sbc_storage::CdrFilter) -> Result<(Vec<CdrRecord>, bool)> {
+    pub async fn page(
+        &self,
+        filter: &sbc_storage::CdrFilter,
+    ) -> Result<(Vec<sbc_storage::CdrRow>, bool)> {
         let Some(store) = &self.store else {
             return Err(Error::Config("no CDR store".into()));
         };
-        let (rows, more) = store
+        store
             .query_cdrs(filter)
             .await
-            .map_err(|e| Error::Transport(format!("cdr query: {}", e)))?;
-        Ok((rows.into_iter().map(CdrRecord::from).collect(), more))
+            .map_err(|e| Error::Transport(format!("cdr query: {}", e)))
     }
 
     /// The store behind this manager, when any.

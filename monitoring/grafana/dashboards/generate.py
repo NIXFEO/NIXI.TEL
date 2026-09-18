@@ -121,6 +121,11 @@ P += [stat("Last CDR age","time() - sbc_last_cdr_written_timestamp_seconds",0,y,
       stat("SIP parse errors (total)","sbc_sip_parse_errors_total",12,y,w=6),
       stat("Failed calls (total)","sbc_calls_failed_total",18,y,w=6)]
 y+=4
+P += [stat("CDR write errors","sum(sbc_cdr_write_errors_total) or vector(0)",0,y,w=6),
+      stat("CDR queue","sbc_cdr_queue_length",6,y,w=6),
+      stat("CDRs written (total)","sbc_cdrs_written_total",12,y,w=6),
+      stat("CDRs purged (total)","sbc_cdrs_purged_total",18,y,w=6)]
+y+=4
 P += [stat("Config store available","sbc_store_available",0,y,w=6),
       stat("Last store backup age","time() - sbc_store_backup_last_success_timestamp_seconds",6,y,w=6,unit="s"),
       stat("Store backup failures (24h)","increase(sbc_store_backup_failures_total[1d])",12,y,w=6),

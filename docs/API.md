@@ -31,7 +31,7 @@ is replaying it through the CRUD endpoints.
 | GET | `/health` | 200 healthy / 503 (public) |
 | GET | `/ready` | 200 `{"status":"ready","store":true,"hydrated":true,"listening":true}` once the SQLite store is open, hydrated and the SIP listeners are bound; 503 `{"status":"not_ready",…}` otherwise (a TOML-only box with `allow_missing_store` is never ready). Public. |
 | GET | `/metrics` | Prometheus text exposition (`sbc_*`): calls, SIP traffic, auth, anti-fraud, media, per-trunk series (`sbc_trunk_up/registered/active_calls/calls_total{trunk,direction,outcome}`, `sbc_trunk_enabled/available/unavailable_seconds/consecutive_failures`), `sbc_call_setup_seconds` / `sbc_call_duration_seconds` histograms — see `monitoring/README.md` |
-| GET | `/api/v1/stats` | active calls, totals, uptime |
+| GET | `/api/v1/stats` | active calls, totals, uptime, `cdr` (`backend` sqlite/file/memory, `queue`, `written_total`, `write_errors_total`, `last_written_at`) |
 | GET | `/api/v1/alerts` | current conditions: `trunk_down` (failure cooldown running) / `trunk_parked` (503 Retry-After) with `unavailable_for_secs`, `trunk_unregistered`, `tls_cert_expiring` (< 14 days) / `tls_cert_expired`, `high_auth_failure_rate`… |
 | GET | `/api/v1/events?types=call,registration,trunk,alert,config` | **SSE** stream |
 
@@ -42,7 +42,7 @@ is replaying it through the CRUD endpoints.
 | GET | `/api/v1/calls` | active calls |
 | DELETE | `/api/v1/calls/{uuid}` | administrative teardown: `202`, the SIP engine BYEs/CANCELs both legs within a second and writes a CDR `admin-kick` |
 | GET | `/api/v1/registrations` | current bindings: `aor`, `contact` (bare URI), `expires_in`, `registered_at`, `transport`, `received_ip` / `received_port` (where an inbound call is sent), `user_agent`, `instance_id` / `reg_id` (RFC 5626) — expired bindings are not listed |
-| GET | `/api/v1/cdrs?limit=&offset=` | paginated CDRs, newest first (`has_more` flag); the API serves the last 10 000 records, the CDR file is the source of truth |
+| GET | `/api/v1/cdrs` | CDRs from the SQLite store, newest first (`started_at`, then insertion). Paging: `limit` (1–1000, default 100), `offset`, or the keyset `cursor` from the previous page's `next_cursor` (exclusive with `offset`). Filters on `started_at`: `from` (inclusive) / `to` (exclusive) as RFC 3339 or unix seconds; `direction` (`inbound` / `outbound` / `local`), `trunk`, `caller` / `callee` (case-sensitive prefixes, ≤ 64 chars), `sip_code`, `answered` (`true` / `false`), `uuid`, `call_id`. `?format=csv` or `Accept: text/csv` streams the same selection as RFC 4180 CSV (`limit` caps the rows, `offset` is ignored) — use the header (`curl -H "Authorization: Bearer $SBC_API_TOKEN" -o cdrs.csv …`), `?token=` only for a one-off browser download (it lands in nginx access logs). A bad parameter is 400 `bad_request` naming it. Without a store (TOML-only box) only plain paging of the in-memory cache is served; filters and CSV answer 503 `store_unavailable`. `GET /api/v1/export` stays config-only. |
 
 #### CDR record
 

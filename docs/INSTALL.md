@@ -286,8 +286,12 @@ server {
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # SSE (/api/v1/events) and CSV exports (/api/v1/cdrs?format=csv) stream:
+        proxy_buffering    off;
+        proxy_read_timeout 600s;
         # The caller supplies its own bearer token; nginx does NOT inject one.
-        # (Do not set proxy_set_header Authorization here.)
+        # (Do not set proxy_set_header Authorization here.) Query-string
+        # tokens (?token=) end up in the access log: prefer the header.
         # These headers are believed only because nginx is in
         # [management] trusted_proxies (loopback by default): a proxy on
         # another host must be listed there or every client is rate-limited
@@ -403,7 +407,10 @@ curl -s -X POST -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/
 ```
 
 Restore = stop, copy, start (the copy is a plain SQLite file; drop any
-stale WAL of the live store):
+stale WAL of the live store). The store also holds the CDRs since lot 3:
+restoring an older copy rewinds them too — export them first
+(`GET /api/v1/cdrs?format=csv`), and expect the `sbc-db-*` copies to grow
+with `[cdr] retention_days`:
 
 ```bash
 sudo systemctl stop sbc
@@ -426,7 +433,7 @@ service down until you either
 ```bash
 # keep the data (the new tables stay, the old binary ignores them):
 sudo systemctl stop sbc
-sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version = 2"
+sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version IN (2, 3)"   # 0.21 added 3 (cdrs)
 sudo systemctl start sbc
 # — or — restore the pre-upgrade copy (loses every change made since):
 sudo systemctl stop sbc && sudo cp -p /opt/sbc/backups/sbc-db-<timestamp>.db /var/lib/sbc/sbc.db && sudo systemctl start sbc

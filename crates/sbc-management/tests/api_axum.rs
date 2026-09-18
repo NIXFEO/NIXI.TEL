@@ -28,6 +28,7 @@ async fn make_state() -> AppState {
     let metrics = Arc::new(SbcMetrics::new());
     let trunks = Arc::new(TrunkManager::new());
     let events = EventBus::new();
+    let store = Arc::new(ConfigStore::open_memory().await.unwrap());
     let trunk_tasks = Arc::new(sbc_core::trunk_tasks::TrunkTasks::new(
         trunks.clone(),
         Default::default(),
@@ -36,11 +37,15 @@ async fn make_state() -> AppState {
         Default::default(),
     ));
     AppState {
-        metrics,
+        metrics: metrics.clone(),
         b2bua: Arc::new(B2buaManager::new(media)),
         trunks,
         registrar: Arc::new(InMemoryRegistrar::new()),
-        cdr: Arc::new(CdrManager::new_memory()),
+        cdr: Arc::new(CdrManager::with_store(
+            store.clone(),
+            metrics.clone(),
+            sbc_core::cdr_writer::CdrWriterConfig::default(),
+        )),
         acl: Arc::new(AclManager::new_permissive()),
         auth: Some(Arc::new(DigestAuthenticator::new(
             "sip.example.com",
@@ -48,7 +53,7 @@ async fn make_state() -> AppState {
         ))),
         dids: Arc::new(RwLock::new(Vec::new())),
         trunk_ips: Arc::new(RwLock::new(Vec::new())),
-        store: Some(Arc::new(ConfigStore::open_memory().await.unwrap())),
+        store: Some(store),
         events,
         reload: Arc::new(Notify::new()),
         realm: "sip.example.com".to_string(),
@@ -1013,6 +1018,7 @@ async fn cdrs_are_paged_and_need_a_token() {
             .await
             .unwrap();
     }
+    state.cdr.flush().await;
 
     let resp = app
         .clone()
@@ -1145,6 +1151,7 @@ async fn cdrs_expose_the_billing_window_newest_first() {
         state.cdr.insert(&r).await.unwrap();
     }
 
+    state.cdr.flush().await;
     let resp = app
         .clone()
         .oneshot(req("GET", "/api/v1/cdrs?limit=10", None, true))
@@ -2042,4 +2049,298 @@ async fn registrations_expose_instance_fields() {
     assert_eq!(json[0]["user_agent"], "Linphone/5");
     assert!(json[0]["expires_in"].as_u64().unwrap() > 0);
     assert!(json[0]["registered_at"].as_u64().unwrap() > 0);
+}
+
+// ── CDR filters, cursor, CSV ─────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn cdr(
+    n: u32,
+    started: u64,
+    caller: &str,
+    callee: &str,
+    trunk: Option<&str>,
+    direction: &str,
+    answered: bool,
+    code: u16,
+) -> sbc_core::storage::CdrRecord {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(started);
+    let mut r =
+        sbc_core::storage::CdrRecord::new(format!("cid-{}", n), caller.into(), callee.into())
+            .with_window(
+                t,
+                answered.then(|| t + std::time::Duration::from_secs(5)),
+                t + std::time::Duration::from_secs(60),
+            );
+    r.uuid = format!("u-{}", n);
+    r.direction = direction.into();
+    r.trunk_id = trunk.map(String::from);
+    r.sip_code = Some(code);
+    r.reason = Some("Q.850;cause=16;text=\"Normal, \"quoted\"\"".into());
+    r
+}
+
+async fn seeded_state() -> AppState {
+    let state = make_state().await;
+    let rows = [
+        cdr(
+            1,
+            1_700_000_100,
+            "alice",
+            "+33612",
+            Some("t1"),
+            "outbound",
+            true,
+            200,
+        ),
+        cdr(
+            2,
+            1_700_000_200,
+            "alice",
+            "+33699",
+            Some("t1"),
+            "outbound",
+            false,
+            486,
+        ),
+        cdr(
+            3,
+            1_700_000_300,
+            "bob",
+            "+33612",
+            Some("t2"),
+            "outbound",
+            true,
+            200,
+        ),
+        cdr(
+            4,
+            1_700_000_400,
+            "+33612",
+            "alice",
+            Some("t1"),
+            "inbound",
+            true,
+            200,
+        ),
+        cdr(5, 1_700_000_500, "carol", "bob", None, "local", false, 487),
+        cdr(
+            6,
+            1_700_000_600,
+            "alicia",
+            "+3361299",
+            Some("t2"),
+            "outbound",
+            true,
+            200,
+        ),
+    ];
+    for r in &rows {
+        state.cdr.insert(r).await.unwrap();
+    }
+    state.cdr.flush().await;
+    state
+}
+
+async fn cdr_ids(app: &axum::Router, query: &str) -> Vec<String> {
+    let json = body_json(
+        app.clone()
+            .oneshot(req("GET", &format!("/api/v1/cdrs{}", query), None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["call_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn cdrs_filter_by_window_direction_trunk_prefix_and_answered() {
+    let state = seeded_state().await;
+    let app = build_router(state, &[]);
+    assert_eq!(
+        cdr_ids(&app, "?from=1700000200&to=1700000400").await,
+        ["cid-3", "cid-2"]
+    );
+    assert_eq!(
+        cdr_ids(&app, "?from=2023-11-14T22:16:40Z&to=2023-11-14T22:20:00Z").await,
+        ["cid-3", "cid-2"]
+    );
+    assert_eq!(cdr_ids(&app, "?direction=inbound").await, ["cid-4"]);
+    assert_eq!(cdr_ids(&app, "?trunk=t2").await, ["cid-6", "cid-3"]);
+    assert_eq!(
+        cdr_ids(&app, "?caller=ali").await,
+        ["cid-6", "cid-2", "cid-1"]
+    );
+    assert_eq!(
+        cdr_ids(&app, "?callee=%2B33612").await,
+        ["cid-6", "cid-3", "cid-1"]
+    );
+    assert_eq!(cdr_ids(&app, "?sip_code=487").await, ["cid-5"]);
+    assert_eq!(cdr_ids(&app, "?answered=false").await, ["cid-5", "cid-2"]);
+    assert_eq!(cdr_ids(&app, "?uuid=u-3").await, ["cid-3"]);
+    assert_eq!(cdr_ids(&app, "?call_id=cid-4").await, ["cid-4"]);
+    for bad in [
+        "?from=yesterday",
+        "?direction=sideways",
+        "?cursor=x",
+        "?limit=0",
+        "?sip_code=abc",
+        "?answered=maybe",
+        "?format=xml",
+        "?from=200&to=100",
+        "?offset=1&cursor=1:1",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", &format!("/api/v1/cdrs{}", bad), None, true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{}", bad);
+        assert_eq!(body_json(resp).await["code"], "bad_request", "{}", bad);
+    }
+    // Cursor walk equals offset walk.
+    let mut by_cursor = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let q = match &cursor {
+            Some(c) => format!("?limit=2&cursor={}", c),
+            None => "?limit=2".into(),
+        };
+        let json = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/api/v1/cdrs{}", q), None, true))
+                .await
+                .unwrap(),
+        )
+        .await;
+        by_cursor.extend(
+            json["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["call_id"].as_str().unwrap().to_string()),
+        );
+        match json["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    let mut by_offset = Vec::new();
+    for o in [0, 2, 4] {
+        by_offset.extend(cdr_ids(&app, &format!("?limit=2&offset={}", o)).await);
+    }
+    assert_eq!(by_cursor, by_offset);
+    assert_eq!(by_cursor.len(), 6);
+}
+
+#[tokio::test]
+async fn cdrs_export_csv_streams_every_matching_row() {
+    let state = seeded_state().await;
+    let app = build_router(state, &[]);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/api/v1/cdrs?format=csv&direction=outbound",
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "text/csv; charset=utf-8");
+    assert!(resp.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .contains("cdrs.csv"));
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines[0], "id,call_id,caller,callee,trunk_id,duration_secs,codec,is_webrtc,disconnect_reason,started_at,ended_at,v,uuid,direction,sip_code,answered_at,billable_secs,source_ip,reason,hangup_by");
+    assert_eq!(lines.len(), 5, "header + 4 outbound rows: {}", text);
+    assert!(
+        lines[1].starts_with(&format!(
+            "{},cid-6,alicia,+3361299,t2,60,",
+            lines[1].split(',').next().unwrap()
+        )),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[1].contains("\"Q.850;cause=16;text=\"\"Normal, \"\"quoted\"\"\"\"\""),
+        "quoted and doubled: {}",
+        lines[1]
+    );
+
+    // Accept: text/csv and a limit cap.
+    let mut r = req("GET", "/api/v1/cdrs?limit=1", None, true);
+    r.headers_mut()
+        .insert("accept", "text/csv".parse().unwrap());
+    let resp = app.clone().oneshot(r).await.unwrap();
+    assert_eq!(resp.headers()["content-type"], "text/csv; charset=utf-8");
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(text.split("\r\n").filter(|l| !l.is_empty()).count(), 2);
+}
+
+#[tokio::test]
+async fn cdrs_without_store_serve_the_cache_and_refuse_filters() {
+    let mut state = make_state().await;
+    state.store = None;
+    state.cdr = Arc::new(CdrManager::new_memory());
+    state
+        .cdr
+        .insert(&cdr(
+            1,
+            1_700_000_100,
+            "a",
+            "b",
+            None,
+            "outbound",
+            true,
+            200,
+        ))
+        .await
+        .unwrap();
+    let app = build_router(state.clone(), &[]);
+    let json = body_json(
+        app.clone()
+            .oneshot(req("GET", "/api/v1/cdrs", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json["count"], 1);
+    assert!(json["next_cursor"].is_null());
+    for q in ["?trunk=x", "?format=csv"] {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", &format!("/api/v1/cdrs{}", q), None, true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", q);
+    }
+    let json = body_json(
+        app.oneshot(req("GET", "/api/v1/stats", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json["cdr"]["backend"], "memory");
+    assert!(json["cdr"]["queue"].is_u64());
 }

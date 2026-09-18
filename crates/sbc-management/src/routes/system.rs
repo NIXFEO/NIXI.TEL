@@ -61,8 +61,20 @@ pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
         "ringing": b2bua_stats.ringing,
         "webrtc_calls": b2bua_stats.webrtc_calls,
         "sip_requests_total": state.metrics.sip_requests_total.load(Ordering::Relaxed),
-        "calls_total": state.metrics.calls_total.load(Ordering::Relaxed),
+                "calls_total": state.metrics.calls_total.load(Ordering::Relaxed),
         "uptime_seconds": state.metrics.uptime_secs(),
+        "cdr": {
+            "backend": state.cdr.backend(),
+            "queue": state.cdr.queue_len(),
+            "written_total": state.metrics.cdrs_written_total.load(Ordering::Relaxed),
+            "write_errors_total": state
+                .metrics
+                .cdr_write_errors
+                .lock()
+                .map(|m| m.values().sum::<u64>())
+                .unwrap_or(0),
+            "last_written_at": state.metrics.last_cdr_written_time.load(Ordering::Relaxed),
+        },
     }))
 }
 
