@@ -2266,3 +2266,176 @@ async fn trunk_state_and_metrics_follow_real_calls() {
         TRUNK_NAME
     )));
 }
+
+// ── Logging: the `call` span ─────────────────────────────────────────────────
+
+fn sbc_lines(lines: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    lines
+        .iter()
+        .filter(|l| {
+            l["target"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("sbc_core::"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_log_line_of_a_dispatched_message_carries_the_call_span() {
+    let buf = log_capture::Buf::default();
+    let _guard = log_capture::install(buf.clone());
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+    buf.clear();
+
+    // The BYE goes through dispatch: every line of its handling is in the span.
+    feed(
+        &mut sbc,
+        rsip::SipMessage::Request(bye_from_caller(&call.spec, 4)),
+        caller_addr(),
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    let lines = buf.lines();
+    let ours = sbc_lines(&lines);
+    assert!(!ours.is_empty());
+    for l in &ours {
+        assert_eq!(l["span"]["name"], "call", "{}", l);
+        assert_eq!(l["span"]["uuid"], call.uuid.as_str(), "{}", l);
+        assert_eq!(l["span"]["call_id"], "cid-1", "{}", l);
+        assert_eq!(l["span"]["trunk"], TRUNK_NAME, "{}", l);
+    }
+    assert!(
+        ours.iter()
+            .any(|l| l["message"].as_str().is_some_and(|m| m.starts_with("CDR:"))),
+        "the CDR line is inside the span"
+    );
+    assert!(!alive(&sbc).await);
+}
+
+#[tokio::test]
+async fn a_new_inbound_invite_records_uuid_trunk_and_direction_as_they_are_known() {
+    let buf = log_capture::Buf::default();
+    let _guard = log_capture::install(buf.clone());
+    let mut sbc = SbcBuilder::new().build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    feed(
+        &mut sbc,
+        rsip::SipMessage::Request(invite_from_trunk("+33999000111", 70)),
+        trunk_addr(),
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut rx).iter().any(|m| m.starts_with("SIP/2.0 404 ")));
+    let lines = buf.lines();
+    let ours = sbc_lines(&lines);
+    assert!(
+        ours.iter().all(|l| l["span"]["call_id"] == "cid-in-1"),
+        "{:#?}",
+        ours
+    );
+    let first = ours.first().unwrap();
+    assert!(
+        first["span"]["uuid"].is_null(),
+        "uuid unknown before the call exists: {}",
+        first
+    );
+    let recorded: Vec<_> = ours
+        .iter()
+        .filter(|l| l["span"]["uuid"].is_string())
+        .collect();
+    assert!(!recorded.is_empty(), "lines after creation carry the uuid");
+    let last = recorded.last().unwrap();
+    assert_eq!(last["span"]["trunk"], TRUNK_NAME, "{}", last);
+    assert_eq!(last["span"]["direction"], "inbound", "{}", last);
+}
+
+#[tokio::test]
+async fn trunk_task_traffic_has_no_span_and_no_info_line() {
+    let buf = log_capture::Buf::default();
+    let _guard = log_capture::install(buf.clone());
+    let mut sbc = SbcBuilder::new().build();
+    register_trunk_ip(&sbc).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let options = request(
+        "OPTIONS sip:127.0.0.1:5060 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bKopt1\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:ping@203.0.113.9>;tag=o1\r\n\
+         To: <sip:127.0.0.1>\r\n\
+         Call-ID: opt-1\r\n\
+         CSeq: 1 OPTIONS\r\n\
+         Content-Length: 0\r\n\r\n"
+            .to_string(),
+    );
+    feed(
+        &mut sbc,
+        rsip::SipMessage::Request(options),
+        trunk_addr(),
+        Some(&tx),
+    )
+    .await
+    .unwrap();
+    assert!(drain(&mut rx)[0].starts_with("SIP/2.0 200 OK"));
+    let hc = rsip::SipMessage::try_from(
+        "SIP/2.0 200 OK\r\n\
+         Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKhc1\r\n\
+         From: <sip:healthcheck@127.0.0.1>;tag=h1\r\n\
+         To: <sip:203.0.113.9:5060>;tag=t1\r\n\
+         Call-ID: hc-genesys-1\r\n\
+         CSeq: 1 OPTIONS\r\n\
+         Content-Length: 0\r\n\r\n",
+    )
+    .unwrap();
+    feed(&mut sbc, hc, trunk_addr(), None).await.unwrap();
+    let lines = buf.lines();
+    let ours = sbc_lines(&lines);
+    assert!(!ours.is_empty());
+    for l in &ours {
+        assert!(
+            l.get("span").is_none(),
+            "no call span for trunk traffic: {}",
+            l
+        );
+        assert_ne!(l["level"], "INFO", "no info noise every 30 s: {}", l);
+    }
+}
+
+#[tokio::test]
+async fn a_normal_call_stays_within_the_info_budget() {
+    let buf = log_capture::Buf::default();
+    let _guard = log_capture::install(buf.clone());
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    buf.clear();
+    connect(&mut sbc, &mut call).await;
+    feed(
+        &mut sbc,
+        rsip::SipMessage::Request(bye_from_caller(&call.spec, 4)),
+        caller_addr(),
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    let lines = buf.lines();
+    let info: Vec<_> = sbc_lines(&lines)
+        .into_iter()
+        .filter(|l| l["level"] == "INFO")
+        .collect();
+    assert!(
+        info.len() <= 10,
+        "{} INFO lines from answer to CDR (budget 10): {:#?}",
+        info.len(),
+        info.iter()
+            .map(|l| l["message"].clone())
+            .collect::<Vec<_>>()
+    );
+    for l in &info {
+        let msg = l["message"].as_str().unwrap_or("");
+        assert!(!msg.contains('\n'), "no bodies at info: {}", msg);
+    }
+}

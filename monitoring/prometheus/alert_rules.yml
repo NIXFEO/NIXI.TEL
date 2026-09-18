@@ -115,6 +115,14 @@ groups:
         annotations:
           summary: "An SBC store backup failed in the last 24 h (disk full? permissions?)"
 
+      - alert: SBCLogLinesDropped
+        # The non-blocking log writer discarded lines (journald/stdout
+        # back-pressure): call forensics for that window are incomplete.
+        expr: increase(sbc_log_dropped_lines_total[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "The SBC is dropping log lines (journald back-pressure)"
+
       - alert: SBCAuthFailureSpike
         expr: rate(sbc_auth_failures_total[5m]) > 5
         for: 10m

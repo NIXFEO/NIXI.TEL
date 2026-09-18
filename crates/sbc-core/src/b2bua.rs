@@ -195,6 +195,26 @@ pub enum InviteResponseClass {
 }
 
 /// A B2BUA call — two legs + shared media session
+/// Fields of the `call` log span.
+#[derive(Debug, Clone)]
+pub struct CallLogFields {
+    pub uuid: CallUuid,
+    pub call_id: String,
+    pub trunk: Option<String>,
+    pub direction: Option<&'static str>,
+}
+
+impl CallLogFields {
+    fn of(c: &B2buaCall) -> Self {
+        Self {
+            uuid: c.uuid.clone(),
+            call_id: c.inbound.call_id.clone(),
+            trunk: c.trunk_name.clone(),
+            direction: c.direction,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct B2buaCall {
     /// Internal UUID for this call
@@ -910,7 +930,7 @@ impl B2buaManager {
                 last_refresh: None,
                 refresh_failures: 0,
             });
-            info!(
+            debug!(
                 "Session timer armed for call {}: {}s (refresh every {}s, Min-SE {})",
                 uuid,
                 interval_secs,
@@ -1258,7 +1278,7 @@ impl B2buaManager {
             .get_mut(uuid)
             .ok_or_else(|| Error::Dialog(format!("B2BUA call {} not found", uuid)))?;
         call.state = CallState::Ringing;
-        info!("B2BUA: call {} ringing", uuid);
+        debug!("B2BUA: call {} ringing", uuid);
         Ok(())
     }
 
@@ -1288,7 +1308,7 @@ impl B2buaManager {
             }
         }
 
-        info!("B2BUA: call {} state → {}", uuid, call.state.as_str());
+        debug!("B2BUA: call {} state → {}", uuid, call.state.as_str());
         drop(calls);
         // 200 OK retransmissions re-enter here: one SSE event per call.
         if first_answer {
@@ -1337,7 +1357,7 @@ impl B2buaManager {
             }
         }
 
-        info!("B2BUA: call {} → Terminating", uuid);
+        debug!("B2BUA: call {} → Terminating", uuid);
         Ok(())
     }
 
@@ -1353,7 +1373,7 @@ impl B2buaManager {
         let mut calls = self.calls.lock().await;
         let duration = if let Some(call) = calls.get_mut(uuid) {
             call.state = CallState::Terminated;
-            info!(
+            debug!(
                 "B2BUA: call {} terminated (duration {}s)",
                 uuid,
                 call.duration_secs()
@@ -1579,7 +1599,7 @@ impl B2buaManager {
             }
 
             if inbound_suffix || outbound_suffix {
-                info!(
+                debug!(
                     "Call-ID suffix match: BYE '{}' matched stored '{}'",
                     call_id, call.inbound.call_id
                 );
@@ -1660,6 +1680,32 @@ impl B2buaManager {
     /// Get the stored Call-IDs for a call (inbound + outbound).
     /// Used to rewrite truncated Call-IDs in relayed BYE messages when the
     /// trunk (e.g. Genesys-based trunks) sends BYE with a shortened Call-ID.
+    /// What the `call` log span carries; found by exact inbound/outbound
+    /// Call-ID, then by suffix (Genesys truncation). Silent: no log line.
+    pub async fn log_fields_for_call_id(&self, call_id: &str) -> Option<CallLogFields> {
+        let calls = self.calls.lock().await;
+        let hit = calls
+            .values()
+            .find(|c| {
+                c.inbound.call_id == call_id
+                    || c.outbound.as_ref().is_some_and(|l| l.call_id == call_id)
+            })
+            .or_else(|| {
+                calls.values().find(|c| {
+                    c.inbound.call_id.ends_with(call_id)
+                        || c.outbound
+                            .as_ref()
+                            .is_some_and(|l| l.call_id.ends_with(call_id))
+                })
+            })?;
+        Some(CallLogFields::of(hit))
+    }
+
+    pub async fn log_fields(&self, uuid: &CallUuid) -> Option<CallLogFields> {
+        let calls = self.calls.lock().await;
+        calls.get(uuid).map(CallLogFields::of)
+    }
+
     pub async fn get_call_ids(&self, uuid: &CallUuid) -> Option<(String, Option<String>)> {
         let calls = self.calls.lock().await;
         calls.get(uuid).map(|c| {

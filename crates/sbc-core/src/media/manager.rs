@@ -729,7 +729,7 @@ impl MediaManager {
             entry.rtp_shutdown_tx = shutdown_tx;
         }
 
-        info!(
+        debug!(
             "Started two-leg RTP proxy for {} (leg-A:{} leg-B:{})",
             session_id, ports_a.rtp, ports_b.rtp
         );
@@ -784,7 +784,7 @@ impl MediaManager {
                     let _ = self.port_allocator.release(pb);
                 }
             }
-            info!("Terminated media session {}", session_id);
+            debug!("Terminated media session {}", session_id);
             Ok(())
         } else {
             Err(Error::Dialog(format!(

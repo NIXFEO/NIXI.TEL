@@ -375,13 +375,18 @@ impl Sbc {
     /// write their CDR ("admin-kick").
     pub(crate) async fn process_admin_kicks(&mut self) {
         for uuid in self.admin_kicks.drain() {
-            let outcome = CallOutcome::AdminKick;
-            self.hangup_both_legs(&uuid, &outcome).await;
-            if self.finish_call(&uuid, outcome).await {
-                info!("Admin kick: call {} ended", &uuid[..8.min(uuid.len())]);
-            } else {
-                debug!("Admin kick: call {} already gone", uuid);
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                let outcome = CallOutcome::AdminKick;
+                self.hangup_both_legs(&uuid, &outcome).await;
+                if self.finish_call(&uuid, outcome).await {
+                    info!("Admin kick: call {} ended", &uuid[..8.min(uuid.len())]);
+                } else {
+                    debug!("Admin kick: call {} already gone", uuid);
+                }
             }
+            .instrument(span)
+            .await;
         }
     }
 
@@ -449,12 +454,17 @@ impl Sbc {
                 &uuid[..8.min(uuid.len())],
                 limit.as_secs()
             );
-            if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
-                self.note_trunk_failure(&name, None);
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
+                    self.note_trunk_failure(&name, None);
+                }
+                let outcome = CallOutcome::SetupTimeout;
+                self.hangup_both_legs(&uuid, &outcome).await;
+                self.finish_call(&uuid, outcome).await;
             }
-            let outcome = CallOutcome::SetupTimeout;
-            self.hangup_both_legs(&uuid, &outcome).await;
-            self.finish_call(&uuid, outcome).await;
+            .instrument(span)
+            .await;
         }
     }
 }

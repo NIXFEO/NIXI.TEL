@@ -24,6 +24,7 @@ pub(crate) mod test_support;
 use crate::acl::{AclManager, Direction};
 use crate::auth::{generate_digest_response, DigestAuthenticator, DigestChallenge};
 use crate::b2bua::B2buaManager;
+use crate::b2bua::CallUuid;
 use crate::config::{DidMapping, NetworkConfig, SbcConfig};
 use crate::dos::{DosProtector, RateLimitConfig};
 use crate::maintenance::{MaintenanceConfig, MaintenanceHandle, MaintenanceTask};
@@ -48,6 +49,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::Instrument;
 use tracing::{debug, error, info, warn};
 
 /// Integrated SBC combining all layers
@@ -173,6 +175,27 @@ pub(crate) fn authorize_aor(
         }
     }
     Ok(())
+}
+
+/// Name of the per-call tracing span.
+pub(crate) const CALL_SPAN: &str = "call";
+
+/// Fill in `call` span fields as they become known on the INVITE path.
+pub(crate) fn record_call_identity(
+    uuid: Option<&str>,
+    trunk: Option<&str>,
+    direction: Option<&str>,
+) {
+    let span = tracing::Span::current();
+    if let Some(u) = uuid {
+        span.record("uuid", u);
+    }
+    if let Some(t) = trunk {
+        span.record("trunk", t);
+    }
+    if let Some(d) = direction {
+        span.record("direction", d);
+    }
 }
 
 /// What `/ready` reports: the store is open, the first hydration
@@ -1286,15 +1309,107 @@ impl Sbc {
         debug!("Processing message from {} via {:?}", source, transport);
 
         // 3. Dispatch
-        match received.message {
+        self.dispatch(received.message, source, transport, reply_tx)
+            .await
+    }
+
+    /// Hand a message past the ban/ACL/DoS gates to its handler inside the
+    /// `call` span, so every log line of the call carries its identity.
+    /// (`.instrument`, never `enter()` across an await: the runtime is
+    /// multi-threaded.) A handler error is logged here, inside the span.
+    pub(crate) async fn dispatch(
+        &mut self,
+        message: SipMessage,
+        source: SocketAddr,
+        transport: rsip::Transport,
+        reply_tx: Option<UnboundedSender<Vec<u8>>>,
+    ) -> Result<()> {
+        let span = self.call_span(&message).await;
+        let result = match message {
             SipMessage::Request(request) => {
                 self.handle_request(request, source, transport, reply_tx.as_ref())
+                    .instrument(span.clone())
                     .await
             }
             SipMessage::Response(response) => {
                 self.handle_response(response, source, transport, reply_tx.as_ref())
+                    .instrument(span.clone())
                     .await
             }
+        };
+        if let Err(e) = &result {
+            let _g = span.enter();
+            error!("Error handling message from {}: {}", source, e);
+        }
+        result
+    }
+
+    /// The `call` span of a message: fields known from the dialog, or
+    /// `Empty` (recorded later by `record_call_identity`) for a new INVITE.
+    /// OPTIONS, REGISTER and the trunk tasks' own traffic get no span.
+    async fn call_span(&self, message: &SipMessage) -> tracing::Span {
+        let call_id = match message {
+            SipMessage::Request(r) => {
+                if matches!(r.method, Method::Options | Method::Register) {
+                    return tracing::Span::none();
+                }
+                r.call_id_header().ok().map(|h| h.value().to_string())
+            }
+            SipMessage::Response(r) => r.call_id_header().ok().map(|h| h.value().to_string()),
+        };
+        let Some(call_id) = call_id else {
+            return tracing::Span::none();
+        };
+        if call_id.starts_with("reg-") || call_id.starts_with("hc-") {
+            return tracing::Span::none();
+        }
+        match self.b2bua.log_fields_for_call_id(&call_id).await {
+            Some(f) => {
+                let span = tracing::info_span!(
+                    CALL_SPAN,
+                    uuid = %f.uuid,
+                    call_id = %call_id,
+                    trunk = tracing::field::Empty,
+                    direction = tracing::field::Empty
+                );
+                if let Some(t) = f.trunk.as_deref() {
+                    span.record("trunk", t);
+                }
+                if let Some(d) = f.direction {
+                    span.record("direction", d);
+                }
+                span
+            }
+            None => tracing::info_span!(
+                CALL_SPAN,
+                uuid = tracing::field::Empty,
+                call_id = %call_id,
+                trunk = tracing::field::Empty,
+                direction = tracing::field::Empty
+            ),
+        }
+    }
+
+    /// The `call` span of a known call (timers, kicks, shutdown loops).
+    pub(crate) async fn call_span_for_uuid(&self, uuid: &CallUuid) -> tracing::Span {
+        match self.b2bua.log_fields(uuid).await {
+            Some(f) => {
+                let span = tracing::info_span!(
+                    CALL_SPAN,
+                    uuid = %f.uuid,
+                    call_id = %f.call_id,
+                    trunk = tracing::field::Empty,
+                    direction = tracing::field::Empty
+                );
+                if let Some(t) = f.trunk.as_deref() {
+                    span.record("trunk", t);
+                }
+                if let Some(d) = f.direction {
+                    span.record("direction", d);
+                }
+                span
+            }
+            None => tracing::Span::none(),
         }
     }
 
@@ -1306,7 +1421,7 @@ impl Sbc {
         transport: rsip::Transport,
         reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
-        info!("Handling {} request from {}", request.method, source);
+        debug!("Handling {} request from {}", request.method, source);
 
         // ── Metrics: count every incoming SIP request ──
         self.metrics.inc_sip_request(&request.method.to_string());
@@ -1371,7 +1486,7 @@ impl Sbc {
         transport: rsip::Transport,
         reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
-        info!("Handling local request: OPTIONS");
+        debug!("Handling local request: OPTIONS");
         self.metrics.inc_sip_response(200);
         let response = self.router.handle_local_request(request)?;
         let data = response.to_string().into_bytes();
@@ -1388,7 +1503,7 @@ impl Sbc {
         transport: rsip::Transport,
         reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
-        info!("Handling local request: REGISTER");
+        debug!("Handling local request: REGISTER");
 
         // If Digest auth is enabled, challenge first
         let mut authenticated: Option<String> = None;
@@ -1434,7 +1549,7 @@ impl Sbc {
                             .await
                         {
                             Ok(username) => {
-                                info!("REGISTER authenticated for user: {}", username);
+                                debug!("REGISTER authenticated for user: {}", username);
                                 authenticated = Some(username);
                             }
                             Err(failure) => {

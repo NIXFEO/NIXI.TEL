@@ -180,7 +180,20 @@ prometheus_bind_address = "127.0.0.1"
 prometheus_port = 9090
 
 [logging]
+# A level or tracing EnvFilter directives: "info", "debug",
+# "sbc_core::media=debug,info". Precedence: `sbc --verbose` (debug) >
+# RUST_LOG in the environment (/etc/sbc/sbc.env) > this key. Run at info:
+# the per-call span (uuid, call_id, trunk, direction) is an info-level
+# span, so at warn/error the lines lose their call context.
 level = "info"
+# "text" for a terminal / journald (`call{uuid=… call_id=… trunk=…}: msg`),
+# "json" for log shipping: one object per line with timestamp, level,
+# target, message and `span` = {name: "call", uuid, call_id, trunk,
+# direction} on every line of a call (trunk/direction absent, not empty,
+# until known — local calls have no trunk). Per-message and per-packet
+# diagnostics are at debug; the writer is non-blocking and lossy
+# (sbc_log_dropped_lines_total counts what journald did not take).
+format = "json"
 
 # ── First-boot trunk seed (then use POST /api/v1/trunks) ────────────────
 #[[trunks]]

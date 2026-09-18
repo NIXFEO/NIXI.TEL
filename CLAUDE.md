@@ -207,6 +207,24 @@ CDR per call, real cause, setup/answer/end window) whatever the path: BYE,
 CANCEL, rejected final, `max_call_duration`, `call_setup_timeout`, RTP
 timeout, shutdown, WS close, admin kick, lost dialog.
 
+## Logging
+
+Every log line of a call carries the `call` span (`uuid`, `call_id`,
+`trunk`, `direction`): `Sbc::dispatch` (sbc/mod.rs) creates it from the
+dialog (`B2buaManager::log_fields_for_call_id`) and `.instrument()`s the
+handler; `record_call_identity` fills the fields on the INVITE path as
+they become known; timer/kick/shutdown loops instrument each call with
+`call_span_for_uuid`; the RTP relay task inherits `Span::current()`.
+Rules: never `span.enter()` across an `.await` (multi-thread runtime —
+use `.instrument`); a new `info!` fires at most once per call, per-message
+and per-packet diagnostics are `debug!`/`trace!` (the flow test
+`a_normal_call_stays_within_the_info_budget` guards the budget); bodies
+never at info. `[logging] format` picks text or JSON; precedence
+`--verbose` > `RUST_LOG` > `[logging] level`; the writer is non-blocking
+and lossy (`sbc_log_dropped_lines_total`). Library tests capture logs with
+`test_support::log_capture` (thread-local `set_default`, never a global
+subscriber).
+
 ## Known minor issues
 
 - **Double 100 Trying** — the SBC sends two per INVITE (stateless, then after
@@ -220,7 +238,8 @@ Delivered: multi-trunk failover, RFC 4028 session timers, DTMF PT
 re-mapping, SIP message builder (true-B2BUA BYEs), SQLite-backed full API +
 SSE, WebRTC WS lifecycle, anti-fraud (fail2ban / IRSF / per-user limits),
 real outbound TLS + mTLS, enriched CDRs (negotiated codec + inbound trunk),
-RTP-timeout / last-CDR metrics, `RUST_LOG`-configurable log level.
+RTP-timeout / last-CDR metrics, per-call log spans with text/JSON output
+(`[logging]`, `RUST_LOG`).
 
 Ideas welcome (open an issue / PR):
 

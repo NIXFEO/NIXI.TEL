@@ -804,3 +804,70 @@ pub(crate) async fn connect(sbc: &mut Sbc, call: &mut TestCall) -> Connected {
         ack_to_trunk: to_trunk.remove(0),
     }
 }
+
+/// Feed a message through the SBC's dispatch (what the event loop does
+/// after the ban/ACL/DoS gates): the handler runs inside the `call` span.
+pub(crate) async fn feed(
+    sbc: &mut Sbc,
+    message: rsip::SipMessage,
+    source: SocketAddr,
+    reply_tx: Option<&UnboundedSender<Vec<u8>>>,
+) -> crate::Result<()> {
+    sbc.dispatch(message, source, rsip::Transport::Udp, reply_tx.cloned())
+        .await
+}
+
+/// A thread-local JSON log capture for flow tests (`set_default`, never a
+/// global subscriber: another test in this binary runs multi-threaded).
+pub(crate) mod log_capture {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    pub struct Buf(Arc<Mutex<Vec<u8>>>);
+    pub struct Guard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Guard {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Guard;
+        fn make_writer(&'a self) -> Guard {
+            Guard(self.0.clone())
+        }
+    }
+
+    impl Buf {
+        /// Every captured line, parsed.
+        pub fn lines(&self) -> Vec<serde_json::Value> {
+            let raw = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            raw.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {}", e, l)))
+                .collect()
+        }
+        pub fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+    }
+
+    /// Install the capture for the current thread; keep the guard alive.
+    pub fn install(buf: Buf) -> tracing::subscriber::DefaultGuard {
+        let sub = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buf)
+            .finish();
+        tracing::subscriber::set_default(sub)
+    }
+}

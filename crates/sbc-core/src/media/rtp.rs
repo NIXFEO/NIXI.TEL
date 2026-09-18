@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tracing::Instrument;
 use tracing::{debug, error, info, warn};
 
 /// RTP Packet (simplified header)
@@ -508,7 +509,7 @@ impl RtpSession {
 
     /// Set endpoint A (caller's real RTP address) — pre-configured from SDP
     pub fn set_endpoint_a(&mut self, addr: SocketAddr) {
-        info!("Session {} endpoint A: {}", self.session_id, addr);
+        debug!("Session {} endpoint A: {}", self.session_id, addr);
         self.endpoint_a = Some(addr);
         let shared = self.endpoint_a_shared.clone();
         tokio::spawn(async move {
@@ -518,7 +519,7 @@ impl RtpSession {
 
     /// Set endpoint B (callee's real RTP address) — pre-configured from SDP
     pub fn set_endpoint_b(&mut self, addr: SocketAddr) {
-        info!("Session {} endpoint B: {}", self.session_id, addr);
+        debug!("Session {} endpoint B: {}", self.session_id, addr);
         self.endpoint_b = Some(addr);
         let shared = self.endpoint_b_shared.clone();
         tokio::spawn(async move {
@@ -711,7 +712,7 @@ impl RtpSession {
                 tokio::select! {
                     shutdown_result = shutdown_rx.recv() => {
                         if shutdown_result.is_some() {
-                            info!("RTP session {} shutting down (explicit signal, relayed {} packets)", session_id, pkt_count);
+                            debug!("RTP session {} shutting down (explicit signal, relayed {} packets)", session_id, pkt_count);
                         } else {
                             warn!("RTP session {} shutdown: channel closed (sender dropped, relayed {} packets)", session_id, pkt_count);
                         }
@@ -756,7 +757,7 @@ impl RtpSession {
                                                 if let Err(e) = rtp_socket_a.send_to(&response, source).await {
                                                     warn!("STUN binding response send error: {}", e);
                                                 } else {
-                                                    info!("STUN binding response sent to {} on leg-A:{} (integrity={})",
+                                                    debug!("STUN binding response sent to {} on leg-A:{} (integrity={})",
                                                         source, ports_a_rtp, ice_pwd_local.is_some());
                                                 }
                                             }
@@ -768,7 +769,7 @@ impl RtpSession {
                                         {
                                             let mut ep = endpoint_a.lock().await;
                                             if ep.is_none() {
-                                                info!("RTP: learned caller (A) via STUN = {} on leg-A:{}", source, ports_a_rtp);
+                                                debug!("RTP: learned caller (A) via STUN = {} on leg-A:{}", source, ports_a_rtp);
                                                 *ep = Some(source);
                                             }
                                         }
@@ -789,7 +790,7 @@ impl RtpSession {
                                         {
                                             let mut ep = endpoint_a.lock().await;
                                             if ep.is_none() {
-                                                info!("RTP: learned caller (A) via DTLS = {} on leg-A:{}", source, ports_a_rtp);
+                                                debug!("RTP: learned caller (A) via DTLS = {} on leg-A:{}", source, ports_a_rtp);
                                                 *ep = Some(source);
                                             }
                                         }
@@ -815,7 +816,7 @@ impl RtpSession {
 
                             // Log first few packets at INFO level for debugging
                             if pkt_count <= 5 {
-                                info!("RTP A recv #{}: {} bytes from {} on leg-A:{}", pkt_count, len, source, ports_a_rtp);
+                                debug!("RTP A recv #{}: {} bytes from {} on leg-A:{}", pkt_count, len, source, ports_a_rtp);
                             }
 
                             // Learn / update caller's real address
@@ -826,7 +827,7 @@ impl RtpSession {
                                     *ep = Some(source);
                                 } else if *ep != Some(source) {
                                     // NAT port change — update
-                                    info!("RTP: caller addr updated {} → {}", ep.unwrap(), source);
+                                    debug!("RTP: caller addr updated {} → {}", ep.unwrap(), source);
                                     *ep = Some(source);
                                 }
                             }
@@ -913,13 +914,13 @@ impl RtpSession {
                                         // Log first few transcodings for debugging
                                         let ab_debug = stats.packets_a_to_b.load(Ordering::Relaxed);
                                         if ab_debug < 5 {
-                                            info!("Transcode A→B #{}: src_pt={} payload={} bytes hdr={} total={}",
+                                            debug!("Transcode A→B #{}: src_pt={} payload={} bytes hdr={} total={}",
                                                 ab_debug + 1, actual_pt, payload_len, header_len, data.len());
                                         }
                                         match tc.transcode(&payload_vec) {
                                             Ok(transcoded) => {
                                                 if ab_debug < 5 {
-                                                    info!("Transcode A→B #{}: {} → {} ({} → {} bytes)",
+                                                    debug!("Transcode A→B #{}: {} → {} ({} → {} bytes)",
                                                         ab_debug + 1,
                                                         tc.src.name(), tc.dst.name(),
                                                         payload_len, transcoded.len());
@@ -946,7 +947,7 @@ impl RtpSession {
                                                         let new_ts = ((old_ts as u64) * dst_rate as u64 / src_rate as u64) as u32;
                                                         new_pkt[4..8].copy_from_slice(&new_ts.to_be_bytes());
                                                         if ab_debug < 5 {
-                                                            info!("Transcode A→B #{}: TS {} → {} (rate {}→{})",
+                                                            debug!("Transcode A→B #{}: TS {} → {} (rate {}→{})",
                                                                 ab_debug + 1, old_ts, new_ts, src_rate, dst_rate);
                                                         }
                                                     }
@@ -977,7 +978,7 @@ impl RtpSession {
                                         Ok(encrypted) => {
                                             let ab_enc = stats.packets_a_to_b.load(Ordering::Relaxed);
                                             if ab_enc < 5 {
-                                                info!("SRTP encrypt A→B #{}: {} → {} bytes (PT={})",
+                                                debug!("SRTP encrypt A→B #{}: {} → {} bytes (PT={})",
                                                     ab_enc + 1, data.len(), encrypted.len(), data[1] & 0x7F);
                                             }
                                             data = encrypted;
@@ -1022,7 +1023,7 @@ impl RtpSession {
                                 let out_len = data.len();
                                 let ab_count = stats.packets_a_to_b.load(Ordering::Relaxed);
                                 if ab_count < 3 {
-                                    info!("RTP A→B #{}: {} → {} ({} bytes)", ab_count+1, source, dst, out_len);
+                                    debug!("RTP A→B #{}: {} → {} ({} bytes)", ab_count+1, source, dst, out_len);
                                 }
                                 if let Err(e) = rtp_socket_b.send_to(&data, dst).await {
                                     warn!("RTP A→B send error: {}", e);
@@ -1035,7 +1036,7 @@ impl RtpSession {
                                     }
                                 }
                             } else {
-                                info!("RTP A: callee endpoint not yet known, packet from {} dropped", source);
+                                debug!("RTP A: callee endpoint not yet known, packet from {} dropped", source);
                             }
                         } else if let Err(e) = result {
                             error!("RTP leg-A recv error: {}", e);
@@ -1057,7 +1058,7 @@ impl RtpSession {
                                                 if let Err(e) = rtp_socket_b.send_to(&response, source).await {
                                                     warn!("STUN binding response send error (leg-B): {}", e);
                                                 } else {
-                                                    info!("STUN binding response sent to {} on leg-B:{} (integrity={})",
+                                                    debug!("STUN binding response sent to {} on leg-B:{} (integrity={})",
                                                         source, ports_b_rtp, ice_pwd_local_b.is_some());
                                                 }
                                             }
@@ -1069,7 +1070,7 @@ impl RtpSession {
                                         {
                                             let mut ep = endpoint_b.lock().await;
                                             if ep.is_none() {
-                                                info!("RTP: learned callee (B) via STUN = {} on leg-B:{}", source, ports_b_rtp);
+                                                debug!("RTP: learned callee (B) via STUN = {} on leg-B:{}", source, ports_b_rtp);
                                                 *ep = Some(source);
                                             }
                                         }
@@ -1090,7 +1091,7 @@ impl RtpSession {
                                         {
                                             let mut ep = endpoint_b.lock().await;
                                             if ep.is_none() {
-                                                info!("RTP: learned callee (B) via DTLS = {} on leg-B:{}", source, ports_b_rtp);
+                                                debug!("RTP: learned callee (B) via DTLS = {} on leg-B:{}", source, ports_b_rtp);
                                                 *ep = Some(source);
                                             }
                                         }
@@ -1116,7 +1117,7 @@ impl RtpSession {
 
                             // Log first few packets at INFO level for debugging
                             if pkt_count <= 5 {
-                                info!("RTP B recv #{}: {} bytes from {} on leg-B:{}", pkt_count, len, source, ports_b_rtp);
+                                debug!("RTP B recv #{}: {} bytes from {} on leg-B:{}", pkt_count, len, source, ports_b_rtp);
                             }
 
                             // Learn / update callee's real address
@@ -1126,7 +1127,7 @@ impl RtpSession {
                                     info!("RTP: learned callee (B) = {} on leg-B:{}", source, ports_b_rtp);
                                     *ep = Some(source);
                                 } else if *ep != Some(source) {
-                                    info!("RTP: callee addr updated {} → {}", ep.unwrap(), source);
+                                    debug!("RTP: callee addr updated {} → {}", ep.unwrap(), source);
                                     *ep = Some(source);
                                 }
                             }
@@ -1139,7 +1140,7 @@ impl RtpSession {
                                 let has_ctx = guard.is_some();
                                 let ba_pkt = stats.packets_b_to_a.load(Ordering::Relaxed);
                                 if ba_pkt < 5 {
-                                    info!("SRTP decrypt B: webrtc_mode_b=true, srtp_recv_b={}, pkt_b_to_a={}",
+                                    debug!("SRTP decrypt B: webrtc_mode_b=true, srtp_recv_b={}, pkt_b_to_a={}",
                                         if has_ctx { "Some" } else { "None" }, ba_pkt);
                                 }
                                 if let Some(ref mut ctx) = *guard {
@@ -1147,7 +1148,7 @@ impl RtpSession {
                                         Ok(plaintext) => {
                                             if ba_pkt < 5 {
                                                 let pt_dec = if plaintext.len() >= 2 { plaintext[1] & 0x7F } else { 0 };
-                                                info!("SRTP decrypt B #{}: {} → {} bytes (PT={})",
+                                                debug!("SRTP decrypt B #{}: {} → {} bytes (PT={})",
                                                     ba_pkt + 1, data.len(), plaintext.len(), pt_dec);
                                             }
                                             data = plaintext;
@@ -1273,7 +1274,7 @@ impl RtpSession {
                                 let has_send_ctx = guard.is_some();
                                 let ba_enc_chk = stats.packets_b_to_a.load(Ordering::Relaxed);
                                 if ba_enc_chk < 5 {
-                                    info!("SRTP encrypt B→A check: srtp_send_a={}, webrtc_mode_a={}, data_len={}",
+                                    debug!("SRTP encrypt B→A check: srtp_send_a={}, webrtc_mode_a={}, data_len={}",
                                         if has_send_ctx { "Some" } else { "None" }, webrtc_mode_a, data.len());
                                 }
                                 if let Some(ref mut ctx) = *guard {
@@ -1282,7 +1283,7 @@ impl RtpSession {
                                         Ok(encrypted) => {
                                             let ba_enc = stats.packets_b_to_a.load(Ordering::Relaxed);
                                             if ba_enc < 5 {
-                                                info!("SRTP encrypt B→A #{}: {} → {} bytes (PT={})",
+                                                debug!("SRTP encrypt B→A #{}: {} → {} bytes (PT={})",
                                                     ba_enc + 1, data.len(), encrypted.len(), pt_before);
                                             }
                                             data = encrypted;
@@ -1310,7 +1311,7 @@ impl RtpSession {
                                 let out_len = data.len();
                                 let ba_count = stats.packets_b_to_a.load(Ordering::Relaxed);
                                 if ba_count < 3 {
-                                    info!("RTP B→A #{}: {} → {} ({} bytes)", ba_count+1, source, dst, out_len);
+                                    debug!("RTP B→A #{}: {} → {} ({} bytes)", ba_count+1, source, dst, out_len);
                                 }
                                 if let Err(e) = rtp_socket_a.send_to(&data, dst).await {
                                     warn!("RTP B→A send error: {}", e);
@@ -1323,7 +1324,7 @@ impl RtpSession {
                                     }
                                 }
                             } else {
-                                info!("RTP B: caller endpoint not yet known, packet from {} dropped", source);
+                                debug!("RTP B: caller endpoint not yet known, packet from {} dropped", source);
                             }
                         } else if let Err(e) = result {
                             error!("RTP leg-B recv error: {}", e);
@@ -1356,7 +1357,7 @@ impl RtpSession {
                     }
                 }
             }
-        });
+        }.instrument(tracing::Span::current()));
 
         Ok(())
     }

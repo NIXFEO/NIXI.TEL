@@ -1,4 +1,5 @@
 use super::*;
+use tracing::Instrument;
 
 /// Caller reply channel + address + transport, as returned by
 /// `B2buaManager::get_caller_reply_info`.
@@ -20,7 +21,7 @@ impl Sbc {
         reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
         let status = response.status_code.code();
-        info!("Handling {} response from {}", status, source);
+        debug!("Handling {} response from {}", status, source);
 
         // ── Metrics: count SIP responses + error classes ──
         self.metrics.inc_sip_response(status);
@@ -40,8 +41,6 @@ impl Sbc {
             .ok()
             .map(|h| h.value().to_string())
             .unwrap_or_default();
-
-        info!("Response Call-ID: {}", call_id);
 
         // ── Route outbound REGISTER / OPTIONS health-check responses ──
         // Trunk REGISTER responses use "reg-" Call-IDs, OPTIONS health checks
@@ -362,7 +361,7 @@ impl Sbc {
                             // requests on the RTP port), not from the SIP signaling address.
                             let caller_is_webrtc_ep = self.b2bua.is_caller_webrtc(&uuid).await;
                             if caller_is_webrtc_ep {
-                                info!("RTP proxy: WebRTC caller — endpoint A will be learned via ICE/STUN (not pre-set from SDP)");
+                                debug!("RTP proxy: WebRTC caller — endpoint A will be learned via ICE/STUN (not pre-set from SDP)");
                             } else if caller_sdp_str_pre.is_none() {
                                 warn!("No caller SDP available — caller endpoint A will be learned dynamically");
                             } else if let Some(ref csdp) = caller_sdp_str_pre {
@@ -371,17 +370,17 @@ impl Sbc {
                                     let addr = if is_private_ip(sdp_addr.ip()) {
                                         if let Some(public_ip) = caller_public_ip {
                                             let fixed = SocketAddr::new(public_ip, sdp_addr.port());
-                                            info!("RTP proxy: caller endpoint A = {} (NAT: SDP had {})", fixed, sdp_addr);
+                                            debug!("RTP proxy: caller endpoint A = {} (NAT: SDP had {})", fixed, sdp_addr);
                                             fixed
                                         } else {
-                                            info!(
+                                            debug!(
                                                 "RTP proxy: caller endpoint A = {} (from SDP)",
                                                 sdp_addr
                                             );
                                             sdp_addr
                                         }
                                     } else {
-                                        info!("RTP proxy: caller endpoint A = {}", sdp_addr);
+                                        debug!("RTP proxy: caller endpoint A = {}", sdp_addr);
                                         sdp_addr
                                     };
                                     let _ = self.media.set_endpoint_a(&media_id, addr);
@@ -394,23 +393,23 @@ impl Sbc {
                             // requests on the RTP port), not from the SIP signaling address.
                             let callee_is_webrtc_ep = self.b2bua.is_callee_webrtc(&uuid).await;
                             if callee_is_webrtc_ep {
-                                info!("RTP proxy: WebRTC callee — endpoint B will be learned via ICE/STUN (not pre-set from SDP)");
+                                debug!("RTP proxy: WebRTC callee — endpoint B will be learned via ICE/STUN (not pre-set from SDP)");
                             } else if let Some(ref bsdp) = callee_sdp_str {
                                 if let Some(sdp_addr) = extract_sdp_rtp_addr(bsdp) {
                                     let addr = if is_private_ip(sdp_addr.ip()) {
                                         if let Some(public_ip) = callee_public_ip {
                                             let fixed = SocketAddr::new(public_ip, sdp_addr.port());
-                                            info!("RTP proxy: callee endpoint B = {} (NAT: SDP had {})", fixed, sdp_addr);
+                                            debug!("RTP proxy: callee endpoint B = {} (NAT: SDP had {})", fixed, sdp_addr);
                                             fixed
                                         } else {
-                                            info!(
+                                            debug!(
                                                 "RTP proxy: callee endpoint B = {} (from SDP)",
                                                 sdp_addr
                                             );
                                             sdp_addr
                                         }
                                     } else {
-                                        info!("RTP proxy: callee endpoint B = {}", sdp_addr);
+                                        debug!("RTP proxy: callee endpoint B = {}", sdp_addr);
                                         sdp_addr
                                     };
                                     let _ = self.media.set_endpoint_b(&media_id, addr);
@@ -479,7 +478,7 @@ impl Sbc {
                                                     .await;
                                             }
 
-                                            info!("Spawning DTLS handshake task for call {} (media {})", uuid, media_id_dtls);
+                                            debug!("Spawning DTLS handshake task for call {} (media {})", uuid, media_id_dtls);
 
                                             tokio::spawn(async move {
                                                 // Create the DTLS-UDP bridge
@@ -513,7 +512,7 @@ impl Sbc {
                                                                     Some(recv_ctx);
                                                                 *srtp_send_shared.lock().await =
                                                                     Some(send_ctx);
-                                                                info!("DTLS-SRTP hot-swap complete for media session {} — audio should flow", media_id_dtls);
+                                                                debug!("DTLS-SRTP hot-swap complete for media session {} — audio should flow", media_id_dtls);
                                                             }
                                                             Err(e) => {
                                                                 error!("Failed to create SRTP contexts from DTLS keys: {}", e);
@@ -524,7 +523,7 @@ impl Sbc {
                                                         error!("DTLS handshake failed for media session {}: {}", media_id_dtls, e);
                                                     }
                                                 }
-                                            });
+                                            }.instrument(tracing::Span::current()));
                                         }
                                     }
 
@@ -537,7 +536,7 @@ impl Sbc {
                                             let srtp_recv_shared_b = winfo_b.srtp_recv_ctx_b;
                                             let srtp_send_shared_b = winfo_b.srtp_send_ctx_b;
 
-                                            info!("Spawning DTLS handshake task for call {} leg-B (media {})", uuid, media_id_dtls_b);
+                                            debug!("Spawning DTLS handshake task for call {} leg-B (media {})", uuid, media_id_dtls_b);
 
                                             tokio::spawn(async move {
                                                 let bridge = Arc::new(DtlsUdpBridge::new(
@@ -565,7 +564,7 @@ impl Sbc {
                                                                     Some(recv_ctx);
                                                                 *srtp_send_shared_b.lock().await =
                                                                     Some(send_ctx);
-                                                                info!("DTLS-SRTP hot-swap complete for leg-B media session {} — audio should flow", media_id_dtls_b);
+                                                                debug!("DTLS-SRTP hot-swap complete for leg-B media session {} — audio should flow", media_id_dtls_b);
                                                             }
                                                             Err(e) => {
                                                                 error!("Failed to create SRTP contexts from DTLS keys (leg-B): {}", e);
@@ -576,7 +575,7 @@ impl Sbc {
                                                         error!("DTLS handshake failed for leg-B media session {}: {}", media_id_dtls_b, e);
                                                     }
                                                 }
-                                            });
+                                            }.instrument(tracing::Span::current()));
                                         }
                                     }
                                 }
@@ -603,7 +602,7 @@ impl Sbc {
                             if let Ok(callee_webrtc_sdp) =
                                 std::str::from_utf8(&response_to_relay.body)
                             {
-                                info!("200 OK from WebRTC callee — SDP:\n{}", callee_webrtc_sdp);
+                                debug!("200 OK from WebRTC callee — SDP:\n{}", callee_webrtc_sdp);
 
                                 // Set remote SDP on the WebRTC session for leg-B (DTLS needs this)
                                 let ws_b = self.b2bua.get_webrtc_session_b(&uuid).await;
@@ -611,7 +610,7 @@ impl Sbc {
                                     let mut sess = ws.lock().await;
                                     sess.set_remote_sdp(callee_webrtc_sdp);
                                     drop(sess);
-                                    info!("WebRTC session B: remote SDP set from callee 200 OK");
+                                    debug!("WebRTC session B: remote SDP set from callee 200 OK");
                                 }
                             }
                         }
@@ -633,7 +632,7 @@ impl Sbc {
                             // deadlock (DTLS task holds the WebRtcSession lock during handshake).
                             let pre_sdp = self.b2bua.get_webrtc_sdp_answer(&uuid).await;
                             if let Some(webrtc_sdp) = pre_sdp {
-                                info!("WebRTC SDP answer for browser:\n{}", webrtc_sdp);
+                                debug!("WebRTC SDP answer for browser:\n{}", webrtc_sdp);
                                 response_to_relay.body = webrtc_sdp.into_bytes();
                                 update_content_length_response(&mut response_to_relay);
                             } else {
@@ -708,9 +707,9 @@ impl Sbc {
                                     self.media.rewrite_sdp_ip(sdp_str)
                                 };
                                 if rewritten != sdp_str {
-                                    info!("SDP 200 OK outbound (to caller):\n{}", rewritten);
+                                    debug!("SDP 200 OK outbound (to caller):\n{}", rewritten);
                                 } else {
-                                    info!("SDP 200 OK outbound (unchanged):\n{}", rewritten);
+                                    debug!("SDP 200 OK outbound (unchanged):\n{}", rewritten);
                                 }
                                 self.b2bua
                                     .set_last_sdp_to_caller(&uuid, rewritten.clone())

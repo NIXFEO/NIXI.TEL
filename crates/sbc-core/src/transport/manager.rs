@@ -342,7 +342,7 @@ impl TransportManager {
                     // Log first few lines of what we sent for diagnostics
                     if let Ok(text) = std::str::from_utf8(data) {
                         let preview: String = text.lines().take(6).collect::<Vec<_>>().join(" | ");
-                        tracing::info!(
+                        tracing::debug!(
                             "Transport reply via existing channel to {}: {}",
                             dest,
                             preview
@@ -360,7 +360,7 @@ impl TransportManager {
             }
         }
         // Fallback: open new connection or send UDP
-        tracing::info!("Transport send (new conn) to {} via {:?}", dest, transport);
+        tracing::debug!("Transport send (new conn) to {} via {:?}", dest, transport);
         self.send(data, dest, transport).await
     }
 

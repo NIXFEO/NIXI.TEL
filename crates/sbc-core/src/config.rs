@@ -27,6 +27,45 @@ pub struct SbcConfig {
     /// (`[trunk_health]`, boot-only).
     #[serde(default)]
     pub trunk_health: TrunkHealthConfig,
+    /// `[logging]`: level and output format (boot-only).
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human lines for a terminal or journald (`call{uuid=… call_id=…}: msg`).
+    #[default]
+    Text,
+    /// One JSON object per line for log shipping (`span` carries the call).
+    Json,
+}
+
+/// `[logging]`, read once at boot.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LoggingConfig {
+    /// A level or `tracing` EnvFilter directives ("info", "debug",
+    /// "sbc_core::media=debug,info"). Precedence: `--verbose` > `RUST_LOG`
+    /// > this key.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: LogFormat::Text,
+        }
+    }
 }
 
 /// `[trunk_health]`: OPTIONS health checks and outbound REGISTER retries.
@@ -620,6 +659,7 @@ impl Default for SbcConfig {
             trunks: Vec::new(),
             dids: Vec::new(),
             trunk_health: TrunkHealthConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -751,6 +791,8 @@ mod example_config_tests {
             ),
             (30, 5, 900)
         );
+        assert_eq!(cfg.logging.level, "info");
+        assert_eq!(cfg.logging.format, LogFormat::Json);
         assert!(!cfg.database.allow_missing_store);
         assert_eq!(
             cfg.database.backup_dir.as_deref(),
@@ -759,6 +801,27 @@ mod example_config_tests {
         assert_eq!(
             (cfg.database.backup_interval_hours, cfg.database.backup_keep),
             (24, 7)
+        );
+    }
+
+    #[test]
+    fn logging_section_is_optional_and_strict() {
+        let raw = include_str!("../../../config/sbc.toml.example");
+        let without: String = {
+            let start = raw.find("[logging]").unwrap();
+            let end = raw[start + 1..]
+                .find("\n[")
+                .map(|i| start + 1 + i)
+                .unwrap_or(raw.len());
+            format!("{}{}", &raw[..start], &raw[end..])
+        };
+        let cfg: SbcConfig = toml::from_str(&without).expect("no [logging] section");
+        assert_eq!(cfg.logging, LoggingConfig::default());
+        let bad = raw.replace("format = \"json\"", "format = \"yaml\"");
+        assert_ne!(bad, raw);
+        assert!(
+            toml::from_str::<SbcConfig>(&bad).is_err(),
+            "an unknown format is a config error"
         );
     }
 

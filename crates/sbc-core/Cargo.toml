@@ -57,4 +57,5 @@ opus = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] } # start_paused tests

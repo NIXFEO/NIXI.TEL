@@ -22,16 +22,21 @@ impl Sbc {
                 .collect()
         };
         for (uuid, call_id, duration) in timed_out {
-            warn!(
-                "Call timeout: {} (Call-ID: {}) exceeded {}s (active {}s) — sending BYE to both sides",
-                &uuid[..8.min(uuid.len())],
-                call_id,
-                max_duration.as_secs(),
-                duration
-            );
-            let outcome = CallOutcome::MaxDuration;
-            self.hangup_both_legs(&uuid, &outcome).await;
-            self.finish_call(&uuid, outcome).await;
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                warn!(
+                    "Call timeout: {} (Call-ID: {}) exceeded {}s (active {}s) — sending BYE to both sides",
+                    &uuid[..8.min(uuid.len())],
+                    call_id,
+                    max_duration.as_secs(),
+                    duration
+                );
+                let outcome = CallOutcome::MaxDuration;
+                self.hangup_both_legs(&uuid, &outcome).await;
+                self.finish_call(&uuid, outcome).await;
+            }
+            .instrument(span)
+            .await;
         }
     }
 
@@ -48,9 +53,14 @@ impl Sbc {
         }
         info!("Graceful shutdown: ending {} active call(s)", active.len());
         for uuid in active {
-            let outcome = CallOutcome::Shutdown;
-            self.hangup_both_legs(&uuid, &outcome).await;
-            self.finish_call(&uuid, outcome).await;
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                let outcome = CallOutcome::Shutdown;
+                self.hangup_both_legs(&uuid, &outcome).await;
+                self.finish_call(&uuid, outcome).await;
+            }
+            .instrument(span)
+            .await;
         }
         // Give time for BYE packets to be sent
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -71,7 +81,7 @@ impl Sbc {
             .map(|h| h.value().to_string())
             .unwrap_or_default();
 
-        info!("Received ACK from {} (Call-ID: {})", source, call_id);
+        debug!("Received ACK from {} (Call-ID: {})", source, call_id);
 
         // The ACK to one of OUR non-2xx finals ends its retransmissions
         // (RFC 3261 §17.2.1 Timer G/H); a 2xx ACK shares the key too and is
@@ -85,7 +95,7 @@ impl Sbc {
         let maybe_uuid = if let Some(uuid) = self.b2bua.find_by_inbound_call_id(&call_id).await {
             Some(uuid)
         } else if let Some(uuid) = self.b2bua.find_by_inbound_call_id_suffix(&call_id).await {
-            info!("ACK matched B2BUA call via suffix match (ACK Call-ID is shorter than stored)");
+            debug!("ACK matched B2BUA call via suffix match (ACK Call-ID is shorter than stored)");
             Some(uuid)
         } else {
             // Also try outbound call-id (in case ACK comes from callee side)
@@ -93,7 +103,7 @@ impl Sbc {
         };
 
         if let Some(uuid) = maybe_uuid {
-            info!("ACK matched B2BUA call {} (call-id: {})", uuid, call_id);
+            debug!("ACK matched B2BUA call {} (call-id: {})", uuid, call_id);
             let _ = self.b2bua.handle_ack(&uuid).await;
 
             // Relay ACK to callee so the callee's INVITE transaction completes
@@ -183,7 +193,7 @@ impl Sbc {
                     cseq_header,
                 );
 
-                info!(
+                debug!(
                     "Relaying ACK to callee at {} via {:?}:\n{}",
                     callee_dest,
                     callee_transport,
@@ -263,7 +273,7 @@ impl Sbc {
         }
 
         if let Some((uuid, is_from_caller)) = found {
-            info!(
+            debug!(
                 "BYE identified as from {} (source: {})",
                 if is_from_caller { "caller" } else { "callee" },
                 source
@@ -302,7 +312,7 @@ impl Sbc {
                         .await;
 
                     let bye_out = if let Some(fresh) = fresh_bye {
-                        info!("BYE (caller→callee): synthetic in-dialog BYE");
+                        debug!("BYE (caller→callee): synthetic in-dialog BYE");
                         fresh
                     } else {
                         let mut raw_bye = rsip::SipMessage::Request(request.clone()).to_string();
@@ -323,7 +333,7 @@ impl Sbc {
                         }
                         self.apply_outbound_topology(&raw_bye, callee_transport)
                     };
-                    info!("BYE relayed to callee:\n{}", bye_out);
+                    debug!("BYE relayed to callee:\n{}", bye_out);
                     self.send_sip(
                         "BYE → callee",
                         bye_out.as_bytes(),
@@ -356,7 +366,7 @@ impl Sbc {
                         .await;
 
                     let bye_out = if let Some(fresh) = fresh_bye {
-                        info!("BYE (callee→caller): synthetic in-dialog BYE");
+                        debug!("BYE (callee→caller): synthetic in-dialog BYE");
                         fresh
                     } else {
                         let mut raw_bye = rsip::SipMessage::Request(request.clone()).to_string();
@@ -456,7 +466,7 @@ impl Sbc {
         if found.is_none() && self.source_is_trunk_related(source).await {
             found = self.b2bua.find_by_inbound_call_id_suffix(&call_id).await;
             if found.is_some() {
-                info!("CANCEL: matched call via Call-ID suffix '{}'", call_id);
+                debug!("CANCEL: matched call via Call-ID suffix '{}'", call_id);
             }
         }
         let Some(uuid) = found else {
@@ -823,18 +833,23 @@ impl Sbc {
         for (uuid, reinvite, dest, transport, reply_tx) in
             self.b2bua.due_session_refreshes(&sbc_ip, sbc_port).await
         {
-            info!(
-                "Session refresh: re-INVITE → {} (call {})",
-                dest,
-                &uuid[..8.min(uuid.len())]
-            );
-            if let Err(e) = self
-                .transport
-                .reply(reinvite.as_bytes(), dest, transport, reply_tx.as_ref())
-                .await
-            {
-                warn!("Session refresh send failed for call {}: {}", uuid, e);
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                info!(
+                    "Session refresh: re-INVITE → {} (call {})",
+                    dest,
+                    &uuid[..8.min(uuid.len())]
+                );
+                if let Err(e) = self
+                    .transport
+                    .reply(reinvite.as_bytes(), dest, transport, reply_tx.as_ref())
+                    .await
+                {
+                    warn!("Session refresh send failed for call {}: {}", uuid, e);
+                }
             }
+            .instrument(span)
+            .await;
         }
     }
 
@@ -848,7 +863,7 @@ impl Sbc {
         transport: rsip::Transport,
         reply_tx: Option<&UnboundedSender<Vec<u8>>>,
     ) -> Result<()> {
-        info!("Received INFO from {}", source);
+        debug!("Received INFO from {}", source);
 
         let call_id = request
             .call_id_header()
@@ -877,13 +892,13 @@ impl Sbc {
             }
             if is_from_caller {
                 if let Some((tx, dest, tp)) = self.b2bua.get_callee_reply_info(&uuid).await {
-                    info!("B2BUA: relaying INFO (caller→callee) to {}", dest);
+                    debug!("B2BUA: relaying INFO (caller→callee) to {}", dest);
                     let out = self.apply_outbound_topology(&raw_info, tp);
                     self.send_sip("INFO → callee", out.as_bytes(), dest, tp, tx.as_ref())
                         .await;
                 }
             } else if let Some((tx, dest, tp)) = self.b2bua.get_caller_reply_info(&uuid).await {
-                info!("B2BUA: relaying INFO (callee→caller) to {}", dest);
+                debug!("B2BUA: relaying INFO (callee→caller) to {}", dest);
                 let out = self.apply_outbound_topology(&raw_info, tp);
                 self.send_sip("INFO → caller", out.as_bytes(), dest, tp, tx.as_ref())
                     .await;

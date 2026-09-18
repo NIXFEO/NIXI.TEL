@@ -606,7 +606,7 @@ async fn register_loop(
     let mut failure_announced = false;
 
     loop {
-        info!("Trunk '{}': sending REGISTER (Expires {})", name, expires);
+        debug!("Trunk '{}': sending REGISTER (Expires {})", name, expires);
         let mut outcome = send_register(&ctx, &spec, expires, &call_id, &mut cseq, &cancel).await;
         if let RegisterOutcome::IntervalTooBrief { min_expires } = outcome {
             if min_expires > expires {

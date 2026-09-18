@@ -137,10 +137,34 @@ sudo systemctl status sbc
 **Always stop gracefully** (`systemctl stop sbc`) so the SBC can BYE active
 calls — this prevents ghost sessions on remote trunks. Never `kill -9`.
 
-Log rotation — `/etc/logrotate.d/sbc`:
+### Logs
+
+The SBC logs to stdout, i.e. journald under systemd. Every line of a call
+carries a `call` span (`uuid`, `call_id`, `trunk`, `direction`), so
+`journalctl -u sbc | grep <Call-ID>` finds a whole call; per-message and
+per-packet diagnostics are at debug. Level precedence: `sbc --verbose` >
+`RUST_LOG` (put `RUST_LOG=sbc_core::media=debug,info` in `/etc/sbc/sbc.env`,
+already an `EnvironmentFile` of the unit) > `[logging] level`.
+
+For log shipping set `[logging] format = "json"`: one object per line with
+`timestamp`, `level`, `target`, `message` and `span`
+(`{"name":"call","uuid":…,"call_id":…,"trunk":…,"direction":…}`), e.g.
+
+```bash
+journalctl -u sbc -o cat | jq -c 'select(.span.uuid == "<uuid>")'
+```
+
+The writer is non-blocking and lossy: when journald does not keep up,
+lines are dropped rather than stalling the SIP loop (`sbc_log_dropped_lines_total`,
+alert `SBCLogLinesDropped`). On `systemctl stop` the last lines may reach
+journald up to a second after `SBC shutdown complete`; `TimeoutStopSec=15`
+is ample.
+
+Log rotation only concerns the CDR file (`[general] cdr_file`), not the SIP
+logs — `/etc/logrotate.d/sbc`:
 
 ```
-/var/log/sbc/*.log /var/log/sbc/*.jsonl {
+/var/log/sbc/*.jsonl {
     daily
     rotate 30
     compress

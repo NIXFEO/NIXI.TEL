@@ -60,7 +60,7 @@ impl TcpListenerServer {
                 }
             };
 
-            info!("Accepted TCP connection from {}", peer_addr);
+            debug!("Accepted TCP connection from {}", peer_addr);
 
             // Spawn a task to handle this connection
             let tx = message_tx.clone();

@@ -236,6 +236,9 @@ pub struct SbcMetrics {
 
     /// Per-trunk gauges and counters (see [`TrunkSeries`]).
     pub trunks: Arc<std::sync::Mutex<HashMap<String, TrunkSeries>>>,
+    /// Lines the non-blocking log writer dropped because stdout/journald
+    /// did not keep up (sampled from the writer's counter).
+    pub log_dropped_lines: Arc<AtomicU64>,
     /// 1 when the SQLite config store is open and hydrated.
     pub store_available: Arc<AtomicU64>,
     /// 1 when the backup timer runs.
@@ -295,6 +298,7 @@ impl SbcMetrics {
             auth_nonces: Arc::new(AtomicU64::new(0)),
             last_cdr_written_time: Arc::new(AtomicU64::new(0)),
             trunks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            log_dropped_lines: Arc::new(AtomicU64::new(0)),
             store_available: Arc::new(AtomicU64::new(0)),
             store_backups_enabled: Arc::new(AtomicU64::new(0)),
             store_backup_interval_secs: Arc::new(AtomicU64::new(0)),
@@ -459,6 +463,10 @@ impl SbcMetrics {
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
+    pub fn set_log_dropped_lines(&self, n: u64) {
+        self.log_dropped_lines.store(n, Ordering::Relaxed);
+    }
+
     pub fn set_store_available(&self, on: bool) {
         self.store_available.store(u64::from(on), Ordering::Relaxed);
     }
@@ -650,6 +658,12 @@ impl SbcMetrics {
             "sbc_last_cdr_written_timestamp_seconds",
             "Unix time of the last CDR written (0 = none since start)",
             self.last_cdr_written_time.load(Ordering::Relaxed)
+        );
+
+        counter!(
+            "sbc_log_dropped_lines",
+            "Log lines dropped by the non-blocking writer since start (journald/stdout back-pressure)",
+            self.log_dropped_lines.load(Ordering::Relaxed)
         );
 
         // ── Config store ──────────────────────────────────────────────────────
@@ -1346,6 +1360,11 @@ mod tests {
         assert!(out.contains("sbc_store_backup_last_bytes 1234\n"));
         assert!(out.contains("sbc_store_backup_failures_total 1\n"));
         assert!(m.store_backup_last_success_time.load(Ordering::Relaxed) > 0);
+        assert!(out.contains("sbc_log_dropped_lines_total 0\n"));
+        m.set_log_dropped_lines(7);
+        assert!(m
+            .render_prometheus()
+            .contains("sbc_log_dropped_lines_total 7\n"));
     }
 
     #[test]

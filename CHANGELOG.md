@@ -174,6 +174,9 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   `{store, hydrated, listening}` until the SQLite store is open, the first
   hydration succeeded and the SIP listeners are bound (public, unchanged
   path — probes that treated 200 as "process up" now see readiness).
+- SDP offers/answers and relayed BYE/ACK bodies (WebRTC `a=ice-pwd:`
+  included) were printed at info; they are debug now, and the UDP parse
+  warning's snippet is one line.
 
 ### Added
 - Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
@@ -204,6 +207,16 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
   `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- Structured logging (lot 3). Every log line of a call — SIP handlers,
+  media relay, timer and admin teardowns — carries a `call` span with
+  `uuid`, `call_id`, `trunk` and `direction` (recorded as they become
+  known; absent, not empty, for a local call's trunk). `[logging] format =
+  "json"` emits one object per line (`timestamp`, `level`, `target`,
+  `message`, `span`) for log shipping, `"text"` prefixes lines with
+  `call{uuid=… call_id=… trunk=…}:` for journald. The writer is
+  non-blocking and lossy (journald back-pressure never stalls the SIP
+  loop); dropped lines are counted in `sbc_log_dropped_lines_total` with
+  the alert rule `SBCLogLinesDropped`.
 - Store backups: `POST /api/v1/backup` writes a consistent `VACUUM INTO`
   copy `sbc-<timestamp>.db` into `[database] backup_dir` (default
   `<dir of sqlite_path>/backups`, created 0700, files 0600 — they hold
@@ -244,6 +257,13 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Dependabot watches cargo and actions.
 
 ### Changed
+- `[logging] level` is honoured (it was parsed into nothing): precedence
+  `sbc --verbose` > `RUST_LOG` > TOML. The per-message and per-RTP-packet
+  lines (`Handling … request`, `Response Call-ID`, `Transport reply`,
+  `RTP A recv #…`, SDP/BYE bodies, DTLS/STUN steps, per-refresh trunk
+  REGISTER lines…) moved to debug: a normal answered call is about seven
+  info lines, all in its span. Anything grepping journald for the old
+  `Response Call-ID:` line should grep the span's `call_id` instead.
 - The SBC refuses to start when the SQLite store cannot be opened or
   hydrated (it used to warn and run with no users, trunks or DIDs while
   reporting ready). `[database] allow_missing_store = true` restores the

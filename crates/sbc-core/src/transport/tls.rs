@@ -131,7 +131,7 @@ impl TlsListenerServer {
             tokio::spawn(async move {
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
-                        info!("TLS handshake successful with {}", peer_addr);
+                        debug!("TLS handshake successful with {}", peer_addr);
                         if let Err(e) = Self::handle_connection(tls_stream, peer_addr, tx).await {
                             // Connection handler errors (read errors, resets) are
                             // normal for SIP clients that close abruptly.
@@ -212,7 +212,7 @@ impl TlsListenerServer {
                 // Log first line for diagnostics
                 if let Ok(text) = std::str::from_utf8(message) {
                     let first_line = text.lines().next().unwrap_or("(empty)");
-                    info!("TLS message from {}: {}", peer_addr, first_line);
+                    debug!("TLS message from {}: {}", peer_addr, first_line);
                 }
 
                 // Parse and send the message with the reply channel

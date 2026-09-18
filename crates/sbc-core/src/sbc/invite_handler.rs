@@ -109,7 +109,7 @@ impl Sbc {
             }
         };
         if is_trunk_ip {
-            info!("INVITE from trunk IP {} — whitelisted", source_ip);
+            debug!("INVITE from trunk IP {} — whitelisted", source_ip);
         }
 
         // ── Per-user call limits (concurrent + setup rate) ──────────────
@@ -345,12 +345,14 @@ impl Sbc {
                 // Direction is known before routing: a trunk-originated
                 // call is inbound, anything else is outbound until the
                 // registrar routes it to a local user (then "local").
-                call.direction = Some(if is_trunk_ip || inbound_trunk.is_some() {
+                let direction = if is_trunk_ip || inbound_trunk.is_some() {
                     "inbound"
                 } else {
                     "outbound"
-                });
+                };
+                call.direction = Some(direction);
                 call.trunk_name = inbound_trunk.clone();
+                super::record_call_identity(Some(&uuid), inbound_trunk.as_deref(), Some(direction));
             }
             drop(calls);
             if let Some(name) = inbound_trunk.as_deref() {
@@ -475,6 +477,7 @@ impl Sbc {
                 if let Some(call) = calls.get_mut(&uuid) {
                     if call.direction != Some("inbound") {
                         call.direction = Some("local");
+                        super::record_call_identity(None, None, Some("local"));
                     }
                 }
             }
@@ -695,7 +698,8 @@ impl Sbc {
                 }
             }
             self.count_call_on_trunk(&uuid, Some(&trunk.name)).await;
-            info!("B2BUA: stored trunk_id={} for call {}", trunk.id, uuid);
+            super::record_call_identity(None, Some(&trunk.name), None);
+            debug!("B2BUA: stored trunk_id={} for call {}", trunk.id, uuid);
 
             let dest = match trunk.destination() {
                 Some(d) => d,
@@ -803,8 +807,8 @@ impl Sbc {
                                 self.media.set_ice_pwd_local_b(media_id, ice_pwd_owned);
                             }
 
-                            info!("Trunk→WebRTC SDP transformation (port {}): generate Opus/SAVPF/ICE/DTLS offer", leg_b_port);
-                            info!("SDP INVITE outbound (Trunk→WebRTC):\n{}", sdp_offer);
+                            debug!("Trunk→WebRTC SDP transformation (port {}): generate Opus/SAVPF/ICE/DTLS offer", leg_b_port);
+                            debug!("SDP INVITE outbound (Trunk→WebRTC):\n{}", sdp_offer);
                             sdp_offer
                         }
                         Err(e) => {
@@ -833,8 +837,8 @@ impl Sbc {
                         10000
                     };
                     let trunk_sdp = transform_webrtc_to_trunk(sdp_str, &sbc_ip, trunk_rtp_port);
-                    info!("WebRTC→Trunk SDP transformation (port {}): strip SAVPF/DTLS/ICE → RTP/AVP PCMA", trunk_rtp_port);
-                    info!("SDP INVITE outbound (WebRTC→Trunk):\n{}", trunk_sdp);
+                    debug!("WebRTC→Trunk SDP transformation (port {}): strip SAVPF/DTLS/ICE → RTP/AVP PCMA", trunk_rtp_port);
+                    debug!("SDP INVITE outbound (WebRTC→Trunk):\n{}", trunk_sdp);
                     trunk_sdp
                 } else if let Some(ref media_id) = media_session_id {
                     // Full proxy mode: replace IP and port with SBC proxy port.
@@ -855,9 +859,9 @@ impl Sbc {
 
                 if !caller_is_webrtc {
                     if rewritten_sdp != sdp_str {
-                        info!("SDP INVITE outbound (to callee):\n{}", rewritten_sdp);
+                        debug!("SDP INVITE outbound (to callee):\n{}", rewritten_sdp);
                     } else {
-                        info!("SDP INVITE outbound (unchanged):\n{}", rewritten_sdp);
+                        debug!("SDP INVITE outbound (unchanged):\n{}", rewritten_sdp);
                     }
                 }
 
@@ -980,9 +984,9 @@ impl Sbc {
             let callid_line = outbound_raw
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("call-id:"));
-            info!("INVITE outbound {}", from_line.unwrap_or("(no From)"));
-            info!("INVITE outbound {}", to_line.unwrap_or("(no To)"));
-            info!("INVITE outbound {}", callid_line.unwrap_or("(no Call-ID)"));
+            debug!("INVITE outbound {}", from_line.unwrap_or("(no From)"));
+            debug!("INVITE outbound {}", to_line.unwrap_or("(no To)"));
+            debug!("INVITE outbound {}", callid_line.unwrap_or("(no Call-ID)"));
         }
         // ── RFC 4028: offer session timers on the trunk leg we originate ──
         // The SBC is the UAC toward the trunk, so it owns the offer: any
@@ -1126,10 +1130,15 @@ impl Sbc {
             );
             // Only a trunk that never answered at all is struck: a 100
             // Trying means it is working on it (slow post-dial delay).
-            if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
-                self.note_trunk_failure(&name, None);
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
+                    self.note_trunk_failure(&name, None);
+                }
+                let _ = self.failover_to_next_trunk(&uuid).await;
             }
-            let _ = self.failover_to_next_trunk(&uuid).await;
+            .instrument(span)
+            .await;
         }
     }
 
@@ -1238,6 +1247,7 @@ impl Sbc {
             }
         }
         self.count_call_on_trunk(uuid, Some(&trunk.name)).await;
+        super::record_call_identity(None, Some(&trunk.name), None);
         true
     }
 
