@@ -88,6 +88,13 @@ media plane against the code and having the specs adversarially reviewed:
   so an NTP step forward tore down every live call as `rtp-timeout`, and a
   packet that arrived but died at the transcoder or the SRTP layer counted
   as activity.
+- RTCP arriving on the separate RTCP port is forwarded only when it comes
+  from the peer this leg learned and looks like RTP/RTCP: it was relayed
+  from any host to the other peer's port, with the result ignored.
+- The keys the docs list as "unused" are now named one by one
+  (`media.rtcp_enabled`, `media.transcoding_threads`, `media.codecs`,
+  `media.webrtc.turn_enabled`): the blanket "`media.*` except the port
+  range" claimed dead keys that are read and hid ones that are not.
 - RFC 5761: RTCP is demultiplexed on the full 192..=223 range, so RTPFB,
   PSFB and XR packets are no longer treated as audio, and the RTCP
   destination port no longer panics in a debug build at port 65535.

@@ -43,7 +43,14 @@ bind_port = 5060
 #key_file  = "/etc/letsencrypt/live/sip.example.com/privkey.pem"
 
 [media]
+# The RTP/RTCP pair pool. A freed pair rests 30 s before it can be reused,
+# so a new call never inherits the previous peer's stray packets: size the
+# range for the call rate, not just for the concurrent calls
+# (sbc_rtp_port_quarantine_forced_total counts a range that is too small).
 rtp_port_range = [10000, 20000]
+# Parsed, read by nothing (see the "unused" class in docs/API.md): RTCP is
+# always relayed, transcoding runs on the relay task, and the codecs of a
+# call come from the SDPs of its two legs.
 rtcp_enabled = true
 transcoding_threads = 4
 codecs = ["PCMU", "PCMA", "Opus"]
@@ -102,9 +109,13 @@ register_default_expires = 3600
 trunk_local_from = "allow"
 
 # Call guards
-max_call_duration = 14400      # answered call hard cap → BYE both legs (CDR "timeout")
+max_call_duration = 14400      # answered call hard cap → BYE both legs (CDR "timeout"); 0 = unlimited, any other value is floored at 60 s
 call_setup_timeout = 60        # unanswered INVITE → CANCEL + 408 to the caller (CDR "setup-timeout")
-rtp_timeout = 90               # no RTP for this long → BYE both legs (CDR "rtp-timeout")
+rtp_timeout = 90               # no RTP *delivered* for this long → BYE both legs (CDR
+                               # "rtp-timeout"), including a call whose media never flowed.
+                               # Checked on a 30 s sweep, so the teardown lands 90-120 s in.
+                               # One direction silent while the other talks is reported, not
+                               # torn down (sbc_media_one_way_calls_total, a hold looks the same).
 invite_timeout = 5             # no >=180 within 5s → trunk failover (raise above the carrier's post-dial delay when a backup trunk exists; a trunk that answered nothing at all also takes a strike)
 
 # RFC 4028 session timers (refresh re-INVITEs on the trunk leg so >4h

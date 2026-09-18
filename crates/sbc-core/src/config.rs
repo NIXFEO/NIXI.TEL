@@ -1103,9 +1103,12 @@ pub fn key_classes() -> serde_json::Value {
         "reload": RELOAD_KEYS,
         "restart": RESTART_KEYS,
         "seed": SEED_KEYS,
+        // Named one by one: a blanket "media.*" claimed three keys were
+        // dead that are, and hid the ones that are not.
         "unused": ["general.name", "general.instance_id", "network.public_ipv6",
                    "security.rate_limit_global", "security.auth_challenge_timeout",
-                   "media.* (except rtp_port_range)", "metrics.*"],
+                   "media.rtcp_enabled", "media.transcoding_threads", "media.codecs",
+                   "media.webrtc.turn_enabled", "metrics.*"],
     })
 }
 

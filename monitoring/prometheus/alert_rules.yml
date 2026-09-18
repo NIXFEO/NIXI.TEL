@@ -99,6 +99,31 @@ groups:
         annotations:
           summary: "SBC config store unavailable (running from TOML seeds only)"
 
+      - alert: SBCMediaOneWay
+        # One direction of a call stayed silent while the other was
+        # delivering: a NAT or firewall asymmetry, or a peer that never
+        # started sending. Reported by the relay, never a teardown.
+        expr: increase(sbc_media_one_way_calls_total[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "One-way audio on {{ $value }} call(s) ({{ $labels.leg }} silent)"
+
+      - alert: SBCMediaRelayFailures
+        # Calls the SBC could not anchor media for: refused with 503 before
+        # dialling, or ended just after the answer (CDR media-unavailable).
+        expr: increase(sbc_media_relay_failures_total[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $value }} call(s) had no media anchor (ports exhausted? relay bind failed?)"
+
+      - alert: SBCRtpPortsForcedReuse
+        # The RTP range is too small for the call rate: pairs are being
+        # reused before their stray-packet quarantine elapsed.
+        expr: increase(sbc_rtp_port_quarantine_forced_total[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "RTP port range too small: {{ $value }} pair(s) reused before quarantine"
+
       - alert: SBCStoreCreatedEmpty
         # The store file was missing at boot and a new, empty one was
         # created: no users, no trunks, no DIDs — every call is refused.

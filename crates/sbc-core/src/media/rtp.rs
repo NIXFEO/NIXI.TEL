@@ -1423,7 +1423,8 @@ impl RtpSession {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SRTP A encrypt error: {} (dropping packet)", e);
+                                            debug!("SRTP A encrypt error: {} (dropping packet)", e);
+                                            media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
                                     }
@@ -1469,8 +1470,24 @@ impl RtpSession {
 
                     // ── RTCP Leg A ─────────────────────────────────────────────
                     result = rtcp_socket_a.recv_from(&mut buf_rtcp_a) => {
-                        if let Ok((len, _source)) = result {
+                        if let Ok((len, source)) = result {
                             let data = buf_rtcp_a[..len].to_vec();
+                            // Only the peer we learned on this leg may have
+                            // its RTCP forwarded (its RTCP comes from
+                            // another port, so the IP is what matters), and
+                            // only if it looks like RTCP/RTP at all.
+                            let known = endpoint_a
+                                .lock()
+                                .await
+                                .is_none_or(|ep| ep.ip() == source.ip());
+                            if !known || !looks_like_rtp(&data) {
+                                debug!(
+                                    "RTCP A: dropping {} bytes from {} (known={})",
+                                    len, source, known
+                                );
+                                media_stats.note_drop(DropReason::NotRtp);
+                                continue;
+                            }
                             let dest = *endpoint_b.lock().await;
                             if let Some(dst) = dest {
                                 // Send RTCP to callee's RTCP port (RTP port + 1 by
@@ -1486,8 +1503,20 @@ impl RtpSession {
 
                     // ── RTCP Leg B ─────────────────────────────────────────────
                     result = rtcp_socket_b.recv_from(&mut buf_rtcp_b) => {
-                        if let Ok((len, _source)) = result {
+                        if let Ok((len, source)) = result {
                             let data = buf_rtcp_b[..len].to_vec();
+                            let known = endpoint_b
+                                .lock()
+                                .await
+                                .is_none_or(|ep| ep.ip() == source.ip());
+                            if !known || !looks_like_rtp(&data) {
+                                debug!(
+                                    "RTCP B: dropping {} bytes from {} (known={})",
+                                    len, source, known
+                                );
+                                media_stats.note_drop(DropReason::NotRtp);
+                                continue;
+                            }
                             let dest = *endpoint_a.lock().await;
                             if let Some(dst) = dest {
                                 // `+ 1` on a u16 panics in a debug build at 65535.
