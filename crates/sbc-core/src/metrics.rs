@@ -266,6 +266,12 @@ pub struct SbcMetrics {
     pub media_tx_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Calls reported as one-way, by the leg that went silent.
     pub media_one_way: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Endpoint decisions: (leg, verdict, reason) → count. `verdict` is
+    /// `latched`, `moved` or `would-reject` (the last one is counted but
+    /// not enforced until the operator has the data).
+    #[allow(clippy::type_complexity)]
+    pub media_endpoint:
+        Arc<std::sync::Mutex<HashMap<(&'static str, &'static str, &'static str), u64>>>,
     /// Calls the SBC could not anchor media for (no ports, relay start
     /// failed): refused before dialling, or ended right after the answer.
     pub media_relay_failures: Arc<AtomicU64>,
@@ -346,6 +352,7 @@ impl SbcMetrics {
             media_tx_packets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_tx_bytes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_one_way: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            media_endpoint: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_relay_failures: Arc::new(AtomicU64::new(0)),
             quarantined_ports: Arc::new(AtomicU64::new(0)),
             forced_port_reuse: Arc::new(AtomicU64::new(0)),
@@ -614,6 +621,18 @@ impl SbcMetrics {
         }
     }
 
+    /// One endpoint decision on `leg`: what was decided and why.
+    pub fn note_endpoint_verdict(
+        &self,
+        leg: &'static str,
+        verdict: &'static str,
+        reason: &'static str,
+    ) {
+        if let Ok(mut m) = self.media_endpoint.lock() {
+            *m.entry((leg, verdict, reason)).or_insert(0) += 1;
+        }
+    }
+
     /// A call was reported one-way: `leg` is the side that went silent.
     pub fn inc_media_one_way(&self, leg: &'static str) {
         if let Ok(mut m) = self.media_one_way.lock() {
@@ -797,6 +816,24 @@ impl SbcMetrics {
                 rows.sort();
                 for (leg, value) in rows {
                     out.push_str(&format!("{}_total{{leg=\"{}\"}} {}\n", name, leg, value));
+                }
+            }
+        }
+
+        {
+            let name = "sbc_media_endpoint_events";
+            out.push_str(&format!(
+                "# HELP {} Media endpoint decisions by leg, verdict (latched/moved/would-reject) and reason\n# TYPE {} counter\n",
+                name, name
+            ));
+            if let Ok(map) = self.media_endpoint.lock() {
+                let mut rows: Vec<(&(&str, &str, &str), &u64)> = map.iter().collect();
+                rows.sort();
+                for ((leg, verdict, reason), value) in rows {
+                    out.push_str(&format!(
+                        "{}_total{{leg=\"{}\",verdict=\"{}\",reason=\"{}\"}} {}\n",
+                        name, leg, verdict, reason, value
+                    ));
                 }
             }
         }

@@ -4,6 +4,7 @@
 //! Phase 4 implementation for SRTP (Secure RTP), STUN, and ICE (NAT traversal)
 
 pub mod dtls;
+pub mod endpoint;
 pub mod ice;
 pub mod manager;
 pub mod port_allocator;

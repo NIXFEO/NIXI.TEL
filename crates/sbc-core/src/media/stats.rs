@@ -240,6 +240,18 @@ impl CallMediaStats {
         self.leg(leg).endpoint_moved.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// How long this leg's peer has been silent, `None` if it never sent
+    /// anything (the endpoint ladder's "is it gone?" input).
+    pub fn quiet_for(&self, leg: Leg) -> Option<std::time::Duration> {
+        let last = self.leg(leg).last_rx_ms.load(Ordering::Relaxed);
+        if last == 0 && self.leg(leg).rx_packets.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(
+            self.now_ms().saturating_sub(last),
+        ))
+    }
+
     /// How long since the last packet the relay actually delivered. `None`
     /// before the first one (the caller decides what to do with a session
     /// that never carried anything).

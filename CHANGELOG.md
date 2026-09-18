@@ -70,6 +70,16 @@ media plane against the code and having the specs adversarially reviewed:
   without correlating logs; the CSV export gains the three columns at the
   end. Rolling back to a pre-0.20 binary now needs
   `DELETE FROM _sqlx_migrations WHERE version IN (2, 3, 4)`.
+- **The endpoint decision is now a policy, shipped in count-only mode**
+  (`media/endpoint.rs`): a pure ladder that says whether a datagram may
+  latch the media endpoint, move it, or neither — the signalled address,
+  the same host on another port (NAT rebinding), a sibling host in the
+  signalled /24 (clustered trunks), the SSRC of the live stream, or a
+  latched address that has been silent for 5 s. Every verdict is counted
+  in `sbc_media_endpoint_events_total{leg,verdict,reason}` and **nothing
+  is refused yet**: the counters say what the real trunk's media path does
+  before any call is at risk. Enforcing the `foreign` refusal is a
+  separate, later decision (`Mode::Moves`).
 - **One-way audio is detected and reported**: when the SBC keeps
   delivering to a peer that has said nothing for 10 s while the other peer
   is talking, the relay logs it once per leg inside the call span and

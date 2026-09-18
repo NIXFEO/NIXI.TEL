@@ -13,6 +13,7 @@
 //!   - The 200 OK SDP sent to caller contains `ports_a.rtp` → caller sends to leg-A.
 //!   - The INVITE SDP sent to callee contains `ports_b.rtp` → callee sends to leg-B.
 
+use crate::media::endpoint::{EndpointPolicy, Observation, Verdict};
 use crate::media::srtp::SrtpContext;
 use crate::media::stats::{DropReason, Leg};
 use crate::media::stun::{
@@ -105,6 +106,9 @@ pub struct RtpSession {
 
     /// Metrics sink for the aggregate counters (set by the manager).
     metrics: Option<Arc<crate::metrics::SbcMetrics>>,
+
+    /// Where this call's media may come from (count-only by default).
+    endpoint_policy: EndpointPolicy,
 
     /// Global RTP packet counter (from SbcMetrics — shared across all sessions)
     global_rtp_counter: Option<Arc<AtomicU64>>,
@@ -409,6 +413,7 @@ impl RtpSession {
             stats: Arc::new(RtpStats::new()),
             media_stats: Arc::new(crate::media::stats::CallMediaStats::new()),
             metrics: None,
+            endpoint_policy: EndpointPolicy::default(),
             global_rtp_counter: None,
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
@@ -656,6 +661,11 @@ impl RtpSession {
         let rtcp_socket_b = self.rtcp_socket_b.clone();
         let stats = self.stats.clone();
         let media_stats = self.media_stats.clone();
+        // What the SDP said, before any packet moved it: the endpoint
+        // ladder's strongest evidence.
+        let signalled_a = *self.endpoint_a_shared.lock().await;
+        let signalled_b = *self.endpoint_b_shared.lock().await;
+        let endpoint_policy = self.endpoint_policy;
         let metrics = self.metrics.clone();
         let session_id = self.session_id.clone();
         let global_rtp_counter = self.global_rtp_counter.clone();
@@ -909,6 +919,14 @@ impl RtpSession {
                             // the endpoint: a single stray byte to the port
                             // must not redirect the audio. (A source filter
                             // and a first-packet latch are lot 4.)
+                            // The endpoint ladder needs the live stream's
+                            // SSRC and the leg's last activity *before* this
+                            // packet updates them.
+                            let live_ssrc = media_stats
+                                .leg(Leg::Caller)
+                                .ssrc
+                                .load(Ordering::Relaxed);
+                            let quiet_for = media_stats.quiet_for(Leg::Caller);
                             match classify_media_input(&data) {
                                 MediaInput::Rtp => media_stats.note_rx(Leg::Caller, &data),
                                 MediaInput::Passthrough => {}
@@ -922,17 +940,75 @@ impl RtpSession {
                                     continue;
                                 }
                             }
-                            if looks_like_rtp(&data) {
+                            {
                                 let mut ep = endpoint_a.lock().await;
-                                if ep.is_none() {
-                                    info!("RTP: learned caller (A) = {} on leg-A:{}", source, ports_a_rtp);
-                                    *ep = Some(source);
-                                    media_stats.note_endpoint_learned(Leg::Caller);
-                                } else if *ep != Some(source) {
-                                    // NAT port change, or a hijack attempt.
-                                    info!("RTP: caller (A) address moved {} → {}", ep.unwrap(), source);
-                                    *ep = Some(source);
-                                    media_stats.note_endpoint_moved(Leg::Caller);
+                                // Where this peer's audio may come from
+                                // (media/endpoint.rs). Count-only for now:
+                                // a refusal is recorded, the audio still
+                                // follows the old behaviour.
+                                let verdict = endpoint_policy.observe(Observation {
+                                    latched: *ep,
+                                    signalled: signalled_a,
+                                    source,
+                                    plausible: looks_like_rtp(&data),
+                                    same_stream: live_ssrc != 0
+                                        && data.len() >= 12
+                                        && live_ssrc
+                                            == u32::from_be_bytes([
+                                                data[8], data[9], data[10], data[11],
+                                            ]),
+                                    latched_quiet_for: quiet_for,
+                                });
+                                match verdict {
+                                    Verdict::Latch(m) => {
+                                        info!("RTP: learned caller (A) = {} on leg-A:{}", source, ports_a_rtp);
+                                        *ep = Some(source);
+                                        media_stats.note_endpoint_learned(Leg::Caller);
+                                        if let Some(ref mx) = metrics {
+                                            mx.note_endpoint_verdict(
+                                                Leg::Caller.label(),
+                                                "latched",
+                                                m.label(),
+                                            );
+                                        }
+                                    }
+                                    Verdict::Keep => {}
+                                    Verdict::Move(m) => {
+                                        info!(
+                                            "RTP: caller (A) address moved {} → {} ({})",
+                                            ep.map(|a| a.to_string()).unwrap_or_default(),
+                                            source,
+                                            m.label()
+                                        );
+                                        *ep = Some(source);
+                                        media_stats.note_endpoint_moved(Leg::Caller);
+                                        if let Some(ref mx) = metrics {
+                                            mx.note_endpoint_verdict(
+                                                Leg::Caller.label(),
+                                                "moved",
+                                                m.label(),
+                                            );
+                                        }
+                                    }
+                                    Verdict::Refuse(reason) => {
+                                        if let Some(ref mx) = metrics {
+                                            mx.note_endpoint_verdict(
+                                                Leg::Caller.label(),
+                                                "would-reject",
+                                                reason.label(),
+                                            );
+                                        }
+                                        if endpoint_policy.applies(verdict) {
+                                            // Observe mode: the old
+                                            // behaviour, only counted.
+                                            debug!(
+                                                "RTP A: endpoint moved to a foreign source {} (counted, not refused)",
+                                                source
+                                            );
+                                            *ep = Some(source);
+                                            media_stats.note_endpoint_moved(Leg::Caller);
+                                        }
+                                    }
                                 }
                             }
 
@@ -1237,6 +1313,14 @@ impl RtpSession {
 
                             // Same rule as leg A: an RTP-shaped datagram
                             // may move the endpoint, a stray byte may not.
+                            // The endpoint ladder needs the live stream's
+                            // SSRC and the leg's last activity *before* this
+                            // packet updates them.
+                            let live_ssrc = media_stats
+                                .leg(Leg::Callee)
+                                .ssrc
+                                .load(Ordering::Relaxed);
+                            let quiet_for = media_stats.quiet_for(Leg::Callee);
                             match classify_media_input(&data) {
                                 MediaInput::Rtp => media_stats.note_rx(Leg::Callee, &data),
                                 MediaInput::Passthrough => {}
@@ -1250,16 +1334,75 @@ impl RtpSession {
                                     continue;
                                 }
                             }
-                            if looks_like_rtp(&data) {
+                            {
                                 let mut ep = endpoint_b.lock().await;
-                                if ep.is_none() {
-                                    info!("RTP: learned callee (B) = {} on leg-B:{}", source, ports_b_rtp);
-                                    *ep = Some(source);
-                                    media_stats.note_endpoint_learned(Leg::Callee);
-                                } else if *ep != Some(source) {
-                                    info!("RTP: callee (B) address moved {} → {}", ep.unwrap(), source);
-                                    *ep = Some(source);
-                                    media_stats.note_endpoint_moved(Leg::Callee);
+                                // Where this peer's audio may come from
+                                // (media/endpoint.rs). Count-only for now:
+                                // a refusal is recorded, the audio still
+                                // follows the old behaviour.
+                                let verdict = endpoint_policy.observe(Observation {
+                                    latched: *ep,
+                                    signalled: signalled_b,
+                                    source,
+                                    plausible: looks_like_rtp(&data),
+                                    same_stream: live_ssrc != 0
+                                        && data.len() >= 12
+                                        && live_ssrc
+                                            == u32::from_be_bytes([
+                                                data[8], data[9], data[10], data[11],
+                                            ]),
+                                    latched_quiet_for: quiet_for,
+                                });
+                                match verdict {
+                                    Verdict::Latch(m) => {
+                                        info!("RTP: learned callee (B) = {} on leg-B:{}", source, ports_b_rtp);
+                                        *ep = Some(source);
+                                        media_stats.note_endpoint_learned(Leg::Callee);
+                                        if let Some(ref mx) = metrics {
+                                            mx.note_endpoint_verdict(
+                                                Leg::Callee.label(),
+                                                "latched",
+                                                m.label(),
+                                            );
+                                        }
+                                    }
+                                    Verdict::Keep => {}
+                                    Verdict::Move(m) => {
+                                        info!(
+                                            "RTP: callee (B) address moved {} → {} ({})",
+                                            ep.map(|a| a.to_string()).unwrap_or_default(),
+                                            source,
+                                            m.label()
+                                        );
+                                        *ep = Some(source);
+                                        media_stats.note_endpoint_moved(Leg::Callee);
+                                        if let Some(ref mx) = metrics {
+                                            mx.note_endpoint_verdict(
+                                                Leg::Callee.label(),
+                                                "moved",
+                                                m.label(),
+                                            );
+                                        }
+                                    }
+                                    Verdict::Refuse(reason) => {
+                                        if let Some(ref mx) = metrics {
+                                            mx.note_endpoint_verdict(
+                                                Leg::Callee.label(),
+                                                "would-reject",
+                                                reason.label(),
+                                            );
+                                        }
+                                        if endpoint_policy.applies(verdict) {
+                                            // Observe mode: the old
+                                            // behaviour, only counted.
+                                            debug!(
+                                                "RTP B: endpoint moved to a foreign source {} (counted, not refused)",
+                                                source
+                                            );
+                                            *ep = Some(source);
+                                            media_stats.note_endpoint_moved(Leg::Callee);
+                                        }
+                                    }
                                 }
                             }
 
@@ -1764,6 +1907,82 @@ mod tests {
         assert_eq!(classify_media_input(&dtls[..5]), MediaInput::Junk);
 
         assert_eq!(classify_media_input(&[]), MediaInput::Junk);
+    }
+
+    /// Every endpoint decision the relay makes reaches the counters: this
+    /// is the measurement that will say what the real trunk's media path
+    /// does before anything is enforced. (The ladder's own rules are unit
+    /// tested in `media/endpoint.rs`; on loopback every socket shares the
+    /// same host, so only the NAT-rebinding rung is reachable here.)
+    #[tokio::test]
+    async fn endpoint_decisions_reach_the_counters_through_the_relay() {
+        let ports_a = PortPair::new(10060).unwrap();
+        let ports_b = PortPair::new(10062).unwrap();
+        let mut session = RtpSession::new_two_leg("endpoint".to_string(), ports_a, ports_b)
+            .await
+            .unwrap();
+        let metrics = Arc::new(crate::metrics::SbcMetrics::new());
+        session.set_metrics(metrics.clone());
+        let stats = session.media_stats();
+
+        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Signalled: the caller's own address (as an SDP would say).
+        session.set_endpoint_a(caller.local_addr().unwrap());
+        session.set_endpoint_b(callee.local_addr().unwrap());
+        session.start().await.unwrap();
+
+        let packet = |ssrc: u32, seq: u16| {
+            let mut p = vec![0x80, 0x00];
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&0u32.to_be_bytes());
+            p.extend_from_slice(&ssrc.to_be_bytes());
+            p.extend_from_slice(&[0xd5u8; 160]);
+            p
+        };
+        let leg_a = format!("127.0.0.1:{}", ports_a.rtp);
+        let mut buf = [0u8; 2048];
+
+        // The real caller establishes the stream.
+        caller.send_to(&packet(1, 1), &leg_a).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            callee.recv_from(&mut buf),
+        )
+        .await
+        .expect("relayed")
+        .unwrap();
+
+        // A second socket on the same host (a NAT rebinding, as far as
+        // the ladder can tell on loopback) sends another stream.
+        stranger.send_to(&packet(9, 1), &leg_a).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            callee.recv_from(&mut buf),
+        )
+        .await
+        .expect("relayed too, in observe mode")
+        .unwrap();
+
+        let rendered = metrics.render_prometheus();
+        let endpoint_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("sbc_media_endpoint_events_total"))
+            .collect();
+        // The caller's own address was signalled and pre-set, so its first
+        // packet is a `Keep` (nothing to count); the stranger is the
+        // verdict that matters.
+        assert_eq!(
+            endpoint_lines,
+            vec![
+                "sbc_media_endpoint_events_total{leg=\"caller\",verdict=\"moved\",reason=\"same-host\"} 1"
+            ],
+            "the move and its reason are counted exactly once"
+        );
+        assert_eq!(stats.caller.endpoint_moved.load(Ordering::Relaxed), 1);
+        // And the real caller is still counted as the one sending.
+        assert_eq!(stats.caller.rx_packets.load(Ordering::Relaxed), 2);
     }
 
     /// Two peers, one relay: the per-leg counters must show what each side

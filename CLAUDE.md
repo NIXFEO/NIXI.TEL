@@ -113,6 +113,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `routing/{trunk,router}.rs` | TrunkConfig, LCR, `route_request_candidates()` for failover |
 | `media/rtp.rs` | Bidirectional RTP relay, STUN/DTLS demux, DTMF PT re-mapping, inactivity timeout |
 | `media/port_allocator.rs` | RTP/RTCP pairs: forward allocation from a cursor, 30 s quarantine before reuse (a new call must not inherit the previous peer's stray packets) |
+| `media/endpoint.rs` | Where a call's media may come from: a pure verdict ladder (signalled address, NAT rebinding, trunk sibling, same stream, quiet peer), count-only until the operator has the data |
 | `media/stats.rs` | Per-call, per-leg media counters (rx/tx packets and bytes, loss, SSRC changes, endpoint moves, drops by reason), the inactivity watchdog's monotonic clock and the one-way detector |
 | `media/{sdp,srtp_crypto,ice,dtls,stun}.rs` | SDP rewriting, SRTP, ICE, DTLS, STUN |
 | `transport/{udp,tcp,tls,ws}.rs` · `transport/tls_connect.rs` | Listeners + real outbound TLS |
