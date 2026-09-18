@@ -3648,24 +3648,46 @@ async fn the_trunks_answer_to_a_bye_stops_the_retransmissions() {
 /// a time, whatever the core count. So the ceiling on call setup is not
 /// the trunk or the codec, it is how long the loop is busy per message.
 /// This holds 200 answered calls at once — the 12-month target — and
-/// reports the cost of setting one up, of a dialog lookup with all 200
-/// live, and of tearing one down (media released, CDR written).
+/// reports what a call costs the loop.
 ///
-/// It prints the numbers (`cargo test -- --nocapture`) and fails only on a
-/// pathological regression, so it stays a measurement and not a
-/// flaky timing assertion.
+/// **What is measured**: the per-call state the B2BUA keeps, the media
+/// anchor, the answer and the ACK (`add_call` + `connect`), the parse of
+/// one INVITE off the wire, a dialog lookup with all 200 calls live, and
+/// the teardown (BYE relayed, media released, CDR written). **Not**
+/// measured: the INVITE handler's own routing, identity and topology work,
+/// which `add_call` sets up directly rather than driving — so read these
+/// as the cost of *carrying* a call, not of routing one.
+///
+/// It prints the numbers (`cargo test -- --nocapture`). Its assertions are
+/// deliberately not a benchmark gate: absolute wall-clock bounds flake on
+/// a loaded machine (a reviewer reproduced that under a 24× busy-loop),
+/// so the bounds are far away and the real guard is the **shape** check
+/// below — the last calls must not cost dramatically more than the first,
+/// which is what an accidental O(n²) or a lock held across an await would
+/// do.
 #[tokio::test]
 async fn two_hundred_calls_fit_in_the_event_loop() {
     const CALLS: usize = 200;
     // A two-leg call anchors a pair on each leg: two pairs, four ports.
     let mut sbc = SbcBuilder::new().media_pairs(CALLS as u16 * 2 + 8).build();
 
-    // ── Setup: INVITE state, media anchor, answer, ACK ──
+    // ── Setup: per-call state, media anchor, answer, ACK ──
+    // Timed in two halves: the first calls run against an almost empty
+    // map, the last against a full one. Their ratio is the shape.
+    const SAMPLE: usize = 20;
     let started = Instant::now();
     let mut calls = Vec::with_capacity(CALLS);
+    let mut first_sample = Duration::ZERO;
+    let mut last_sample = Duration::ZERO;
     for i in 0..CALLS {
+        let at = Instant::now();
         let mut call = add_call(&mut sbc, CallSpec::numbered(i)).await;
         connect(&mut sbc, &mut call).await;
+        if i < SAMPLE {
+            first_sample += at.elapsed();
+        } else if i >= CALLS - SAMPLE {
+            last_sample += at.elapsed();
+        }
         calls.push(call);
     }
     let per_setup = started.elapsed() / CALLS as u32;
@@ -3760,34 +3782,54 @@ async fn two_hundred_calls_fit_in_the_event_loop() {
         1e6 / (5.0 * parse_us + setup_us + teardown_us)
     );
 
-    // A debug build is several times slower than a release one, so the
-    // bar is deliberately far away: it catches an accidental O(n²) or a
-    // lock held across an await, not a slow laptop.
+    // The real guard: cost must not grow with the number of live calls.
+    // A quadratic path or a lock held across an await shows up here as a
+    // ratio in the tens or hundreds, whatever else the machine is doing,
+    // because both halves are measured under the same conditions.
+    let ratio = last_sample.as_secs_f64() / first_sample.as_secs_f64().max(1e-9);
+    println!(
+        "setup cost, last {} calls vs first {}: x{:.2}",
+        SAMPLE, SAMPLE, ratio
+    );
     assert!(
-        per_setup < Duration::from_millis(5),
+        ratio < 8.0,
+        "setting up a call with {} already live costs {:.1}x what it costs with none \
+         ({:?} vs {:?} for {} calls): something in the path is not constant-time",
+        CALLS,
+        ratio,
+        last_sample,
+        first_sample,
+        SAMPLE
+    );
+
+    // Absolute bounds, only to catch a change of order of magnitude: a
+    // debug build on a loaded machine is easily 20x a quiet release one,
+    // so these are far away on purpose.
+    assert!(
+        per_setup < Duration::from_millis(100),
         "call setup costs {:?} with {} live calls",
         per_setup,
         CALLS
     );
     assert!(
-        per_lookup < Duration::from_micros(500),
+        per_lookup < Duration::from_millis(5),
         "a dialog lookup costs {:?} with {} calls in the map",
         per_lookup,
         CALLS
     );
     assert!(
-        per_miss < Duration::from_micros(500),
+        per_miss < Duration::from_millis(5),
         "a missed dialog lookup costs {:?} with {} calls in the map",
         per_miss,
         CALLS
     );
     assert!(
-        per_teardown < Duration::from_millis(5),
+        per_teardown < Duration::from_millis(100),
         "teardown costs {:?}",
         per_teardown
     );
     assert!(
-        per_parse < Duration::from_millis(1),
+        per_parse < Duration::from_millis(10),
         "parsing one INVITE costs {:?}",
         per_parse
     );

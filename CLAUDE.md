@@ -312,9 +312,15 @@ The SIP side, with **200 answered calls live at once** (release build):
 | Control-plane step | Cost |
 |---|---|
 | Parse one INVITE with SDP off the wire | 2 µs |
-| Set a call up (INVITE state, media anchor, 200 OK, ACK) | 100-140 µs |
-| Tear it down (BYE relayed, media released, CDR written) | 26-32 µs |
+| Carry a call: per-call state, media anchor, 200 OK, ACK | 100-140 µs |
+| Tear it down (BYE relayed, media released, CDR written) | 25-32 µs |
 | Resolve the dialog of one message (linear scan of 200 calls) | 0.4-1.2 µs |
+
+The setup figure is what a call costs the loop *once routed*: the harness
+builds the call state directly, so `invite_handler`'s own routing, identity
+and topology work is not in it. The test's guard is the ratio between the
+last 20 setups and the first 20 (0.4 measured, i.e. no growth), not the
+wall-clock, which flakes on a loaded machine.
 
 
 A G.711 trunk ↔ Opus client call costs about 4.8 ms of CPU per second

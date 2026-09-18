@@ -19,7 +19,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
 use crate::transport::udp::ReceivedMessage;
-use crate::transport::{frame_sip_message, is_keepalive};
+use crate::transport::{frame_sip_message, Framing};
 use crate::{Error, Result};
 
 /// Per-destination TLS parameters (from trunk config).
@@ -47,6 +47,12 @@ impl TlsClientParams {
 pub struct TlsClientConnection {
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     peer: SocketAddr,
+    /// Set by the reader on EOF or read error, and by the writer on a
+    /// write error. Without it `is_closed()` only reported a *writer task*
+    /// that had exited, which a peer-initiated close never causes: the
+    /// pool then handed the dead connection out again and `send` returned
+    /// `Ok(())` for bytes the socket had already discarded.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TlsClientConnection {
@@ -98,9 +104,11 @@ impl TlsClientConnection {
 
         let (mut read_half, mut write_half) = tokio::io::split(stream);
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Writer task: serialize all sends onto the connection.
         let peer = dest;
+        let closed_writer = closed.clone();
         tokio::spawn(async move {
             while let Some(data) = write_rx.recv().await {
                 if let Err(e) = write_half.write_all(&data).await {
@@ -109,10 +117,12 @@ impl TlsClientConnection {
                 }
                 let _ = write_half.flush().await;
             }
+            closed_writer.store(true, std::sync::atomic::Ordering::Relaxed);
         });
 
         // Reader task: Content-Length framing → SBC pipeline.
         let reply_tx_for_reader = write_tx.clone();
+        let closed_reader = closed.clone();
         tokio::spawn(async move {
             let mut buffer: Vec<u8> = Vec::with_capacity(8192);
             let mut chunk = [0u8; 8192];
@@ -124,27 +134,42 @@ impl TlsClientConnection {
                     }
                     Ok(n) => {
                         buffer.extend_from_slice(&chunk[..n]);
-                        while let Some((msg_end, remaining_start)) = frame_sip_message(&buffer) {
-                            let raw = buffer[..msg_end].to_vec();
-                            buffer.drain(..remaining_start);
-                            if is_keepalive(&raw) {
-                                continue;
-                            }
-                            match rsip::SipMessage::try_from(raw) {
-                                Ok(message) => {
-                                    let _ = message_tx.send(ReceivedMessage {
-                                        message,
-                                        source: peer,
-                                        transport: rsip::Transport::Tls,
-                                        reply_tx: Some(reply_tx_for_reader.clone()),
-                                    });
+                        let mut closing = None;
+                        loop {
+                            match frame_sip_message(&buffer) {
+                                Framing::Keepalive { count } => {
+                                    buffer.drain(..count);
                                 }
-                                Err(e) => warn!("TLS: unparseable SIP from {}: {}", peer, e),
+                                Framing::Message { end } => {
+                                    let raw = buffer[..end].to_vec();
+                                    buffer.drain(..end);
+                                    match rsip::SipMessage::try_from(raw) {
+                                        Ok(message) => {
+                                            let _ = message_tx.send(ReceivedMessage {
+                                                message,
+                                                source: peer,
+                                                transport: rsip::Transport::Tls,
+                                                reply_tx: Some(reply_tx_for_reader.clone()),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            warn!("TLS: unparseable SIP from {}: {}", peer, e)
+                                        }
+                                    }
+                                }
+                                Framing::Incomplete => break,
+                                Framing::Malformed(why) => {
+                                    closing = Some(why);
+                                    break;
+                                }
                             }
                         }
-                        if buffer.len() > 256 * 1024 {
-                            warn!("TLS read buffer overflow from {}, resetting", peer);
-                            buffer.clear();
+                        if let Some(why) = closing {
+                            warn!(
+                                "Outbound TLS to {} closed: unframeable stream ({})",
+                                peer, why
+                            );
+                            break;
                         }
                     }
                     Err(e) => {
@@ -153,11 +178,15 @@ impl TlsClientConnection {
                     }
                 }
             }
+            // The peer is gone (EOF, read error, or an unframeable
+            // stream): the pool must not hand this connection out again.
+            closed_reader.store(true, std::sync::atomic::Ordering::Relaxed);
         });
 
         Ok(Arc::new(Self {
             write_tx,
             peer: dest,
+            closed,
         }))
     }
 
@@ -168,7 +197,7 @@ impl TlsClientConnection {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.write_tx.is_closed()
+        self.closed.load(std::sync::atomic::Ordering::Relaxed) || self.write_tx.is_closed()
     }
 }
 
@@ -292,30 +321,6 @@ pub(crate) mod danger {
                 SignatureScheme::RSA_PSS_SHA512,
             ]
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn framing_complete_and_partial() {
-        let msg = b"SIP/2.0 200 OK\r\nContent-Length: 4\r\n\r\nbody";
-        assert_eq!(frame_sip_message(msg), Some((msg.len(), msg.len())));
-
-        let partial = b"SIP/2.0 200 OK\r\nContent-Length: 10\r\n\r\nbo";
-        assert_eq!(frame_sip_message(partial), None);
-
-        let no_headers = b"SIP/2.0 200";
-        assert_eq!(frame_sip_message(no_headers), None);
-
-        // Two pipelined messages: first is framed, remainder untouched
-        let two = b"OPTIONS sip:x SIP/2.0\r\nContent-Length: 0\r\n\r\nBYE sip:y SIP/2.0\r\n";
-        let (end, _) = frame_sip_message(two).unwrap();
-        assert!(std::str::from_utf8(&two[..end])
-            .unwrap()
-            .starts_with("OPTIONS"));
     }
 }
 

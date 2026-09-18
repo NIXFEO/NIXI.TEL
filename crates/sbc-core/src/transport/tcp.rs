@@ -4,6 +4,7 @@
 //! Supports connection pooling and proper stream parsing.
 
 use crate::transport::udp::ReceivedMessage;
+use crate::transport::Framing;
 use crate::{Error, Result};
 use rsip::SipMessage;
 use std::net::SocketAddr;
@@ -12,9 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-/// Maximum size for a single SIP message over TCP
-const MAX_MESSAGE_SIZE: usize = 65535;
 
 /// TCP listener for SIP messages
 pub struct TcpListenerServer {
@@ -121,112 +119,48 @@ impl TcpListenerServer {
             // Append to buffer
             buffer.extend_from_slice(&chunk[..n]);
 
-            // Try to extract complete SIP messages
-            while let Some((message, remaining)) = Self::extract_message(&buffer)? {
-                // Skip pure CRLF keepalives (RFC 5626 §4.4.1)
-                let trimmed = message
-                    .iter()
-                    .filter(|&&b| b != b'\r' && b != b'\n')
-                    .count();
-                if trimmed == 0 {
-                    buffer = remaining.to_vec();
-                    continue;
-                }
-
-                // Parse and send the message with the reply channel
-                match Self::parse_sip_message_with_reply(message, peer_addr, reply_tx.clone()) {
-                    Ok(received_msg) => {
-                        if let Err(e) = message_tx.send(received_msg) {
-                            error!("Failed to send message to handler: {}", e);
-                            return Ok(()); // Channel closed
+            // Frame every complete message in the buffer. Each arm either
+            // consumes bytes or leaves the loop: this runs inside the
+            // per-connection task, *before* the ban/ACL/DoS pipeline, so a
+            // framing result that consumed nothing used to pin a core on
+            // one unauthenticated connection with nothing able to stop it.
+            loop {
+                match crate::transport::frame_sip_message(&buffer) {
+                    Framing::Keepalive { count } => {
+                        buffer.drain(..count);
+                    }
+                    Framing::Message { end } => {
+                        let message = buffer[..end].to_vec();
+                        buffer.drain(..end);
+                        match Self::parse_sip_message_with_reply(
+                            &message,
+                            peer_addr,
+                            reply_tx.clone(),
+                        ) {
+                            Ok(received_msg) => {
+                                if let Err(e) = message_tx.send(received_msg) {
+                                    error!("Failed to send message to handler: {}", e);
+                                    return Ok(()); // Channel closed
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse SIP message from {}: {}", peer_addr, e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to parse SIP message from {}: {}", peer_addr, e);
+                    Framing::Incomplete => break,
+                    Framing::Malformed(why) => {
+                        warn!(
+                            "TCP connection from {} closed: unframeable stream ({})",
+                            peer_addr, why
+                        );
+                        return Ok(());
                     }
                 }
-
-                // Update buffer with remaining data
-                buffer = remaining.to_vec();
-            }
-
-            // Prevent buffer from growing indefinitely
-            if buffer.len() > MAX_MESSAGE_SIZE {
-                warn!(
-                    "Buffer overflow for TCP connection from {}, resetting",
-                    peer_addr
-                );
-                buffer.clear();
             }
         }
 
         Ok(())
-    }
-
-    /// Extract a complete SIP message from the buffer
-    /// Returns (message, remaining_data) if a complete message is found
-    fn extract_message(buffer: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        // SIP messages are separated by \r\n\r\n between headers and body
-        // We need to find Content-Length to know where the message ends
-
-        // Find end of headers
-        let header_end = if let Some(pos) = Self::find_subsequence(buffer, b"\r\n\r\n") {
-            pos
-        } else {
-            // No complete headers yet
-            return Ok(None);
-        };
-
-        // Extract headers
-        let headers = &buffer[..header_end];
-
-        // Parse Content-Length
-        let content_length = Self::parse_content_length(headers)?;
-
-        // Calculate total message size
-        let message_end = header_end + 4 + content_length; // +4 for \r\n\r\n
-
-        if buffer.len() >= message_end {
-            // We have a complete message
-            Ok(Some((&buffer[..message_end], &buffer[message_end..])))
-        } else {
-            // Waiting for more data
-            Ok(None)
-        }
-    }
-
-    /// Find a subsequence in a byte slice
-    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-    }
-
-    /// Parse Content-Length header from SIP headers
-    fn parse_content_length(headers: &[u8]) -> Result<usize> {
-        let headers_str = std::str::from_utf8(headers)
-            .map_err(|e| Error::Parse(format!("Invalid UTF-8 in headers: {}", e)))?;
-
-        // Look for Content-Length header (case-insensitive)
-        for line in headers_str.lines() {
-            let line_lower = line.to_lowercase();
-            if line_lower.starts_with("content-length:") || line_lower.starts_with("l:")
-            // Compact form
-            {
-                let value = line
-                    .split(':')
-                    .nth(1)
-                    .ok_or_else(|| Error::Parse("Invalid Content-Length header".to_string()))?
-                    .trim();
-
-                return value
-                    .parse::<usize>()
-                    .map_err(|e| Error::Parse(format!("Failed to parse Content-Length: {}", e)));
-            }
-        }
-
-        // No Content-Length header, assume 0
-        Ok(0)
     }
 
     /// Parse SIP message from raw bytes (with reply channel for responses)
@@ -360,31 +294,44 @@ impl TcpConnection {
                     }
                     Ok(n) => {
                         buffer.extend_from_slice(&chunk[..n]);
-                        while let Some((msg_end, remaining_start)) =
-                            crate::transport::frame_sip_message(&buffer)
-                        {
-                            let raw = buffer[..msg_end].to_vec();
-                            buffer.drain(..remaining_start);
-                            if crate::transport::is_keepalive(&raw) {
-                                continue;
-                            }
-                            match rsip::SipMessage::try_from(raw) {
-                                Ok(message) => {
-                                    let _ = message_tx.send(ReceivedMessage {
-                                        message,
-                                        source: dest,
-                                        transport: rsip::Transport::Tcp,
-                                        reply_tx: Some(reply_tx.clone()),
-                                    });
+                        // Every arm consumes bytes or leaves the loop, so
+                        // no framing result can spin this task.
+                        let mut closing = None;
+                        loop {
+                            match crate::transport::frame_sip_message(&buffer) {
+                                Framing::Keepalive { count } => {
+                                    buffer.drain(..count);
                                 }
-                                Err(e) => {
-                                    warn!("TCP: unparseable SIP from {}: {}", dest, e)
+                                Framing::Message { end } => {
+                                    let raw = buffer[..end].to_vec();
+                                    buffer.drain(..end);
+                                    match rsip::SipMessage::try_from(raw) {
+                                        Ok(message) => {
+                                            let _ = message_tx.send(ReceivedMessage {
+                                                message,
+                                                source: dest,
+                                                transport: rsip::Transport::Tcp,
+                                                reply_tx: Some(reply_tx.clone()),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            warn!("TCP: unparseable SIP from {}: {}", dest, e)
+                                        }
+                                    }
+                                }
+                                Framing::Incomplete => break,
+                                Framing::Malformed(why) => {
+                                    closing = Some(why);
+                                    break;
                                 }
                             }
                         }
-                        if buffer.len() > MAX_MESSAGE_SIZE {
-                            warn!("TCP read buffer overflow from {}, resetting", dest);
-                            buffer.clear();
+                        if let Some(why) = closing {
+                            warn!(
+                                "Outbound TCP to {} closed: unframeable stream ({})",
+                                dest, why
+                            );
+                            break;
                         }
                     }
                     Err(e) => {
@@ -404,21 +351,40 @@ impl TcpConnection {
     }
 
     /// Send a SIP message on this connection.
+    ///
+    /// Bounded, like the connect: the SIP event loop awaits this inline,
+    /// so a peer that advertises a zero receive window and never drains
+    /// it would otherwise park the whole SBC in `write_all` for ever. The
+    /// elapsed case is a transport error, which makes `send_tcp` evict the
+    /// connection and the caller fail over.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         debug!("Sending {} bytes to {} via TCP", data.len(), self.peer_addr);
 
-        let mut writer = self.writer.lock().await;
-        writer
-            .write_all(data)
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to write to TCP stream: {}", e)))?;
-
-        writer
-            .flush()
-            .await
-            .map_err(|e| Error::Transport(format!("Failed to flush TCP stream: {}", e)))?;
-
-        Ok(())
+        let peer = self.peer_addr;
+        let write = async {
+            let mut writer = self.writer.lock().await;
+            writer
+                .write_all(data)
+                .await
+                .map_err(|e| Error::Transport(format!("Failed to write to TCP stream: {}", e)))?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| Error::Transport(format!("Failed to flush TCP stream: {}", e)))?;
+            Ok(())
+        };
+        match tokio::time::timeout(crate::transport::OUTBOUND_WRITE_TIMEOUT, write).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.closed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(Error::Transport(format!(
+                    "TCP write to {} timed out after {:?}",
+                    peer,
+                    crate::transport::OUTBOUND_WRITE_TIMEOUT
+                )))
+            }
+        }
     }
 
     /// Whether the peer has closed the connection (or the read failed):
@@ -429,72 +395,6 @@ impl TcpConnection {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_find_subsequence() {
-        let haystack = b"Hello\r\n\r\nWorld";
-        let needle = b"\r\n\r\n";
-        assert_eq!(
-            TcpListenerServer::find_subsequence(haystack, needle),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn test_parse_content_length() {
-        let headers = b"Via: SIP/2.0/TCP example.com\r\nContent-Length: 142\r\n";
-        assert_eq!(
-            TcpListenerServer::parse_content_length(headers).unwrap(),
-            142
-        );
-    }
-
-    #[test]
-    fn test_parse_content_length_compact() {
-        let headers = b"Via: SIP/2.0/TCP example.com\r\nl: 50\r\n";
-        assert_eq!(
-            TcpListenerServer::parse_content_length(headers).unwrap(),
-            50
-        );
-    }
-
-    #[test]
-    fn test_parse_content_length_missing() {
-        let headers = b"Via: SIP/2.0/TCP example.com\r\n";
-        assert_eq!(TcpListenerServer::parse_content_length(headers).unwrap(), 0);
-    }
-
-    #[test]
-    fn test_extract_message_complete() {
-        let buffer = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 0\r\n\r\n";
-        let result = TcpListenerServer::extract_message(buffer).unwrap();
-        assert!(result.is_some());
-        let (msg, remaining) = result.unwrap();
-        assert_eq!(msg.len(), buffer.len());
-        assert_eq!(remaining.len(), 0);
-    }
-
-    #[test]
-    fn test_extract_message_incomplete() {
-        let buffer = b"INVITE sip:bob@example.com SIP/2.0\r\n";
-        let result = TcpListenerServer::extract_message(buffer).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_message_with_body() {
-        let buffer = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 5\r\n\r\nHello";
-        let result = TcpListenerServer::extract_message(buffer).unwrap();
-        assert!(result.is_some());
-        let (msg, remaining) = result.unwrap();
-        assert_eq!(msg.len(), buffer.len());
-        assert_eq!(remaining.len(), 0);
     }
 }
 
@@ -619,5 +519,84 @@ mod outbound_reader_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the reader never noticed the peer closing");
+    }
+}
+
+#[cfg(test)]
+mod listener_hardening_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+
+    /// The critical one. `header_end + 4 + content_length` was unchecked
+    /// arithmetic on a peer-controlled value, so a `Content-Length` of
+    /// `2^64 - 4 - header_end` wrapped the message end to zero: the
+    /// listener framed an empty message, consumed nothing, and re-framed
+    /// it for ever without ever awaiting. That loop runs in the
+    /// per-connection task, **before** the ban, ACL and DoS gates, so one
+    /// unauthenticated connection pinned a core with nothing able to see
+    /// or stop it, and two saturated the production box.
+    ///
+    /// The observable fix: the connection is closed instead. Before it,
+    /// this test hangs at 100% of a core.
+    #[tokio::test]
+    async fn a_crafted_content_length_closes_the_connection_instead_of_spinning() {
+        let listener = TcpListenerServer::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _ = listener.listen(tx).await;
+        });
+
+        let mut peer = TcpStream::connect(addr).await.expect("connect");
+        peer.write_all(b"SIP/2.0 200 OK\r\nP: \r\nl: 18446744073709551568\r\n\r\n")
+            .await
+            .expect("write");
+
+        // EOF, quickly: the listener refuses to resynchronise a stream it
+        // cannot frame.
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut buf))
+            .await
+            .expect("the listener neither answered nor closed: it is spinning")
+            .expect("read");
+        assert_eq!(n, 0, "the connection is closed, not answered");
+    }
+
+    /// A legitimate message on the same path still gets through, and a
+    /// single CRLF keepalive in front of it does not eat it (RFC 3261
+    /// §7.5).
+    #[tokio::test]
+    async fn a_keepalive_then_a_real_message_both_arrive() {
+        let listener = TcpListenerServer::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _ = listener.listen(tx).await;
+        });
+
+        let mut peer = TcpStream::connect(addr).await.expect("connect");
+        peer.write_all(
+            b"\r\nOPTIONS sip:sbc@127.0.0.1 SIP/2.0\r\n\
+              Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKopt\r\n\
+              From: <sip:a@x>;tag=1\r\nTo: <sip:b@y>\r\n\
+              Call-ID: framing-1\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .expect("write");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the message reached the pipeline")
+            .expect("channel open");
+        assert_eq!(received.transport, rsip::Transport::Tcp);
+        match received.message {
+            SipMessage::Request(r) => assert_eq!(r.method, rsip::Method::Options),
+            other => panic!("expected an OPTIONS request, got {:?}", other),
+        }
     }
 }

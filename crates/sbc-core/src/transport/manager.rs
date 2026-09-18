@@ -453,11 +453,15 @@ mod outbound_pool_tests {
     use crate::transport::tls_connect::TlsClientParams;
     use tokio::net::TcpListener;
 
+    /// A destination that stops listening must not leave a pool entry
+    /// behind. The peer here accepts once and stops, so the retry's
+    /// reconnect fails — which is the path this test actually covers; the
+    /// write-failure eviction is covered by
+    /// `a_send_failure_never_leaves_the_connection_in_the_pool` below.
     #[tokio::test]
-    async fn send_tcp_drops_a_dead_connection_from_the_pool() {
+    async fn a_destination_that_stopped_listening_leaves_no_pool_entry() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dest = listener.local_addr().unwrap();
-        // The peer accepts and closes immediately: the pooled connection is dead.
         tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             drop(sock);
@@ -480,77 +484,55 @@ mod outbound_pool_tests {
                 }
             }
         }
-        assert!(failed, "writing to a peer that closed must eventually fail");
+        assert!(failed, "a peer that stopped listening must fail a send");
         assert!(
             !tm.tcp_connections.contains_key(&dest),
-            "the dead connection is evicted from the pool"
+            "no entry for a destination we cannot reach"
         );
     }
 
-    /// A peer that closed one connection and still listens must get a
-    /// fresh one — and the replacement must not deadlock on the pool's
-    /// own shard lock, which is why the lookup is scoped. A deadlock here
-    /// would hang the whole SIP event loop, so the send is time-boxed.
+    /// The eviction inside `send_tcp`'s error branch: a send that fails
+    /// on a pooled connection must take that connection out of the pool,
+    /// so the next call reconnects instead of writing into a dead socket
+    /// until restart.
+    ///
+    /// The peer accepts, reads once and drops the socket. The sends
+    /// follow each other with no pause, so the reader has not yet
+    /// condemned the connection and `send_tcp` takes the *reuse* path —
+    /// which is the branch under test, rather than the reconnect one.
     #[tokio::test]
-    async fn a_closed_pooled_connection_is_replaced_by_a_fresh_one() {
+    async fn a_send_failure_never_leaves_the_connection_in_the_pool() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dest = listener.local_addr().unwrap();
-        // Accepts for ever; the first connection is dropped at once, later
-        // ones are kept open.
         tokio::spawn(async move {
-            let mut kept = Vec::new();
-            let mut first = true;
-            while let Ok((sock, _)) = listener.accept().await {
-                if first {
-                    first = false;
-                    drop(sock);
-                } else {
-                    kept.push(sock);
-                }
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                use tokio::io::AsyncReadExt;
+                let _ = sock.read(&mut buf).await;
+                // Dropped with data still unread by us: the kernel sends
+                // a reset, so our next write on it fails.
+                drop(sock);
             }
         });
 
         let tm = TransportManager::new();
         let probe = b"OPTIONS sip:probe SIP/2.0\r\nContent-Length: 0\r\n\r\n";
-        tm.send_tcp(probe, dest).await.expect("first connection");
-        // A live clone, not a raw pointer: once the pool drops the old
-        // connection the allocator may hand its address straight back.
-        let first_conn = tm
-            .tcp_connections
-            .get(&dest)
-            .map(|c| c.clone())
-            .expect("pooled");
-
-        // Wait for the reader to notice the close.
-        let mut saw_closed = false;
-        for _ in 0..100 {
-            let closed = tm
-                .tcp_connections
-                .get(&dest)
-                .map(|c| c.is_closed())
-                .unwrap_or(false);
-            if closed {
-                saw_closed = true;
+        let mut saw_failure = false;
+        // No sleeps: a reset arrives within a few writes on loopback.
+        for _ in 0..200 {
+            if tm.send_tcp(probe, dest).await.is_err() {
+                assert!(
+                    !tm.tcp_connections.contains_key(&dest),
+                    "a failed send left its connection in the pool"
+                );
+                saw_failure = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(saw_closed, "the reader never saw the peer close");
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), tm.send_tcp(probe, dest))
-            .await
-            .expect("replacing a closed pooled connection must not block")
-            .expect("reconnect");
-        let second_conn = tm
-            .tcp_connections
-            .get(&dest)
-            .map(|c| c.clone())
-            .expect("pooled again");
         assert!(
-            !Arc::ptr_eq(&first_conn, &second_conn),
-            "the pool handed out a new connection"
+            saw_failure,
+            "a peer that resets every connection must eventually fail a send"
         );
-        assert!(first_conn.is_closed() && !second_conn.is_closed());
     }
 
     #[test]

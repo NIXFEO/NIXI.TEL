@@ -133,6 +133,55 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 
 ### Fixed
 
+Lot 5 / 4b review. The diff of the ten commits above was reviewed
+adversarially the same way lots 3 and 4 were: six reviewers by dimension
+against a pinned worktree, then three skeptics per finding, majority
+keeping it. 50 findings raised, 22 survived, and these are the fixes.
+Two were critical, both in the work that had just been written.
+
+- **The DTLS fingerprint check refused every WebRTC call.** A DTLS server
+  only receives the client's certificate if it asks for one, and the
+  handshake configuration left `client_auth` at its default
+  (`NoClientCert`). A browser offers `a=setup:actpass`, which makes the
+  SBC the server, so `peer_certificates` came back empty and the brand-new
+  check failed the handshake — the guard killing exactly what it was
+  written to protect, with no test catching it because the new tests call
+  the checker directly. `RequireAnyClientCert` now asks for the
+  certificate without validating a chain (RFC 5763 §6.6), and a test pins
+  it for all three roles.
+- **A crafted `Content-Length` pinned a core on an unauthenticated TCP
+  connection.** `header_end + 4 + content_length` was unchecked `usize`
+  arithmetic on a peer-controlled value: `2^64 - 4 - header_end` wrapped
+  the message end to zero, so the reader framed an empty message,
+  consumed nothing, and re-framed it for ever without awaiting. On the
+  **inbound** listener that loop runs before the ban, ACL and DoS gates,
+  so one connection was enough per core and nothing could see it. The
+  framing is now a single hardened function shared by both listeners and
+  both outbound readers, returning either bytes to consume or a reason to
+  close the connection — a shape in which no framing result can fail to
+  make progress. It also restores the leading-CRLF skip (RFC 3261 §7.5)
+  that the shared version had dropped, so a softphone keepalive no longer
+  swallows the message behind it.
+- An outbound TCP write is now bounded like the connect is: it was
+  awaited inline in the SIP event loop with no timeout, so a peer that
+  advertised a zero receive window and never drained it would park every
+  call on the box.
+- An outbound **TLS** connection now knows when its peer has closed.
+  `is_closed()` only reported a writer task that had exited, which a
+  peer-initiated close never causes, so the pool handed the dead
+  connection out again and `send` returned success for bytes the socket
+  had already discarded. The TCP half of this diff had the flag; TLS was
+  left without it.
+- The control-plane measurement says what it measures. It reported the
+  cost of "setting a call up" while the harness builds the call state
+  directly, leaving `invite_handler`'s routing out of the figure; and its
+  wall-clock thresholds flaked under load (a reviewer reproduced it under
+  a 24× busy-loop). It now states the scope, and its guard is the ratio
+  between the last twenty setups and the first twenty, which catches a
+  quadratic path whatever else the machine is doing.
+- The pool test that claimed to cover eviction after a failed send only
+  covered a failed reconnect. Both paths are covered now.
+
 Lot 4 (media). The items were specified against the code, the specs were
 adversarially reviewed, and the resulting diff was reviewed again: that
 second pass found 28 real defects in this very work, including two that

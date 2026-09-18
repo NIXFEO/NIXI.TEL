@@ -259,9 +259,7 @@ impl DtlsContext {
     ///
     /// After handshake completes, SRTP keying material is exported.
     pub async fn perform_handshake(&self, bridge: Arc<DtlsUdpBridge>) -> Result<()> {
-        use webrtc_dtls::config::Config;
         use webrtc_dtls::conn::DTLSConn;
-        use webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile;
         use webrtc_util::KeyingMaterialExporter;
 
         let is_client = self.role == DtlsRole::Active;
@@ -273,12 +271,7 @@ impl DtlsContext {
         // CRITICAL: Use the SAME certificate that was used to compute the SDP fingerprint.
         // If we generate a new cert here, the browser sees a different fingerprint during
         // DTLS and sends a fatal alert, killing the connection.
-        let config = Config {
-            certificates: vec![self.dtls_certificate.clone()],
-            srtp_protection_profiles: vec![SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80],
-            insecure_skip_verify: true, // We verify fingerprint via SDP, not via X.509 chain
-            ..Default::default()
-        };
+        let config = Self::handshake_config(self.dtls_certificate.clone());
 
         // Perform handshake (with timeout)
         let dtls_conn = tokio::time::timeout(
@@ -339,6 +332,36 @@ impl DtlsContext {
         *self.handshake_complete.lock().await = true;
 
         Ok(())
+    }
+
+    /// The DTLS configuration both roles use.
+    ///
+    /// `client_auth` is **not** the default. A DTLS server that does not
+    /// send a CertificateRequest gets no certificate from its client, and
+    /// `peer_certificates` comes back empty — which, with the fingerprint
+    /// check below, would fail every handshake where the SBC is the
+    /// server. That is the normal case: a browser offers `a=setup:actpass`
+    /// and `sbc_dtls_role` makes the SBC passive. RFC 5763 §5 requires the
+    /// request for exactly this reason: in DTLS-SRTP both ends
+    /// authenticate by certificate, so both must present one.
+    ///
+    /// `RequireAnyClientCert` asks for the certificate without trying to
+    /// validate a chain: the certificate is self-signed and the SDP
+    /// fingerprint is what authenticates it (`verify_peer_certificate`).
+    fn handshake_config(
+        certificate: webrtc_dtls::crypto::Certificate,
+    ) -> webrtc_dtls::config::Config {
+        use webrtc_dtls::config::{ClientAuthType, Config};
+        use webrtc_dtls::extension::extension_use_srtp::SrtpProtectionProfile;
+        Config {
+            certificates: vec![certificate],
+            srtp_protection_profiles: vec![SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80],
+            // The X.509 chain says nothing about a self-signed peer; the
+            // fingerprint does.
+            insecure_skip_verify: true,
+            client_auth: ClientAuthType::RequireAnyClientCert,
+            ..Default::default()
+        }
     }
 
     /// The peer's certificate must hash to the fingerprint the SDP named.
@@ -812,5 +835,34 @@ mod peer_verification_tests {
             .expect("the offer's fingerprint reached the DTLS context");
         assert_eq!(fp.algorithm, "sha-256");
         assert!(fp.fingerprint.starts_with("11:22:33:44"));
+    }
+}
+
+#[cfg(test)]
+mod handshake_config_tests {
+    use super::*;
+    use webrtc_dtls::config::ClientAuthType;
+
+    /// A DTLS server that sends no CertificateRequest gets no certificate
+    /// from its client, so `peer_certificates` comes back empty and the
+    /// fingerprint check refuses the session. That is the normal WebRTC
+    /// case (a browser offers `a=setup:actpass`, so the SBC is passive),
+    /// which means the default `client_auth` would have failed **every**
+    /// WebRTC call — the check breaking the thing it protects.
+    #[tokio::test]
+    async fn the_server_role_asks_the_peer_for_its_certificate() {
+        for role in [DtlsRole::Passive, DtlsRole::ActPass, DtlsRole::Active] {
+            let ctx = DtlsContext::new(role).unwrap();
+            let config = DtlsContext::handshake_config(ctx.dtls_certificate.clone());
+            assert!(
+                matches!(config.client_auth, ClientAuthType::RequireAnyClientCert),
+                "role {:?} must request the peer's certificate",
+                role
+            );
+            // Requested, but not chain-validated: the certificate is
+            // self-signed and the SDP fingerprint is the authenticator.
+            assert!(config.insecure_skip_verify);
+            assert_eq!(config.certificates.len(), 1, "our own certificate is sent");
+        }
     }
 }

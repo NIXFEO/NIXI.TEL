@@ -3,6 +3,7 @@
 //! Handles SIP message reception and transmission over TLS (SIPS).
 
 use crate::transport::udp::ReceivedMessage;
+use crate::transport::Framing;
 use crate::{Error, Result};
 use rsip::SipMessage;
 use std::net::SocketAddr;
@@ -12,9 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-/// Maximum size for a single SIP message over TLS
-const MAX_MESSAGE_SIZE: usize = 65535;
 
 /// TLS listener for SIP messages
 pub struct TlsListenerServer {
@@ -144,126 +142,50 @@ impl TlsListenerServer {
             // Append to buffer
             buffer.extend_from_slice(&chunk[..n]);
 
-            // Try to extract complete SIP messages
-            while let Some((message, remaining)) = Self::extract_message(&buffer)? {
-                // Skip pure CRLF keepalives (RFC 5626 §4.4.1)
-                let trimmed = message
-                    .iter()
-                    .filter(|&&b| b != b'\r' && b != b'\n')
-                    .count();
-                if trimmed == 0 {
-                    buffer = remaining.to_vec();
-                    continue;
-                }
-
-                // Log first line for diagnostics
-                if let Ok(text) = std::str::from_utf8(message) {
-                    let first_line = text.lines().next().unwrap_or("(empty)");
-                    debug!("TLS message from {}: {}", peer_addr, first_line);
-                }
-
-                // Parse and send the message with the reply channel
-                match Self::parse_sip_message_with_reply(message, peer_addr, reply_tx.clone()) {
-                    Ok(received_msg) => {
-                        if let Err(e) = message_tx.send(received_msg) {
-                            error!("Failed to send message to handler: {}", e);
-                            return Ok(()); // Channel closed
+            // One hardened framer for both listeners and both outbound
+            // readers: each arm consumes bytes or leaves the loop, so a
+            // crafted Content-Length cannot pin this task.
+            loop {
+                match crate::transport::frame_sip_message(&buffer) {
+                    Framing::Keepalive { count } => {
+                        buffer.drain(..count);
+                    }
+                    Framing::Message { end } => {
+                        let message = buffer[..end].to_vec();
+                        buffer.drain(..end);
+                        if let Ok(text) = std::str::from_utf8(&message) {
+                            let first_line = text.lines().next().unwrap_or("(empty)");
+                            debug!("TLS message from {}: {}", peer_addr, first_line);
+                        }
+                        match Self::parse_sip_message_with_reply(
+                            &message,
+                            peer_addr,
+                            reply_tx.clone(),
+                        ) {
+                            Ok(received_msg) => {
+                                if let Err(e) = message_tx.send(received_msg) {
+                                    error!("Failed to send message to handler: {}", e);
+                                    return Ok(()); // Channel closed
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse SIP message from {}: {}", peer_addr, e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to parse SIP message from {}: {}", peer_addr, e);
+                    Framing::Incomplete => break,
+                    Framing::Malformed(why) => {
+                        warn!(
+                            "TLS connection from {} closed: unframeable stream ({})",
+                            peer_addr, why
+                        );
+                        return Ok(());
                     }
                 }
-
-                // Update buffer with remaining data
-                buffer = remaining.to_vec();
-            }
-
-            // Prevent buffer from growing indefinitely
-            if buffer.len() > MAX_MESSAGE_SIZE {
-                warn!(
-                    "Buffer overflow for TLS connection from {}, resetting",
-                    peer_addr
-                );
-                buffer.clear();
             }
         }
 
         Ok(())
-    }
-
-    /// Extract a complete SIP message from the buffer (same as TCP)
-    fn extract_message(buffer: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        // Skip leading CRLF keepalives (RFC 5626 §4.4.1)
-        // Softphones send "\r\n\r\n" or "\r\n" as keepalive pings on TLS connections.
-        let buffer = {
-            let mut start = 0;
-            while start < buffer.len() && (buffer[start] == b'\r' || buffer[start] == b'\n') {
-                start += 1;
-            }
-            &buffer[start..]
-        };
-
-        if buffer.is_empty() {
-            return Ok(None);
-        }
-
-        // Find end of headers
-        let header_end = if let Some(pos) = Self::find_subsequence(buffer, b"\r\n\r\n") {
-            pos
-        } else {
-            return Ok(None);
-        };
-
-        // Empty headers = another keepalive, skip
-        if header_end == 0 {
-            return Ok(Some((&buffer[..4], &buffer[4..])));
-        }
-
-        // Extract headers
-        let headers = &buffer[..header_end];
-
-        // Parse Content-Length
-        let content_length = Self::parse_content_length(headers)?;
-
-        // Calculate total message size
-        let message_end = header_end + 4 + content_length;
-
-        if buffer.len() >= message_end {
-            Ok(Some((&buffer[..message_end], &buffer[message_end..])))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Find a subsequence in a byte slice
-    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-    }
-
-    /// Parse Content-Length header from SIP headers
-    fn parse_content_length(headers: &[u8]) -> Result<usize> {
-        let headers_str = std::str::from_utf8(headers)
-            .map_err(|e| Error::Parse(format!("Invalid UTF-8 in headers: {}", e)))?;
-
-        for line in headers_str.lines() {
-            let line_lower = line.to_lowercase();
-            if line_lower.starts_with("content-length:") || line_lower.starts_with("l:") {
-                let value = line
-                    .split(':')
-                    .nth(1)
-                    .ok_or_else(|| Error::Parse("Invalid Content-Length header".to_string()))?
-                    .trim();
-
-                return value
-                    .parse::<usize>()
-                    .map_err(|e| Error::Parse(format!("Failed to parse Content-Length: {}", e)));
-            }
-        }
-
-        Ok(0)
     }
 
     /// Parse SIP message from raw bytes (with reply channel for responses)
@@ -319,29 +241,5 @@ impl TlsListenerServer {
                 format!("{}", resp.status_code)
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_find_subsequence() {
-        let haystack = b"Hello\r\n\r\nWorld";
-        let needle = b"\r\n\r\n";
-        assert_eq!(
-            TlsListenerServer::find_subsequence(haystack, needle),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn test_parse_content_length() {
-        let headers = b"Via: SIP/2.0/TLS example.com\r\nContent-Length: 142\r\n";
-        assert_eq!(
-            TlsListenerServer::parse_content_length(headers).unwrap(),
-            142
-        );
     }
 }
