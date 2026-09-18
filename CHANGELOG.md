@@ -7,6 +7,14 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 ## [Unreleased]
 
 ### Added
+- `sbc_media_packets_dropped_total{reason}`: why the media path refused a
+  packet, in aggregate. The per-reason tally existed per call (a log line
+  and the CDR flags) and nowhere an operator could graph, so a payload-type
+  mismatch or a refused ICE check was invisible above the single call. It
+  is summed once per call from the per-call counters, never on the packet
+  path. Grafana grows a Health panel for it next to the new signalling-loss
+  panel (dashboard version 6), and `SBCIceChecksRefused` fires on more than
+  ten refused ICE checks in an hour.
 - **The control plane measured at the 12-month target**
   (`two_hundred_calls_fit_in_the_event_loop`): 200 answered calls held at
   once, then the real cost of a setup (137 µs), a teardown (32 µs) and

@@ -141,6 +141,17 @@ groups:
         annotations:
           summary: "{{ $value }} call(s) had no media anchor (ports exhausted? relay bind failed?)"
 
+      - alert: SBCIceChecksRefused
+        # STUN Binding Requests arriving on a media port without a
+        # MESSAGE-INTEGRITY that verifies against our own ice-pwd. A
+        # correct peer always signs its checks, so a steady rate is either
+        # someone probing the media ports or a session whose credentials
+        # went out of step.
+        expr: increase(sbc_media_packets_dropped_total{reason="ice-auth"}[1h]) > 10
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $value }} unauthenticated ICE checks refused in the last hour"
+
       - alert: SBCRtpPortsForcedReuse
         # The RTP range is too small for the call rate: pairs are being
         # reused before their stray-packet quarantine elapsed.

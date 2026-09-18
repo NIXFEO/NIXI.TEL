@@ -15,6 +15,9 @@ requests it never got an answer to), per-trunk series (`sbc_trunk_up`, `sbc_trun
 `sbc_trunk_consecutive_failures`), the media plane
 (`sbc_media_packets_relayed_total{leg}`, `sbc_media_bytes_relayed_total{leg}`,
 `sbc_media_one_way_calls_total{leg}`, `sbc_media_relay_failures_total`,
+`sbc_media_packets_dropped_total{reason}` (why the media path refused a
+packet: `payload-type`, `transcode`, `srtp`, `ice-auth`…, summed once per
+call so the packet path stays lock-free),
 `sbc_media_endpoint_events_total{leg,verdict,reason}` (`verdict="would-reject"`
 is counted, not enforced — read it before enabling enforcement),
 `sbc_transcode_seconds` (one packet through the transcoder: ~0.14 µs for
@@ -54,7 +57,8 @@ Optional alerting rules are in `prometheus/alert_rules.yml`: `SBCDown`,
 `SBCStoreBackupStale`, `SBCStoreBackupFailed`, `SBCCertExpiringSoon`,
 `SBCCertExpired`, `SBCConfigReloadFailed`, `SBCCdrWriteErrors`,
 `SBCCdrQueueBacklog`, `SBCLogLinesDropped`, `SBCAuthFailureSpike`,
-`SBCTransactionTimeouts`, `SBCRequestRetransmissionsHigh`.
+`SBCTransactionTimeouts`, `SBCRequestRetransmissionsHigh`,
+`SBCIceChecksRefused`.
 Validate with `promtool check rules prometheus/alert_rules.yml`.
 
 ## Grafana

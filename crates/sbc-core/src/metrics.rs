@@ -290,6 +290,10 @@ pub struct SbcMetrics {
     pub request_retransmissions: Arc<AtomicU64>,
     /// Requests that got no answer at all within 32 s (Timer B/F).
     pub transaction_timeouts: Arc<AtomicU64>,
+    /// Packets the media path refused, by reason (`media::stats::DropReason`
+    /// labels). Summed once per call from the per-call counters, never on
+    /// the packet path.
+    pub media_drops: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Calls the SBC could not anchor media for (no ports, relay start
     /// failed): refused before dialling, or ended right after the answer.
     pub media_relay_failures: Arc<AtomicU64>,
@@ -377,6 +381,7 @@ impl SbcMetrics {
             media_endpoint: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_retransmissions: Arc::new(AtomicU64::new(0)),
             transaction_timeouts: Arc::new(AtomicU64::new(0)),
+            media_drops: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_relay_failures: Arc::new(AtomicU64::new(0)),
             quarantined_ports: Arc::new(AtomicU64::new(0)),
             forced_port_reuse: Arc::new(AtomicU64::new(0)),
@@ -667,6 +672,16 @@ impl SbcMetrics {
         }
     }
 
+    /// Fold one finished call's drop tally into the aggregate.
+    pub fn add_media_drops(&self, reason: &'static str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Ok(mut m) = self.media_drops.lock() {
+            *m.entry(reason).or_insert(0) += count;
+        }
+    }
+
     pub fn inc_request_retransmission(&self) {
         self.request_retransmissions.fetch_add(1, Ordering::Relaxed);
     }
@@ -853,11 +868,18 @@ impl SbcMetrics {
             }
         }
 
-        for (name, help, map) in [(
-            "sbc_media_one_way_calls",
-            "Calls where one direction stayed silent while the other was delivering",
-            &self.media_one_way,
-        )] {
+        for (name, help, map) in [
+            (
+                "sbc_media_one_way_calls",
+                "Calls where one direction stayed silent while the other was delivering",
+                &self.media_one_way,
+            ),
+            (
+                "sbc_media_packets_dropped",
+                "Packets the media path refused, by reason",
+                &self.media_drops,
+            ),
+        ] {
             out.push_str(&format!(
                 "# HELP {} {}\n# TYPE {} counter\n",
                 name, help, name
@@ -865,8 +887,18 @@ impl SbcMetrics {
             if let Ok(map) = map.lock() {
                 let mut rows: Vec<(&&str, &u64)> = map.iter().collect();
                 rows.sort();
-                for (leg, value) in rows {
-                    out.push_str(&format!("{}_total{{leg=\"{}\"}} {}\n", name, leg, value));
+                for (key, value) in rows {
+                    // The one-way series is labelled by leg, the drop
+                    // series by reason: same shape, one label each.
+                    let label = if name == "sbc_media_one_way_calls" {
+                        "leg"
+                    } else {
+                        "reason"
+                    };
+                    out.push_str(&format!(
+                        "{}_total{{{}=\"{}\"}} {}\n",
+                        name, label, key, value
+                    ));
                 }
             }
         }
@@ -1765,6 +1797,43 @@ mod tests {
         assert_eq!(
             HealthStatus::Unhealthy("y".to_string()).as_str(),
             "unhealthy"
+        );
+    }
+}
+
+#[cfg(test)]
+mod media_drop_metric_tests {
+    use super::*;
+
+    /// The per-call drop tally is only in a log line and the CDR flags
+    /// until it is folded in here: without this series an operator cannot
+    /// see refused ICE checks or payload-type mismatches in aggregate.
+    #[test]
+    fn the_drop_reasons_render_one_labelled_series_each() {
+        let m = SbcMetrics::new();
+        m.add_media_drops("ice-auth", 3);
+        m.add_media_drops("payload-type", 2);
+        m.add_media_drops("ice-auth", 1);
+        m.add_media_drops("srtp", 0); // a call with none must add no row
+        let out = m.render_prometheus();
+        assert!(
+            out.contains("sbc_media_packets_dropped_total{reason=\"ice-auth\"} 4"),
+            "{}",
+            out
+        );
+        assert!(out.contains("sbc_media_packets_dropped_total{reason=\"payload-type\"} 2"));
+        assert!(
+            !out.contains("reason=\"srtp\""),
+            "a zero tally adds no series: {}",
+            out
+        );
+        // And the one-way series keeps its own label name.
+        m.inc_media_one_way("callee");
+        let out = m.render_prometheus();
+        assert!(
+            out.contains("sbc_media_one_way_calls_total{leg=\"callee\"} 1"),
+            "{}",
+            out
         );
     }
 }

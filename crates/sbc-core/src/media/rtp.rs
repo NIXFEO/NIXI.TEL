@@ -1805,6 +1805,13 @@ impl RtpSession {
             // One line per call on the way out: what each leg sent and
             // received, and every drop that explains the difference.
             info!("Media session {} ended: {}", session_id, media_stats.summary());
+            // And the same tally in aggregate, once per call — the packet
+            // path must stay free of the metrics lock.
+            if let Some(ref m) = metrics {
+                for reason in DropReason::ALL {
+                    m.add_media_drops(reason.label(), media_stats.drops(reason));
+                }
+            }
         }.instrument(tracing::Span::current()));
 
         Ok(())

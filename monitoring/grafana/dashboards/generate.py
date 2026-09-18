@@ -156,8 +156,19 @@ y+=4
 # session_expires: the SBC pays a 422 round trip on every call until it is raised.
 P += [stat("Session-timer 422 retries (total)","sbc_session_timer_422_retries_total",0,y,w=6)]
 y+=4
+# UDP loss on the signalling path. Retransmissions alone mean the SBC is
+# covering for a lossy link (RFC 3261 Timer A/E did its job); a timeout
+# means a request got no answer at all in 32 s (Timer B/F), which is a
+# peer that is unreachable rather than slow.
+P += [ts("SIP requests retransmitted vs unanswered (/min)",
+        [tgt("rate(sbc_sip_request_retransmissions_total[5m]) * 60","retransmitted (Timer A/E)"),
+         tgt("rate(sbc_sip_transaction_timeouts_total[5m]) * 60","gave up (Timer B/F)"),
+         tgt("sum by (transport)(rate(sbc_sip_send_failures_total[5m])) * 60","send failed {{transport}}")],0,y),
+      ts("Media drops by reason (/min)",
+        [tgt("sum by (reason)(rate(sbc_media_packets_dropped_total[5m])) * 60","{{reason}}")],12,y,stack=True)]
+y+=8
 
 dash={"uid":"nixi-sbc-overview","title":"NIXI SBC — Overview","tags":["sbc","nixi"],
-    "timezone":"browser","schemaVersion":39,"version":5,"refresh":"30s",
+    "timezone":"browser","schemaVersion":39,"version":6,"refresh":"30s",
     "time":{"from":"now-6h","to":"now"},"editable":True,"panels":P}
 print(json.dumps(dash,indent=2))
