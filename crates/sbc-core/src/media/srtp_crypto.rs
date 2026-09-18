@@ -19,8 +19,10 @@ type HmacSha1 = Hmac<Sha1>;
 const REPLAY_WINDOW: u64 = 64;
 /// Streams tracked per direction. A relay leg carries one SSRC, two
 /// after a re-INVITE; the cap is what stops a peer that rotates its SSRC
-/// from growing the map.
-const MAX_STREAMS: usize = 8;
+/// from growing the map. Live streams are never evicted (see
+/// [`SrtpCrypto::stream_mut`]), so this is also how many distinct SSRCs
+/// one direction can carry before new ones are refused.
+const MAX_STREAMS: usize = 16;
 
 /// The RFC 3711 §3.3.1 state of one SSRC in one direction: the rollover
 /// counter and the highest sequence number seen (`s_l`), plus the replay
@@ -43,24 +45,36 @@ impl StreamState {
     /// it implies — RFC 3711 §3.3.1. The ROC is **not on the wire**: both
     /// ends must derive the same one from the sequence numbers they see,
     /// which is why the guess is "the index nearest to `s_l`".
-    fn estimate(&self, seq: u16) -> (u64, u32) {
+    ///
+    /// `None` when no plausible index exists, and the packet must be
+    /// dropped rather than indexed: the RFC's "set v to (ROC - 1) mod
+    /// 2^32" has no meaning at ROC 0 (there is no earlier rollover), and
+    /// `wrapping_sub` there installed ROC 0xFFFFFFFF and an index near
+    /// 2^48 — after which every in-sequence packet of that stream was
+    /// refused as a reuse, for ever.
+    fn estimate(&self, seq: u16) -> Option<(u64, u32)> {
         if !self.started {
-            return ((seq as u64), 0);
+            return Some((seq as u64, 0));
         }
         let s_l = self.s_l;
         let roc = self.roc;
         let v = if s_l < 32768 {
             if seq as i32 - s_l as i32 > 32768 {
-                roc.wrapping_sub(1)
+                // A jump back over half the sequence space would belong to
+                // the previous rollover. Before the first one there is
+                // none.
+                roc.checked_sub(1)?
             } else {
                 roc
             }
         } else if (s_l as i32) - 32768 > seq as i32 {
-            roc.wrapping_add(1)
+            // And the counter itself must not wrap: 2^48 packets on one
+            // key is far past where the key must be renegotiated.
+            roc.checked_add(1)?
         } else {
             roc
         };
-        (((v as u64) << 16) | seq as u64, v)
+        Some((((v as u64) << 16) | seq as u64, v))
     }
 
     /// Accept a packet at `(index, roc, seq)`: advance `s_l`/ROC when it
@@ -75,6 +89,12 @@ impl StreamState {
             return;
         }
         if index > self.highest_index {
+            // Belt and braces: only this rollover or the next may move the
+            // stream forward, so no estimate can install a far-future
+            // index and wedge the stream.
+            if roc != self.roc && roc != self.roc.wrapping_add(1) {
+                return;
+            }
             let shift = index - self.highest_index;
             self.replay = if shift >= 64 { 0 } else { self.replay << shift };
             self.replay |= 1;
@@ -204,8 +224,20 @@ impl SrtpCrypto {
         // index estimation the receiver uses keeps both ends on the same
         // ROC across a wrap.
         let roc = {
-            let state = Self::stream_mut(&mut self.send, &mut self.clock, ssrc);
-            let (index, roc) = state.estimate(seq);
+            let Some(state) = Self::stream_mut(&mut self.send, &mut self.clock, ssrc) else {
+                return Err(Error::Media(format!(
+                    "SRTP: {} streams already live, refusing a new SSRC {:08x} \
+                     rather than resetting one's rollover counter",
+                    MAX_STREAMS, ssrc
+                )));
+            };
+            let Some((index, roc)) = state.estimate(seq) else {
+                return Err(Error::Media(format!(
+                    "SRTP: no plausible packet index for ssrc {:08x} seq {} \
+                     (sequence jumped backwards before the first rollover)",
+                    ssrc, seq
+                )));
+            };
             // Never encrypt twice under the same index: AES-CM would
             // reuse the keystream, and two packets XORed together give up
             // their plaintext (RFC 3711 §9.1). A duplicate the far leg
@@ -265,10 +297,26 @@ impl SrtpCrypto {
         // The index this packet claims (§3.3.1), then the replay list
         // (§3.3.2): a duplicate or a packet older than the window is
         // discarded before any crypto work.
+        //
+        // Read-only, deliberately. Touching the map here let an
+        // unauthenticated packet stamp an SSRC as recently used and evict
+        // the coldest entry — which, right after a burst of spoofed
+        // SSRCs, is always the legitimate stream, destroying its rollover
+        // counter and its replay window. Nothing is inserted, stamped or
+        // evicted until the tag has verified.
         let (index, roc) = {
-            let state = Self::stream_mut(&mut self.recv, &mut self.clock, ssrc);
-            let (index, roc) = state.estimate(seq);
-            if state.is_replayed(index) {
+            let existing = self.recv.get(&ssrc);
+            let probe = match existing {
+                Some(state) => state.estimate(seq),
+                None => StreamState::default().estimate(seq),
+            };
+            let Some((index, roc)) = probe else {
+                return Err(Error::Media(format!(
+                    "SRTP: no plausible packet index for ssrc {:08x} seq {}",
+                    ssrc, seq
+                )));
+            };
+            if existing.is_some_and(|state| state.is_replayed(index)) {
                 return Err(Error::Media(format!(
                     "SRTP replay: ssrc {:08x} index {} already seen (or past the window)",
                     ssrc, index
@@ -285,8 +333,14 @@ impl SrtpCrypto {
             return Err(Error::Media("SRTP authentication failed".to_string()));
         }
 
-        // Authentic: the index is now part of the stream's history.
-        Self::stream_mut(&mut self.recv, &mut self.clock, ssrc).accept(index, roc, seq);
+        // Authentic: only now may the stream table be touched.
+        let Some(state) = Self::stream_mut(&mut self.recv, &mut self.clock, ssrc) else {
+            return Err(Error::Media(format!(
+                "SRTP: {} streams already live, refusing a new SSRC {:08x}",
+                MAX_STREAMS, ssrc
+            )));
+        };
+        state.accept(index, roc, seq);
 
         // Extract header
         let header_len = self.get_rtp_header_length(packet)?;
@@ -402,27 +456,38 @@ impl SrtpCrypto {
     }
 
     /// The state of one SSRC in one direction, created on first sight.
-    /// Bounded: past [`MAX_STREAMS`] the coldest SSRC is evicted, so a
-    /// peer rotating its SSRC costs memory that does not grow.
+    ///
+    /// Bounded, and **a stream that has carried a packet is never
+    /// evicted**. Evicting one reset its rollover counter to zero, so the
+    /// encryptor re-derived the IV and tag of the packet it had sent
+    /// 65 536 packets earlier: two packets under one AES-CM keystream,
+    /// whose XOR is the XOR of their plaintexts (RFC 3711 §9.1). The
+    /// sending SSRC is the *far leg's*, which the SBC only relays, so
+    /// eight spoofed datagrams with fresh SSRCs were enough to force it.
+    ///
+    /// `None` when every slot holds a live stream: the caller drops the
+    /// packet, which is counted, rather than trading a live stream's
+    /// counter for a new one. The endpoint ladder in `media/endpoint.rs`
+    /// is the layer meant to refuse those datagrams outright; it is
+    /// count-only until the operator has the data to enforce it.
     fn stream_mut<'a>(
         streams: &'a mut HashMap<u32, StreamState>,
         clock: &mut u64,
         ssrc: u32,
-    ) -> &'a mut StreamState {
+    ) -> Option<&'a mut StreamState> {
         *clock += 1;
         let now = *clock;
         if !streams.contains_key(&ssrc) && streams.len() >= MAX_STREAMS {
-            if let Some(coldest) = streams
+            let victim = streams
                 .iter()
+                .filter(|(_, st)| !st.started)
                 .min_by_key(|(_, st)| st.last_used)
-                .map(|(k, _)| *k)
-            {
-                streams.remove(&coldest);
-            }
+                .map(|(k, _)| *k);
+            streams.remove(&victim?);
         }
         let state = streams.entry(ssrc).or_default();
         state.last_used = now;
-        state
+        Some(state)
     }
 
     /// The rollover counter this context would use for that SSRC when
@@ -1190,19 +1255,143 @@ mod rollover_tests {
         assert_eq!(receiver.receiver_roc(0xBBBB), Some(0));
     }
 
-    /// A peer that rotates its SSRC must not grow the state without bound.
+    /// A peer that rotates its SSRC must not grow the state without
+    /// bound — and, past the cap, must not be served at the expense of a
+    /// live stream: dropping a started stream resets its rollover counter
+    /// and the next packet reuses an AES-CM keystream. So the new SSRC is
+    /// refused instead, which is a counted drop rather than a crypto
+    /// failure.
     #[test]
-    fn the_stream_table_is_bounded() {
-        let mut receiver = ctx();
+    fn the_stream_table_is_bounded_and_live_streams_are_kept() {
         let mut sender = ctx();
-        for i in 0..(MAX_STREAMS as u32 * 4) {
-            let p = sender.encrypt_rtp(&rtp(0x1000 + i, 1)).unwrap();
-            let _ = receiver.decrypt_srtp(&p);
+        let mut receiver = ctx();
+        // Fill the sender's table with live streams.
+        for i in 0..MAX_STREAMS as u32 {
+            let packet = rtp(0x1000 + i, 1);
+            let srtp = sender.encrypt_rtp(&packet).expect("within the cap");
+            assert_eq!(receiver.decrypt_srtp(&srtp).expect("delivered"), packet);
         }
-        let (send_len, recv_len) = receiver.tracked_streams();
-        assert!(recv_len <= MAX_STREAMS, "receiver tracks {}", recv_len);
-        assert_eq!(send_len, 0);
-        assert!(sender.tracked_streams().0 <= MAX_STREAMS);
+        assert_eq!(sender.tracked_streams().0, MAX_STREAMS);
+        assert_eq!(receiver.tracked_streams().1, MAX_STREAMS);
+
+        // One more SSRC is refused, by name, on both sides.
+        let err = sender
+            .encrypt_rtp(&rtp(0x2000, 1))
+            .expect_err("past the cap");
+        assert!(
+            format!("{}", err).contains("refusing a new SSRC"),
+            "{}",
+            err
+        );
+        assert_eq!(sender.tracked_streams().0, MAX_STREAMS, "no growth");
+
+        // And the streams that were already there still work, with their
+        // counters intact.
+        for i in 0..MAX_STREAMS as u32 {
+            let packet = rtp(0x1000 + i, 2);
+            let srtp = sender.encrypt_rtp(&packet).expect("still live");
+            assert_eq!(receiver.decrypt_srtp(&srtp).expect("delivered"), packet);
+        }
+    }
+
+    /// The security property behind that refusal: a burst of datagrams
+    /// that never authenticate must leave the legitimate stream's state
+    /// untouched. The pre-authentication path used to stamp the
+    /// attacker's SSRC as recently used and evict the coldest entry —
+    /// which, right after such a burst, is always the real stream — so
+    /// spoofed packets destroyed its rollover counter and replay window.
+    #[test]
+    fn an_unauthenticated_burst_cannot_evict_the_live_stream() {
+        let mut sender = ctx();
+        let mut receiver = ctx();
+        let real = 0xAAAA_BBBB;
+
+        // A real stream, carried past a rollover so its counter matters.
+        for seq in (65500u16..=65535).chain(0..=20) {
+            let srtp = sender.encrypt_rtp(&rtp(real, seq)).unwrap();
+            receiver.decrypt_srtp(&srtp).expect("delivered");
+        }
+        assert_eq!(receiver.receiver_roc(real), Some(1));
+        assert_eq!(receiver.tracked_streams().1, 1, "one authenticated stream");
+
+        // Now a flood of SSRCs the attacker cannot sign: one packet
+        // built with another key, its SSRC rewritten for each attempt,
+        // four times the cap.
+        let mut attacker = {
+            let master_key = vec![0x99u8; 16];
+            let master_salt = vec![0x88u8; 14];
+            let (ck, ak, sk) = derive_srtp_keys(&master_key, &master_salt, 0).unwrap();
+            SrtpCrypto::new(ck, ak, sk, 10).unwrap()
+        };
+        let template = attacker.encrypt_rtp(&rtp(0xDEAD_0000, 5)).unwrap();
+        for i in 0..(MAX_STREAMS as u32 * 4) {
+            let mut forged = template.clone();
+            forged[8..12].copy_from_slice(&(0xDEAD_0000u32 + i).to_be_bytes());
+            assert!(
+                receiver.decrypt_srtp(&forged).is_err(),
+                "a packet we cannot authenticate must not be delivered"
+            );
+        }
+        assert_eq!(
+            receiver.tracked_streams().1,
+            1,
+            "not one unauthenticated SSRC entered the table"
+        );
+        assert_eq!(
+            receiver.receiver_roc(real),
+            Some(1),
+            "the real stream kept its rollover counter"
+        );
+
+        // And it still decrypts, in sequence, with its replay window
+        // intact.
+        for seq in 21u16..=30 {
+            let srtp = sender.encrypt_rtp(&rtp(real, seq)).unwrap();
+            receiver
+                .decrypt_srtp(&srtp)
+                .unwrap_or_else(|e| panic!("seq {} after the burst: {}", seq, e));
+        }
+        let replayed = sender.encrypt_rtp(&rtp(real, 31)).unwrap();
+        receiver.decrypt_srtp(&replayed).expect("first delivery");
+        assert!(
+            receiver.decrypt_srtp(&replayed).is_err(),
+            "the replay window survived the burst"
+        );
+    }
+
+    /// A sequence number that jumps backwards over half the space before
+    /// the stream has ever rolled over belongs to no index: RFC 3711
+    /// §3.3.1's "ROC - 1" has no meaning at ROC 0. Wrapping it installed
+    /// ROC 0xFFFFFFFF and an index near 2^48, after which every ordinary
+    /// packet of that stream was refused as a reuse — for ever.
+    #[test]
+    fn a_backwards_jump_before_the_first_rollover_is_dropped_not_installed() {
+        let mut sender = ctx();
+        let ssrc = 0x1234;
+        for seq in 1000u16..=1009 {
+            sender.encrypt_rtp(&rtp(ssrc, seq)).expect("in sequence");
+        }
+        assert_eq!(sender.sender_roc(ssrc), Some(0));
+
+        // s_l = 1009, so seq 45000 is a jump of more than 32768: it would
+        // belong to the rollover before this one, and there is none.
+        let err = sender
+            .encrypt_rtp(&rtp(ssrc, 45000))
+            .expect_err("no plausible index");
+        assert!(format!("{}", err).contains("no plausible"), "{}", err);
+        assert_eq!(
+            sender.sender_roc(ssrc),
+            Some(0),
+            "the anomaly did not touch the counter"
+        );
+
+        // The stream carries on, which is the whole point.
+        for seq in 1010u16..=1020 {
+            sender
+                .encrypt_rtp(&rtp(ssrc, seq))
+                .unwrap_or_else(|e| panic!("seq {} after the anomaly: {}", seq, e));
+        }
+        assert_eq!(sender.sender_roc(ssrc), Some(0));
     }
 }
 

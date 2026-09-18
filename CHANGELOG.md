@@ -162,6 +162,28 @@ Two were critical, both in the work that had just been written.
   make progress. It also restores the leading-CRLF skip (RFC 3261 §7.5)
   that the shared version had dropped, so a softphone keepalive no longer
   swallows the message behind it.
+- **The SRTP rollover counter no longer trades a live stream for a new
+  one, and no longer underflows.** Three defects in the counter added
+  above, all found by the review:
+  - Evicting a started stream reset its counter to zero, so the encryptor
+    re-derived the IV and tag of the packet it had sent 65 536 packets
+    earlier: two packets under one AES-CM keystream, whose XOR is the XOR
+    of their plaintexts (RFC 3711 §9.1). The sending SSRC is the far
+    leg's, which the SBC only relays, so a handful of spoofed datagrams
+    with fresh SSRCs was enough to force it. A live stream is never
+    evicted now; past the cap (raised to 16 per direction) a new SSRC is
+    refused, which is a counted drop instead of a crypto failure.
+  - The pre-authentication path was not read-only: it stamped the
+    sender's SSRC as recently used and could evict the coldest entry,
+    which right after a burst of spoofed SSRCs is always the legitimate
+    stream. Nothing is inserted, stamped or evicted until the tag has
+    verified.
+  - A sequence number jumping backwards over half the space before the
+    first rollover took RFC 3711 §3.3.1's "ROC - 1", which has no meaning
+    at ROC 0: the wrap installed ROC 0xFFFFFFFF and an index near 2^48,
+    after which every ordinary packet of that stream was refused as a
+    reuse, permanently. Such a packet is now dropped and the stream
+    carries on.
 - An outbound TCP write is now bounded like the connect is: it was
   awaited inline in the SIP event loop with no timeout, so a peer that
   advertised a zero receive window and never drained it would park every
