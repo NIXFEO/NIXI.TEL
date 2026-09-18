@@ -537,6 +537,7 @@ pub(crate) struct SbcBuilder {
     digest: Option<(String, std::collections::HashMap<String, String>)>,
     identity_policy: IdentityPolicy,
     register_policy: crate::register::RegisterPolicy,
+    cdr_store: Option<Arc<sbc_storage::ConfigStore>>,
 }
 
 impl SbcBuilder {
@@ -550,7 +551,14 @@ impl SbcBuilder {
             digest: None,
             identity_policy: IdentityPolicy::default(),
             register_policy: crate::register::RegisterPolicy::default(),
+            cdr_store: None,
         }
+    }
+
+    /// Write CDRs to this store (the writer task runs on the test runtime).
+    pub(crate) fn cdr_store(mut self, store: Arc<sbc_storage::ConfigStore>) -> Self {
+        self.cdr_store = Some(store);
+        self
     }
 
     pub(crate) fn register_policy(mut self, policy: crate::register::RegisterPolicy) -> Self {
@@ -624,6 +632,13 @@ impl SbcBuilder {
         }
         sbc.identity_policy = self.identity_policy;
         sbc.register_policy = self.register_policy;
+        if let Some(store) = self.cdr_store {
+            sbc.cdr = Arc::new(CdrManager::with_store(
+                store,
+                sbc.metrics.clone(),
+                crate::cdr_writer::CdrWriterConfig::default(),
+            ));
+        }
         let mut trunk = TrunkConfig::new(TRUNK_NAME.to_string());
         trunk.host = trunk_addr().ip().to_string();
         trunk.port = trunk_addr().port();

@@ -192,6 +192,17 @@ prometheus_enabled = true
 prometheus_bind_address = "127.0.0.1"
 prometheus_port = 9090
 
+[cdr]
+# CDRs are rows of the SQLite store (GET /api/v1/cdrs filters, cursor, CSV).
+# jsonl_path mirrors every committed record as JSON lines (falls back to the
+# legacy [general] cdr_file); the history in that file and its rotated .N
+# siblings is imported once at first boot (import_jsonl; .gz files are
+# skipped — zcat them into import_path first if you need them). Rows older
+# than retention_days are purged daily (0 keeps everything). Boot-only.
+jsonl_path = "/var/log/sbc/cdr.jsonl"
+retention_days = 400
+import_jsonl = true
+
 [logging]
 # A level or tracing EnvFilter directives: "info", "debug",
 # "sbc_core::media=debug,info". Precedence: `sbc --verbose` (debug) >

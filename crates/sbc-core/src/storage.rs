@@ -146,6 +146,33 @@ impl CdrRecord {
 
     /// One JSON object (JSON-lines file format and API items). Legacy keys
     /// come first, in their historical order.
+    /// The store row of this record (`cdrs`, migration 0003).
+    pub fn to_row(&self) -> sbc_storage::CdrRow {
+        sbc_storage::CdrRow {
+            rowid: 0,
+            id: self.id.clone(),
+            v: i64::from(self.v),
+            uuid: self.uuid.clone(),
+            call_id: self.call_id.clone(),
+            direction: self.direction.clone(),
+            caller: self.caller.clone(),
+            callee: self.callee.clone(),
+            source_ip: self.source_ip.clone(),
+            trunk_id: self.trunk_id.clone(),
+            codec: self.codec.clone(),
+            is_webrtc: self.is_webrtc,
+            started_at: self.started_at as i64,
+            answered_at: self.answered_at.map(|t| t as i64),
+            ended_at: self.ended_at as i64,
+            duration_secs: self.duration_secs as i64,
+            billable_secs: self.billable_secs as i64,
+            sip_code: self.sip_code.map(i64::from),
+            disconnect_reason: self.disconnect_reason.clone(),
+            reason: self.reason.clone(),
+            hangup_by: self.hangup_by.clone(),
+        }
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
             error!("CDR serialization failed: {}", e);
@@ -160,6 +187,44 @@ impl CdrRecord {
 /// Most recent records kept in memory for the API; the file is the source
 /// of truth for billing.
 pub const MAX_CACHED_CDRS: usize = 10_000;
+
+impl From<sbc_storage::CdrRow> for CdrRecord {
+    fn from(r: sbc_storage::CdrRow) -> Self {
+        Self {
+            id: r.id,
+            call_id: r.call_id,
+            caller: r.caller,
+            callee: r.callee,
+            trunk_id: r.trunk_id,
+            duration_secs: r.duration_secs.max(0) as u64,
+            codec: r.codec,
+            is_webrtc: r.is_webrtc,
+            disconnect_reason: r.disconnect_reason,
+            started_at: r.started_at.max(0) as u64,
+            ended_at: r.ended_at.max(0) as u64,
+            v: u8::try_from(r.v).unwrap_or(CDR_SCHEMA_VERSION),
+            uuid: r.uuid,
+            direction: r.direction,
+            sip_code: r.sip_code.and_then(|c| u16::try_from(c).ok()),
+            answered_at: r.answered_at.map(|t| t.max(0) as u64),
+            billable_secs: r.billable_secs.max(0) as u64,
+            source_ip: r.source_ip,
+            reason: r.reason,
+            hangup_by: r.hangup_by,
+        }
+    }
+}
+
+/// What `CdrManager::insert` did with a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdrInsert {
+    /// Queued for the store writer (durable within milliseconds).
+    Queued,
+    /// Written by the file/memory backend (no store).
+    Stored,
+    /// The writer queue was full or closed: the record lives in the cache only.
+    CacheOnly,
+}
 
 /// Statistiques de stockage
 #[derive(Debug, Clone, Default)]
@@ -365,7 +430,7 @@ impl CdrStorage for FileCdrStorage {
 
 /// Parse one JSON line: serde for well-formed rows (v1 and v2), the
 /// historical substring parser as a fallback for damaged legacy lines.
-fn parse_cdr_json(json: &str) -> Option<CdrRecord> {
+pub(crate) fn parse_cdr_json(json: &str) -> Option<CdrRecord> {
     match serde_json::from_str::<CdrRecord>(json) {
         Ok(r) => Some(r),
         Err(_) => parse_cdr_json_legacy(json),
@@ -431,35 +496,88 @@ fn parse_cdr_json_legacy(json: &str) -> Option<CdrRecord> {
 
 /// UUID v4 simple (hex aléatoire)
 fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        t,
-        (t >> 16) & 0xffff,
-        (t >> 8) & 0x0fff,
-        0x8000 | ((t >> 4) & 0x3fff),
-        (t as u64).wrapping_mul(0x123456789abc),
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// CDR Manager — orchestre le stockage
 pub struct CdrManager {
+    /// The in-memory cache (and, without a store, the file backend).
     storage: Arc<dyn CdrStorage>,
+    /// Store mode: the writer task's queue.
+    tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::cdr_writer::CdrMsg>>>,
+    writer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    queue_len: Arc<std::sync::atomic::AtomicU64>,
+    store: Option<Arc<sbc_storage::ConfigStore>>,
+    metrics: Option<Arc<crate::metrics::SbcMetrics>>,
+    backend_name: &'static str,
 }
 
 impl CdrManager {
-    pub fn new_memory() -> Self {
+    fn without_store(storage: Arc<dyn CdrStorage>, backend_name: &'static str) -> Self {
         Self {
-            storage: Arc::new(InMemoryCdrStorage::new()),
+            storage,
+            tx: std::sync::Mutex::new(None),
+            writer: std::sync::Mutex::new(None),
+            queue_len: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            store: None,
+            metrics: None,
+            backend_name,
         }
     }
 
+    pub fn new_memory() -> Self {
+        Self::without_store(Arc::new(InMemoryCdrStorage::new()), "memory")
+    }
+
     pub fn with_storage(storage: Arc<dyn CdrStorage>) -> Self {
-        Self { storage }
+        Self::without_store(storage, "custom")
+    }
+
+    /// Store mode: records are cached and queued to a writer task that
+    /// commits them to SQLite (needs a runtime).
+    pub fn with_store(
+        store: Arc<sbc_storage::ConfigStore>,
+        metrics: Arc<crate::metrics::SbcMetrics>,
+        cfg: crate::cdr_writer::CdrWriterConfig,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::cdr_writer::CDR_QUEUE_CAPACITY);
+        let queue_len = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = crate::cdr_writer::CdrWriter::spawn(
+            rx,
+            store.clone(),
+            metrics.clone(),
+            cfg,
+            queue_len.clone(),
+        );
+        Self {
+            storage: Arc::new(InMemoryCdrStorage::new()),
+            tx: std::sync::Mutex::new(Some(tx)),
+            writer: std::sync::Mutex::new(Some(writer)),
+            queue_len,
+            store: Some(store),
+            metrics: Some(metrics),
+            backend_name: "sqlite",
+        }
+    }
+
+    /// A store-mode manager whose writer is never spawned (queue tests).
+    #[cfg(test)]
+    pub(crate) fn with_unspawned_writer_for_tests(
+        store: Arc<sbc_storage::ConfigStore>,
+        metrics: Arc<crate::metrics::SbcMetrics>,
+        capacity: usize,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        std::mem::forget(rx);
+        Self {
+            storage: Arc::new(InMemoryCdrStorage::new()),
+            tx: std::sync::Mutex::new(Some(tx)),
+            writer: std::sync::Mutex::new(None),
+            queue_len: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            store: Some(store),
+            metrics: Some(metrics),
+            backend_name: "sqlite",
+        }
     }
 
     /// Get a reference to the underlying storage (for direct CDR inserts)
@@ -470,14 +588,97 @@ impl CdrManager {
     /// Create a CDR manager with file-based storage (JSON-lines)
     pub async fn new_file(path: &str) -> Result<Self> {
         let storage = FileCdrStorage::new(path).await?;
-        Ok(Self {
-            storage: Arc::new(storage),
-        })
+        Ok(Self::without_store(Arc::new(storage), "file"))
     }
 
-    /// Store one finished call's record (the SBC's single write path).
-    pub async fn insert(&self, record: &CdrRecord) -> Result<()> {
-        self.storage.insert_cdr(record).await
+    pub fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// `sqlite` (store mode), `file` or `memory`.
+    pub fn backend(&self) -> &'static str {
+        self.backend_name
+    }
+
+    pub fn queue_len(&self) -> u64 {
+        self.queue_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn sender(&self) -> Option<tokio::sync::mpsc::Sender<crate::cdr_writer::CdrMsg>> {
+        self.tx.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Store one finished call's record (the SBC's single write path). In
+    /// store mode this never does IO: the record goes to the cache and the
+    /// writer's queue.
+    pub async fn insert(&self, record: &CdrRecord) -> Result<CdrInsert> {
+        let Some(tx) = self.sender() else {
+            self.storage.insert_cdr(record).await?;
+            return Ok(CdrInsert::Stored);
+        };
+        let _ = self.storage.insert_cdr(record).await;
+        match tx.try_send(crate::cdr_writer::CdrMsg::Record(Box::new(record.clone()))) {
+            Ok(()) => {
+                let n = self
+                    .queue_len
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if let Some(m) = &self.metrics {
+                    m.set_cdr_queue_length(n);
+                }
+                Ok(CdrInsert::Queued)
+            }
+            Err(e) => {
+                if let Some(m) = &self.metrics {
+                    m.inc_cdr_write_error("queue");
+                }
+                error!(
+                    "CDR writer queue unavailable ({}): record {} kept in the memory cache only",
+                    e, record.id
+                );
+                Ok(CdrInsert::CacheOnly)
+            }
+        }
+    }
+
+    /// Wait until everything queued so far is committed (no-op without a writer).
+    pub async fn flush(&self) {
+        let Some(tx) = self.sender() else { return };
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if tx.send(crate::cdr_writer::CdrMsg::Flush(ack)).await.is_ok() {
+            let _ = done.await;
+        }
+    }
+
+    /// Drain the queue and stop the writer (shutdown), bounded by `timeout`.
+    pub async fn close(&self, timeout: std::time::Duration) {
+        self.flush().await;
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(tx);
+        let handle = self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            if tokio::time::timeout(timeout, h).await.is_err() {
+                warn!("CDR writer did not stop within {:?}", timeout);
+            }
+        }
+    }
+
+    /// A filtered page from the store (newest first) and whether more
+    /// rows exist. Errors without a store.
+    pub async fn page(&self, filter: &sbc_storage::CdrFilter) -> Result<(Vec<CdrRecord>, bool)> {
+        let Some(store) = &self.store else {
+            return Err(Error::Config("no CDR store".into()));
+        };
+        let (rows, more) = store
+            .query_cdrs(filter)
+            .await
+            .map_err(|e| Error::Transport(format!("cdr query: {}", e)))?;
+        Ok((rows.into_iter().map(CdrRecord::from).collect(), more))
+    }
+
+    /// The store behind this manager, when any.
+    pub fn store(&self) -> Option<Arc<sbc_storage::ConfigStore>> {
+        self.store.clone()
     }
 
     /// Enregistrer un appel terminé (legacy helper, tests only: no window).
@@ -502,7 +703,7 @@ impl CdrManager {
             record = record.with_codec(c);
         }
 
-        self.storage.insert_cdr(&record).await?;
+        self.insert(&record).await?;
         info!(
             "CDR recorded: {} → {} ({} secs, webrtc={})",
             caller, callee, duration_secs, is_webrtc

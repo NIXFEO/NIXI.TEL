@@ -2860,7 +2860,7 @@ async fn nat_rebinding_moves_the_inbound_call_to_the_new_port() {
     );
 
     register_trunk_ip(&sbc).await;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     sbc.handle_invite(
         invite_from_trunk("bob", 70),
         trunk_addr(),
@@ -3047,4 +3047,52 @@ async fn wildcard_register_rules_and_unparsable_contact() {
     .await;
     assert!(out[0].starts_with("SIP/2.0 400 Bad Request"), "{}", out[0]);
     assert_eq!(registrations(&sbc), 0);
+}
+
+// ── CDRs in the store ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn full_call_with_a_store_writes_the_cdr_to_sqlite() {
+    let store = Arc::new(sbc_storage::ConfigStore::open_memory().await.unwrap());
+    let mut sbc = SbcBuilder::new().cdr_store(store.clone()).build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    connect(&mut sbc, &mut call).await;
+    sbc.handle_bye(
+        bye_from_caller(&call.spec, 4),
+        caller_addr(),
+        rsip::Transport::Udp,
+        Some(&call.caller_tx),
+    )
+    .await
+    .unwrap();
+    sbc.cdr.flush().await;
+    let (rows, more) = store
+        .query_cdrs(&sbc_storage::CdrFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert!(!more);
+    let row = &rows[0];
+    assert_eq!(row.sip_code, Some(200));
+    assert_eq!(row.direction, "outbound");
+    assert_eq!(row.trunk_id.as_deref(), Some(TRUNK_NAME));
+    assert_eq!(row.uuid, call.uuid);
+    assert!(row.answered_at.is_some());
+    assert_eq!(
+        sbc.cdr.get_recent(10).await.unwrap().len(),
+        1,
+        "the cache stays synchronous"
+    );
+    assert_eq!(sbc.cdr.backend(), "sqlite");
+    assert!(
+        sbc.metrics
+            .last_cdr_written_time
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "stamped after the durable commit"
+    );
+    sbc.cdr.close(Duration::from_secs(2)).await;
 }

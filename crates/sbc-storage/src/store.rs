@@ -26,7 +26,7 @@ fn migrator() -> sqlx::migrate::Migrator {
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl ConfigStore {

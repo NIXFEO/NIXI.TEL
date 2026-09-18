@@ -35,6 +35,7 @@ pub mod sip_builder;
 pub mod topology;
 pub mod transcoding;
 
+pub mod cdr_writer;
 pub mod trunk_register;
 pub mod trunk_tasks;
 

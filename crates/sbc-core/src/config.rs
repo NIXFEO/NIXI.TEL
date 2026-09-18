@@ -30,6 +30,43 @@ pub struct SbcConfig {
     /// `[logging]`: level and output format (boot-only).
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// `[cdr]`: the CDR writer (boot-only).
+    #[serde(default)]
+    pub cdr: CdrConfig,
+}
+
+/// `[cdr]`: CDRs live in the SQLite store; the JSONL file is an optional
+/// mirror and the source of the one-time history import.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CdrConfig {
+    /// JSONL mirror of every committed batch (falls back to the legacy
+    /// `[general] cdr_file`; None = no file).
+    #[serde(default)]
+    pub jsonl_path: Option<String>,
+    /// History imported once at first boot (default: the mirror path and
+    /// its rotated `.N` siblings; `.gz` files are skipped).
+    #[serde(default)]
+    pub import_path: Option<String>,
+    /// Rows older than this are purged daily; 0 keeps everything.
+    #[serde(default)]
+    pub retention_days: u32,
+    #[serde(default = "default_import_jsonl")]
+    pub import_jsonl: bool,
+}
+
+fn default_import_jsonl() -> bool {
+    true
+}
+
+impl Default for CdrConfig {
+    fn default() -> Self {
+        Self {
+            jsonl_path: None,
+            import_path: None,
+            retention_days: 0,
+            import_jsonl: true,
+        }
+    }
 }
 
 /// Log output format.
@@ -683,6 +720,7 @@ impl Default for SbcConfig {
             dids: Vec::new(),
             trunk_health: TrunkHealthConfig::default(),
             logging: LoggingConfig::default(),
+            cdr: CdrConfig::default(),
         }
     }
 }
@@ -822,6 +860,16 @@ mod example_config_tests {
             ),
             (60, 3600, 3600)
         );
+        assert_eq!(
+            cfg.cdr.jsonl_path.as_deref(),
+            Some("/var/log/sbc/cdr.jsonl")
+        );
+        assert_eq!(cfg.cdr.retention_days, 400);
+        assert!(cfg.cdr.import_jsonl);
+        assert!(
+            SbcConfig::default().cdr.import_jsonl,
+            "absent [cdr] still imports"
+        );
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.logging.format, LogFormat::Json);
         assert!(!cfg.database.allow_missing_store);
@@ -931,6 +979,7 @@ const RESTART_KEYS: &[&str] = &[
     "management.",
     "trunk_health.",
     "logging.",
+    "cdr.",
 ];
 const SEED_KEYS: &[&str] = &[
     "security.sip_users",

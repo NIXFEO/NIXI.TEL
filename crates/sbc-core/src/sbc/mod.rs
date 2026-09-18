@@ -544,25 +544,6 @@ impl Sbc {
         // --- Reload notify (shared between API and event loop) ---
         let reload_notify = Arc::new(tokio::sync::Notify::new());
 
-        // --- CDR storage (shared between call handler and API) ---
-        let cdr: Arc<CdrManager> = if let Some(ref cdr_file) = config.general.cdr_file {
-            match CdrManager::new_file(cdr_file).await {
-                Ok(mgr) => {
-                    info!("CDR file storage: {}", cdr_file);
-                    Arc::new(mgr)
-                }
-                Err(e) => {
-                    warn!(
-                        "CDR file storage failed ({}), using memory: {}",
-                        cdr_file, e
-                    );
-                    Arc::new(CdrManager::new_memory())
-                }
-            }
-        } else {
-            Arc::new(CdrManager::new_memory())
-        };
-
         // --- Event bus (feeds the SSE API endpoint) ---
         let events = crate::events::EventBus::new();
         b2bua.set_event_bus(events.clone());
@@ -636,6 +617,37 @@ impl Sbc {
                     config.database.sqlite_path, e
                 )));
             }
+        };
+
+        // --- CDR storage: rows of the store (writer task), else the legacy
+        // JSONL file (written on the SIP loop), else memory ---
+        let cdr: Arc<CdrManager> = match (&config_store, &config.general.cdr_file) {
+            (Some(store), _) => {
+                let cfg = crate::cdr_writer::CdrWriterConfig::from_config(config);
+                info!(
+                    "CDR store: SQLite (mirror {:?}, retention {} days)",
+                    cfg.jsonl_path.as_ref().map(|p| p.display().to_string()),
+                    cfg.retention_days
+                );
+                Arc::new(CdrManager::with_store(store.clone(), metrics.clone(), cfg))
+            }
+            (None, Some(cdr_file)) => match CdrManager::new_file(cdr_file).await {
+                Ok(mgr) => {
+                    warn!(
+                        "CDR store unavailable — JSONL only at {} (written on the SIP loop)",
+                        cdr_file
+                    );
+                    Arc::new(mgr)
+                }
+                Err(e) => {
+                    warn!(
+                        "CDR file storage failed ({}), using memory: {}",
+                        cdr_file, e
+                    );
+                    Arc::new(CdrManager::new_memory())
+                }
+            },
+            (None, None) => Arc::new(CdrManager::new_memory()),
         };
 
         // ── Collect trunk IPs for inbound INVITE whitelist ──
@@ -1467,6 +1479,9 @@ impl Sbc {
             }
         }
 
+        // Drain the CDR writer: everything queued by the calls the shutdown
+        // ended is committed before the process exits.
+        self.cdr.close(Duration::from_secs(5)).await;
         info!("SBC event loop stopped");
     }
 

@@ -126,3 +126,53 @@ pub struct BackupInfo {
     pub bytes: u64,
     pub took_ms: u64,
 }
+
+/// One row of `cdrs` (migration 0003): the CDR v2 record as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct CdrRow {
+    /// SQLite rowid (0 on insert; part of the paging cursor).
+    #[serde(default)]
+    pub rowid: i64,
+    pub id: String,
+    pub v: i64,
+    pub uuid: String,
+    pub call_id: String,
+    pub direction: String,
+    pub caller: String,
+    pub callee: String,
+    pub source_ip: String,
+    pub trunk_id: Option<String>,
+    pub codec: Option<String>,
+    pub is_webrtc: bool,
+    pub started_at: i64,
+    pub answered_at: Option<i64>,
+    pub ended_at: i64,
+    pub duration_secs: i64,
+    pub billable_secs: i64,
+    pub sip_code: Option<i64>,
+    pub disconnect_reason: String,
+    pub reason: Option<String>,
+    pub hangup_by: String,
+}
+
+/// `GET /api/v1/cdrs` filters; every field optional. Prefixes are
+/// case-sensitive ranges on the indexed columns.
+#[derive(Debug, Clone, Default)]
+pub struct CdrFilter {
+    /// `started_at >=`
+    pub from: Option<i64>,
+    /// `started_at <`
+    pub to: Option<i64>,
+    pub direction: Option<String>,
+    pub trunk: Option<String>,
+    pub caller_prefix: Option<String>,
+    pub callee_prefix: Option<String>,
+    pub sip_code: Option<i64>,
+    pub answered: Option<bool>,
+    pub uuid: Option<String>,
+    pub call_id: Option<String>,
+    /// Keyset cursor: rows strictly older than (started_at, rowid).
+    pub before: Option<(i64, i64)>,
+    pub offset: usize,
+    pub limit: usize,
+}

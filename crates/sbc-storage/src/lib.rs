@@ -5,12 +5,14 @@
 //! (network listeners, media, logging) stays in the TOML file; its dynamic
 //! entries are imported into the store on first boot.
 
+pub mod cdr;
 pub mod error;
 pub mod models;
 pub mod store;
 
 pub use error::{Error, Result};
 pub use models::{
-    AclRuleRow, BackupInfo, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow,
+    AclRuleRow, BackupInfo, BanRow, CdrFilter, CdrRow, DestinationRuleRow, DidRow, RouteRow,
+    TrunkRow, UserRow,
 };
 pub use store::{newest_backup, prune_backups, ConfigStore, Table};

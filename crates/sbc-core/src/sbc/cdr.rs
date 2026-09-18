@@ -225,8 +225,17 @@ impl Sbc {
         record.hangup_by = outcome.hangup_by().to_string();
 
         match self.cdr.insert(&record).await {
-            Ok(()) => {
-                self.metrics.record_cdr_written();
+            Ok(outcome) => {
+                // In store mode the writer stamps after the durable commit.
+                if !self.cdr.has_store() {
+                    self.metrics.record_cdr_written();
+                }
+                if outcome == crate::storage::CdrInsert::CacheOnly {
+                    warn!(
+                        "CDR {} kept in the memory cache only (writer queue full or closed)",
+                        record.id
+                    );
+                }
                 info!(
                     "CDR: {} → {} ({}, {} billable s of {} s, codec={}, trunk={}, sip={:?}, webrtc={})",
                     record.caller,

@@ -239,6 +239,14 @@ pub struct SbcMetrics {
     /// Lines the non-blocking log writer dropped because stdout/journald
     /// did not keep up (sampled from the writer's counter).
     pub log_dropped_lines: Arc<AtomicU64>,
+    /// CDR write failures by stage: queue (full/closed), sqlite, jsonl, duplicate.
+    pub cdr_write_errors: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Records queued for the CDR writer, not yet committed.
+    pub cdr_queue_length: Arc<AtomicU64>,
+    /// Records committed to the store.
+    pub cdrs_written_total: Arc<AtomicU64>,
+    /// Records purged by retention.
+    pub cdrs_purged_total: Arc<AtomicU64>,
     /// notAfter of each TLS/WSS listener's certificate, by (listener, bind).
     pub tls_cert_expiry: Arc<std::sync::Mutex<HashMap<(String, String), u64>>>,
     /// Config reloads by result ("ok" / "error"). Pre-seeded to 0 so both
@@ -307,6 +315,10 @@ impl SbcMetrics {
             last_cdr_written_time: Arc::new(AtomicU64::new(0)),
             trunks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             log_dropped_lines: Arc::new(AtomicU64::new(0)),
+            cdr_write_errors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cdr_queue_length: Arc::new(AtomicU64::new(0)),
+            cdrs_written_total: Arc::new(AtomicU64::new(0)),
+            cdrs_purged_total: Arc::new(AtomicU64::new(0)),
             tls_cert_expiry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config_reloads: Arc::new(std::sync::Mutex::new(HashMap::from([
                 ("ok", 0u64),
@@ -477,6 +489,28 @@ impl SbcMetrics {
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
+    pub fn inc_cdr_write_error(&self, stage: &'static str) {
+        self.add_cdr_write_errors(stage, 1);
+    }
+
+    pub fn add_cdr_write_errors(&self, stage: &'static str, n: u64) {
+        if let Ok(mut map) = self.cdr_write_errors.lock() {
+            *map.entry(stage).or_insert(0) += n;
+        }
+    }
+
+    pub fn set_cdr_queue_length(&self, n: u64) {
+        self.cdr_queue_length.store(n, Ordering::Relaxed);
+    }
+
+    pub fn add_cdrs_written(&self, n: u64) {
+        self.cdrs_written_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_cdrs_purged(&self, n: u64) {
+        self.cdrs_purged_total.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn set_tls_cert_expiry(&self, listener: &str, bind: &str, not_after: u64) {
         if let Ok(mut map) = self.tls_cert_expiry.lock() {
             map.insert((listener.to_string(), bind.to_string()), not_after);
@@ -728,6 +762,34 @@ impl SbcMetrics {
             "sbc_log_dropped_lines",
             "Log lines dropped by the non-blocking writer since start (journald/stdout back-pressure)",
             self.log_dropped_lines.load(Ordering::Relaxed)
+        );
+
+        // ── CDR writer ────────────────────────────────────────────────────────
+        out.push_str("# HELP sbc_cdr_write_errors_total CDR write failures by stage (queue, sqlite, jsonl, duplicate)\n# TYPE sbc_cdr_write_errors_total counter\n");
+        if let Ok(map) = self.cdr_write_errors.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort();
+            for (stage, n) in entries {
+                out.push_str(&format!(
+                    "sbc_cdr_write_errors_total{{stage=\"{}\"}} {}\n",
+                    stage, n
+                ));
+            }
+        }
+        gauge!(
+            "sbc_cdr_queue_length",
+            "CDRs queued for the store writer, not yet committed",
+            self.cdr_queue_length.load(Ordering::Relaxed)
+        );
+        counter!(
+            "sbc_cdrs_written",
+            "CDRs committed to the store",
+            self.cdrs_written_total.load(Ordering::Relaxed)
+        );
+        counter!(
+            "sbc_cdrs_purged",
+            "CDRs removed by retention",
+            self.cdrs_purged_total.load(Ordering::Relaxed)
         );
 
         // ── Config store ──────────────────────────────────────────────────────
@@ -1425,6 +1487,16 @@ mod tests {
         assert!(out.contains("sbc_store_backup_failures_total 1\n"));
         assert!(m.store_backup_last_success_time.load(Ordering::Relaxed) > 0);
         assert!(out.contains("sbc_log_dropped_lines_total 0\n"));
+        assert!(out.contains("# TYPE sbc_cdr_write_errors_total counter\n"));
+        m.inc_cdr_write_error("sqlite");
+        m.set_cdr_queue_length(4);
+        m.add_cdrs_written(2);
+        m.add_cdrs_purged(1);
+        let out2 = m.render_prometheus();
+        assert!(out2.contains("sbc_cdr_write_errors_total{stage=\"sqlite\"} 1\n"));
+        assert!(out2.contains("sbc_cdr_queue_length 4\n"));
+        assert!(out2.contains("sbc_cdrs_written_total 2\n"));
+        assert!(out2.contains("sbc_cdrs_purged_total 1\n"));
         assert!(
             out.contains("sbc_config_reloads_total{result=\"error\"} 0\n"),
             "{}",
