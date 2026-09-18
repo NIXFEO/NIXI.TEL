@@ -1065,6 +1065,9 @@ impl Sbc {
                 dest, outbound_transport, e
             );
             self.metrics.inc_sip_send_failure(outbound_transport);
+            if let Some(name) = self.outbound_trunk_of(&uuid).await {
+                self.note_trunk_failure(&name, None);
+            }
             if !self.failover_to_next_trunk(&uuid).await {
                 warn!(
                     "INVITE for call {} could not be forwarded anywhere — 503 to the caller",
@@ -1121,7 +1124,9 @@ impl Sbc {
                 attempt,
                 self.invite_timeout
             );
-            if let Some(name) = self.outbound_trunk_of(&uuid).await {
+            // Only a trunk that never answered at all is struck: a 100
+            // Trying means it is working on it (slow post-dial delay).
+            if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
                 self.note_trunk_failure(&name, None);
             }
             let _ = self.failover_to_next_trunk(&uuid).await;
@@ -1208,6 +1213,7 @@ impl Sbc {
             .await
         {
             warn!("Failover: send to trunk '{}' failed: {}", trunk.name, e);
+            self.note_trunk_failure(&trunk.name, None);
             return Box::pin(self.failover_to_next_trunk(uuid)).await;
         }
 
@@ -1224,6 +1230,7 @@ impl Sbc {
             if let Some(call) = calls.get_mut(uuid) {
                 call.trunk_name = Some(trunk.name.clone());
                 call.callee_reply_tx = None;
+                call.callee_responded = false;
                 call.session_timer_retry_count = 0;
                 if let Some(out) = call.outbound.as_mut() {
                     out.remote_addr = new_dest;

@@ -156,42 +156,54 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   fail2ban (`ban_on_auth_failure`); unauthenticated requests from a banned
   IP get 403 while a valid token is always served (the API is the tool
   that lifts bans).
+- The OPTIONS health check and the outbound REGISTER loop of a trunk were
+  spawned once at boot and never stopped: a trunk created through the API
+  was never probed or registered, a deleted one was probed forever, changed
+  credentials or hosts were ignored until a restart. `trunk_tasks.rs` keeps
+  one set of tasks per enabled trunk and re-syncs on every trunk write,
+  SIGHUP and `POST /api/v1/reload` (start / stop / restart on host, port,
+  transport, credentials, realm, register flag or interval change; a
+  removed or disabled registered trunk gets an `Expires: 0`, a restarted
+  one keeps its binding). Outbound REGISTER keeps one Call-ID and a
+  monotonic CSeq per sequence; a `423 Interval Too Brief` is retried with
+  the trunk's `Min-Expires` (remembered); a *refused* REGISTER (4xx/5xx)
+  backs off 30 s → 15 min (reset on success) while a timeout or send
+  failure retries every 60 s; an OPTIONS down→up transition re-registers
+  immediately; a changed trunk host is re-resolved on hydrate.
 
 ### Added
-- Trunk tasks follow the trunk table (lot 3). The OPTIONS health check and
-  the outbound REGISTER loop of a trunk were spawned once at boot and never
-  stopped: a trunk created through the API was never probed or registered,
-  a deleted one was probed forever, changed credentials or hosts were
-  ignored until a restart. `trunk_tasks.rs` keeps one set of tasks per
-  enabled trunk and re-syncs on every trunk write, SIGHUP and
-  `POST /api/v1/reload` (start / stop / restart on host, port, transport,
-  credentials, realm, register flag or interval change); a stopped
-  registered trunk gets a best-effort `Expires: 0`. Outbound REGISTER: a
-  `423 Interval Too Brief` is retried with the trunk's `Min-Expires` and
-  the value is remembered; a refused or unanswered REGISTER backs off
-  30 s → 15 min (reset on success, cap `[trunk_health]
-  register_backoff_max`) instead of every 60 s; an OPTIONS down→up
-  transition re-registers immediately. New `[trunk_health]` section
-  (`options_interval`, `options_timeout`, `register_backoff_max`), SSE
-  events `trunk_registered` / `trunk_unregistered`, `registered` on
-  `GET /api/v1/trunks`, `trunk_unregistered` in `GET /api/v1/alerts`, and a
-  changed trunk host is re-resolved on hydrate.
 - Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
   `consecutive_failures` and the cooldown were only ever touched by the
   OPTIONS health check, so `max_concurrent_calls` and the failure ladder
   never applied to traffic. Every call now counts on the trunk its outbound
   leg (or its inbound source) is on, moves with a failover and is released
-  by `finish_call`; 408/5xx/6xx and unanswered attempts count as trunk
-  failures (3 in a row → 30 s, then 2 min, then 5 min without new calls), a
-  `503 Retry-After` parks the trunk for exactly that long (1 s–1 h), a 200
-  OK resets. New metrics: `sbc_trunk_up{trunk}` (once the trunk answered
-  OPTIONS at least once), `sbc_trunk_registered{trunk}`,
-  `sbc_trunk_active_calls{trunk}`, `sbc_trunk_calls_total{trunk,outcome}`
-  (answered / failed / cancelled / timeout — ASR = answered / all), and the
-  histograms `sbc_call_setup_seconds` (INVITE → answer, answered calls) and
-  `sbc_call_duration_seconds` (billable window). Alert rules
+  by `finish_call`. A trunk is struck by a 408/500/502/503/504 final, a
+  send failure, or no answer at all within `invite_timeout` (with a backup)
+  / `call_setup_timeout` — never by the callee's answer (486, 603, 404,
+  501, 6xx fail over or relay without cooling the trunk): 3 strikes in a
+  row → 30 s, then 2 min, then 5 min without new calls; a 200 OK resets. A
+  `503 Retry-After` parks the trunk for exactly that long (1 s–1 h); a park
+  survives a 200 OK and is lifted by expiry or a re-enable
+  (`POST /api/v1/trunks/{name}/enable`, which also forgives the cooldown).
+  New metrics: `sbc_trunk_up{trunk}` (once the trunk answered OPTIONS at
+  least once), `sbc_trunk_registered{trunk}`, `sbc_trunk_active_calls{trunk}`,
+  `sbc_trunk_calls_total{trunk,direction,outcome}` (answered / rejected /
+  failed / cancelled / timeout / failover — outbound ASR = answered / all on
+  `direction="outbound"`), `sbc_trunk_enabled`, `sbc_trunk_available`,
+  `sbc_trunk_unavailable_seconds`, `sbc_trunk_consecutive_failures` (from
+  the trunk table, appended by `GET /metrics`) and the histograms
+  `sbc_call_setup_seconds` (INVITE → answer, answered calls) and
+  `sbc_call_duration_seconds` (billable window). `GET /api/v1/trunks`
+  `health` is now `up` / `degraded` / `down` (cooldown running) / `parked`
+  with `unavailable_for_secs`, and `GET /api/v1/alerts` raises `trunk_down`
+  / `trunk_parked` only while the router skips the trunk; call-fed
+  transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
-  `SBCTrunkParked` and a "Trunks" Grafana row ship in `monitoring/`.
+  `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- Trunk tasks: `[trunk_health]` section (`options_interval`,
+  `options_timeout`, `register_backoff_max`), SSE events
+  `trunk_registered` / `trunk_unregistered`, `registered` on
+  `GET /api/v1/trunks`, `trunk_unregistered` in `GET /api/v1/alerts`.
 - Maintenance sweeper (60 s) bounding the in-memory tables (DoS per-IP
   state, digest nonces, expired registrations, ban and per-user rate
   windows) with hard caps and gauges `sbc_dos_tracked_ips`,

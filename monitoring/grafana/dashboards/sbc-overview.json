@@ -1592,7 +1592,7 @@
     {
       "id": 34,
       "type": "timeseries",
-      "title": "Trunk health (1 = answers OPTIONS)",
+      "title": "Trunk health (1 = answers OPTIONS) and availability (router selects it)",
       "datasource": {
         "type": "prometheus",
         "uid": "efdqq22ymisqod"
@@ -1611,7 +1611,16 @@
           },
           "expr": "sbc_trunk_up",
           "refId": "A",
-          "legendFormat": "{{trunk}}"
+          "legendFormat": "{{trunk}} up"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_trunk_available",
+          "refId": "A",
+          "legendFormat": "{{trunk}} available"
         }
       ],
       "fieldConfig": {
@@ -1692,7 +1701,7 @@
     {
       "id": 36,
       "type": "timeseries",
-      "title": "ASR per trunk (30m)",
+      "title": "Outbound ASR per trunk (30m)",
       "datasource": {
         "type": "prometheus",
         "uid": "efdqq22ymisqod"
@@ -1709,7 +1718,7 @@
             "type": "prometheus",
             "uid": "efdqq22ymisqod"
           },
-          "expr": "sum by (trunk)(rate(sbc_trunk_calls_total{outcome=\"answered\"}[30m])) / sum by (trunk)(rate(sbc_trunk_calls_total[30m]))",
+          "expr": "sum by (trunk)(rate(sbc_trunk_calls_total{direction=\"outbound\",outcome=\"answered\"}[30m])) / sum by (trunk)(rate(sbc_trunk_calls_total{direction=\"outbound\"}[30m]))",
           "refId": "A",
           "legendFormat": "{{trunk}}"
         }
@@ -1742,7 +1751,7 @@
     {
       "id": 37,
       "type": "timeseries",
-      "title": "Finished calls per trunk by outcome (/min)",
+      "title": "Finished calls per trunk by direction/outcome (/min)",
       "datasource": {
         "type": "prometheus",
         "uid": "efdqq22ymisqod"
@@ -1759,9 +1768,9 @@
             "type": "prometheus",
             "uid": "efdqq22ymisqod"
           },
-          "expr": "sum by (trunk, outcome)(rate(sbc_trunk_calls_total[5m])) * 60",
+          "expr": "sum by (trunk, direction, outcome)(rate(sbc_trunk_calls_total[5m])) * 60",
           "refId": "A",
-          "legendFormat": "{{trunk}} {{outcome}}"
+          "legendFormat": "{{trunk}} {{direction}} {{outcome}}"
         }
       ],
       "fieldConfig": {

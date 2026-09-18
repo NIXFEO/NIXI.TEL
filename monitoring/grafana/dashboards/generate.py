@@ -108,11 +108,11 @@ P += [stat("Trunks up","sum(sbc_trunk_up)",0,y,w=4),
       stat("Setup p95 (30m)","histogram_quantile(0.95, sum(rate(sbc_call_setup_seconds_bucket[30m])) by (le))",16,y,w=4,unit="s"),
       stat("Duration p50 (1h)","histogram_quantile(0.5, sum(rate(sbc_call_duration_seconds_bucket[1h])) by (le))",20,y,w=4,unit="s")]
 y+=4
-P += [ts("Trunk health (1 = answers OPTIONS)",[tgt("sbc_trunk_up","{{trunk}}")],0,y),
+P += [ts("Trunk health (1 = answers OPTIONS) and availability (router selects it)",[tgt("sbc_trunk_up","{{trunk}} up"),tgt("sbc_trunk_available","{{trunk}} available")],0,y),
       ts("Active calls per trunk",[tgt("sbc_trunk_active_calls","{{trunk}}")],12,y,stack=True)]
 y+=8
-P += [ts("ASR per trunk (30m)",[tgt('sum by (trunk)(rate(sbc_trunk_calls_total{outcome="answered"}[30m])) / sum by (trunk)(rate(sbc_trunk_calls_total[30m]))',"{{trunk}}")],0,y,unit="percentunit"),
-      ts("Finished calls per trunk by outcome (/min)",[tgt("sum by (trunk, outcome)(rate(sbc_trunk_calls_total[5m])) * 60","{{trunk}} {{outcome}}")],12,y,stack=True)]
+P += [ts("Outbound ASR per trunk (30m)",[tgt('sum by (trunk)(rate(sbc_trunk_calls_total{direction="outbound",outcome="answered"}[30m])) / sum by (trunk)(rate(sbc_trunk_calls_total{direction="outbound"}[30m]))',"{{trunk}}")],0,y,unit="percentunit"),
+      ts("Finished calls per trunk by direction/outcome (/min)",[tgt("sum by (trunk, direction, outcome)(rate(sbc_trunk_calls_total[5m])) * 60","{{trunk}} {{direction}} {{outcome}}")],12,y,stack=True)]
 y+=8
 # Health
 P.append(row("Health", y)); y+=1

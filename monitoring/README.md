@@ -3,10 +3,15 @@
 Ready-to-use Prometheus + Grafana setup for the NIXI SBC.
 
 The SBC exposes Prometheus metrics at `GET /metrics` on its management API
-(behind the bearer token). All series are prefixed `sbc_` — calls, SIP
-traffic (by method / by response code), auth, anti-fraud (bans, IRSF
-destination blocks, per-user limits), media (RTP/SRTP/transcoding) and
-health (last-CDR age, RTP timeouts).
+(behind the bearer token; the `[metrics]` TOML block is not used). All
+series are prefixed `sbc_` — calls, SIP traffic (by method / by response
+code), auth, anti-fraud (bans, IRSF destination blocks, per-user limits),
+media (RTP/SRTP/transcoding), health (last-CDR age, RTP timeouts, send
+failures), per-trunk series (`sbc_trunk_up`, `sbc_trunk_registered`,
+`sbc_trunk_active_calls`, `sbc_trunk_calls_total{trunk,direction,outcome}`,
+`sbc_trunk_enabled`, `sbc_trunk_available`, `sbc_trunk_unavailable_seconds`,
+`sbc_trunk_consecutive_failures`) and the histograms
+`sbc_call_setup_seconds` / `sbc_call_duration_seconds`.
 
 ## Prometheus
 
@@ -22,8 +27,10 @@ scrape_configs:
       - targets: ['127.0.0.1:8080']
 ```
 
-Optional alerting rules are in `prometheus/alert_rules.yml`
-(`SBCDown`, `SBCCdrsStale`, `SBCRtpTimeouts`, `SBCAuthFailureSpike`).
+Optional alerting rules are in `prometheus/alert_rules.yml`: `SBCDown`,
+`SBCCdrsStale`, `SBCRtpTimeouts`, `SBCSessionTimer422Retries`,
+`SBCSipSendFailures`, `SBCTrunkDown`, `SBCTrunkRegistrationFailing`,
+`SBCTrunkAsrLow`, `SBCTrunkUnavailable`, `SBCAuthFailureSpike`.
 Validate with `promtool check rules prometheus/alert_rules.yml`.
 
 ## Grafana

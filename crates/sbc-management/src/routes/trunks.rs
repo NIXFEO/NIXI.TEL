@@ -210,22 +210,19 @@ fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
         .get_stats()
         .into_iter()
         .find(|(t, _)| t.name == row.name);
-    let (health, active, total, failed, consecutive, registered) = match &live {
+    let now = std::time::Instant::now();
+    let (health, active, total, failed, consecutive, registered, unavailable_for_secs) = match &live
+    {
         Some((_, s)) => (
-            if s.consecutive_failures == 0 {
-                "up"
-            } else if s.disabled_until.is_some() {
-                "down"
-            } else {
-                "degraded"
-            },
+            s.health_label(now),
             s.active_calls,
             s.total_calls,
             s.failed_calls,
             s.consecutive_failures,
             s.registered,
+            s.unavailable_for(now).map(|d| d.as_secs()),
         ),
-        None => ("unknown", 0, 0, 0, 0, false),
+        None => ("unknown", 0, 0, 0, 0, false, None),
     };
     // `registered`: true/false for trunks the SBC registers with, null otherwise.
     let registered = row.register_with_trunk.then_some(registered);
@@ -257,7 +254,8 @@ fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
             "verify": row.tls_verify,
             "mtls": row.tls_client_cert.is_some(),
         },
-        "health": health,
+                "health": health,
+        "unavailable_for_secs": unavailable_for_secs,
         "registered": registered,
         "active_calls": active,
         "total_calls": total,
@@ -288,7 +286,7 @@ pub async fn list_trunks(State(state): State<AppState>) -> ApiResult<Json<serde_
                         "host": t.host,
                         "port": t.port,
                         "enabled": t.enabled,
-                        "health": if s.consecutive_failures == 0 { "up" } else { "degraded" },
+                                                "health": s.health_label(std::time::Instant::now()),
                         "registered": t.register_with_trunk.then_some(s.registered),
                         "active_calls": s.active_calls,
                         "total_calls": s.total_calls,

@@ -29,10 +29,11 @@ pub async fn ready() -> impl IntoResponse {
 }
 
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        [("content-type", "text/plain; version=0.0.4")],
-        state.metrics.render_prometheus(),
-    )
+    let mut body = state.metrics.render_prometheus();
+    body.push_str(&sbc_core::metrics::render_trunk_availability(
+        &state.trunks.get_stats(),
+    ));
+    ([("content-type", "text/plain; version=0.0.4")], body)
 }
 
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
@@ -51,13 +52,18 @@ pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
     let mut alerts = Vec::new();
 
+    let now = std::time::Instant::now();
     for (t, s) in &state.trunks.get_stats() {
-        if s.consecutive_failures >= 3 {
+        // Only while the router actually skips the trunk: a cooldown that
+        // expired is not an alert any more.
+        if let Some(left) = s.unavailable_for(now) {
+            let parked = s.health_label(now) == "parked";
             alerts.push(json!({
-                "level": "critical",
-                "type": "trunk_down",
+                "level": if parked { "warning" } else { "critical" },
+                "type": if parked { "trunk_parked" } else { "trunk_down" },
                 "trunk": t.name,
                 "failures": s.consecutive_failures,
+                "unavailable_for_secs": left.as_secs(),
             }));
         }
         if t.enabled && t.register_with_trunk && !s.registered {

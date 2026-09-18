@@ -31,7 +31,6 @@ async fn make_state() -> AppState {
     let trunk_tasks = Arc::new(sbc_core::trunk_tasks::TrunkTasks::new(
         trunks.clone(),
         Default::default(),
-        None,
         metrics.clone(),
         events.clone(),
         Default::default(),
@@ -1422,9 +1421,10 @@ async fn bearer_token_brute_force_bans_the_client_ip() {
 async fn trunk_mutations_drive_the_task_registry() {
     let state = make_state().await;
     let tasks = state.trunk_tasks.clone();
-    assert!(tasks.attach_socket(Arc::new(
-        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()
-    )));
+    assert!(tasks.attach_socket(
+        Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+        None
+    ));
     let app = build_router(state, &[]);
 
     let resp = app
@@ -1515,4 +1515,96 @@ async fn trunk_mutations_drive_the_task_registry() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(tasks.running().is_empty());
     tasks.shutdown().await;
+}
+
+/// `health` follows the router's view (parked / down only while it skips
+/// the trunk), `/alerts` and `/metrics` expose availability, and a
+/// re-enable forgives the park.
+#[tokio::test]
+async fn trunk_health_alerts_and_metrics_reflect_availability() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/trunks",
+            Some(r#"{"name":"pstn-1","host":"127.0.0.1","port":5998,"transport":"UDP"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The trunk answered 503 Retry-After: 120 → parked.
+    assert!(state
+        .trunks
+        .update_state_by_name("pstn-1", |s| s.park_for(120)));
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/trunks/pstn-1", None, true))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["health"], "parked");
+    assert!(json["unavailable_for_secs"].as_u64().unwrap() > 100);
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/alerts", None, true))
+        .await
+        .unwrap();
+    assert!(body_json(resp).await.to_string().contains("trunk_parked"));
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/metrics", None, true))
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("sbc_trunk_enabled{trunk=\"pstn-1\"} 1\n"),
+        "{}",
+        text
+    );
+    assert!(
+        text.contains("sbc_trunk_available{trunk=\"pstn-1\"} 0\n"),
+        "{}",
+        text
+    );
+    assert!(text.contains("# TYPE sbc_trunk_calls_total counter\n"));
+
+    // Disable + enable: the park is forgiven.
+    for action in ["disable", "enable"] {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/v1/trunks/pstn-1/{}", action),
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/trunks/pstn-1", None, true))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["health"], "up");
+    assert!(json["unavailable_for_secs"].is_null());
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/alerts", None, true))
+        .await
+        .unwrap();
+    assert!(!body_json(resp).await.to_string().contains("trunk_parked"));
+    state.trunk_tasks.shutdown().await;
 }

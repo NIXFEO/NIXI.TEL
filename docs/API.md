@@ -30,9 +30,9 @@ is replaying it through the CRUD endpoints.
 |---|---|---|
 | GET | `/health` | 200 healthy / 503 (public) |
 | GET | `/ready` | readiness probe (public) |
-| GET | `/metrics` | Prometheus text format |
+| GET | `/metrics` | Prometheus text exposition (`sbc_*`): calls, SIP traffic, auth, anti-fraud, media, per-trunk series (`sbc_trunk_up/registered/active_calls/calls_total{trunk,direction,outcome}`, `sbc_trunk_enabled/available/unavailable_seconds/consecutive_failures`), `sbc_call_setup_seconds` / `sbc_call_duration_seconds` histograms — see `monitoring/README.md` |
 | GET | `/api/v1/stats` | active calls, totals, uptime |
-| GET | `/api/v1/alerts` | trunk down, auth/call failure rates |
+| GET | `/api/v1/alerts` | current conditions: `trunk_down` (failure cooldown running) / `trunk_parked` (503 Retry-After) with `unavailable_for_secs`, `trunk_unregistered`, `high_auth_failure_rate`… |
 | GET | `/api/v1/events?types=call,registration,trunk,alert,config` | **SSE** stream |
 
 ### Calls & registrations
@@ -88,10 +88,10 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/v1/trunks` | stored config + live health (`health`, `active_calls`, `consecutive_failures`, `registered`: true/false for trunks with `register_with_trunk`, null otherwise), password redacted |
+| GET | `/api/v1/trunks` | stored config + live state, password redacted: `health` = `up` / `degraded` (failures, still selectable) / `down` (failure cooldown running) / `parked` (the trunk asked for a pause with `503 Retry-After`; lifted by expiry or `/enable`), `unavailable_for_secs` (null when selectable), `active_calls`, `total_calls`, `failed_calls` (failed attempts **and** OPTIONS misses), `consecutive_failures`, `registered` (true/false for trunks with `register_with_trunk`, null otherwise) |
 | POST | `/api/v1/trunks` | full field set: `name`, `host`, `port`, `transport` (UDP/TCP/TLS/WS/WSS), `auth_required`, `username`, `password`, `register_with_trunk`, `prefix_patterns[]`, `priority`, `weight`, `cost_per_minute`, `number_format`, `country_code`, `national_prefix`, `caller_number_override`, `allowed_codecs[]`, `max_concurrent_calls`, `tls_sni`, `tls_ca_cert`, `tls_verify`, `tls_client_cert`, `tls_client_key` |
 | GET/PUT/PATCH/DELETE | `/api/v1/trunks/{name}` | GET masks `password` as `"***"`; PUT replaces every field (an omitted `password` clears it) and refuses `"***"`; PATCH merges any subset (RFC 7396: `null` clears a field, the password and TLS material stay unless given, unknown keys such as the GET-only `tls`/`health`/`registered` → 400); DELETE refuses while calls are active. Every write re-syncs the trunk's OPTIONS health check and outbound REGISTER loop (start, stop, or restart when host/port/transport/credentials/interval change) |
-| POST | `/api/v1/trunks/{name}/enable` · `/disable` | |
+| POST | `/api/v1/trunks/{name}/enable` · `/disable` | `enable` also forgives the failure cooldown and a `503 Retry-After` park |
 
 ### Routes (prefix → trunk)
 

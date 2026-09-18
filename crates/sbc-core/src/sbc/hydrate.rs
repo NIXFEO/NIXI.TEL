@@ -174,12 +174,11 @@ pub async fn apply_trunks_and_routes(
         let mut cfg = trunk_row_to_config(row, extra);
 
         if let Some(existing) = tm.find_by_name(&row.name) {
-            // A changed host/port (or one never resolved) needs a fresh
-            // destination: the trunk tasks restart on the new address.
+            // A changed host/port needs a fresh destination: the trunk
+            // tasks restart on the new address. (An unchanged, unresolved
+            // host is not retried here: this runs on the SIP loop.)
             let changed = existing.host != cfg.host || existing.port != cfg.port;
-            if (changed || existing.resolved_addr.is_none())
-                && cfg.resolve_destination().await.is_none()
-            {
+            if changed && cfg.resolve_destination().await.is_none() {
                 warn!(
                     "Hydrate: trunk '{}': DNS resolution failed for {}:{} — will retry",
                     cfg.name, cfg.host, cfg.port

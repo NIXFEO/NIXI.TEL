@@ -36,8 +36,7 @@ certificates, a reverse proxy (nginx) to expose the management API.
 | 5061 | TCP | SIP over TLS |
 | 8443 | TCP | SIP over WSS (WebRTC) |
 | 10000–20000 | UDP | RTP media |
-| 8080 | TCP | Management REST API (bind to localhost) |
-| 9090 | TCP | Prometheus metrics (bind to localhost) |
+| 8080 | TCP | Management REST API, incl. `GET /metrics` for Prometheus (bind to localhost) |
 
 **DNS** (optional, for TLS/WSS with real certificates): point your SIP and
 WebRTC hostnames at the server's public IP.
@@ -286,8 +285,9 @@ changes leave a trace. Ship those logs to your central logging and alert on
 
 ## 8. Firewall
 
-Expose only the media/signalling ports. Keep the management API (8080) and
-Prometheus metrics (9090) closed — reach them via localhost or an SSH tunnel:
+Expose only the media/signalling ports. Keep the management API (8080,
+which also serves `/metrics`) closed — reach it via localhost, the nginx
+reverse proxy or an SSH tunnel:
 
 ```bash
 sudo ufw allow 80/tcp                 # ACME/HTTP (certbot), if used
@@ -297,7 +297,7 @@ sudo ufw allow 5060/tcp
 sudo ufw allow 5061/tcp
 sudo ufw allow 8443/tcp
 sudo ufw allow 10000:20000/udp        # RTP media
-# Do NOT open 8080 (management API) or 9090 (metrics).
+# Do NOT open 8080 (management API, incl. /metrics).
 sudo ufw enable
 ```
 

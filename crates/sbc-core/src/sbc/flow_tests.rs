@@ -443,6 +443,28 @@ async fn invite_timeout_cancels_and_retargets_to_the_next_trunk() {
     assert_eq!(attempt.dest, backup_addr);
     assert_eq!(attempt.trunk_id, Some(backup_id));
     assert_ne!(backup_id, call.trunk_id, "moved off the first trunk");
+    let first = sbc.trunk_manager.get_state(&call.trunk_id).unwrap();
+    assert_eq!(
+        (first.active_calls, first.consecutive_failures),
+        (0, 1),
+        "the silent first trunk released the call and took a strike"
+    );
+    assert_eq!(
+        sbc.trunk_manager
+            .get_state(&backup_id)
+            .unwrap()
+            .active_calls,
+        1,
+        "the backup now carries it"
+    );
+    assert_eq!(
+        sbc.metrics
+            .trunk_series(TRUNK_NAME)
+            .unwrap()
+            .calls
+            .get(&("outbound".to_string(), "failover")),
+        Some(&1)
+    );
     assert!(alive(&sbc).await);
     assert!(
         drain(&mut call.caller_rx).is_empty(),
@@ -668,6 +690,22 @@ async fn trunk_call_to_an_unknown_number_is_answered_404() {
         nf
     );
     assert!(nf.contains("Call-ID: cid-in-1\r\n"));
+    let s = sbc.trunk_manager.state_by_name(TRUNK_NAME).unwrap();
+    assert_eq!(s.active_calls, 0, "charged to the source trunk, released");
+    assert_eq!(s.total_calls, 1);
+    assert_eq!(
+        s.consecutive_failures, 0,
+        "our 404 is not the trunk's failure"
+    );
+    assert_eq!(
+        sbc.metrics
+            .trunk_series(TRUNK_NAME)
+            .unwrap()
+            .calls
+            .get(&("inbound".to_string(), "failed")),
+        Some(&1),
+        "inbound refusals stay out of the outbound ASR"
+    );
     assert!(nf.contains("CSeq: 1 INVITE\r\n"));
 
     assert!(
@@ -2055,6 +2093,13 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     let trunk_cfg = sbc.trunk_manager.get_trunk(&tid).unwrap();
     let state = |sbc: &Sbc| sbc.trunk_manager.get_state(&tid).unwrap();
     let series = |sbc: &Sbc| sbc.metrics.trunk_series(TRUNK_NAME).unwrap();
+    let outbound = |sbc: &Sbc, outcome: &'static str| {
+        series(sbc)
+            .calls
+            .get(&("outbound".to_string(), outcome))
+            .copied()
+            .unwrap_or(0)
+    };
 
     // 1. An answered call is counted on the trunk while it lives; the 200
     //    OK resets an earlier failure; the BYE releases it and counts the
@@ -2081,9 +2126,8 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     .unwrap();
     let s = state(&sbc);
     assert_eq!((s.active_calls, s.total_calls), (0, 1));
-    let m = series(&sbc);
-    assert_eq!(m.active_calls, 0);
-    assert_eq!(m.calls.get("answered"), Some(&1));
+    assert_eq!(series(&sbc).active_calls, 0);
+    assert_eq!(outbound(&sbc, "answered"), 1);
     assert_eq!(sbc.metrics.call_setup_seconds.count(), 1);
     assert_eq!(sbc.metrics.call_duration_seconds.count(), 1);
 
@@ -2118,12 +2162,11 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     assert_eq!(s.active_calls, 0, "released on the final");
     assert_eq!(s.consecutive_failures, 1);
     let parked = s
-        .disabled_until
-        .map(|u| u.saturating_duration_since(std::time::Instant::now()))
+        .unavailable_for(std::time::Instant::now())
         .unwrap_or_default();
     assert!(parked > Duration::from_secs(100), "parked for {:?}", parked);
     assert!(!s.can_accept_call(&trunk_cfg), "no new call routed there");
-    assert_eq!(series(&sbc).calls.get("failed"), Some(&1));
+    assert_eq!(outbound(&sbc, "failed"), 1);
     assert_eq!(
         sbc.metrics.call_setup_seconds.count(),
         1,
@@ -2131,8 +2174,12 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     );
 
     // 3. 486 Busy Here is the callee's answer, not the trunk's failure:
-    //    relayed, counted as failed for ASR, no cooldown.
+    //    relayed, counted as rejected (not answered, for ASR), no cooldown.
+    //    (The park from step 2 survives a 200 OK: only a re-enable lifts it.)
     sbc.trunk_manager.update_state(&tid, |s| s.record_success());
+    assert!(!state(&sbc).can_accept_call(&trunk_cfg), "still parked");
+    sbc.trunk_manager.update_state(&tid, |s| s.clear_cooldowns());
+    assert!(state(&sbc).can_accept_call(&trunk_cfg), "re-enable forgives");
     let mut call3 = add_call(&mut sbc, CallSpec::numbered(3)).await;
     sbc.handle_response(
         response_for(
@@ -2156,7 +2203,35 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     let s = state(&sbc);
     assert_eq!((s.active_calls, s.consecutive_failures), (0, 0));
     assert!(s.disabled_until.is_none());
-    assert_eq!(series(&sbc).calls.get("failed"), Some(&2));
+    assert_eq!(outbound(&sbc, "rejected"), 1);
+    assert_eq!(outbound(&sbc, "failed"), 1, "unchanged");
+
+    // 3b. Three 603 Declines in a row (a 6xx, so a failover candidate would
+    //     be tried) never cool the trunk: not in the strike set.
+    for n in 10..13 {
+        let mut c = add_call(&mut sbc, CallSpec::numbered(n)).await;
+        sbc.handle_response(
+            response_for(
+                &c.spec,
+                "603 Decline",
+                &c.spec.branch,
+                c.spec.cseq,
+                "INVITE",
+                "",
+                "",
+            ),
+            trunk_addr(),
+            rsip::Transport::Udp,
+            None,
+        )
+        .await
+        .unwrap();
+        drain(&mut c.caller_rx);
+    }
+    let s = state(&sbc);
+    assert_eq!(s.consecutive_failures, 0, "603 is the callee's answer");
+    assert!(s.can_accept_call(&trunk_cfg));
+    assert_eq!(outbound(&sbc, "rejected"), 4);
 
     // 4. A CANCEL is its own outcome.
     let mut call4 = add_call(&mut sbc, CallSpec::numbered(4)).await;
@@ -2170,13 +2245,13 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     .unwrap();
     drain(&mut call4.caller_rx);
     assert_eq!(state(&sbc).active_calls, 0);
-    assert_eq!(series(&sbc).calls.get("cancelled"), Some(&1));
+    assert_eq!(outbound(&sbc, "cancelled"), 1);
 
     // Exposition: the series carry the trunk label.
     let out = sbc.metrics.render_prometheus();
     assert!(
         out.contains(&format!(
-            "sbc_trunk_calls_total{{trunk=\"{}\",outcome=\"answered\"}} 1\n",
+            "sbc_trunk_calls_total{{trunk=\"{}\",direction=\"outbound\",outcome=\"answered\"}} 1\n",
             TRUNK_NAME
         )),
         "{}",

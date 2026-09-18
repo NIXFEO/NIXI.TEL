@@ -71,24 +71,23 @@ groups:
         # attempts: the trunk rejects or does not answer most calls
         # (routing/number-format problem on our side, or the carrier's).
         expr: |
-          (sum by (trunk)(increase(sbc_trunk_calls_total{outcome="answered"}[30m]))
-            / sum by (trunk)(increase(sbc_trunk_calls_total[30m]))) < 0.3
-          and sum by (trunk)(increase(sbc_trunk_calls_total[30m])) >= 10
+          (sum by (trunk)(increase(sbc_trunk_calls_total{direction="outbound",outcome="answered"}[30m]))
+            / sum by (trunk)(increase(sbc_trunk_calls_total{direction="outbound"}[30m]))) < 0.3
+          and sum by (trunk)(increase(sbc_trunk_calls_total{direction="outbound"}[30m])) >= 10
         for: 10m
         labels: { severity: warning }
         annotations:
           summary: "ASR on trunk {{ $labels.trunk }} below 30% over 30 minutes"
 
-      - alert: SBCTrunkParked
-        # A trunk answered 503 Retry-After or failed 3 calls in a row: the
-        # SBC routes nothing there until the cooldown ends. Informational
-        # when failover carries the traffic; check the carrier otherwise.
-        expr: increase(sbc_trunk_calls_total{outcome="failed"}[10m]) >= 3
-              and sbc_trunk_active_calls == 0
-        for: 5m
+      - alert: SBCTrunkUnavailable
+        # An enabled trunk the router will not select: 3+ strikes in a row
+        # (cooldown) or a 503 Retry-After park. Informational when failover
+        # carries the traffic; with a single trunk every call is refused.
+        expr: sbc_trunk_available == 0 and on(trunk) sbc_trunk_enabled == 1
+        for: 1m
         labels: { severity: warning }
         annotations:
-          summary: "Trunk {{ $labels.trunk }} is failing calls (3+ in 10 minutes)"
+          summary: "Trunk {{ $labels.trunk }} is not selectable (cooldown or 503 Retry-After park)"
 
       - alert: SBCAuthFailureSpike
         expr: rate(sbc_auth_failures_total[5m]) > 5

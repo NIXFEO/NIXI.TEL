@@ -14,11 +14,14 @@
 //! INVITE); the event loop routes the answers by their `reg-` / `hc-`
 //! Call-ID through [`PendingResponses`].
 //!
-//! REGISTER: a `423 Interval Too Brief` is retried once with the trunk's
-//! `Min-Expires`, which is remembered for the following refreshes; a
-//! refused or unanswered REGISTER backs off exponentially (30 s → 15 min,
-//! reset on success) instead of hammering the trunk every minute; an
-//! OPTIONS down→up transition wakes a backed-off loop immediately.
+//! REGISTER: one Call-ID and a monotonic CSeq per registration sequence
+//! (RFC 3261 §10.2); a `423 Interval Too Brief` is retried once with the
+//! trunk's `Min-Expires`, which is remembered for the following refreshes;
+//! a *refused* REGISTER (4xx/5xx) backs off exponentially (30 s → 15 min,
+//! reset on success) instead of hammering the trunk every minute, while a
+//! timeout or a send failure keeps a fixed 60 s retry so a lost datagram
+//! does not stretch the outage; an OPTIONS down→up transition wakes a
+//! backed-off loop immediately.
 use crate::auth::{generate_digest_response, DigestChallenge};
 use crate::events::{event_ts, EventBus, SbcEvent};
 use crate::metrics::SbcMetrics;
@@ -28,7 +31,7 @@ use crate::trunk_register::{extract_header, parse_expires, parse_status};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -45,7 +48,7 @@ pub type PendingResponses = Arc<DashMap<String, oneshot::Sender<String>>>;
 /// fields that do not affect probing or registration (priority, prefixes,
 /// codecs, limits…) are deliberately absent. `enabled` is not part of it:
 /// a disabled trunk simply has no entry.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     pub id: TrunkId,
     pub name: String,
@@ -58,6 +61,23 @@ pub struct TaskSpec {
     pub password: Option<String>,
     pub realm: Option<String>,
     pub registration_interval: Duration,
+}
+
+impl std::fmt::Debug for TaskSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskSpec")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("transport", &self.transport)
+            .field("dest", &self.dest)
+            .field("register", &self.register)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("realm", &self.realm)
+            .field("registration_interval", &self.registration_interval)
+            .finish()
+    }
 }
 
 impl TaskSpec {
@@ -88,6 +108,11 @@ pub struct TrunkTasksConfig {
     pub register_timeout: Duration,
     /// Floor of the refresh period (0.8 × granted Expires is clamped to it).
     pub refresh_min: Duration,
+    /// Floor of the configured registration interval (the refresh cap).
+    pub refresh_floor: Duration,
+    /// Fixed retry after a timeout, send failure or malformed answer.
+    pub retry_fixed: Duration,
+    /// Exponential retry after a refused REGISTER (4xx/5xx).
     pub backoff_min: Duration,
     pub backoff_max: Duration,
 }
@@ -100,6 +125,8 @@ impl Default for TrunkTasksConfig {
             options_timeout: Duration::from_secs(5),
             register_timeout: Duration::from_secs(10),
             refresh_min: Duration::from_secs(30),
+            refresh_floor: Duration::from_secs(60),
+            retry_fixed: Duration::from_secs(60),
             backoff_min: Duration::from_secs(30),
             backoff_max: Duration::from_secs(900),
         }
@@ -179,6 +206,9 @@ struct Ctx {
     events: EventBus,
     config: TrunkTasksConfig,
     socket: Arc<UdpSocket>,
+    /// Process shutdown: un-REGISTERs are fire-and-forget (the SIP loop
+    /// that would route the answer is gone).
+    fast_stop: Arc<AtomicBool>,
 }
 
 impl Ctx {
@@ -195,6 +225,10 @@ struct Running {
     spec: TaskSpec,
     generation: u64,
     cancel: CancellationToken,
+    /// False when the tasks are merely restarted for a spec change while
+    /// the trunk keeps registering: the new registration supersedes the
+    /// binding, an `Expires: 0` racing it would drop it.
+    unregister_on_stop: Arc<AtomicBool>,
     health: JoinHandle<()>,
     register: Option<JoinHandle<()>>,
 }
@@ -211,20 +245,21 @@ pub struct RunningInfo {
 pub struct TrunkTasks {
     trunks: Arc<TrunkManager>,
     pending: PendingResponses,
-    identity: Option<SbcIdentity>,
     metrics: Arc<SbcMetrics>,
     events: EventBus,
     config: TrunkTasksConfig,
-    socket: OnceLock<Arc<UdpSocket>>,
+    /// The SIP listener's UDP socket and the SBC's identity, attached once
+    /// the listeners are up.
+    socket: OnceLock<(Arc<UdpSocket>, Option<SbcIdentity>)>,
     running: Mutex<HashMap<String, Running>>,
     generation: AtomicU64,
+    fast_stop: Arc<AtomicBool>,
 }
 
 impl TrunkTasks {
     pub fn new(
         trunks: Arc<TrunkManager>,
         pending: PendingResponses,
-        identity: Option<SbcIdentity>,
         metrics: Arc<SbcMetrics>,
         events: EventBus,
         config: TrunkTasksConfig,
@@ -232,20 +267,21 @@ impl TrunkTasks {
         Self {
             trunks,
             pending,
-            identity,
             metrics,
             events,
             config,
             socket: OnceLock::new(),
             running: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            fast_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// The UDP socket the tasks send from (the SIP listener's). Until it is
-    /// attached, `sync` does nothing. False when one was already attached.
-    pub fn attach_socket(&self, sock: Arc<UdpSocket>) -> bool {
-        self.socket.set(sock).is_ok()
+    /// The UDP socket the tasks send from (the SIP listener's) and the
+    /// identity the trunk sees us as. Until attached, `sync` does nothing.
+    /// False when already attached.
+    pub fn attach_socket(&self, sock: Arc<UdpSocket>, identity: Option<SbcIdentity>) -> bool {
+        self.socket.set((sock, identity)).is_ok()
     }
 
     pub fn has_socket(&self) -> bool {
@@ -256,7 +292,7 @@ impl TrunkTasks {
     /// tasks of trunks that vanished, were disabled or changed; start the
     /// missing ones. Non-blocking.
     pub fn sync(&self) {
-        let Some(socket) = self.socket.get() else {
+        let Some((socket, identity)) = self.socket.get() else {
             debug!("Trunk tasks: no UDP socket yet — nothing started");
             return;
         };
@@ -279,17 +315,25 @@ impl TrunkTasks {
             let Some(r) = running.remove(&name) else {
                 continue;
             };
-            let why = if desired.contains_key(&name) {
-                "changed — restarting its tasks"
-            } else {
-                "removed or disabled — stopping its tasks"
-            };
-            info!("Trunk '{}' {}", name, why);
+            match desired.get(&name) {
+                Some(next) => {
+                    info!("Trunk '{}' changed — restarting its tasks", name);
+                    // Still registering: the new loop's REGISTER supersedes
+                    // the binding; no Expires: 0 that could race it.
+                    if next.register && r.spec.register {
+                        r.unregister_on_stop.store(false, Ordering::Relaxed);
+                    }
+                    self.metrics.set_trunk_up(&name, None);
+                    self.metrics.set_trunk_registered(&name, None);
+                }
+                None => {
+                    info!("Trunk '{}' removed or disabled — stopping its tasks", name);
+                    self.metrics.remove_trunk(&name);
+                }
+            }
             r.cancel.cancel();
             self.trunks
                 .update_state(&r.spec.id, |s| s.registered = false);
-            self.metrics.set_trunk_up(&name, None);
-            self.metrics.set_trunk_registered(&name, None);
         }
 
         let mut to_start: Vec<(String, TaskSpec)> = desired
@@ -301,14 +345,16 @@ impl TrunkTasks {
             let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
             let cancel = CancellationToken::new();
             let wake = Arc::new(Notify::new());
+            let unregister_on_stop = Arc::new(AtomicBool::new(true));
             let ctx = Arc::new(Ctx {
                 trunks: self.trunks.clone(),
                 pending: self.pending.clone(),
-                identity: self.identity.clone(),
+                identity: identity.clone(),
                 metrics: self.metrics.clone(),
                 events: self.events.clone(),
                 config: self.config.clone(),
                 socket: socket.clone(),
+                fast_stop: self.fast_stop.clone(),
             });
             info!(
                 "Trunk '{}': starting OPTIONS health check{} ({}:{})",
@@ -333,6 +379,7 @@ impl TrunkTasks {
                     spec.clone(),
                     cancel.child_token(),
                     wake.clone(),
+                    unregister_on_stop.clone(),
                 ))
             });
             running.insert(
@@ -341,6 +388,7 @@ impl TrunkTasks {
                     spec,
                     generation,
                     cancel,
+                    unregister_on_stop,
                     health,
                     register,
                 },
@@ -363,9 +411,11 @@ impl TrunkTasks {
         out
     }
 
-    /// Stop every task; registered trunks get a best-effort `Expires: 0`
-    /// (bounded: the SIP loop may already be gone at process shutdown).
+    /// Process shutdown: stop every task; registered trunks get a
+    /// fire-and-forget `Expires: 0` (the SIP loop that would route the
+    /// answer is gone by now), then a short bounded wait.
     pub async fn shutdown(&self) {
+        self.fast_stop.store(true, Ordering::Relaxed);
         let handles: Vec<(JoinHandle<()>, Option<JoinHandle<()>>)> = {
             let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
             running
@@ -384,7 +434,7 @@ impl TrunkTasks {
                 }
             }
         };
-        if tokio::time::timeout(Duration::from_secs(3), wait)
+        if tokio::time::timeout(Duration::from_millis(500), wait)
             .await
             .is_err()
         {
@@ -495,7 +545,7 @@ async fn health_loop(
                     consecutive_failures: 0,
                     ts: event_ts(),
                 });
-                wake_register.notify_one();
+                wake_register.notify_waiters();
             }
         } else if ever_responded {
             ctx.trunks
@@ -539,20 +589,25 @@ async fn register_loop(
     spec: TaskSpec,
     cancel: CancellationToken,
     wake: Arc<Notify>,
+    unregister_on_stop: Arc<AtomicBool>,
 ) {
     let name = spec.name.clone();
-    let interval = spec.registration_interval.max(ctx.config.refresh_min);
+    let interval = spec.registration_interval.max(ctx.config.refresh_floor);
     let mut expires: u32 = spec
         .registration_interval
         .as_secs()
         .clamp(1, u32::MAX as u64) as u32;
     let mut backoff = Backoff::new(ctx.config.backoff_min, ctx.config.backoff_max);
+    // One Call-ID and a monotonic CSeq for the whole sequence (RFC 3261
+    // §10.2); the `reg-` prefix routes the answers to us.
+    let call_id = format!("reg-{}-{}", name, rand8());
+    let mut cseq: u32 = 0;
     let mut registered = false;
     let mut failure_announced = false;
 
     loop {
         info!("Trunk '{}': sending REGISTER (Expires {})", name, expires);
-        let mut outcome = send_register(&ctx, &spec, expires, &cancel).await;
+        let mut outcome = send_register(&ctx, &spec, expires, &call_id, &mut cseq, &cancel).await;
         if let RegisterOutcome::IntervalTooBrief { min_expires } = outcome {
             if min_expires > expires {
                 info!(
@@ -560,13 +615,13 @@ async fn register_loop(
                     name, min_expires
                 );
                 expires = min_expires;
-                outcome = send_register(&ctx, &spec, expires, &cancel).await;
+                outcome = send_register(&ctx, &spec, expires, &call_id, &mut cseq, &cancel).await;
             }
         }
         if outcome == RegisterOutcome::Cancelled {
             break;
         }
-        let wait = match outcome {
+        match outcome {
             RegisterOutcome::Registered { granted } => {
                 ctx.trunks.update_state(&spec.id, |s| s.registered = true);
                 ctx.metrics.set_trunk_registered(&name, Some(true));
@@ -584,7 +639,10 @@ async fn register_loop(
                 failure_announced = false;
                 backoff.reset();
                 let refresh = Duration::from_secs((u64::from(granted) * 8 / 10).max(1));
-                refresh.clamp(ctx.config.refresh_min, interval)
+                let wait = refresh.clamp(ctx.config.refresh_min, interval);
+                if sleep_or_cancel(wait, &cancel).await {
+                    break;
+                }
             }
             failure => {
                 let reason = failure.reason();
@@ -599,29 +657,59 @@ async fn register_loop(
                 }
                 registered = false;
                 failure_announced = true;
-                let wait = backoff.next_wait();
+                // A refusal (credentials, policy) backs off; a lost datagram
+                // or a dead path retries at a fixed pace so a short blip
+                // does not stretch into a long outage.
+                let wait = match failure {
+                    RegisterOutcome::Refused { .. } | RegisterOutcome::IntervalTooBrief { .. } => {
+                        backoff.next_wait()
+                    }
+                    _ => ctx.config.retry_fixed,
+                };
                 warn!(
                     "Trunk '{}': REGISTER failed ({}) — retrying in {:?}",
                     name, reason, wait
                 );
-                wait
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = wake.notified() => debug!("Trunk '{}': health up — registering now", name),
+                    _ = cancel.cancelled() => break,
+                }
             }
-        };
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = wake.notified() => debug!("Trunk '{}': health up — registering now", name),
-            _ = cancel.cancelled() => break,
         }
     }
 
-    // Stopped (trunk removed, disabled, changed, or shutdown): best-effort
-    // un-register so the trunk does not keep a dead binding.
-    if registered {
-        let _ = tokio::time::timeout(
-            ctx.config.register_timeout,
-            send_register(&ctx, &spec, 0, &CancellationToken::new()),
-        )
-        .await;
+    // Stopped. Removed or disabled trunk: un-register so it does not keep a
+    // dead binding (awaited while the SIP loop is alive, fire-and-forget at
+    // process shutdown). Restarted for a spec change: the new loop's
+    // REGISTER supersedes the binding, nothing to do.
+    if registered && unregister_on_stop.load(Ordering::Relaxed) {
+        if ctx.fast_stop.load(Ordering::Relaxed) {
+            if let Some(dest) = spec.dest {
+                cseq += 1;
+                let from = format!(
+                    "<sip:{}@{}>;tag={}",
+                    spec.username.as_deref().unwrap_or("anonymous"),
+                    spec.host,
+                    rand8()
+                );
+                let bye = build_register(&spec, &ctx.local_ip(), &call_id, cseq, &from, 0, None);
+                let _ = ctx.socket.send_to(bye.as_bytes(), dest).await;
+            }
+        } else {
+            let _ = tokio::time::timeout(
+                ctx.config.register_timeout * 2,
+                send_register(
+                    &ctx,
+                    &spec,
+                    0,
+                    &call_id,
+                    &mut cseq,
+                    &CancellationToken::new(),
+                ),
+            )
+            .await;
+        }
     }
     ctx.trunks.update_state(&spec.id, |s| s.registered = false);
 }
@@ -696,24 +784,27 @@ fn build_register(
     )
 }
 
-/// One REGISTER cycle: request, one Digest retry on 401/407, outcome.
+/// One REGISTER cycle on the caller's Call-ID: request, one Digest retry
+/// on 401/407 (next CSeq), outcome.
 async fn send_register(
     ctx: &Ctx,
     spec: &TaskSpec,
     expires: u32,
+    call_id: &str,
+    cseq: &mut u32,
     cancel: &CancellationToken,
 ) -> RegisterOutcome {
     let Some(dest) = spec.dest else {
         return RegisterOutcome::SendFailed("no destination (DNS)".into());
     };
-    let call_id = format!("reg-{}-{}", spec.name, rand8());
     let local_ip = ctx.local_ip();
     let username = spec.username.as_deref().unwrap_or("anonymous");
     let from = format!("<sip:{}@{}>;tag={}", username, spec.host, rand8());
     let request_uri = format!("sip:{}", spec.host);
 
-    let first = build_register(spec, &local_ip, &call_id, 1, &from, expires, None);
-    let raw = match send_and_wait(ctx, &call_id, first, dest, cancel).await {
+    *cseq += 1;
+    let first = build_register(spec, &local_ip, call_id, *cseq, &from, expires, None);
+    let raw = match send_and_wait(ctx, call_id, first, dest, cancel).await {
         Ok(raw) => raw,
         Err(outcome) => return outcome,
     };
@@ -751,16 +842,17 @@ async fn send_register(
             } else {
                 "Proxy-Authorization"
             };
+            *cseq += 1;
             let second = build_register(
                 spec,
                 &local_ip,
-                &call_id,
-                2,
+                call_id,
+                *cseq,
                 &from,
                 expires,
                 Some((auth_header, &auth_value)),
             );
-            let raw2 = match send_and_wait(ctx, &call_id, second, dest, cancel).await {
+            let raw2 = match send_and_wait(ctx, call_id, second, dest, cancel).await {
                 Ok(raw) => raw,
                 Err(outcome) => return outcome,
             };
@@ -795,6 +887,8 @@ mod tests {
             options_timeout: Duration::from_millis(60),
             register_timeout: Duration::from_millis(200),
             refresh_min: Duration::from_millis(20),
+            refresh_floor: Duration::from_millis(20),
+            retry_fixed: Duration::from_millis(30),
             backoff_min: Duration::from_millis(20),
             backoff_max: Duration::from_millis(80),
         }
@@ -860,13 +954,12 @@ mod tests {
         let tasks = Arc::new(TrunkTasks::new(
             trunks,
             Default::default(),
-            None,
             metrics,
             events,
             fast_config(),
         ));
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        assert!(tasks.attach_socket(sock));
+        assert!(tasks.attach_socket(sock, None));
         tasks
     }
 
@@ -991,14 +1084,16 @@ mod tests {
         let tasks = TrunkTasks::new(
             trunks,
             Default::default(),
-            None,
             Arc::new(SbcMetrics::new()),
             EventBus::new(),
             fast_config(),
         );
         tasks.sync();
         assert!(tasks.running().is_empty());
-        assert!(tasks.attach_socket(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())));
+        assert!(tasks.attach_socket(
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            None
+        ));
         tasks.sync();
         assert_eq!(tasks.running().len(), 1);
         tasks.shutdown().await;
@@ -1136,9 +1231,13 @@ mod tests {
             }
         };
         assert!(
-            refresh.contains("CSeq: 1 REGISTER\r\n"),
-            "new Call-ID, new cycle: {}",
+            refresh.contains("CSeq: 3 REGISTER\r\n"),
+            "same sequence, next CSeq: {}",
             refresh
+        );
+        assert_eq!(
+            extract_header(&refresh, "call-id"),
+            extract_header(&req, "call-id")
         );
         tasks.shutdown().await;
     }
@@ -1168,10 +1267,10 @@ mod tests {
         );
         let retry = recv_register().await;
         assert!(retry.contains("Expires: 3600\r\n"), "{}", retry);
-        assert!(
-            retry.contains("CSeq: 1 REGISTER\r\n"),
-            "a new transaction: {}",
-            retry
+        assert!(retry.contains("CSeq: 2 REGISTER\r\n"), "{}", retry);
+        assert_eq!(
+            extract_header(&retry, "call-id"),
+            extract_header(&req, "call-id")
         );
         peer.answer(&pending, &retry, "200 OK", "Expires: 3600\r\n");
         // Next cycle starts at the remembered value.
@@ -1225,6 +1324,77 @@ mod tests {
         );
         assert!(!trunks.get_state(&id).unwrap().registered);
         assert_eq!(metrics.trunk_series("t1").unwrap().registered, Some(false));
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_for_a_spec_change_does_not_unregister() {
+        let peer = Peer::new().await;
+        let (trunks, id) = harness(&peer, true);
+        let tasks = tasks(trunks.clone(), Arc::new(SbcMetrics::new()), EventBus::new()).await;
+        let pending = tasks.pending.clone();
+        tasks.sync();
+        let req = loop {
+            let r = peer.recv().await.expect("request");
+            if r.starts_with("REGISTER ") {
+                break r;
+            }
+        };
+        peer.answer(&pending, &req, "200 OK", "Expires: 300\r\n");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(trunks.get_state(&id).unwrap().registered);
+
+        let mut cfg = trunks.get_trunk(&id).unwrap();
+        cfg.password = Some("rotated".into());
+        trunks.update_trunk_by_name("t1", cfg);
+        tasks.sync();
+        // The next REGISTERs are the new loop's (CSeq 1, new Call-ID); no
+        // Expires: 0 races them.
+        let mut seen = 0;
+        while seen < 3 {
+            let r = peer.recv().await.expect("request");
+            if r.starts_with("REGISTER ") {
+                assert!(
+                    !r.contains("Expires: 0\r\n"),
+                    "no un-register on restart: {}",
+                    r
+                );
+                if seen == 0 {
+                    assert!(r.contains("CSeq: 1 REGISTER\r\n"), "{}", r);
+                    assert_ne!(
+                        extract_header(&r, "call-id"),
+                        extract_header(&req, "call-id")
+                    );
+                }
+                peer.answer(&pending, &r, "200 OK", "Expires: 300\r\n");
+                seen += 1;
+            }
+        }
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unanswered_register_retries_at_the_fixed_pace() {
+        let peer = Peer::new().await;
+        let (trunks, _) = harness(&peer, true);
+        let tasks = tasks(trunks.clone(), Arc::new(SbcMetrics::new()), EventBus::new()).await;
+        tasks.sync();
+        let mut stamps = Vec::new();
+        while stamps.len() < 3 {
+            let r = peer.recv().await.expect("request");
+            if r.starts_with("REGISTER ") {
+                stamps.push(std::time::Instant::now());
+            }
+        }
+        let gap1 = stamps[1] - stamps[0];
+        let gap2 = stamps[2] - stamps[1];
+        assert!(gap1 < Duration::from_millis(400), "{:?}", gap1);
+        assert!(
+            gap2 < gap1 + Duration::from_millis(100),
+            "no exponential growth on timeouts: {:?} then {:?}",
+            gap1,
+            gap2
+        );
         tasks.shutdown().await;
     }
 

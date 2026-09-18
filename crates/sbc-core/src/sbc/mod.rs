@@ -580,7 +580,6 @@ impl Sbc {
         let trunk_tasks = Arc::new(crate::trunk_tasks::TrunkTasks::new(
             trunk_manager.clone(),
             pending_register_responses.clone(),
-            identity.clone(),
             metrics.clone(),
             events.clone(),
             crate::trunk_tasks::TrunkTasksConfig::from(&config.trunk_health),
@@ -916,7 +915,6 @@ impl Sbc {
         let trunk_tasks = Arc::new(crate::trunk_tasks::TrunkTasks::new(
             trunk_manager.clone(),
             pending_register_responses.clone(),
-            None,
             metrics.clone(),
             events.clone(),
             crate::trunk_tasks::TrunkTasksConfig::default(),
@@ -967,7 +965,7 @@ impl Sbc {
     pub fn start_trunk_tasks(&self) {
         match self.transport.udp_socket() {
             Some(sock) => {
-                self.trunk_tasks.attach_socket(sock);
+                self.trunk_tasks.attach_socket(sock, self.identity.clone());
                 self.trunk_tasks.sync();
             }
             None => warn!(
@@ -1097,13 +1095,11 @@ impl Sbc {
                 _ = sigterm.recv() => {
                     info!("SIGTERM received — graceful shutdown");
                     self.graceful_shutdown().await;
-                    self.trunk_tasks.shutdown().await;
                     break;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("SIGINT received — graceful shutdown");
                     self.graceful_shutdown().await;
-                    self.trunk_tasks.shutdown().await;
                     break;
                 }
             }
@@ -1127,8 +1123,7 @@ impl Sbc {
                     _ = tokio::signal::ctrl_c() => {
                         info!("SIGINT received — graceful shutdown");
                         self.graceful_shutdown().await;
-                        self.trunk_tasks.shutdown().await;
-                        break;
+                    break;
                     }
                 }
             }

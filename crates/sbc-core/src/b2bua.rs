@@ -318,6 +318,9 @@ pub struct B2buaCall {
     /// The trunk whose active-call counter currently includes this call
     /// (see `Sbc::count_call_on_trunk`); None once released.
     pub trunk_counted: Option<String>,
+    /// The live outbound attempt got at least one response (even a 100
+    /// Trying): the trunk is alive, a timeout is not its silence.
+    pub callee_responded: bool,
 
     /// Codec negotiated for this call (e.g. "PCMU", "Opus")
     pub codec: Option<String>,
@@ -400,6 +403,7 @@ impl B2buaCall {
             callee_number: None,
             trunk_name: None,
             trunk_counted: None,
+            callee_responded: false,
             codec: None,
             callee_is_webrtc: false,
             webrtc_session_b: None,
@@ -839,6 +843,14 @@ impl B2buaManager {
 
     /// A >=180 provisional arrived: the current trunk is progressing the
     /// dialog — disable failover for this call.
+    /// Any response to the live outbound attempt arrived.
+    pub async fn mark_callee_responded(&self, uuid: &CallUuid) {
+        let mut calls = self.calls.lock().await;
+        if let Some(call) = calls.get_mut(uuid) {
+            call.callee_responded = true;
+        }
+    }
+
     pub async fn mark_provisional_received(&self, uuid: &CallUuid) {
         let mut calls = self.calls.lock().await;
         if let Some(fo) = calls.get_mut(uuid).and_then(|c| c.failover.as_mut()) {

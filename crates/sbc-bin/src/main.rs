@@ -120,6 +120,9 @@ async fn main() -> Result<()> {
 
     // Run main event loop — blocks until shutdown
     sbc.run().await;
+    // The SIP loop is gone: stop the trunk tasks (fire-and-forget
+    // un-REGISTERs, bounded wait).
+    sbc.trunk_tasks().shutdown().await;
 
     info!("SBC shutdown complete");
     Ok(())

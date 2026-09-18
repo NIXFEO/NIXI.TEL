@@ -180,11 +180,18 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
 
 - **Trunk capacity and cooldown are real** — a call counts on its trunk
   from the forwarded INVITE (or from the inbound INVITE's source trunk) to
-  `finish_call`; 408/5xx/6xx, unanswered attempts and OPTIONS misses feed
-  the failure ladder (3 → 30 s, 6 → 2 min, 10 → 5 min without new calls), a
-  `503 Retry-After` parks the trunk for that long, a 200 OK resets. The
-  router skips full or parked trunks; failover moves the count. Per-trunk
-  metrics: `sbc_trunk_up/registered/active_calls/calls_total{outcome}`.
+  `finish_call`. Strikes: a 408/500/502/503/504 final, a send failure, no
+  answer at all (not even 100 Trying) within `invite_timeout` (when a
+  backup exists) or `call_setup_timeout`, and OPTIONS misses — never the
+  callee's answer (486, 603, 404, 501, 6xx). 3 → 30 s, 6 → 2 min, 10 →
+  5 min without new calls; a 200 OK or an OPTIONS answer resets. A
+  `503 Retry-After` parks the trunk for that long; the park survives a 200
+  OK and is lifted by expiry or `POST /trunks/{name}/enable`. The router
+  skips full, cooling or parked trunks; failover moves the count and
+  counts a `failover` outcome on the trunk it left. Per-trunk metrics:
+  `sbc_trunk_up/registered/active_calls/calls_total{direction,outcome}`
+  plus `sbc_trunk_enabled/available/unavailable_seconds` from the table.
+  The OPTIONS/REGISTER tasks follow the trunk table (`trunk_tasks.rs`).
 
 Some callees (e.g. Jambonz-based) drop media without sending BYE — after
 `security.rtp_timeout` (90 s) without RTP the SBC BYEs both legs and writes a

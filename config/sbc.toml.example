@@ -80,7 +80,7 @@ trunk_local_from = "allow"
 max_call_duration = 14400      # answered call hard cap → BYE both legs (CDR "timeout")
 call_setup_timeout = 60        # unanswered INVITE → CANCEL + 408 to the caller (CDR "setup-timeout")
 rtp_timeout = 90               # no RTP for this long → BYE both legs (CDR "rtp-timeout")
-invite_timeout = 5             # no >=180 within 5s → trunk failover
+invite_timeout = 5             # no >=180 within 5s → trunk failover (raise above the carrier's post-dial delay when a backup trunk exists; a trunk that answered nothing at all also takes a strike)
 
 # RFC 4028 session timers (refresh re-INVITEs on the trunk leg so >4h
 # calls survive). Off by default; enable after validating with your trunk.
@@ -162,6 +162,8 @@ options_timeout = 5
 register_backoff_max = 900
 
 [metrics]
+# Parsed for compatibility, not used: metrics are served by the management
+# API at GET /metrics (bearer token), see monitoring/README.md.
 prometheus_enabled = true
 prometheus_bind_address = "127.0.0.1"
 prometheus_port = 9090

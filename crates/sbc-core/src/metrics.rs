@@ -2,6 +2,20 @@
 //!
 //! Exposes SBC operational metrics for monitoring dashboards.
 //! Compatible with Prometheus scraping format (text/plain).
+//!
+//! Conventions (keep them when adding a family):
+//! - names are `sbc_<subject>_<unit>`; counters end in `_total` (the
+//!   `counter!` macro appends it: pass the base name), timestamps in
+//!   `_timestamp_seconds`, durations in `_seconds`;
+//! - unlabelled series go through the `gauge!` / `counter!` macros;
+//!   labelled families are hand-rendered from a map, sorted by label so
+//!   the exposition is stable, with label values escaped by
+//!   [`escape_label`];
+//! - a labelled family is exported only for keys that exist (a trunk that
+//!   never answered OPTIONS has no `sbc_trunk_up`), and one `# TYPE` line
+//!   per family — a second one makes Prometheus reject the whole scrape;
+//! - series derived from another manager's snapshot (trunk availability)
+//!   are rendered by a free function the `/metrics` route appends.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,9 +106,12 @@ pub struct TrunkSeries {
     pub up: Option<bool>,
     pub registered: Option<bool>,
     pub active_calls: u64,
-    /// Finished calls by outcome (`answered`, `failed`, `cancelled`,
-    /// `timeout`…) — ASR = answered / sum.
-    pub calls: HashMap<&'static str, u64>,
+    /// Finished calls by (direction, outcome): `answered`, `rejected` (the
+    /// callee's answer: busy, declined, unknown number…), `failed` (the
+    /// trunk's or the SBC's: 5xx, 408, no route), `cancelled`, `timeout`,
+    /// `failover` (the attempt moved to the next trunk). Outbound ASR =
+    /// answered / all, both on `direction="outbound"`.
+    pub calls: HashMap<(String, &'static str), u64>,
 }
 
 /// All SBC counters and gauges
@@ -477,9 +494,11 @@ impl SbcMetrics {
         self.with_trunk(trunk, |t| t.active_calls = n);
     }
 
-    /// One finished call on this trunk, by outcome.
-    pub fn inc_trunk_call(&self, trunk: &str, outcome: &'static str) {
-        self.with_trunk(trunk, |t| *t.calls.entry(outcome).or_insert(0) += 1);
+    /// One finished call (or moved attempt) on this trunk.
+    pub fn inc_trunk_call(&self, trunk: &str, direction: &str, outcome: &'static str) {
+        self.with_trunk(trunk, |t| {
+            *t.calls.entry((direction.to_string(), outcome)).or_insert(0) += 1
+        });
     }
 
     /// Forget a trunk's series (deleted through the API).
@@ -775,7 +794,7 @@ impl SbcMetrics {
             let mut calls = String::new();
             for name in names {
                 let t = &map[name];
-                let label = name.replace('\\', "\\\\").replace('"', "\\\"");
+                let label = escape_label(name);
                 if let Some(up) = t.up {
                     ups.push_str(&format!(
                         "sbc_trunk_up{{trunk=\"{}\"}} {}\n",
@@ -796,10 +815,13 @@ impl SbcMetrics {
                 ));
                 let mut outcomes: Vec<_> = t.calls.iter().collect();
                 outcomes.sort();
-                for (outcome, n) in outcomes {
+                for ((direction, outcome), n) in outcomes {
                     calls.push_str(&format!(
-                        "sbc_trunk_calls_total{{trunk=\"{}\",outcome=\"{}\"}} {}\n",
-                        label, outcome, n
+                        "sbc_trunk_calls_total{{trunk=\"{}\",direction=\"{}\",outcome=\"{}\"}} {}\n",
+                        label,
+                        escape_label(direction),
+                        outcome,
+                        n
                     ));
                 }
             }
@@ -809,7 +831,7 @@ impl SbcMetrics {
             out.push_str(&regs);
             out.push_str("# HELP sbc_trunk_active_calls Calls currently on the trunk (both directions)\n# TYPE sbc_trunk_active_calls gauge\n");
             out.push_str(&actives);
-            out.push_str("# HELP sbc_trunk_calls_total Finished calls per trunk by outcome (answered, failed, cancelled, timeout)\n# TYPE sbc_trunk_calls_total counter\n");
+            out.push_str("# HELP sbc_trunk_calls_total Finished calls per trunk by direction and outcome (answered, rejected, failed, cancelled, timeout, failover)\n# TYPE sbc_trunk_calls_total counter\n");
             out.push_str(&calls);
         }
 
@@ -858,6 +880,67 @@ impl Default for SbcMetrics {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Escape a label value for the text exposition (backslash, quote, newline).
+pub fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Trunk availability from a `TrunkManager` snapshot: `sbc_trunk_enabled`,
+/// `sbc_trunk_available` (enabled and neither in cooldown nor parked: the
+/// router will select it), `sbc_trunk_unavailable_seconds` (time left in
+/// the cooldown/park) and `sbc_trunk_consecutive_failures`. Appended by
+/// the `/metrics` route after [`SbcMetrics::render_prometheus`].
+pub fn render_trunk_availability(
+    stats: &[(
+        crate::routing::TrunkConfig,
+        crate::routing::trunk::TrunkState,
+    )],
+) -> String {
+    let now = std::time::Instant::now();
+    let mut rows: Vec<_> = stats.iter().collect();
+    rows.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    let mut enabled = String::new();
+    let mut available = String::new();
+    let mut unavailable = String::new();
+    let mut failures = String::new();
+    for (cfg, state) in rows {
+        let label = escape_label(&cfg.name);
+        let left = state.unavailable_for(now);
+        enabled.push_str(&format!(
+            "sbc_trunk_enabled{{trunk=\"{}\"}} {}\n",
+            label,
+            u8::from(cfg.enabled)
+        ));
+        available.push_str(&format!(
+            "sbc_trunk_available{{trunk=\"{}\"}} {}\n",
+            label,
+            u8::from(cfg.enabled && left.is_none())
+        ));
+        unavailable.push_str(&format!(
+            "sbc_trunk_unavailable_seconds{{trunk=\"{}\"}} {}\n",
+            label,
+            left.map(|d| d.as_secs()).unwrap_or(0)
+        ));
+        failures.push_str(&format!(
+            "sbc_trunk_consecutive_failures{{trunk=\"{}\"}} {}\n",
+            label, state.consecutive_failures
+        ));
+    }
+    let mut out = String::with_capacity(512);
+    out.push_str("# HELP sbc_trunk_enabled Trunk enabled in the table (1) or disabled (0)\n# TYPE sbc_trunk_enabled gauge\n");
+    out.push_str(&enabled);
+    out.push_str("# HELP sbc_trunk_available Trunk selectable by the router: enabled, not in failure cooldown, not parked by a 503 Retry-After\n# TYPE sbc_trunk_available gauge\n");
+    out.push_str(&available);
+    out.push_str("# HELP sbc_trunk_unavailable_seconds Seconds left before the router selects the trunk again (0 when available)\n# TYPE sbc_trunk_unavailable_seconds gauge\n");
+    out.push_str(&unavailable);
+    out.push_str("# HELP sbc_trunk_consecutive_failures Consecutive call or probe failures (reset by a 200 OK or an OPTIONS answer)\n# TYPE sbc_trunk_consecutive_failures gauge\n");
+    out.push_str(&failures);
+    out
 }
 
 // ── Health check ───────────────────────────────────────────────────────────────
@@ -997,10 +1080,11 @@ mod tests {
         let m = SbcMetrics::new();
         m.set_trunk_up("genesys", Some(true));
         m.set_trunk_active_calls("genesys", 3);
-        m.inc_trunk_call("genesys", "answered");
-        m.inc_trunk_call("genesys", "answered");
-        m.inc_trunk_call("genesys", "failed");
-        m.set_trunk_registered("cpaas", Some(false));
+        m.inc_trunk_call("genesys", "outbound", "answered");
+        m.inc_trunk_call("genesys", "outbound", "answered");
+        m.inc_trunk_call("genesys", "outbound", "rejected");
+        m.inc_trunk_call("genesys", "inbound", "failed");
+        m.set_trunk_registered("cp\"aas", Some(false));
         let out = m.render_prometheus();
         assert!(
             out.contains("sbc_trunk_up{trunk=\"genesys\"} 1\n"),
@@ -1008,20 +1092,64 @@ mod tests {
             out
         );
         assert!(
-            !out.contains("sbc_trunk_up{trunk=\"cpaas\""),
+            !out.contains("sbc_trunk_up{trunk=\"cp"),
             "unknown health is not exported"
         );
-        assert!(out.contains("sbc_trunk_registered{trunk=\"cpaas\"} 0\n"));
+        assert!(
+            out.contains("sbc_trunk_registered{trunk=\"cp\\\"aas\"} 0\n"),
+            "{}",
+            out
+        );
         assert!(!out.contains("sbc_trunk_registered{trunk=\"genesys\""));
         assert!(out.contains("sbc_trunk_active_calls{trunk=\"genesys\"} 3\n"));
-        assert!(out.contains("sbc_trunk_active_calls{trunk=\"cpaas\"} 0\n"));
-        assert!(out.contains("sbc_trunk_calls_total{trunk=\"genesys\",outcome=\"answered\"} 2\n"));
-        assert!(out.contains("sbc_trunk_calls_total{trunk=\"genesys\",outcome=\"failed\"} 1\n"));
-        m.remove_trunk("cpaas");
-        assert!(m.trunk_series("cpaas").is_none());
+        assert!(out.contains(
+            "sbc_trunk_calls_total{trunk=\"genesys\",direction=\"outbound\",outcome=\"answered\"} 2\n"
+        ));
+        assert!(out.contains(
+            "sbc_trunk_calls_total{trunk=\"genesys\",direction=\"outbound\",outcome=\"rejected\"} 1\n"
+        ));
+        assert!(out.contains(
+            "sbc_trunk_calls_total{trunk=\"genesys\",direction=\"inbound\",outcome=\"failed\"} 1\n"
+        ));
+        assert_eq!(out.matches("# TYPE sbc_trunk_up gauge").count(), 1);
+        m.remove_trunk("cp\"aas");
+        assert!(m.trunk_series("cp\"aas").is_none());
         assert!(m
             .render_prometheus()
             .contains("sbc_call_setup_seconds_bucket{le=\"+Inf\"} 0\n"));
+    }
+
+    #[test]
+    fn trunk_availability_is_rendered_from_the_manager_snapshot() {
+        let mut cfg = crate::routing::TrunkConfig::new("t1".into());
+        cfg.enabled = true;
+        let mut state = crate::routing::trunk::TrunkState::new(cfg.id);
+        state.park_for(120);
+        let mut off = crate::routing::TrunkConfig::new("t2".into());
+        off.enabled = false;
+        let off_state = crate::routing::trunk::TrunkState::new(off.id);
+        let out = render_trunk_availability(&[(cfg, state), (off, off_state)]);
+        assert!(
+            out.contains("sbc_trunk_enabled{trunk=\"t1\"} 1\n"),
+            "{}",
+            out
+        );
+        assert!(
+            out.contains("sbc_trunk_available{trunk=\"t1\"} 0\n"),
+            "parked"
+        );
+        assert!(
+            out.contains("sbc_trunk_unavailable_seconds{trunk=\"t1\"} 1"),
+            "{}",
+            out
+        );
+        assert!(out.contains("sbc_trunk_consecutive_failures{trunk=\"t1\"} 1\n"));
+        assert!(out.contains("sbc_trunk_enabled{trunk=\"t2\"} 0\n"));
+        assert!(
+            out.contains("sbc_trunk_available{trunk=\"t2\"} 0\n"),
+            "disabled"
+        );
+        assert_eq!(out.matches("# TYPE sbc_trunk_available gauge").count(), 1);
     }
 
     #[test]

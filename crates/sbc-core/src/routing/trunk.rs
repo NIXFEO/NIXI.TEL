@@ -354,6 +354,10 @@ pub struct TrunkState {
     pub consecutive_failures: u32,
     /// Temporarily disabled until this time (for health-based cooldown)
     pub disabled_until: Option<std::time::Instant>,
+    /// Parked until this time by the trunk's own `503 Retry-After`: unlike
+    /// the cooldown, a 200 OK does not lift it — only expiry or a
+    /// re-enable does.
+    pub parked_until: Option<std::time::Instant>,
 }
 
 impl TrunkState {
@@ -366,24 +370,56 @@ impl TrunkState {
             registered: false,
             consecutive_failures: 0,
             disabled_until: None,
+            parked_until: None,
         }
     }
 
     /// Check if trunk can accept a new call (capacity + health check)
     pub fn can_accept_call(&self, config: &TrunkConfig) -> bool {
-        // Check health cooldown
-        if let Some(until) = self.disabled_until {
-            if std::time::Instant::now() < until {
-                return false; // Still in cooldown
-            }
+        if self.unavailable_for(std::time::Instant::now()).is_some() {
+            return false; // cooldown or park still running
         }
         self.active_calls < config.max_concurrent_calls
     }
 
-    /// Record a successful call (reset consecutive failures)
+    /// How long the router will keep skipping this trunk (cooldown or
+    /// park), None when it is selectable.
+    pub fn unavailable_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        [self.disabled_until, self.parked_until]
+            .into_iter()
+            .flatten()
+            .filter(|until| *until > now)
+            .map(|until| until - now)
+            .max()
+    }
+
+    /// `up` (selectable, no failure), `degraded` (failures, still
+    /// selectable), `down` (failure cooldown running), `parked` (the
+    /// trunk asked for a pause with `503 Retry-After`).
+    pub fn health_label(&self, now: std::time::Instant) -> &'static str {
+        if self.parked_until.is_some_and(|u| u > now) {
+            "parked"
+        } else if self.disabled_until.is_some_and(|u| u > now) {
+            "down"
+        } else if self.consecutive_failures > 0 {
+            "degraded"
+        } else {
+            "up"
+        }
+    }
+
+    /// Record a successful call or probe: failures reset, the cooldown is
+    /// lifted; a park the trunk asked for is left alone.
     pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.disabled_until = None;
+    }
+
+    /// Operator re-enable: everything is forgiven, park included.
+    pub fn clear_cooldowns(&mut self) {
+        self.consecutive_failures = 0;
+        self.disabled_until = None;
+        self.parked_until = None;
     }
 
     /// Record a trunk failure and apply cooldown if too many consecutive failures
@@ -411,7 +447,7 @@ impl TrunkState {
         self.failed_calls += 1;
         self.consecutive_failures += 1;
         let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-        self.disabled_until = Some(match self.disabled_until {
+        self.parked_until = Some(match self.parked_until {
             Some(current) if current > until => current,
             _ => until,
         });
@@ -543,6 +579,11 @@ impl TrunkManager {
         if new_config.host == existing.host && new_config.port == existing.port {
             new_config.resolved_addr = existing.resolved_addr;
         }
+        if !existing.enabled && new_config.enabled {
+            // Re-enabling through the API or a reload forgives the
+            // cooldown and any park.
+            self.update_state(&existing.id, |s| s.clear_cooldowns());
+        }
         self.trunks.insert(existing.id, new_config);
         true
     }
@@ -559,6 +600,8 @@ impl TrunkManager {
     pub fn enable_trunk(&self, id: &TrunkId) -> bool {
         if let Some(mut entry) = self.trunks.get_mut(id) {
             entry.enabled = true;
+            drop(entry);
+            self.update_state(id, |s| s.clear_cooldowns());
             true
         } else {
             false

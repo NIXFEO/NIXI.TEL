@@ -253,8 +253,11 @@ impl Sbc {
                 .observe_call_duration(record.billable_secs as f64);
         }
         if let Some(name) = record.trunk_id.as_deref() {
-            self.metrics
-                .inc_trunk_call(name, Self::trunk_outcome_label(&outcome, answered));
+            self.metrics.inc_trunk_call(
+                name,
+                &record.direction,
+                Self::trunk_outcome_label(&outcome, answered),
+            );
         }
         self.count_call_on_trunk(uuid, None).await;
 
@@ -446,6 +449,9 @@ impl Sbc {
                 &uuid[..8.min(uuid.len())],
                 limit.as_secs()
             );
+            if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
+                self.note_trunk_failure(&name, None);
+            }
             let outcome = CallOutcome::SetupTimeout;
             self.hangup_both_legs(&uuid, &outcome).await;
             self.finish_call(&uuid, outcome).await;

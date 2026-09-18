@@ -162,6 +162,8 @@ impl Sbc {
                         return Ok(());
                     }
 
+                    // Any answer from the live attempt: the trunk is not silent.
+                    self.b2bua.mark_callee_responded(&uuid).await;
                     if status >= 300 {
                         self.ack_callee_final(&uuid, &response_to).await;
                     }
@@ -826,7 +828,13 @@ impl Sbc {
                     if is_trunk_failure {
                         // The trunk itself failed: feed its state (cooldown
                         // ladder, or the exact park a 503 Retry-After asks for).
-                        if let Some(name) = self.outbound_trunk_of(&uuid).await {
+                        // Only the strike set counts: a 603 Decline or a 501
+                        // fails over but is not the trunk's fault.
+                        if let Some(name) = self
+                            .outbound_trunk_of(&uuid)
+                            .await
+                            .filter(|_| super::trunk_state::is_trunk_strike_code(status))
+                        {
                             let retry_after = if status == 503 {
                                 super::trunk_state::retry_after_secs(
                                     &rsip::SipMessage::Response(response.clone()).to_string(),
