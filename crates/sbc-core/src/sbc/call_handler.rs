@@ -1,4 +1,10 @@
 use super::*;
+use std::time::Instant;
+
+/// How long `graceful_shutdown` keeps resending unanswered requests
+/// before giving up on them. Long enough for two or three of Timer E's
+/// attempts, short enough that `systemctl stop` does not wait.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 
 impl Sbc {
     /// Check for calls that have exceeded `security.max_call_duration` and
@@ -62,8 +68,32 @@ impl Sbc {
             .instrument(span)
             .await;
         }
-        // Give time for BYE packets to be sent
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Drain the client transactions instead of sleeping through
+        // them. These BYEs are the whole reason the retransmission layer
+        // exists — a BYE the trunk never received is the OverMaxCall
+        // ghost session — and they were the only ones never resent: the
+        // event loop that drives Timer E exits as soon as this returns,
+        // so the cache was filled and then dropped with the process. The
+        // old flat 500 ms was exactly T1, i.e. it ended at the moment the
+        // first resend became due.
+        //
+        // Best effort, and bounded: inbound 200 OKs are not dispatched
+        // here (the loop is gone), so a resend stops only at Timer F or
+        // at this budget.
+        let deadline = Instant::now() + SHUTDOWN_DRAIN;
+        let mut ticker = tokio::time::interval(client_tx::TIMER_T1);
+        ticker.tick().await; // fires immediately
+        while Instant::now() < deadline && !self.client_tx.is_empty() {
+            ticker.tick().await;
+            self.retransmit_requests().await;
+        }
+        if !self.client_tx.is_empty() {
+            warn!(
+                "Graceful shutdown: {} request(s) still unanswered after {:?} — the peer may keep a ghost session",
+                self.client_tx.len(),
+                SHUTDOWN_DRAIN
+            );
+        }
         info!("Graceful shutdown: all calls ended");
     }
 
@@ -1022,16 +1052,23 @@ impl Sbc {
         //   1. Initiate a new INVITE to refer_target
         //   2. Send NOTIFY sipfrag updates to the transferor
         //   3. Bridge the new call and disconnect the original
-        // For now we relay the REFER as-is (attended transfer via relay).
+        // For now we relay the REFER as-is (attended transfer via relay),
+        // but through the topology rewrite every other relayed request
+        // uses: forwarded verbatim, its top Via still named the
+        // transferor, so the transferee answered *the transferor* (RFC
+        // 3261 §18.2.2) and the SBC never saw the 202 — which since the
+        // client transaction layer means the request is resent until
+        // Timer F, 32 s of duplicates for nothing.
+        let raw_refer = rsip::SipMessage::Request(request).to_string();
         if is_from_caller {
             if let Some((callee_reply_tx, callee_dest, callee_transport)) =
                 self.b2bua.get_callee_reply_info(&uuid).await
             {
                 info!("REFER: relaying to callee at {}", callee_dest);
-                let raw = rsip::SipMessage::Request(request).to_string();
+                let out = self.apply_outbound_topology(&raw_refer, callee_transport);
                 self.send_sip(
                     "REFER → callee",
-                    raw.as_bytes(),
+                    out.as_bytes(),
                     callee_dest,
                     callee_transport,
                     callee_reply_tx.as_ref(),
@@ -1042,10 +1079,10 @@ impl Sbc {
             self.b2bua.get_caller_reply_info(&uuid).await
         {
             info!("REFER: relaying to caller at {}", caller_addr);
-            let raw = rsip::SipMessage::Request(request).to_string();
+            let out = self.apply_outbound_topology(&raw_refer, caller_transport);
             self.send_sip(
                 "REFER → caller",
-                raw.as_bytes(),
+                out.as_bytes(),
                 caller_addr,
                 caller_transport,
                 caller_reply_tx.as_ref(),

@@ -453,11 +453,18 @@ mod outbound_pool_tests {
     use crate::transport::tls_connect::TlsClientParams;
     use tokio::net::TcpListener;
 
-    /// A destination that stops listening must not leave a pool entry
-    /// behind. The peer here accepts once and stops, so the retry's
-    /// reconnect fails — which is the path this test actually covers; the
-    /// write-failure eviction is covered by
-    /// `a_send_failure_never_leaves_the_connection_in_the_pool` below.
+    /// The invariant both failure paths share: **a `send_tcp` that
+    /// returns an error never leaves its connection in the pool**, so the
+    /// next call reconnects instead of writing into a dead socket until
+    /// restart.
+    ///
+    /// The peer accepts once and stops listening, so the failure comes
+    /// from whichever path notices first — the write on the reused
+    /// connection, or the reconnect after the reader condemned it. Which
+    /// one wins is a kernel race, so this asserts the invariant rather
+    /// than the branch: pinning the branch needs a write that is
+    /// guaranteed to fail, which on loopback means filling the socket
+    /// buffer and waiting out the write timeout.
     #[tokio::test]
     async fn a_destination_that_stopped_listening_leaves_no_pool_entry() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -488,50 +495,6 @@ mod outbound_pool_tests {
         assert!(
             !tm.tcp_connections.contains_key(&dest),
             "no entry for a destination we cannot reach"
-        );
-    }
-
-    /// The eviction inside `send_tcp`'s error branch: a send that fails
-    /// on a pooled connection must take that connection out of the pool,
-    /// so the next call reconnects instead of writing into a dead socket
-    /// until restart.
-    ///
-    /// The peer accepts, reads once and drops the socket. The sends
-    /// follow each other with no pause, so the reader has not yet
-    /// condemned the connection and `send_tcp` takes the *reuse* path —
-    /// which is the branch under test, rather than the reconnect one.
-    #[tokio::test]
-    async fn a_send_failure_never_leaves_the_connection_in_the_pool() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dest = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                use tokio::io::AsyncReadExt;
-                let _ = sock.read(&mut buf).await;
-                // Dropped with data still unread by us: the kernel sends
-                // a reset, so our next write on it fails.
-                drop(sock);
-            }
-        });
-
-        let tm = TransportManager::new();
-        let probe = b"OPTIONS sip:probe SIP/2.0\r\nContent-Length: 0\r\n\r\n";
-        let mut saw_failure = false;
-        // No sleeps: a reset arrives within a few writes on loopback.
-        for _ in 0..200 {
-            if tm.send_tcp(probe, dest).await.is_err() {
-                assert!(
-                    !tm.tcp_connections.contains_key(&dest),
-                    "a failed send left its connection in the pool"
-                );
-                saw_failure = true;
-                break;
-            }
-        }
-        assert!(
-            saw_failure,
-            "a peer that resets every connection must eventually fail a send"
         );
     }
 

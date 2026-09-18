@@ -230,7 +230,25 @@ Two were critical, both in the work that had just been written.
   between the last twenty setups and the first twenty, which catches a
   quadratic path whatever else the machine is doing.
 - The pool test that claimed to cover eviction after a failed send only
-  covered a failed reconnect. Both paths are covered now.
+  covered a failed reconnect. It now states the invariant both paths
+  share — a send that fails never leaves its connection in the pool —
+  because which path notices a dead peer first is a kernel race, and a
+  test that pretended otherwise was flaky.
+- **Shutdown BYEs are retransmitted.** They were the one case the
+  retransmission layer exists for and the only one it did not cover: the
+  event loop that drives Timer E exits as soon as `graceful_shutdown`
+  returns, so each BYE went out once and the cache died with the process.
+  The old flat 500 ms sleep was exactly T1, i.e. it ended at the moment
+  the first resend became due. Shutdown now drains the cache for up to
+  2 s and warns about whatever is still unanswered.
+- **A relayed REFER goes through the topology rewrite** like every other
+  relayed request. Forwarded verbatim, its top Via still named the
+  transferor, so the transferee answered the transferor and the SBC never
+  saw the 202 (RFC 3261 §18.2.2) — which since the transaction layer
+  meant 32 s of retransmissions for a response that could not arrive.
+- A failed INVITE forward counted `sbc_sip_send_failures_total` twice:
+  the manual increment stayed behind when the accounting moved into
+  `send_request_tracked`.
 
 Lot 4 (media). The items were specified against the code, the specs were
 adversarially reviewed, and the resulting diff was reviewed again: that

@@ -817,12 +817,31 @@ async fn graceful_shutdown_byes_connected_calls_and_cancels_pending_ones() {
 
     sbc.graceful_shutdown().await;
 
+    // A shutdown BYE nobody answers is now resent while the drain
+    // budget lasts (Timer E): that is the OverMaxCall case the layer was
+    // built for, and the one it used to miss because the event loop that
+    // drives the timer exits with this call. Every resend is the same
+    // bytes, so the peer sees a retransmission and not a second BYE.
     let to_caller = drain(&mut connected.caller_rx);
-    assert_eq!(to_caller.len(), 1, "{:?}", to_caller);
+    assert!(!to_caller.is_empty(), "the caller got its BYE");
     assert!(to_caller[0].starts_with("BYE sip:alice@10.0.0.9:5060 SIP/2.0\r\n"));
     assert!(to_caller[0].contains("Reason: Q.850;cause=16;text=\"Server shutdown\"\r\n"));
+    assert!(
+        to_caller.iter().all(|m| m == &to_caller[0]),
+        "only byte-identical retransmissions: {:?}",
+        to_caller
+    );
+    assert!(
+        to_caller.len() > 1,
+        "an unanswered shutdown BYE is resent, not sent once"
+    );
     let to_trunk = drain(&mut connected.callee_rx);
-    assert_eq!(to_trunk.len(), 1, "{:?}", to_trunk);
+    assert!(!to_trunk.is_empty(), "{:?}", to_trunk);
+    assert!(
+        to_trunk.iter().all(|m| m == &to_trunk[0]),
+        "only byte-identical retransmissions: {:?}",
+        to_trunk
+    );
     assert!(
         to_trunk[0].starts_with(&format!("BYE {} SIP/2.0\r\n", TRUNK_CONTACT)),
         "{}",
@@ -832,7 +851,12 @@ async fn graceful_shutdown_byes_connected_calls_and_cancels_pending_ones() {
     assert!(to_trunk[0].contains("CSeq: 4 BYE\r\n"));
 
     let to_trunk = drain(&mut pending.callee_rx);
-    assert_eq!(to_trunk.len(), 1, "{:?}", to_trunk);
+    assert!(!to_trunk.is_empty(), "{:?}", to_trunk);
+    assert!(
+        to_trunk.iter().all(|m| m == &to_trunk[0]),
+        "only byte-identical retransmissions: {:?}",
+        to_trunk
+    );
     assert!(
         to_trunk[0].starts_with("CANCEL sip:bob@203.0.113.9:5060 SIP/2.0\r\n"),
         "pending INVITE is CANCELed, not BYEd: {}",
@@ -842,6 +866,8 @@ async fn graceful_shutdown_byes_connected_calls_and_cancels_pending_ones() {
     assert!(to_trunk[0].contains("CSeq: 3 CANCEL\r\n"));
     assert!(to_trunk[0].contains("Call-ID: cid-2\r\n"));
     // The ringing caller has no dialog yet: its INVITE gets a final.
+    // That is a response, which the client transaction layer never
+    // tracks, so exactly one goes out.
     let to_caller = drain(&mut pending.caller_rx);
     assert_eq!(to_caller.len(), 1, "{:?}", to_caller);
     assert!(

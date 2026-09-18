@@ -217,8 +217,8 @@ impl ClientTxCache {
         (out, expired)
     }
 
-    /// Tracked transactions.
-    #[cfg(test)]
+    /// Tracked transactions: what shutdown reports as still unanswered,
+    /// and what the tests count.
     pub(crate) fn len(&self) -> usize {
         self.txs.lock().unwrap_or_else(|e| e.into_inner()).len()
     }

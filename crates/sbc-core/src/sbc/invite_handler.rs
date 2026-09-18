@@ -1075,7 +1075,7 @@ impl Sbc {
                 "INVITE toward {} via {:?} could not be sent: {} — failing over",
                 dest, outbound_transport, e
             );
-            self.metrics.inc_sip_send_failure(outbound_transport);
+            // `send_request_tracked` already counted the failure.
             if let Some(name) = self.outbound_trunk_of(&uuid).await {
                 self.note_trunk_failure(&name, None);
             }
