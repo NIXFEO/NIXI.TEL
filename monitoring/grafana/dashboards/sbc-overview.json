@@ -7,7 +7,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 4,
+  "version": 5,
   "refresh": "30s",
   "time": {
     "from": "now-6h",
@@ -1254,6 +1254,233 @@
     },
     {
       "id": 27,
+      "type": "timeseries",
+      "title": "Delivered to each leg (packets/s)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "rate(sbc_media_packets_relayed_total[5m])",
+          "refId": "A",
+          "legendFormat": "to {{leg}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Media incidents (/h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 66
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "increase(sbc_media_one_way_calls_total[1h])",
+          "refId": "A",
+          "legendFormat": "one-way ({{leg}} silent)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "increase(sbc_media_relay_failures_total[1h])",
+          "refId": "A",
+          "legendFormat": "no media anchor"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "increase(sbc_rtp_port_quarantine_forced_total[1h])",
+          "refId": "A",
+          "legendFormat": "ports reused before quarantine"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Endpoint decisions (/h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 74
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "increase(sbc_media_endpoint_events_total[1h])",
+          "refId": "A",
+          "legendFormat": "{{leg}} {{verdict}} {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "RTP port pool (pairs)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "efdqq22ymisqod"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 74
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_allocated_rtp_ports",
+          "refId": "A",
+          "legendFormat": "allocated (quarantine included)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "efdqq22ymisqod"
+          },
+          "expr": "sbc_rtp_ports_quarantined",
+          "refId": "A",
+          "legendFormat": "waiting out quarantine"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 31,
       "type": "row",
       "title": "Trunks",
       "collapsed": false,
@@ -1261,12 +1488,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 82
       },
       "panels": []
     },
     {
-      "id": 28,
+      "id": 32,
       "type": "stat",
       "title": "Trunks up",
       "datasource": {
@@ -1277,7 +1504,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 67
+        "y": 83
       },
       "targets": [
         {
@@ -1320,7 +1547,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 33,
       "type": "stat",
       "title": "Trunks down",
       "datasource": {
@@ -1331,7 +1558,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 67
+        "y": 83
       },
       "targets": [
         {
@@ -1374,7 +1601,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 34,
       "type": "stat",
       "title": "Trunk registrations failing",
       "datasource": {
@@ -1385,7 +1612,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 67
+        "y": 83
       },
       "targets": [
         {
@@ -1428,7 +1655,7 @@
       }
     },
     {
-      "id": 31,
+      "id": 35,
       "type": "stat",
       "title": "Calls on trunks",
       "datasource": {
@@ -1439,7 +1666,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 67
+        "y": 83
       },
       "targets": [
         {
@@ -1482,7 +1709,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 36,
       "type": "stat",
       "title": "Setup p95 (30m)",
       "datasource": {
@@ -1493,7 +1720,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 67
+        "y": 83
       },
       "targets": [
         {
@@ -1536,7 +1763,7 @@
       }
     },
     {
-      "id": 33,
+      "id": 37,
       "type": "stat",
       "title": "Duration p50 (1h)",
       "datasource": {
@@ -1547,7 +1774,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 67
+        "y": 83
       },
       "targets": [
         {
@@ -1590,7 +1817,7 @@
       }
     },
     {
-      "id": 34,
+      "id": 38,
       "type": "timeseries",
       "title": "Trunk health (1 = answers OPTIONS) and availability (router selects it)",
       "datasource": {
@@ -1601,7 +1828,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 87
       },
       "targets": [
         {
@@ -1649,7 +1876,7 @@
       }
     },
     {
-      "id": 35,
+      "id": 39,
       "type": "timeseries",
       "title": "Active calls per trunk",
       "datasource": {
@@ -1660,7 +1887,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 87
       },
       "targets": [
         {
@@ -1699,7 +1926,7 @@
       }
     },
     {
-      "id": 36,
+      "id": 40,
       "type": "timeseries",
       "title": "Outbound ASR per trunk (30m)",
       "datasource": {
@@ -1710,7 +1937,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 95
       },
       "targets": [
         {
@@ -1749,7 +1976,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 41,
       "type": "timeseries",
       "title": "Finished calls per trunk by direction/outcome (/min)",
       "datasource": {
@@ -1760,7 +1987,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 79
+        "y": 95
       },
       "targets": [
         {
@@ -1799,7 +2026,7 @@
       }
     },
     {
-      "id": 38,
+      "id": 42,
       "type": "row",
       "title": "Health",
       "collapsed": false,
@@ -1807,12 +2034,12 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 103
       },
       "panels": []
     },
     {
-      "id": 39,
+      "id": 43,
       "type": "stat",
       "title": "Last CDR age",
       "datasource": {
@@ -1823,7 +2050,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 88
+        "y": 104
       },
       "targets": [
         {
@@ -1866,7 +2093,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 44,
       "type": "stat",
       "title": "RTP timeouts (total)",
       "datasource": {
@@ -1877,7 +2104,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 88
+        "y": 104
       },
       "targets": [
         {
@@ -1920,7 +2147,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 45,
       "type": "stat",
       "title": "SIP parse errors (total)",
       "datasource": {
@@ -1931,7 +2158,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 88
+        "y": 104
       },
       "targets": [
         {
@@ -1974,7 +2201,7 @@
       }
     },
     {
-      "id": 42,
+      "id": 46,
       "type": "stat",
       "title": "Failed calls (total)",
       "datasource": {
@@ -1985,7 +2212,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 88
+        "y": 104
       },
       "targets": [
         {
@@ -2028,7 +2255,7 @@
       }
     },
     {
-      "id": 43,
+      "id": 47,
       "type": "stat",
       "title": "CDR write errors",
       "datasource": {
@@ -2039,7 +2266,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 92
+        "y": 108
       },
       "targets": [
         {
@@ -2082,7 +2309,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 48,
       "type": "stat",
       "title": "CDR queue",
       "datasource": {
@@ -2093,7 +2320,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 92
+        "y": 108
       },
       "targets": [
         {
@@ -2136,7 +2363,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 49,
       "type": "stat",
       "title": "CDRs written (total)",
       "datasource": {
@@ -2147,7 +2374,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 92
+        "y": 108
       },
       "targets": [
         {
@@ -2190,7 +2417,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 50,
       "type": "stat",
       "title": "CDRs purged (total)",
       "datasource": {
@@ -2201,7 +2428,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 92
+        "y": 108
       },
       "targets": [
         {
@@ -2244,7 +2471,7 @@
       }
     },
     {
-      "id": 47,
+      "id": 51,
       "type": "stat",
       "title": "Config store available",
       "datasource": {
@@ -2255,7 +2482,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 96
+        "y": 112
       },
       "targets": [
         {
@@ -2298,7 +2525,7 @@
       }
     },
     {
-      "id": 48,
+      "id": 52,
       "type": "stat",
       "title": "Last store backup age",
       "datasource": {
@@ -2309,7 +2536,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 96
+        "y": 112
       },
       "targets": [
         {
@@ -2352,7 +2579,7 @@
       }
     },
     {
-      "id": 49,
+      "id": 53,
       "type": "stat",
       "title": "Store backup failures (24h)",
       "datasource": {
@@ -2363,7 +2590,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 96
+        "y": 112
       },
       "targets": [
         {
@@ -2406,7 +2633,7 @@
       }
     },
     {
-      "id": 50,
+      "id": 54,
       "type": "stat",
       "title": "Last backup size",
       "datasource": {
@@ -2417,7 +2644,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 96
+        "y": 112
       },
       "targets": [
         {
@@ -2460,7 +2687,7 @@
       }
     },
     {
-      "id": 51,
+      "id": 55,
       "type": "stat",
       "title": "Session-timer 422 retries (total)",
       "datasource": {
@@ -2471,7 +2698,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 100
+        "y": 116
       },
       "targets": [
         {

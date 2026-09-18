@@ -99,6 +99,27 @@ P.append(ts("SRTP (packets/s)",[
     tgt("rate(sbc_srtp_decrypted_total[5m])","decrypted"),
 ],12,y,unit="pps"))
 y+=8
+# Where the audio actually went: delivered per leg, and the three ways a
+# call goes wrong on the media plane (no anchor, one-way, port pressure).
+P.append(ts("Delivered to each leg (packets/s)",[
+    tgt('rate(sbc_media_packets_relayed_total[5m])',"to {{leg}}"),
+],0,y,unit="pps"))
+P.append(ts("Media incidents (/h)",[
+    tgt("increase(sbc_media_one_way_calls_total[1h])","one-way ({{leg}} silent)"),
+    tgt("increase(sbc_media_relay_failures_total[1h])","no media anchor"),
+    tgt("increase(sbc_rtp_port_quarantine_forced_total[1h])","ports reused before quarantine"),
+],12,y,stack=True))
+y+=8
+# `would-reject` is counted, never enforced: read it before deciding to
+# enforce (media/endpoint.rs).
+P.append(ts("Endpoint decisions (/h)",[
+    tgt("increase(sbc_media_endpoint_events_total[1h])","{{leg}} {{verdict}} {{reason}}"),
+],0,y,stack=True))
+P.append(ts("RTP port pool (pairs)",[
+    tgt("sbc_allocated_rtp_ports","allocated (quarantine included)"),
+    tgt("sbc_rtp_ports_quarantined","waiting out quarantine"),
+],12,y))
+y+=8
 # Trunks — fed by real calls (sbc/trunk_state.rs) and OPTIONS health checks
 P.append(row("Trunks", y)); y+=1
 P += [stat("Trunks up","sum(sbc_trunk_up)",0,y,w=4),
@@ -137,6 +158,6 @@ P += [stat("Session-timer 422 retries (total)","sbc_session_timer_422_retries_to
 y+=4
 
 dash={"uid":"nixi-sbc-overview","title":"NIXI SBC — Overview","tags":["sbc","nixi"],
-    "timezone":"browser","schemaVersion":39,"version":4,"refresh":"30s",
+    "timezone":"browser","schemaVersion":39,"version":5,"refresh":"30s",
     "time":{"from":"now-6h","to":"now"},"editable":True,"panels":P}
 print(json.dumps(dash,indent=2))
