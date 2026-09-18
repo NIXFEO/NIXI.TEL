@@ -90,12 +90,10 @@ pub async fn create_rule(
             "direction must be inbound, outbound or both",
         ));
     }
-    // Validate the CIDR before storing (single IPs accepted too).
-    if cidr.parse::<std::net::IpAddr>().is_err() && !cidr.contains('/') {
-        return Err(ApiError::bad_request(format!(
-            "invalid CIDR or IP: {}",
-            cidr
-        )));
+    // Validate with the parser hydration uses, so a stored rule is always
+    // a rule the runtime can enforce.
+    if let Err(e) = sbc_core::acl::parse_cidr(&cidr) {
+        return Err(ApiError::bad_request(e.to_string()));
     }
 
     let row = AclRuleRow {

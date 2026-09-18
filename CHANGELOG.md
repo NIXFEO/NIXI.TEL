@@ -7,6 +7,107 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 ## [Unreleased]
 
 ### Fixed
+
+Adversarial review of the whole lot-3 change (16 areas, every finding
+verified independently): the confirmed defects and the low-severity ones
+worth fixing.
+
+- `POST /api/v1/trunks/{name}/enable` now forgives the failure cooldown
+  and a `503 Retry-After` park on a trunk that is *already* enabled — the
+  only kind that can be parked, and the remedy the docs pointed at. It was
+  a no-op unless the trunk had been disabled first.
+- OPTIONS health checks and outbound REGISTER are UDP-only and now say so:
+  a TCP/TLS/WS trunk gets no tasks instead of UDP datagrams on its TLS
+  port (which never answered, so `sbc_trunk_registered` stayed 0 and the
+  critical `SBCTrunkRegistrationFailing` alert fired for ever). Their Via
+  and Contact carry the port the SIP listener is really bound to, and the
+  identity used for Via/Contact/Record-Route follows the UDP listener's
+  `bind_port` instead of a hardcoded 5060.
+- `security.max_call_duration = 0` means unlimited, as documented: it was
+  clamped to 60 s, so a reload with 0 cut every call after a minute. Other
+  values keep the 60 s floor.
+- **Registrar bindings are bounded**: at most 10 per AOR and 5000 in total
+  (the oldest is evicted), and at most 10 Contacts per REGISTER (more is a
+  400). The lot-3 rewrite had dropped the previous
+  one-binding-per-source pruning with no replacement, so a single
+  credential holder could fill memory — and the identity gate cloned the
+  whole table on every INVITE. That scan now filters inside the
+  registrar's lock.
+- Registrar ordering: a REGISTER whose CSeq is not higher within its own
+  Call-ID changes nothing (RFC 3261 §10.3 step 7), and a removed binding
+  is remembered for 64 s so a retransmission that arrives after the
+  un-REGISTER cannot resurrect it. AORs are canonicalised once
+  (`canonical_aor`: no display name, no URI parameters, no port, host
+  lower-cased), so a phone that registers `<sip:a@H:5060;transport=udp>`
+  is reachable for a DID mapped to `sip:a@h`.
+- CDRs: `CdrManager::close` is bounded by its timeout as a whole (it could
+  wait for ever while the writer retried a refusing store, so
+  `systemctl stop` hit `TimeoutStopSec`, SIGKILLed the process and skipped
+  the trunk un-REGISTERs); the JSONL mirror is written *before* the store
+  commit, so a store outage leaves a durable copy instead of records that
+  only existed in the queue.
+- The one-time JSONL history import is streamed and committed in chunks of
+  500 instead of holding the whole history in memory and in one
+  transaction (a year of CDRs would OOM a 2 GB box, and the boot would
+  then loop). Imported rows get a content-derived id, so an interrupted
+  import resumes without duplicating anything and two legacy lines that
+  shared a clock-derived id stay two records instead of one.
+- `POST /api/v1/import`: ACL rules are validated with the parser hydration
+  uses (a rule like `198.51.100.0/240` was stored, listed by the API and
+  silently dropped at hydration, so its deny was never enforced — the
+  `POST /api/v1/acl/rules` route had the same gap), `user_limits` must
+  carry both defaults or neither (the runtime applies them as a pair), and
+  negative trunk numbers are refused instead of wrapping to `u32::MAX`.
+  The import transaction takes the write lock up front.
+- `[security.ban] enabled = false` really stops enforcing bans (stored and
+  manual ones included) instead of only stopping new ones.
+- A TOML parse error no longer echoes the offending source line, which can
+  be the API token or a trunk password, into the log, the reload report and
+  `GET /api/v1/config`.
+- A reload that re-hydrates from the store flips `/ready` to 200 (a boot
+  with `allow_missing_store` used to stay 503 for ever).
+- A missing store file is still created empty (that is how a first boot
+  works), but it is now loud: a warning naming the path,
+  `sbc_store_created_empty`, the `SBCStoreCreatedEmpty` alert rule and an
+  `/api/v1/alerts` entry — on a box that had a store this is a lost volume
+  or a mistyped restore, and every call is being refused.
+- A failed `POST /api/v1/tls/reload` publishes the SSE `tls_reload_failed`
+  alert this changelog promised (only the SIGHUP path did).
+- `security.rtp_timeout` now also ends a call where **no** RTP ever
+  arrived (media blocked in both directions): it was gated on having seen
+  at least one packet, so such a call ran to `max_call_duration` in
+  silence, billed and holding its ports.
+- The RTP relay only moves a learned media endpoint for a datagram that
+  looks like RTP (12 bytes, version 2), so a stray byte to the port cannot
+  redirect a call's audio, and the move is logged at info again. A relay
+  that stops normally logs at debug instead of a warning on every
+  teardown. (A source filter and a first-packet latch stay lot-4 work.)
+- Logging: the RTP-timeout, setup-timeout, failover and WS-close teardowns
+  run inside the call span (their warnings, BYEs and CDR lines were
+  escaping the `call{…}` fields), a failed message is logged once instead
+  of twice, and an empty or very short Call-ID no longer makes a line
+  adopt an unrelated live call's `uuid`.
+- `/api/v1/alerts` no longer reports a trunk the operator disabled as
+  `trunk_down`, and disabling a trunk keeps its per-trunk series while it
+  still carries calls. A trunk's `answered` counters start at 0 so the ASR
+  alert fires at 0 % instead of staying silent for want of a series.
+- Failover re-checks the candidate trunk's live state (disabled, full,
+  cooling, parked) instead of sending it a call it just refused.
+- The CSV export prefixes a field starting with `=`, `@`, or `+`/`-` and a
+  non-digit with an apostrophe (spreadsheet formula injection); `+33…`
+  numbers keep their exact value. `?uuid=` uses the index instead of
+  scanning the table.
+- `backup_name_key` no longer panics on a non-ASCII filename in the backup
+  directory (reached at boot), and the last-successful-backup gauge is
+  seeded from disk even when the timer is disabled.
+- The keys documented as "unused" (`[metrics]`, `general.name` /
+  `instance_id`, `security.rate_limit_global` / `auth_challenge_timeout`)
+  can now really be deleted from the file, and `[media] public_ip` — a key
+  that never existed — is gone from the example.
+- An outbound trunk registration being replaced no longer has its
+  `registered` flag cleared by the loop it replaced, and the shutdown
+  un-REGISTER carries credentials when the trunk challenged us before.
+
 - Outbound calls no longer fail with `422 Session Interval Too Small`: the
   SBC ACKs the 422 and re-sends the INVITE once with the trunk's `Min-SE`
   (RFC 4028 §7.4); session-timer headers are replaced, never appended, on

@@ -192,13 +192,24 @@ an HTTP error, restart only when the API itself is unreachable (curl exit
 7):
 
 ```bash
+#!/bin/sh
 # /etc/letsencrypt/renewal-hooks/deploy/reload-sbc-tls.sh
+# chmod +x — certbot skips a hook that is not executable, silently.
+set -u
 . /etc/sbc/sbc.env
-curl -fsS -X POST -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/tls/reload
+: "${SBC_API_TOKEN:?SBC_API_TOKEN missing from /etc/sbc/sbc.env}"
+curl -fsS -X POST -H "Authorization: Bearer $SBC_API_TOKEN" \
+     http://127.0.0.1:8080/api/v1/tls/reload
 rc=$?
 [ $rc -eq 7 ] && systemctl restart sbc     # API down: the graceful restart reloads everything
+[ $rc -ne 0 ] && logger -t sbc-tls-hook "TLS reload failed (curl $rc)"
 exit 0
 ```
+
+Test it once by hand (`sh -x .../reload-sbc-tls.sh`): a hook that is not
+executable, or a missing `SBC_API_TOKEN`, otherwise fails in silence and the
+certificate expires. A failed reload also publishes an SSE `alert`
+(`tls_reload_failed`) and leaves the previous certificate in use.
 
 Check with `GET /api/v1/tls/certificates` (`not_after`, `fingerprint_sha256`).
 Note: a key that does not match its certificate is refused at boot too.
@@ -423,7 +434,12 @@ sudo systemctl start sbc
 
 A store that cannot be opened or read at boot is fatal (the SBC would run
 with no users, trunks or DIDs): the unit ends failed, `journalctl -u sbc`
-names the path. `[database] allow_missing_store = true` is the escape
+names the path. A store file that is simply **missing** is created empty
+instead (that is how a first boot works) — when nothing is hydrated from
+it the boot logs a warning and `sbc_store_created_empty` goes to 1, with
+the `SBCStoreCreatedEmpty` alert and an `/api/v1/alerts` entry: on a box
+that had a store, that means the file was lost (an unmounted volume, a
+mistyped restore) and every call is being refused. `[database] allow_missing_store = true` is the escape
 hatch (TOML seeds only, `/ready` stays 503). Grab a config snapshot via
 `GET /api/v1/export` as well before major upgrades: unlike the file copy
 it restores **live**, without a stop and without touching the CDRs
@@ -444,7 +460,7 @@ service down until you either
 ```bash
 # keep the data (the new tables stay, the old binary ignores them):
 sudo systemctl stop sbc
-sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version IN (2, 3)"   # 0.21 added 3 (cdrs)
+sqlite3 /var/lib/sbc/sbc.db "DELETE FROM _sqlx_migrations WHERE version IN (2, 3)"   # 2 = security persistence, 3 = cdrs
 sudo systemctl start sbc
 # — or — restore the pre-upgrade copy (loses every change made since):
 sudo systemctl stop sbc && sudo cp -p /opt/sbc/backups/sbc-db-<timestamp>.db /var/lib/sbc/sbc.db && sudo systemctl start sbc

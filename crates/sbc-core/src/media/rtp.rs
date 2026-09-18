@@ -281,6 +281,15 @@ impl RtpPacket {
 /// Returns 0 if the packet is too short or malformed.
 /// This properly handles WebRTC packets which typically have one-byte or
 /// two-byte header extensions (RFC 5285).
+/// Cheap plausibility check before an endpoint is learned or moved: a
+/// full RTP/RTCP header and version 2 (RFC 3550 §5.1). It does not
+/// authenticate anything — it only stops a stray or hand-crafted byte
+/// from redirecting a call's audio. SRTP/DTLS payloads pass (the header
+/// is in clear), STUN and DTLS are demuxed before this.
+fn looks_like_rtp(data: &[u8]) -> bool {
+    data.len() >= 12 && (data[0] >> 6) == 2
+}
+
 fn rtp_header_length(data: &[u8]) -> usize {
     if data.len() < 12 {
         return 0;
@@ -710,12 +719,16 @@ impl RtpSession {
 
             loop {
                 tokio::select! {
+                    // The normal stop: `MediaManager::terminate_session`
+                    // drops the sender, so `None` is the expected value —
+                    // it is not a fault and must not be a warning.
                     shutdown_result = shutdown_rx.recv() => {
-                        if shutdown_result.is_some() {
-                            debug!("RTP session {} shutting down (explicit signal, relayed {} packets)", session_id, pkt_count);
-                        } else {
-                            warn!("RTP session {} shutdown: channel closed (sender dropped, relayed {} packets)", session_id, pkt_count);
-                        }
+                        debug!(
+                            "RTP session {} stopped ({}, relayed {} packets)",
+                            session_id,
+                            if shutdown_result.is_some() { "signal" } else { "released" },
+                            pkt_count
+                        );
                         break;
                     }
 
@@ -727,9 +740,23 @@ impl RtpSession {
                             .unwrap_or_default()
                             .as_secs();
                         let idle_secs = now.saturating_sub(last);
-                        if idle_secs > rtp_timeout_secs && pkt_count > 0 {
-                            warn!("RTP session {} no media for {}s (timeout={}s) — terminating (relayed {} packets)",
-                                session_id, idle_secs, rtp_timeout_secs, pkt_count);
+                        // `last_activity` starts at the relay's start, so
+                        // this also covers a call where no packet ever
+                        // arrived (media blocked both ways) — the
+                        // documented behaviour, and otherwise such a call
+                        // runs to `max_call_duration` in silence.
+                        if idle_secs > rtp_timeout_secs {
+                            warn!(
+                                "RTP session {} no media for {}s (timeout={}s) — terminating ({})",
+                                session_id,
+                                idle_secs,
+                                rtp_timeout_secs,
+                                if pkt_count == 0 {
+                                    "no packet ever arrived".to_string()
+                                } else {
+                                    format!("relayed {} packets", pkt_count)
+                                }
+                            );
                             if let Some(ref c) = global_rtp_timeout_counter {
                                 c.fetch_add(1, Ordering::Relaxed);
                             }
@@ -819,15 +846,19 @@ impl RtpSession {
                                 debug!("RTP A recv #{}: {} bytes from {} on leg-A:{}", pkt_count, len, source, ports_a_rtp);
                             }
 
-                            // Learn / update caller's real address
-                            {
+                            // Learn / update caller's real address.
+                            // Only a datagram that looks like RTP may move
+                            // the endpoint: a single stray byte to the port
+                            // must not redirect the audio. (A source filter
+                            // and a first-packet latch are lot 4.)
+                            if looks_like_rtp(&data) {
                                 let mut ep = endpoint_a.lock().await;
                                 if ep.is_none() {
                                     info!("RTP: learned caller (A) = {} on leg-A:{}", source, ports_a_rtp);
                                     *ep = Some(source);
                                 } else if *ep != Some(source) {
-                                    // NAT port change — update
-                                    debug!("RTP: caller addr updated {} → {}", ep.unwrap(), source);
+                                    // NAT port change, or a hijack attempt.
+                                    info!("RTP: caller (A) address moved {} → {}", ep.unwrap(), source);
                                     *ep = Some(source);
                                 }
                             }
@@ -1120,14 +1151,15 @@ impl RtpSession {
                                 debug!("RTP B recv #{}: {} bytes from {} on leg-B:{}", pkt_count, len, source, ports_b_rtp);
                             }
 
-                            // Learn / update callee's real address
-                            {
+                            // Same rule as leg A: an RTP-shaped datagram
+                            // may move the endpoint, a stray byte may not.
+                            if looks_like_rtp(&data) {
                                 let mut ep = endpoint_b.lock().await;
                                 if ep.is_none() {
                                     info!("RTP: learned callee (B) = {} on leg-B:{}", source, ports_b_rtp);
                                     *ep = Some(source);
                                 } else if *ep != Some(source) {
-                                    debug!("RTP: callee addr updated {} → {}", ep.unwrap(), source);
+                                    info!("RTP: callee (B) address moved {} → {}", ep.unwrap(), source);
                                     *ep = Some(source);
                                 }
                             }

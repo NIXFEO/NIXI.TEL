@@ -1597,20 +1597,14 @@ async fn trunk_health_alerts_and_metrics_reflect_availability() {
     );
     assert!(text.contains("# TYPE sbc_trunk_calls_total counter\n"));
 
-    // Disable + enable: the park is forgiven.
-    for action in ["disable", "enable"] {
-        let resp = app
-            .clone()
-            .oneshot(req(
-                "POST",
-                &format!("/api/v1/trunks/pstn-1/{}", action),
-                None,
-                true,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
+    // `enable` alone forgives the park — the trunk never stopped being
+    // enabled, and that is the remedy the docs give the operator.
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/trunks/pstn-1/enable", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
     let resp = app
         .clone()
         .oneshot(req("GET", "/api/v1/trunks/pstn-1", None, true))
@@ -1626,6 +1620,229 @@ async fn trunk_health_alerts_and_metrics_reflect_availability() {
         .unwrap();
     assert!(!body_json(resp).await.to_string().contains("trunk_parked"));
     state.trunk_tasks.shutdown().await;
+}
+
+/// An ACL rule the runtime could not parse must never reach the store:
+/// hydration would drop it and the deny would not be enforced.
+#[tokio::test]
+async fn acl_rules_are_validated_with_the_runtime_parser() {
+    let app = build_router(make_state().await, &[]);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/acl/rules",
+            Some(r#"{"cidr":"198.51.100.0/240","action":"deny"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("invalid CIDR"),
+        "{}",
+        json
+    );
+    assert_eq!(
+        get_json(&app, "/api/v1/acl/rules").await,
+        serde_json::json!([])
+    );
+
+    // A bare IP and a real block are both accepted.
+    for cidr in ["203.0.113.7", "203.0.113.0/24", "2001:db8::/32"] {
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/acl/rules",
+                Some(&format!(r#"{{"cidr":"{}","action":"allow"}}"#, cidr)),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "{}", cidr);
+    }
+}
+
+/// A CDR field a caller chose must not be evaluated as a formula when the
+/// CSV export is opened in a spreadsheet — while E.164 numbers keep their
+/// exact value.
+#[tokio::test]
+async fn csv_export_neutralises_spreadsheet_formulas() {
+    let state = make_state().await;
+    let store = state.store.clone().unwrap();
+    let mut row = sbc_storage::CdrRow {
+        rowid: 0,
+        id: "c1".into(),
+        v: 2,
+        uuid: "u1".into(),
+        call_id: "cid-1".into(),
+        direction: "inbound".into(),
+        caller: "=cmd|' /C calc'!A0".into(),
+        callee: "+33123456789".into(),
+        source_ip: "203.0.113.9".into(),
+        trunk_id: Some("@SUM(1+1)".into()),
+        codec: Some("PCMU".into()),
+        is_webrtc: false,
+        started_at: 1_700_000_000,
+        answered_at: None,
+        ended_at: 1_700_000_060,
+        duration_secs: 60,
+        billable_secs: 0,
+        sip_code: Some(200),
+        disconnect_reason: "-normal".into(),
+        reason: None,
+        hangup_by: "caller".into(),
+    };
+    store.insert_cdrs(std::slice::from_ref(&row)).await.unwrap();
+    row.id = "c2".into();
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(req("GET", "/api/v1/cdrs?format=csv", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let csv = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(csv.contains(",'=cmd|' /C calc'!A0,"), "{}", csv);
+    assert!(!csv.contains(",=cmd"), "{}", csv);
+    assert!(csv.contains("'@SUM(1+1)"), "{}", csv);
+    assert!(csv.contains("'-normal"), "{}", csv);
+    assert!(
+        csv.contains(",+33123456789,"),
+        "an E.164 number keeps its exact value: {}",
+        csv
+    );
+}
+
+/// A failed TLS reload over the API raises the same SSE alert as the
+/// SIGHUP path (a certbot hook is the usual caller, and nobody reads its
+/// output).
+#[tokio::test]
+async fn a_failed_tls_reload_over_the_api_publishes_an_alert() {
+    let state = make_state().await;
+    let (cert, key) = self_signed_pair("alert.test");
+    state.tls.register(
+        sbc_core::transport::TlsListenerIdentity::load(
+            "wss",
+            "127.0.0.1:8443".parse().unwrap(),
+            &cert,
+            &key,
+        )
+        .unwrap(),
+    );
+
+    // certbot wrote a truncated file (or the key is not readable yet).
+    std::fs::write(&cert, "-----BEGIN CERTIFICATE-----\nnope\n").unwrap();
+    let mut events = state.events.subscribe();
+    let app = build_router(state, &[]);
+    let resp = app
+        .oneshot(req("POST", "/api/v1/tls/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body_json(resp).await["code"], "tls_reload_failed");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+        .await
+        .expect("an alert event")
+        .unwrap();
+    match event {
+        sbc_core::events::SbcEvent::Alert { kind, level, .. } => {
+            assert_eq!(kind, "tls_reload_failed");
+            assert_eq!(level, "warning");
+        }
+        other => panic!("unexpected event {:?}", other),
+    }
+}
+
+/// OPTIONS health checks and outbound REGISTER are UDP-only: a TCP/TLS
+/// trunk gets no tasks, and therefore no permanent `trunk_unregistered`
+/// alert it could never clear.
+#[tokio::test]
+async fn non_udp_trunks_get_no_tasks_and_no_registration_alert() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    for (name, transport) in [("udp-1", "UDP"), ("tls-1", "TLS")] {
+        let body = format!(
+            r#"{{"name":"{}","host":"127.0.0.1","port":5061,"transport":"{}",
+                 "register_with_trunk":true,"auth_required":true,
+                 "username":"u","password":"p"}}"#,
+            name, transport
+        );
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/api/v1/trunks", Some(&body), true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "{}", name);
+    }
+    // No socket attached in this harness, so nothing runs at all; the
+    // point is which trunks the registry would take.
+    assert!(!state.trunk_tasks.has_socket());
+
+    let alerts = {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/api/v1/alerts", None, true))
+            .await
+            .unwrap();
+        body_json(resp).await.to_string()
+    };
+    assert!(
+        alerts.contains("udp-1") && alerts.contains("trunk_unregistered"),
+        "the UDP trunk that registers is alerted: {}",
+        alerts
+    );
+    assert!(
+        !alerts.contains("tls-1"),
+        "a TLS trunk never registers, so it must not be alerted: {}",
+        alerts
+    );
+}
+
+/// A trunk the operator disabled is skipped by the router on purpose:
+/// `/alerts` must not report it as down.
+#[tokio::test]
+async fn a_disabled_trunk_is_not_an_alert() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/trunks",
+            Some(r#"{"name":"pstn-1","host":"127.0.0.1","port":5060,"transport":"UDP"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(state
+        .trunks
+        .update_state_by_name("pstn-1", |s| s.park_for(600)));
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/trunks/pstn-1/disable", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/alerts", None, true))
+        .await
+        .unwrap();
+    let alerts = body_json(resp).await.to_string();
+    assert!(!alerts.contains("trunk_parked"), "{}", alerts);
+    assert!(!alerts.contains("trunk_down"), "{}", alerts);
 }
 
 /// `/ready` is public and answers 503 with the three flags until the store
@@ -2585,12 +2802,32 @@ async fn import_validates_the_document_before_touching_the_store() {
         (
             "/api/v1/import",
             r#"{"acl_rules": [{"id": "a", "cidr": "not-an-ip", "action": "allow", "direction": "both", "priority": 1, "enabled": true}]}"#.into(),
-            "invalid CIDR or IP",
+            "invalid CIDR 'not-an-ip'",
         ),
         (
             "/api/v1/import",
             r#"{"acl_default_action": "maybe"}"#.into(),
             "acl_default_action must be",
+        ),
+        (
+            // Looks like a CIDR, is not one: it would be stored, listed by
+            // the API and silently dropped at hydration.
+            "/api/v1/import",
+            r#"{"acl_rules": [{"id": "a", "cidr": "198.51.100.0/240", "action": "deny", "direction": "inbound", "priority": 1, "enabled": true}]}"#.into(),
+            "invalid CIDR",
+        ),
+        (
+            "/api/v1/import",
+            r#"{"user_limits": {"default_max_concurrent_calls": 20}}"#.into(),
+            "give both default_max_concurrent_calls",
+        ),
+        (
+            "/api/v1/import",
+            format!(
+                r#"{{"trunks": [{}]}}"#,
+                trunk_doc("t", "p", "UDP").replace("\"priority\":100", "\"priority\":-5")
+            ),
+            "priority must be between 0 and",
         ),
         (
             "/api/v1/import",

@@ -12,7 +12,12 @@
 //! Both loops send over the shared UDP socket the SIP listener uses (the
 //! trunk must see the same source address for REGISTER, OPTIONS and
 //! INVITE); the event loop routes the answers by their `reg-` / `hc-`
-//! Call-ID through [`PendingResponses`].
+//! Call-ID through [`PendingResponses`]. **Only UDP trunks get tasks**:
+//! a TCP/TLS/WS trunk would receive UDP datagrams on a port that speaks
+//! another protocol, so it is skipped with a warning instead of being
+//! probed wrongly (and instead of raising a permanent
+//! `trunk_unregistered` alert). Health-checking and registering over
+//! TCP/TLS needs the transport manager and is not implemented.
 //!
 //! REGISTER: one Call-ID and a monotonic CSeq per registration sequence
 //! (RFC 3261 §10.2); a `423 Interval Too Brief` is retried once with the
@@ -29,7 +34,7 @@ use crate::routing::{TransportType, TrunkConfig, TrunkId, TrunkManager};
 use crate::topology::SbcIdentity;
 use crate::trunk_register::{extract_header, parse_expires, parse_status};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -206,6 +211,13 @@ struct Ctx {
     events: EventBus,
     config: TrunkTasksConfig,
     socket: Arc<UdpSocket>,
+    /// Port the SIP listener is bound to — what Via and Contact must
+    /// advertise so the trunk answers where we listen.
+    local_port: u16,
+    /// Last Digest challenge each trunk sent us (`header name`,
+    /// challenge), so the fire-and-forget un-REGISTER at process
+    /// shutdown can carry credentials instead of being ignored.
+    last_challenge: DashMap<String, (&'static str, DigestChallenge)>,
     /// Process shutdown: un-REGISTERs are fire-and-forget (the SIP loop
     /// that would route the answer is gone).
     fast_stop: Arc<AtomicBool>,
@@ -253,6 +265,9 @@ pub struct TrunkTasks {
     socket: OnceLock<(Arc<UdpSocket>, Option<SbcIdentity>)>,
     running: Mutex<HashMap<String, Running>>,
     generation: AtomicU64,
+    /// Trunks already reported as "no tasks, not a UDP trunk", so a
+    /// re-sync on every API write does not repeat the warning.
+    non_udp_warned: Mutex<HashSet<String>>,
     fast_stop: Arc<AtomicBool>,
 }
 
@@ -273,6 +288,7 @@ impl TrunkTasks {
             socket: OnceLock::new(),
             running: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            non_udp_warned: Mutex::new(HashSet::new()),
             fast_stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -296,13 +312,30 @@ impl TrunkTasks {
             debug!("Trunk tasks: no UDP socket yet — nothing started");
             return;
         };
-        let desired: HashMap<String, TaskSpec> = self
-            .trunks
-            .list_trunks()
-            .iter()
-            .filter(|t| t.enabled)
-            .map(|t| (t.name.clone(), TaskSpec::from_config(t)))
-            .collect();
+        let enabled = self.trunks.list_trunks();
+        let enabled = enabled.iter().filter(|t| t.enabled);
+        let mut desired: HashMap<String, TaskSpec> = HashMap::new();
+        {
+            let mut warned = self
+                .non_udp_warned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for t in enabled {
+                if t.transport == TransportType::Udp {
+                    warned.remove(&t.name);
+                    desired.insert(t.name.clone(), TaskSpec::from_config(t));
+                } else if warned.insert(t.name.clone()) {
+                    // Sending an OPTIONS or REGISTER datagram to a TCP/TLS
+                    // port gets no answer and would report the trunk down
+                    // for ever.
+                    warn!(
+                        "Trunk '{}' is {:?}: no OPTIONS health check and no outbound REGISTER \
+                         (both are UDP-only) — its health comes from real calls",
+                        t.name, t.transport
+                    );
+                }
+            }
+        }
 
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -328,7 +361,12 @@ impl TrunkTasks {
                 }
                 None => {
                     info!("Trunk '{}' removed or disabled — stopping its tasks", name);
-                    self.metrics.remove_trunk(&name);
+                    // Keep the trunk's series (it may still carry calls,
+                    // and `sbc_trunk_calls_total` is cumulative); only
+                    // the probe-fed gauges stop being reported. A deleted
+                    // trunk is removed by the API handler itself.
+                    self.metrics.set_trunk_up(&name, None);
+                    self.metrics.set_trunk_registered(&name, None);
                 }
             }
             r.cancel.cancel();
@@ -354,6 +392,8 @@ impl TrunkTasks {
                 events: self.events.clone(),
                 config: self.config.clone(),
                 socket: socket.clone(),
+                local_port: identity.as_ref().map(|i| i.sip_port).unwrap_or(5060),
+                last_challenge: DashMap::new(),
                 fast_stop: self.fast_stop.clone(),
             });
             info!(
@@ -488,7 +528,7 @@ async fn health_loop(
         let local_ip = ctx.local_ip();
         let msg = format!(
             "OPTIONS sip:{host}:{port} SIP/2.0\r\n\
-             Via: SIP/2.0/UDP {ip}:5060;branch={branch};rport\r\n\
+             Via: SIP/2.0/UDP {ip}:{local_port};branch={branch};rport\r\n\
              Max-Forwards: 70\r\n\
              From: <sip:healthcheck@{ip}>;tag={tag}\r\n\
              To: <sip:{host}:{port}>\r\n\
@@ -499,6 +539,7 @@ async fn health_loop(
             host = spec.host,
             port = spec.port,
             ip = local_ip,
+            local_port = ctx.local_port,
             branch = branch(),
             tag = rand8(),
             call_id = call_id,
@@ -687,13 +728,34 @@ async fn register_loop(
         if ctx.fast_stop.load(Ordering::Relaxed) {
             if let Some(dest) = spec.dest {
                 cseq += 1;
-                let from = format!(
-                    "<sip:{}@{}>;tag={}",
-                    spec.username.as_deref().unwrap_or("anonymous"),
-                    spec.host,
-                    rand8()
+                let username = spec.username.as_deref().unwrap_or("anonymous");
+                let from = format!("<sip:{}@{}>;tag={}", username, spec.host, rand8());
+                // No SIP loop left to route a 401, so the credentials go
+                // out with the request: a registrar that challenges would
+                // otherwise ignore this Expires: 0 and keep a dead binding.
+                let auth = ctx.last_challenge.get(&spec.name).map(|e| {
+                    let (header, challenge) = e.value();
+                    (
+                        *header,
+                        generate_digest_response(
+                            username,
+                            spec.password.as_deref().unwrap_or(""),
+                            challenge,
+                            "REGISTER",
+                            &format!("sip:{}", spec.host),
+                        ),
+                    )
+                });
+                let bye = build_register(
+                    &spec,
+                    &ctx.local_ip(),
+                    ctx.local_port,
+                    &call_id,
+                    cseq,
+                    &from,
+                    0,
+                    auth.as_ref().map(|(h, v)| (*h, v.as_str())),
                 );
-                let bye = build_register(&spec, &ctx.local_ip(), &call_id, cseq, &from, 0, None);
                 let _ = ctx.socket.send_to(bye.as_bytes(), dest).await;
             }
         } else {
@@ -711,7 +773,9 @@ async fn register_loop(
             .await;
         }
     }
-    ctx.trunks.update_state(&spec.id, |s| s.registered = false);
+    // `registered` is cleared by `sync()` when it cancels this loop, before
+    // the replacement starts: clearing it here would race a replacement
+    // that has already registered.
 }
 
 /// Send the request, wait for the answer routed by the event loop.
@@ -747,9 +811,11 @@ async fn send_and_wait(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_register(
     spec: &TaskSpec,
     local_ip: &str,
+    local_port: u16,
     call_id: &str,
     cseq: u32,
     from: &str,
@@ -762,18 +828,19 @@ fn build_register(
         .unwrap_or_default();
     format!(
         "REGISTER sip:{host} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP {ip}:5060;branch={branch};rport\r\n\
+         Via: SIP/2.0/UDP {ip}:{local_port};branch={branch};rport\r\n\
          Max-Forwards: 70\r\n\
          From: {from}\r\n\
          To: <sip:{user}@{host}>\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} REGISTER\r\n\
-         Contact: <sip:{user}@{ip}:5060;transport=udp>\r\n\
+         Contact: <sip:{user}@{ip}:{local_port};transport=udp>\r\n\
          {auth}Expires: {expires}\r\n\
          User-Agent: NIXI-SBC/1.0\r\n\
          Content-Length: 0\r\n\r\n",
         host = spec.host,
         ip = local_ip,
+        local_port = local_port,
         branch = branch(),
         from = from,
         user = username,
@@ -803,7 +870,16 @@ async fn send_register(
     let request_uri = format!("sip:{}", spec.host);
 
     *cseq += 1;
-    let first = build_register(spec, &local_ip, call_id, *cseq, &from, expires, None);
+    let first = build_register(
+        spec,
+        &local_ip,
+        ctx.local_port,
+        call_id,
+        *cseq,
+        &from,
+        expires,
+        None,
+    );
     let raw = match send_and_wait(ctx, call_id, first, dest, cancel).await {
         Ok(raw) => raw,
         Err(outcome) => return outcome,
@@ -842,10 +918,15 @@ async fn send_register(
             } else {
                 "Proxy-Authorization"
             };
+            // Remembered so the fire-and-forget un-REGISTER at process
+            // shutdown can be authenticated too.
+            ctx.last_challenge
+                .insert(spec.name.clone(), (auth_header, challenge.clone()));
             *cseq += 1;
             let second = build_register(
                 spec,
                 &local_ip,
+                ctx.local_port,
                 call_id,
                 *cseq,
                 &from,
@@ -951,12 +1032,21 @@ mod tests {
         metrics: Arc<SbcMetrics>,
         events: EventBus,
     ) -> Arc<TrunkTasks> {
+        tasks_with(trunks, metrics, events, fast_config()).await
+    }
+
+    async fn tasks_with(
+        trunks: Arc<TrunkManager>,
+        metrics: Arc<SbcMetrics>,
+        events: EventBus,
+        config: TrunkTasksConfig,
+    ) -> Arc<TrunkTasks> {
         let tasks = Arc::new(TrunkTasks::new(
             trunks,
             Default::default(),
             metrics,
             events,
-            fast_config(),
+            config,
         ));
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         assert!(tasks.attach_socket(sock, None));
@@ -1377,24 +1467,90 @@ mod tests {
     async fn unanswered_register_retries_at_the_fixed_pace() {
         let peer = Peer::new().await;
         let (trunks, _) = harness(&peer, true);
-        let tasks = tasks(trunks.clone(), Arc::new(SbcMetrics::new()), EventBus::new()).await;
+        // The fixed retry is far longer than the whole backoff ladder, so
+        // a regression to exponential backoff cannot pass this test.
+        let config = TrunkTasksConfig {
+            register_timeout: Duration::from_millis(50),
+            retry_fixed: Duration::from_millis(400),
+            backoff_min: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(40),
+            ..fast_config()
+        };
+        let tasks = tasks_with(
+            trunks.clone(),
+            Arc::new(SbcMetrics::new()),
+            EventBus::new(),
+            config,
+        )
+        .await;
         tasks.sync();
         let mut stamps = Vec::new();
         while stamps.len() < 3 {
-            let r = peer.recv().await.expect("request");
-            if r.starts_with("REGISTER ") {
-                stamps.push(std::time::Instant::now());
-            }
+            // The peer never answers: each cycle is register_timeout +
+            // retry_fixed ≈ 450 ms.
+            let r = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let r = peer.recv().await.expect("request");
+                    if r.starts_with("REGISTER ") {
+                        return std::time::Instant::now();
+                    }
+                }
+            })
+            .await
+            .expect("a REGISTER within 3 s");
+            stamps.push(r);
         }
-        let gap1 = stamps[1] - stamps[0];
-        let gap2 = stamps[2] - stamps[1];
-        assert!(gap1 < Duration::from_millis(400), "{:?}", gap1);
+        for (i, gap) in [stamps[1] - stamps[0], stamps[2] - stamps[1]]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                gap > Duration::from_millis(300),
+                "gap {} was {:?}: a timeout must wait retry_fixed (400 ms), not the backoff ladder (10-40 ms)",
+                i,
+                gap
+            );
+        }
+        tasks.shutdown().await;
+    }
+
+    /// Both loops speak UDP over the SIP listener's socket: a TCP/TLS/WS
+    /// trunk must get no tasks at all rather than UDP datagrams on a port
+    /// that speaks something else.
+    #[tokio::test]
+    async fn non_udp_trunks_get_no_tasks() {
+        let peer = Peer::new().await;
+        let (trunks, id) = harness(&peer, true);
+        let metrics = Arc::new(SbcMetrics::new());
+        let tasks = tasks(trunks.clone(), metrics.clone(), EventBus::new()).await;
+
+        let mut tls = trunks.get_trunk(&id).unwrap();
+        tls.transport = TransportType::Tls;
+        assert!(trunks.update_trunk_by_name("t1", tls));
+        tasks.sync();
+        assert!(tasks.running().is_empty(), "{:?}", tasks.running());
         assert!(
-            gap2 < gap1 + Duration::from_millis(100),
-            "no exponential growth on timeouts: {:?} then {:?}",
-            gap1,
-            gap2
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                peer.sock.recv_from(&mut [0u8; 64])
+            )
+            .await
+            .is_err(),
+            "a TLS trunk must not be probed over UDP"
         );
+        let text = metrics.render_prometheus();
+        assert!(
+            !text.contains("sbc_trunk_registered{trunk=\"t1\"}"),
+            "no registration gauge for a TLS trunk, so no alert that can never clear: {}",
+            text
+        );
+
+        // Back to UDP: the tasks start.
+        let mut udp = trunks.get_trunk(&id).unwrap();
+        udp.transport = TransportType::Udp;
+        assert!(trunks.update_trunk_by_name("t1", udp));
+        tasks.sync();
+        assert_eq!(tasks.running().len(), 1);
         tasks.shutdown().await;
     }
 

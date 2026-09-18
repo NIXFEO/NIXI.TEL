@@ -710,10 +710,14 @@ fn backup_name_key(name: &str) -> Option<(String, u32)> {
         Some((stamp, suffix)) => (stamp, suffix),
         None => return None,
     };
-    let ok = stamp.len() == 15
-        && stamp[..8].bytes().all(|b| b.is_ascii_digit())
-        && &stamp[8..9] == "-"
-        && stamp[9..].bytes().all(|b| b.is_ascii_digit());
+    // Byte-wise: slicing a &str at 8 or 9 would panic on a filename with
+    // a multi-byte character (`newest_backup` reads whatever is in the
+    // directory, at boot).
+    let b = stamp.as_bytes();
+    let ok = b.len() == 15
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'-'
+        && b[9..].iter().all(u8::is_ascii_digit);
     if !ok {
         return None;
     }

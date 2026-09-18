@@ -719,24 +719,29 @@ impl Sbc {
         };
 
         for (uuid, bye, dest, tp, tx, callee_died) in affected {
-            warn!(
-                "WS closed mid-call: terminating call {} (peer {})",
-                &uuid[..8.min(uuid.len())],
-                peer
-            );
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                warn!(
+                    "WS closed mid-call: terminating call {} (peer {})",
+                    &uuid[..8.min(uuid.len())],
+                    peer
+                );
 
-            if let (Some(msg), Some(dest)) = (bye, dest) {
-                self.send_sip(
-                    "ws-close → surviving leg",
-                    msg.as_bytes(),
-                    dest,
-                    tp,
-                    tx.as_ref(),
-                )
-                .await;
+                if let (Some(msg), Some(dest)) = (bye, dest) {
+                    self.send_sip(
+                        "ws-close → surviving leg",
+                        msg.as_bytes(),
+                        dest,
+                        tp,
+                        tx.as_ref(),
+                    )
+                    .await;
+                }
+                self.finish_call(&uuid, CallOutcome::WsClosed { callee_died })
+                    .await;
             }
-            self.finish_call(&uuid, CallOutcome::WsClosed { callee_died })
-                .await;
+            .instrument(span)
+            .await;
         }
     }
 

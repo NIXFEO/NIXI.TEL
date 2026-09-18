@@ -510,6 +510,8 @@ pub struct CdrManager {
     store: Option<Arc<sbc_storage::ConfigStore>>,
     metrics: Option<Arc<crate::metrics::SbcMetrics>>,
     backend_name: &'static str,
+    /// Shutdown signal for the writer task (see `close`).
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CdrManager {
@@ -522,6 +524,7 @@ impl CdrManager {
             store: None,
             metrics: None,
             backend_name,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -542,12 +545,14 @@ impl CdrManager {
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(crate::cdr_writer::CDR_QUEUE_CAPACITY);
         let queue_len = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer = crate::cdr_writer::CdrWriter::spawn(
             rx,
             store.clone(),
             metrics.clone(),
             cfg,
             queue_len.clone(),
+            stopping.clone(),
         );
         Self {
             storage: Arc::new(InMemoryCdrStorage::new()),
@@ -557,6 +562,7 @@ impl CdrManager {
             store: Some(store),
             metrics: Some(metrics),
             backend_name: "sqlite",
+            stopping,
         }
     }
 
@@ -577,6 +583,7 @@ impl CdrManager {
             store: Some(store),
             metrics: Some(metrics),
             backend_name: "sqlite",
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -650,14 +657,30 @@ impl CdrManager {
         }
     }
 
-    /// Drain the queue and stop the writer (shutdown), bounded by `timeout`.
+    /// Drain the queue and stop the writer (shutdown), bounded by
+    /// `timeout` **as a whole**: a store that refuses every write (disk
+    /// full) must not hold the SIP shutdown open. The writer stops
+    /// retrying as soon as this is called; what it could not commit is in
+    /// the JSONL mirror.
     pub async fn close(&self, timeout: std::time::Duration) {
-        self.flush().await;
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now() + timeout;
+        if tokio::time::timeout_at(deadline, self.flush())
+            .await
+            .is_err()
+        {
+            warn!(
+                "CDR writer did not drain within {:?} — {} record(s) still queued",
+                timeout,
+                self.queue_len()
+            );
+        }
         let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(tx);
         let handle = self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(h) = handle {
-            if tokio::time::timeout(timeout, h).await.is_err() {
+            if tokio::time::timeout_at(deadline, h).await.is_err() {
                 warn!("CDR writer did not stop within {:?}", timeout);
             }
         }

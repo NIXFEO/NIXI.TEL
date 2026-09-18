@@ -194,7 +194,12 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   `+sip.instance` (`register.rs`): a phone re-registering from a new port
   refreshes its one binding (inbound calls follow the newest source), two
   phones behind one NAT keep theirs; `register_min_expires` → 423,
-  `register_max_expires` clamps (both reload-class).
+  `register_max_expires` clamps (both reload-class). AORs have one
+  spelling (`register::canonical_aor`: no display name, no URI params, no
+  port, host lower-cased) so a REGISTER and a later inbound call agree.
+  Within one Call-ID a REGISTER whose CSeq is not higher changes nothing
+  (RFC 3261 §10.3 step 7) — a removed binding is remembered for 64 s so a
+  retransmission cannot resurrect it.
 - **Non-2xx finals are ACKed and attributed by Via branch** — every INVITE
   attempt toward a trunk (initial, 407/422 retry, failover) is remembered;
   a late 487/422 from a superseded attempt is ACKed and dropped instead of
@@ -218,7 +223,12 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   counts a `failover` outcome on the trunk it left. Per-trunk metrics:
   `sbc_trunk_up/registered/active_calls/calls_total{direction,outcome}`
   plus `sbc_trunk_enabled/available/unavailable_seconds` from the table.
-  The OPTIONS/REGISTER tasks follow the trunk table (`trunk_tasks.rs`).
+  The OPTIONS/REGISTER tasks follow the trunk table (`trunk_tasks.rs`) and
+  are **UDP-only**: a TCP/TLS/WS trunk gets no probe and no outbound
+  REGISTER (they would be UDP datagrams on a port that speaks something
+  else), so its health comes from real calls. `POST /trunks/{name}/enable`
+  forgives the cooldown and the park even when the trunk was already
+  enabled — that is the documented remedy.
 
 Some callees (e.g. Jambonz-based) drop media without sending BYE — after
 `security.rtp_timeout` (90 s) without RTP the SBC BYEs both legs and writes a
@@ -243,7 +253,9 @@ never at info. `[logging] format` picks text or JSON; precedence
 `--verbose` > `RUST_LOG` > `[logging] level`; the writer is non-blocking
 and lossy (`sbc_log_dropped_lines_total`). Library tests capture logs with
 `test_support::log_capture` (thread-local `set_default`, never a global
-subscriber).
+subscriber). A field learned late (the outbound `trunk`, or a failover)
+appears twice on a text line, once per `record`; in JSON a parser keeps
+the last value.
 
 ## Known minor issues
 
@@ -251,6 +263,11 @@ subscriber).
   processing with Record-Route). Benign, could be optimized.
 - **B2BUA lock** — `B2buaManager.calls` is a `Mutex<HashMap>`; fine at current
   volumes, migrate to DashMap if targeting 100+ concurrent calls.
+- **Dead connection-oriented binding** — a registrar binding made over
+  TCP/TLS keeps its reply channel after the peer's connection closed (only
+  WS/WSS teardown is detected), so an inbound INVITE for that user is
+  written into a dead channel and reported as sent until the binding
+  expires. Pre-dates lot 3; fix with the transport-level close events.
 
 ## Roadmap
 

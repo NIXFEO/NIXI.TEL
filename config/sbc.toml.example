@@ -47,7 +47,8 @@ rtp_port_range = [10000, 20000]
 rtcp_enabled = true
 transcoding_threads = 4
 codecs = ["PCMU", "PCMA", "Opus"]
-public_ip = "203.0.113.10"
+# (the address advertised in SDP is [network] public_ipv4 — [media] has no
+# public_ip key of its own)
 
 [media.webrtc]
 enabled = true
@@ -178,11 +179,16 @@ ban_on_auth_failure = true
 # a trunk that stops answering rests through the router's cooldown. The
 # probes and outbound REGISTER loops follow the trunk table live (API,
 # reload) — these timings are read at boot only.
+# Both are sent over the SIP UDP socket: a trunk whose transport is TCP,
+# TLS, WS or WSS gets no probe and no outbound REGISTER (its health then
+# comes from real calls only).
 options_interval = 30
 options_timeout = 5
-# A refused or unanswered outbound REGISTER is retried with exponential
-# backoff from 30 s up to this cap (reset on success); a 423 Interval Too
-# Brief is retried with the trunk's Min-Expires.
+# A *refused* outbound REGISTER (4xx/5xx, and a 423 whose Min-Expires does
+# not help) backs off exponentially from 30 s up to this cap, reset on
+# success. A timeout or a send failure keeps a fixed 60 s retry instead, so
+# one lost datagram does not stretch into a long outage. A 423 Interval Too
+# Brief is retried once with the trunk's Min-Expires, which is remembered.
 register_backoff_max = 900
 
 [metrics]

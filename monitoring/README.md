@@ -11,6 +11,7 @@ failures), per-trunk series (`sbc_trunk_up`, `sbc_trunk_registered`,
 `sbc_trunk_active_calls`, `sbc_trunk_calls_total{trunk,direction,outcome}`,
 `sbc_trunk_enabled`, `sbc_trunk_available`, `sbc_trunk_unavailable_seconds`,
 `sbc_trunk_consecutive_failures`), the config store (`sbc_store_available`,
+`sbc_store_created_empty`,
 `sbc_store_backups_enabled`, `sbc_store_backup_interval_seconds`,
 `sbc_store_backup_last_success_timestamp_seconds`,
 `sbc_store_backup_last_bytes`, `sbc_store_backup_failures_total`), reloads

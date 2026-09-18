@@ -99,6 +99,17 @@ groups:
         annotations:
           summary: "SBC config store unavailable (running from TOML seeds only)"
 
+      - alert: SBCStoreCreatedEmpty
+        # The store file was missing at boot and a new, empty one was
+        # created: no users, no trunks, no DIDs — every call is refused.
+        # Either a first boot before any API write, or a lost store (an
+        # unmounted volume, a mistyped restore).
+        expr: sbc_store_created_empty == 1
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "SBC started with a brand-new empty config store — restore it"
+
       - alert: SBCStoreBackupStale
         # No successful backup for twice the configured interval while the
         # timer is enabled (the interval gauge follows backup_interval_hours).

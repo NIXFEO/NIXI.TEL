@@ -392,6 +392,25 @@ pub struct Sbc {
     security: Arc<crate::security::SecurityManager>,
 }
 
+/// `security.max_call_duration` as a cap: 0 means unlimited (documented),
+/// anything else is floored at 60 s so a typo cannot cut every call after
+/// a few seconds.
+fn max_call_duration_of(sec: &crate::config::SecurityConfig) -> Duration {
+    match sec.max_call_duration {
+        0 => Duration::MAX,
+        secs => Duration::from_secs(secs.max(60)),
+    }
+}
+
+/// `Duration::MAX` (the "no cap" sentinel) reads as `unlimited` in logs.
+fn fmt_cap(d: Duration) -> String {
+    if d == Duration::MAX {
+        "unlimited".to_string()
+    } else {
+        format!("{}s", d.as_secs())
+    }
+}
+
 impl Sbc {
     /// Create a new SBC instance from full configuration. Nothing HTTP is
     /// started here: the management API (axum, `sbc-management`) is
@@ -538,7 +557,17 @@ impl Sbc {
             } else {
                 public_ip.to_string()
             };
-            SbcIdentity::new(&public_ip.to_string(), &domain, 5060, false)
+            // Via, Contact and Record-Route must name the port we listen
+            // on, not a hardcoded 5060.
+            let sip_port = config
+                .network
+                .listeners
+                .iter()
+                .find(|l| l.transport == crate::config::TransportType::UDP)
+                .or_else(|| config.network.listeners.first())
+                .map(|l| l.bind_port)
+                .unwrap_or(5060);
+            SbcIdentity::new(&public_ip.to_string(), &domain, sip_port, false)
         });
 
         // --- Reload notify (shared between API and event loop) ---
@@ -554,10 +583,21 @@ impl Sbc {
 
         // --- SQLite config store (dynamic config source of truth) ---
         let readiness = Arc::new(Readiness::new());
+        // A missing file is created by `open` (that is how a first boot
+        // works), but on a box that had a store it means the file was lost
+        // — an unmounted volume, a mistyped restore — and the SBC would
+        // come up with no users, trunks or DIDs at all.
+        let store_existed = std::path::Path::new(&config.database.sqlite_path).exists();
         let config_store = match sbc_storage::ConfigStore::open(&config.database.sqlite_path).await
         {
             Ok(store) => {
                 let store = Arc::new(store);
+                if !store_existed {
+                    warn!(
+                        "Config store {} did not exist — a new, empty one was created. If you expected an existing store, stop the service and restore it (docs/INSTALL.md §10).",
+                        config.database.sqlite_path
+                    );
+                }
                 import::first_boot_import(&store, config).await;
                 import::seed_security(&store, config).await;
 
@@ -585,6 +625,35 @@ impl Sbc {
                     }
                 }
                 metrics.set_store_available(readiness.hydrated());
+
+                // A store we just created, with nothing to serve, is
+                // indistinguishable from a lost one — and a first boot
+                // must still work, so this is a loud, alertable signal
+                // rather than a refusal to start.
+                if !store_existed {
+                    let empty = store
+                        .list_users()
+                        .await
+                        .map(|r| r.is_empty())
+                        .unwrap_or(true)
+                        && store
+                            .list_trunks()
+                            .await
+                            .map(|r| r.is_empty())
+                            .unwrap_or(true)
+                        && store
+                            .list_dids()
+                            .await
+                            .map(|r| r.is_empty())
+                            .unwrap_or(true);
+                    metrics.set_store_created_empty(empty);
+                    if empty {
+                        warn!(
+                            "Config store {} is brand new and holds no users, trunks or DIDs: every call will be refused until it is populated (API) or restored. sbc_store_created_empty = 1.",
+                            config.database.sqlite_path
+                        );
+                    }
+                }
 
                 // Restore persisted bans (restart must not amnesty offenders)
                 let now = crate::sbc::import::now_rfc3339();
@@ -714,7 +783,7 @@ impl Sbc {
             admin_kicks: Arc::new(AdminKicks::new()),
             identity_policy: IdentityPolicy::from_config(&config.security),
             invite_tx: invite_tx::InviteTxCache::new(),
-            max_call_duration: Duration::from_secs(config.security.max_call_duration.max(60)),
+            max_call_duration: max_call_duration_of(&config.security),
             security,
             session_timer: config.security.session_timer_enabled.then(|| {
                 (
@@ -827,12 +896,12 @@ impl Sbc {
             self.session_timer = session_timer;
             applied.push("security.session_timer".to_string());
         }
-        let max_call_duration = Duration::from_secs(sec.max_call_duration.max(60));
+        let max_call_duration = max_call_duration_of(sec);
         if max_call_duration != self.max_call_duration {
             info!(
-                "Reload: max_call_duration {}s → {}s",
-                self.max_call_duration.as_secs(),
-                max_call_duration.as_secs()
+                "Reload: max_call_duration {} → {}",
+                fmt_cap(self.max_call_duration),
+                fmt_cap(max_call_duration)
             );
             self.max_call_duration = max_call_duration;
             applied.push("security.max_call_duration".to_string());
@@ -971,6 +1040,8 @@ impl Sbc {
         let config = match SbcConfig::from_toml_str(&raw) {
             Ok(c) => c,
             Err(e) => {
+                // `from_toml_str` already dropped the source excerpt (it
+                // can quote the token or a trunk password).
                 let r = fail(self, e.to_string());
                 return Err(Error::Config(r.error.unwrap_or_default()));
             }
@@ -997,6 +1068,12 @@ impl Sbc {
             self.register_trunk_tls_configs();
             self.trunk_tasks.sync();
             hydrated = true;
+            // Recovery path: a boot with `allow_missing_store`, or one
+            // whose first hydration failed, left `/ready` at 503 — this
+            // reload is what fixes it.
+            self.readiness.set_store_open();
+            self.readiness.set_hydrated();
+            self.metrics.set_store_available(true);
             // API-set global user limits (settings) win over the TOML defaults.
             let concurrent = store
                 .get_setting(hydrate::SETTING_DEFAULT_CONCURRENT)
@@ -1401,9 +1478,9 @@ impl Sbc {
                 received = self.transport.recv_message() => {
                     match received {
                         Some(msg) => {
-                            if let Err(e) = self.handle_message(msg).await {
-                                error!("Error handling message: {}", e);
-                            }
+                            // `dispatch` logs the error inside the call span
+                            // (with the source): nothing to add here.
+                            let _ = self.handle_message(msg).await;
                         }
                         None => {
                             warn!("Transport channel closed, stopping SBC");
@@ -1460,9 +1537,7 @@ impl Sbc {
                     received = self.transport.recv_message() => {
                         match received {
                             Some(msg) => {
-                                if let Err(e) = self.handle_message(msg).await {
-                                    error!("Error handling message: {}", e);
-                                }
+                                let _ = self.handle_message(msg).await;
                             }
                             None => {
                                 warn!("Transport channel closed, stopping SBC");
@@ -1586,6 +1661,7 @@ impl Sbc {
             }
             SipMessage::Response(r) => r.call_id_header().ok().map(|h| h.value().to_string()),
         };
+        let call_id = call_id.filter(|c| !c.trim().is_empty());
         let Some(call_id) = call_id else {
             return tracing::Span::none();
         };
@@ -1802,7 +1878,7 @@ impl Sbc {
             .map_err(|e| Error::Other(format!("Missing To header: {}", e)))?
             .value()
             .to_string();
-        let aor = normalize_aor(&aor_raw);
+        let aor = crate::register::canonical_aor(&aor_raw);
 
         // RFC 3261 §10.3 step 5: an authenticated user binds (or unbinds,
         // Expires: 0 / Contact: *) only its own AOR, on a domain we serve —
@@ -2228,15 +2304,6 @@ impl Default for Sbc {
 /// "<sip:user@domain>" → "sip:user@domain"
 /// "Display Name <sip:user@domain>" → "sip:user@domain"
 /// "sip:user@domain" → "sip:user@domain" (unchanged)
-fn normalize_aor(raw: &str) -> String {
-    let s = raw.trim();
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        s[start + 1..end].trim().to_string()
-    } else {
-        s.to_string()
-    }
-}
-
 /// Extract the callee AOR from the INVITE Request-URI.
 /// Returns the full AOR like "sip:alice@sip.example.com"
 /// or user-only "alice@sip.example.com" for registrar lookup.

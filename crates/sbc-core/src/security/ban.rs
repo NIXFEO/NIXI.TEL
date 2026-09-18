@@ -146,8 +146,14 @@ impl BanManager {
         })
     }
 
-    /// Hot path: is this source banned right now?
+    /// Hot path: is this source banned right now? With the feature turned
+    /// off (`[security.ban] enabled = false`, reload-class) nothing is
+    /// enforced — including bans already stored and manual ones — so
+    /// disabling it really opens the door again.
     pub fn is_banned(&self, ip: IpAddr) -> bool {
+        if !self.config.read().unwrap().enabled {
+            return false;
+        }
         // NOTE: the Ref guard from get() MUST be dropped before remove() —
         // removing while holding a same-shard guard deadlocks DashMap.
         let expired = match self.bans.get(&ip) {

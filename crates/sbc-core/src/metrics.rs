@@ -257,6 +257,10 @@ pub struct SbcMetrics {
     pub config_last_reload_time: Arc<AtomicU64>,
     /// 1 when the SQLite config store is open and hydrated.
     pub store_available: Arc<AtomicU64>,
+    /// 1 when this process created the store file at boot and found no
+    /// users, trunks or DIDs to serve — a lost or unmounted store looks
+    /// exactly like this.
+    pub store_created_empty: Arc<AtomicU64>,
     /// 1 when the backup timer runs.
     pub store_backups_enabled: Arc<AtomicU64>,
     /// The timer's interval (seconds), for the staleness alert.
@@ -326,6 +330,7 @@ impl SbcMetrics {
             ]))),
             config_last_reload_time: Arc::new(AtomicU64::new(0)),
             store_available: Arc::new(AtomicU64::new(0)),
+            store_created_empty: Arc::new(AtomicU64::new(0)),
             store_backups_enabled: Arc::new(AtomicU64::new(0)),
             store_backup_interval_secs: Arc::new(AtomicU64::new(0)),
             store_backup_last_success_time: Arc::new(AtomicU64::new(0)),
@@ -538,6 +543,11 @@ impl SbcMetrics {
         self.store_available.store(u64::from(on), Ordering::Relaxed);
     }
 
+    pub fn set_store_created_empty(&self, on: bool) {
+        self.store_created_empty
+            .store(u64::from(on), Ordering::Relaxed);
+    }
+
     pub fn set_store_backups(&self, interval: Option<Duration>) {
         self.store_backups_enabled
             .store(u64::from(interval.is_some()), Ordering::Relaxed);
@@ -600,7 +610,17 @@ impl SbcMetrics {
     // ── Per-trunk series ─────────────────────────────────────────────────
     fn with_trunk<F: FnOnce(&mut TrunkSeries)>(&self, trunk: &str, f: F) {
         if let Ok(mut map) = self.trunks.lock() {
-            f(map.entry(trunk.to_string()).or_default());
+            let entry = map.entry(trunk.to_string()).or_insert_with(|| {
+                // Seed the `answered` counters: without an existing series
+                // PromQL's vector matching drops the trunk from the ASR
+                // rule, which is exactly the 0 % case it must catch.
+                let mut series = TrunkSeries::default();
+                for direction in ["inbound", "outbound"] {
+                    series.calls.insert((direction.to_string(), "answered"), 0);
+                }
+                series
+            });
+            f(entry);
         }
     }
 
@@ -797,6 +817,11 @@ impl SbcMetrics {
             "sbc_store_available",
             "SQLite config store open and hydrated (1) or missing (0)",
             self.store_available.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "sbc_store_created_empty",
+            "The store file was missing at boot and nothing was hydrated from it (1): restore it",
+            self.store_created_empty.load(Ordering::Relaxed)
         );
         gauge!(
             "sbc_store_backups_enabled",
@@ -1481,6 +1506,7 @@ mod tests {
         m.inc_store_backup_failure();
         let out = m.render_prometheus();
         assert!(out.contains("sbc_store_available 1\n"), "{}", out);
+        assert!(out.contains("sbc_store_created_empty 0\n"), "{}", out);
         assert!(out.contains("sbc_store_backups_enabled 1\n"));
         assert!(out.contains("sbc_store_backup_interval_seconds 86400\n"));
         assert!(out.contains("sbc_store_backup_last_bytes 1234\n"));

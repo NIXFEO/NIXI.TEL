@@ -95,11 +95,17 @@ pub struct AclRule {
     pub updated_at: u64,
 }
 
+/// The parse the runtime uses for an ACL rule's `cidr` (a bare IP or a
+/// CIDR block). The API validates with this so a rule it accepts is a rule
+/// hydration can actually enforce.
+pub fn parse_cidr(cidr: &str) -> Result<IpNetwork> {
+    cidr.parse::<IpNetwork>()
+        .map_err(|e| Error::Config(format!("invalid CIDR '{}': {}", cidr, e)))
+}
+
 impl AclRule {
     pub fn new(id: &str, name: &str, cidr: &str, action: AclAction, priority: i32) -> Result<Self> {
-        let cidr = cidr
-            .parse::<IpNetwork>()
-            .map_err(|e| Error::Config(format!("invalid CIDR '{}': {}", cidr, e)))?;
+        let cidr = parse_cidr(cidr)?;
         Ok(Self {
             id: id.to_string(),
             name: name.to_string(),

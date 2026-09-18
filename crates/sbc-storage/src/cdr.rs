@@ -6,6 +6,23 @@ use sqlx::QueryBuilder;
 
 const COLUMNS: &str = "id, v, uuid, call_id, direction, caller, callee, source_ip, trunk_id, codec, is_webrtc, started_at, answered_at, ended_at, duration_secs, billable_secs, sip_code, disconnect_reason, reason, hangup_by";
 
+/// `INSERT OR IGNORE` every row on an open transaction; returns how many
+/// were actually stored.
+async fn insert_rows_on(conn: &mut sqlx::SqliteConnection, rows: &[CdrRow]) -> Result<usize> {
+    let mut n = 0usize;
+    for r in rows {
+        let mut qb = QueryBuilder::new("");
+        push_row(&mut qb, r);
+        n += qb
+            .build()
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?
+            .rows_affected() as usize;
+    }
+    Ok(n)
+}
+
 fn db_err(e: sqlx::Error) -> Error {
     Error::Database(e.to_string())
 }
@@ -80,17 +97,7 @@ impl ConfigStore {
         marker_value: &str,
     ) -> Result<usize> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let mut n = 0usize;
-        for r in rows {
-            let mut qb = QueryBuilder::new("");
-            push_row(&mut qb, r);
-            n += qb
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .rows_affected() as usize;
-        }
+        let n = insert_rows_on(&mut tx, rows).await?;
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -100,6 +107,18 @@ impl ConfigStore {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(n)
+    }
+
+    /// One chunk of an import: the rows commit on their own, without the
+    /// marker, so a long history can be loaded in bounded pieces instead
+    /// of one transaction that has to hold everything in memory. The rows
+    /// are idempotent (`INSERT OR IGNORE` on a content-derived id), so an
+    /// interrupted import simply resumes at the next boot.
+    pub async fn import_cdr_chunk(&self, rows: &[CdrRow]) -> Result<usize> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let n = insert_rows_on(&mut tx, rows).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(n)
     }
@@ -122,7 +141,10 @@ impl ConfigStore {
             qb.push(" AND trunk_id = ").push_bind(t.clone());
         }
         if let Some(u) = &f.uuid {
-            qb.push(" AND uuid = ").push_bind(u.clone());
+            // `uuid <> ''` lets SQLite use the partial unique index
+            // (`WHERE uuid <> ''`) instead of scanning the table; an empty
+            // uuid never identifies a call anyway.
+            qb.push(" AND uuid <> '' AND uuid = ").push_bind(u.clone());
         }
         if let Some(c) = &f.call_id {
             qb.push(" AND call_id = ").push_bind(c.clone());

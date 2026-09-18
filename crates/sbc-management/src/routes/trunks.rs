@@ -442,6 +442,15 @@ async fn set_trunk_enabled(
         &name,
     )
     .await;
+    if enabled {
+        // `enable` is the documented remedy for a failure cooldown or a
+        // `503 Retry-After` park, and only an *enabled* trunk can be in
+        // either state — hydration alone forgives them on a
+        // disabled→enabled transition, so clear them here too.
+        state
+            .trunks
+            .update_state_by_name(&name, |s| s.clear_cooldowns());
+    }
     Ok(Json(json!({ "name": name, "enabled": enabled })))
 }
 

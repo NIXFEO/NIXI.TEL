@@ -175,6 +175,15 @@ async fn import_on(
     let replace = mode == ImportMode::Replace;
     let mut report = ImportReport::default();
 
+    // Take the write lock before the first read: a deferred transaction
+    // that reads first has to upgrade later, and a concurrent writer then
+    // makes the upgrade fail outright instead of waiting out the
+    // `busy_timeout`. This no-op UPDATE matches no row.
+    sqlx::query("UPDATE settings SET value = value WHERE key = ''")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
     // Trunks first: a replace deletes the trunks the document dropped and
     // SQLite cascades their routes (migration 0001), so those routes are
     // counted with the trunk, not in the routes section.

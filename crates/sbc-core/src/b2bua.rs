@@ -1682,6 +1682,10 @@ impl B2buaManager {
     /// trunk (e.g. Genesys-based trunks) sends BYE with a shortened Call-ID.
     /// What the `call` log span carries; found by exact inbound/outbound
     /// Call-ID, then by suffix (Genesys truncation). Silent: no log line.
+    /// Shortest Call-ID suffix that may identify a call (a truncated
+    /// Genesys Call-ID is still a UUID-like token).
+    pub const MIN_CALL_ID_SUFFIX: usize = 8;
+
     pub async fn log_fields_for_call_id(&self, call_id: &str) -> Option<CallLogFields> {
         let calls = self.calls.lock().await;
         let hit = calls
@@ -1691,6 +1695,12 @@ impl B2buaManager {
                     || c.outbound.as_ref().is_some_and(|l| l.call_id == call_id)
             })
             .or_else(|| {
+                // Genesys truncates Call-IDs, so a suffix match is needed
+                // — but only for a needle long enough to identify a call:
+                // "" matches everything and a short one matches by luck.
+                if call_id.len() < Self::MIN_CALL_ID_SUFFIX {
+                    return None;
+                }
                 calls.values().find(|c| {
                     c.inbound.call_id.ends_with(call_id)
                         || c.outbound

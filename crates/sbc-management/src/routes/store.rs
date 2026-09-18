@@ -221,10 +221,22 @@ fn parse_document(body: &Value, realm: &str) -> ApiResult<ImportDoc> {
     };
     doc.user_limits = match obj.get("user_limits") {
         None | Some(Value::Null) => None,
-        Some(v) => Some(
-            serde_json::from_value::<ImportUserLimits>(v.clone())
-                .map_err(|e| invalid(format!("user_limits: {}", e)))?,
-        ),
+        Some(v) => {
+            let limits: ImportUserLimits = serde_json::from_value(v.clone())
+                .map_err(|e| invalid(format!("user_limits: {}", e)))?;
+            // The runtime applies the API-set defaults only as a pair (it
+            // falls back to the TOML ones otherwise), so half a pair would
+            // be stored and exported but never enforced.
+            if limits.default_max_concurrent_calls.is_some()
+                != limits.default_max_calls_per_minute.is_some()
+            {
+                return Err(invalid(
+                    "user_limits: give both default_max_concurrent_calls and \
+                     default_max_calls_per_minute, or neither (null clears both)",
+                ));
+            }
+            Some(limits)
+        }
     };
     validate(&mut doc, realm)?;
     Ok(doc)
@@ -334,11 +346,23 @@ fn validate(doc: &mut ImportDoc, realm: &str) -> ApiResult<()> {
             if !(1..=65535).contains(&t.port) {
                 return Err(invalid(format!("{}: port must be 1-65535", at)));
             }
-            if t.max_concurrent_calls < 0 || t.registration_interval < 0 {
-                return Err(invalid(format!(
-                    "{}: max_concurrent_calls and registration_interval must be >= 0",
-                    at
-                )));
+            // Every one of these becomes a u32 in the runtime: a negative
+            // value would wrap to a nonsensical limit.
+            for (field, value) in [
+                ("max_concurrent_calls", t.max_concurrent_calls),
+                ("registration_interval", t.registration_interval),
+                ("priority", t.priority),
+                ("weight", t.weight),
+                ("cost_per_minute", t.cost_per_minute),
+            ] {
+                if !(0..=i64::from(u32::MAX)).contains(&value) {
+                    return Err(invalid(format!(
+                        "{}: {} must be between 0 and {}",
+                        at,
+                        field,
+                        u32::MAX
+                    )));
+                }
             }
             json_string_list(&at, "prefix_patterns", &t.prefix_patterns)?;
             json_string_list(&at, "allowed_codecs", &t.allowed_codecs)?;
@@ -367,8 +391,11 @@ fn validate(doc: &mut ImportDoc, realm: &str) -> ApiResult<()> {
                     at
                 )));
             }
-            if r.cidr.parse::<std::net::IpAddr>().is_err() && !r.cidr.contains('/') {
-                return Err(invalid(format!("{}: invalid CIDR or IP '{}'", at, r.cidr)));
+            // The parser hydration uses: a rule that only looks like a
+            // CIDR would be stored, listed by the API and silently dropped
+            // at hydration, so its deny would never be enforced.
+            if let Err(e) = sbc_core::acl::parse_cidr(&r.cidr) {
+                return Err(invalid(format!("{}: {}", at, e)));
             }
         }
     }

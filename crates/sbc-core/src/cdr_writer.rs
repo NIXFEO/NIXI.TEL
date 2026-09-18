@@ -17,6 +17,8 @@ use tracing::{error, info, warn};
 
 pub const CDR_QUEUE_CAPACITY: usize = 8192;
 const BATCH_MAX: usize = 64;
+/// Rows per transaction while importing the JSONL history.
+const IMPORT_CHUNK: usize = 500;
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 const RETENTION_FIRST_RUN: Duration = Duration::from_secs(60);
@@ -82,6 +84,10 @@ pub struct CdrWriter {
     metrics: Arc<SbcMetrics>,
     cfg: CdrWriterConfig,
     queue_len: Arc<AtomicU64>,
+    /// Set by `CdrManager::close`: stop retrying a refusing store so the
+    /// drain stays inside the shutdown budget (the batch is already in the
+    /// JSONL mirror).
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CdrWriter {
@@ -91,6 +97,7 @@ impl CdrWriter {
         metrics: Arc<SbcMetrics>,
         cfg: CdrWriterConfig,
         queue_len: Arc<AtomicU64>,
+        stopping: Arc<std::sync::atomic::AtomicBool>,
     ) -> JoinHandle<()> {
         tokio::spawn(
             Self {
@@ -99,6 +106,7 @@ impl CdrWriter {
                 metrics,
                 cfg,
                 queue_len,
+                stopping,
             }
             .run(),
         )
@@ -153,9 +161,19 @@ impl CdrWriter {
         info!("CDR writer stopped");
     }
 
-    /// Commit a batch (retrying until the store takes it), then mirror it.
+    /// Mirror a batch, then commit it (retrying while the store refuses).
+    ///
+    /// The JSONL mirror is written *first* on purpose: it is the only
+    /// durable copy while the store is failing, and a restart during an
+    /// outage would otherwise lose the queue with no trace anywhere.
     async fn write_batch(&self, batch: &[CdrRecord]) {
         let rows: Vec<CdrRow> = batch.iter().map(CdrRecord::to_row).collect();
+        if let Some(path) = &self.cfg.jsonl_path {
+            if let Err(e) = mirror(path, batch).await {
+                self.metrics.inc_cdr_write_error("jsonl");
+                warn!("CDR mirror {}: {}", path.display(), e);
+            }
+        }
         let mut wait = RETRY_MIN;
         loop {
             match self.store.insert_cdrs(&rows).await {
@@ -175,6 +193,19 @@ impl CdrWriter {
                 }
                 Err(e) => {
                     self.metrics.inc_cdr_write_error("sqlite");
+                    if self.stopping.load(Ordering::Relaxed) {
+                        error!(
+                            "CDR: storing {} record(s) failed during shutdown ({}) — left in {}",
+                            rows.len(),
+                            e,
+                            self.cfg
+                                .jsonl_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "no mirror configured".into())
+                        );
+                        break;
+                    }
                     error!(
                         "CDR: storing {} record(s) failed ({}) — retrying in {:?}",
                         rows.len(),
@@ -191,16 +222,40 @@ impl CdrWriter {
             .fetch_sub(batch.len() as u64, Ordering::Relaxed)
             .saturating_sub(batch.len() as u64);
         self.metrics.set_cdr_queue_length(left);
-        if let Some(path) = &self.cfg.jsonl_path {
-            if let Err(e) = mirror(path, batch).await {
-                self.metrics.inc_cdr_write_error("jsonl");
-                warn!("CDR mirror {}: {}", path.display(), e);
-            }
+    }
+
+    /// Commit one import chunk, leaving `chunk` empty. A failure is
+    /// logged and counted: the marker is only written at the end, so the
+    /// next boot retries what did not land.
+    async fn commit_import_chunk(&self, chunk: &mut Vec<CdrRow>) -> usize {
+        if chunk.is_empty() {
+            return 0;
         }
+        let n = match self.store.import_cdr_chunk(chunk).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.metrics.inc_cdr_write_error("sqlite");
+                warn!(
+                    "CDR import: a chunk of {} record(s) failed ({}) — retried at the next boot",
+                    chunk.len(),
+                    e
+                );
+                0
+            }
+        };
+        chunk.clear();
+        n
     }
 
     /// Import the JSONL history once: rotated `.N` siblings oldest first,
-    /// then the live file; every row and the marker commit together.
+    /// then the live file.
+    ///
+    /// Streamed line by line and committed in chunks of
+    /// [`IMPORT_CHUNK`], so a history of any size costs bounded memory (a
+    /// whole-file read of a year of CDRs would OOM a small box, and the
+    /// boot would then loop). Every row's id is derived from its content,
+    /// so the chunks are idempotent and an interrupted import resumes at
+    /// the next boot. The marker is written last, in its own transaction.
     async fn import_jsonl_once(&self, path: &Path) {
         match self.store.get_setting(JSONL_IMPORT_MARKER).await {
             Ok(None) => {}
@@ -214,44 +269,90 @@ impl CdrWriter {
         if files.is_empty() {
             return;
         }
-        let mut rows: Vec<CdrRow> = Vec::new();
+        let mut parsed = 0usize;
+        let mut stored = 0usize;
         let mut skipped = 0usize;
         let mut per_file = Vec::new();
+        let mut chunk: Vec<CdrRow> = Vec::with_capacity(IMPORT_CHUNK);
         for f in &files {
-            let raw = match tokio::fs::read_to_string(f).await {
-                Ok(s) => s,
+            let file = match tokio::fs::File::open(f).await {
+                Ok(file) => file,
                 Err(e) => {
                     warn!("CDR import: cannot read {}: {}", f.display(), e);
                     continue;
                 }
             };
-            let before = rows.len();
-            for line in raw.lines().filter(|l| !l.trim().is_empty()) {
-                match crate::storage::parse_cdr_json(line) {
-                    Some(r) => rows.push(r.to_row()),
+            let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(file));
+            let before = parsed;
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(
+                            "CDR import: {} stopped at line {}: {}",
+                            f.display(),
+                            parsed,
+                            e
+                        );
+                        break;
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match crate::storage::parse_cdr_json(&line) {
+                    Some(r) => {
+                        let mut row = r.to_row();
+                        // A legacy id came from a sub-second clock and can
+                        // repeat; two different lines must not collapse
+                        // into one row (`INSERT OR IGNORE`). Derive it
+                        // from the line instead: same line → same id (so
+                        // a resumed import is idempotent), different
+                        // lines → different ids.
+                        row.id = legacy_row_id(&row.id, &line);
+                        parsed += 1;
+                        chunk.push(row);
+                    }
                     None => skipped += 1,
                 }
+                if chunk.len() >= IMPORT_CHUNK {
+                    stored += self.commit_import_chunk(&mut chunk).await;
+                }
             }
-            per_file.push(format!("{}={}", f.display(), rows.len() - before));
+            per_file.push(format!("{}={}", f.display(), parsed - before));
         }
+        stored += self.commit_import_chunk(&mut chunk).await;
         let marker = format!(
-            "{} rows={} skipped={} files=[{}]",
+            "{} rows={} stored={} skipped={} files=[{}]",
             crate::sbc::import::now_rfc3339(),
-            rows.len(),
+            parsed,
+            stored,
             skipped,
             per_file.join(", ")
         );
         match self
             .store
-            .import_cdrs(&rows, JSONL_IMPORT_MARKER, &marker)
+            .import_cdrs(&[], JSONL_IMPORT_MARKER, &marker)
             .await
         {
-            Ok(n) => info!(
-                "CDR import: {} record(s) from {} file(s) stored ({} unparsable line(s) skipped)",
-                n,
-                files.len(),
-                skipped
-            ),
+            Ok(_) => {
+                if stored < parsed {
+                    // Rows already in the store: a resumed import, or a
+                    // marker removed by hand. Say so instead of hiding it.
+                    warn!(
+                        "CDR import: {} of {} record(s) were already stored",
+                        parsed - stored,
+                        parsed
+                    );
+                }
+                info!(
+                    "CDR import: {} record(s) from {} file(s) stored ({} unparsable line(s) skipped)",
+                    stored,
+                    files.len(),
+                    skipped
+                )
+            }
             Err(e) => {
                 self.metrics.inc_cdr_write_error("sqlite");
                 error!(
@@ -288,6 +389,25 @@ impl CdrWriter {
 }
 
 /// The live file and its plain rotated siblings, oldest first.
+/// A stable id for an imported legacy row: the original id when it is
+/// usable, with the line's own fingerprint appended so two different
+/// lines that shared a clock-derived id stay two rows. Deterministic, so
+/// re-importing the same line is a no-op.
+fn legacy_row_id(original: &str, line: &str) -> String {
+    // FNV-1a over the line: no dependency, and collisions here would only
+    // merge two byte-identical lines, which is the wanted behaviour.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in line.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    if original.is_empty() {
+        format!("jsonl-{:016x}", hash)
+    } else {
+        format!("{}-{:016x}", original, hash)
+    }
+}
+
 fn import_files(path: &Path) -> Vec<PathBuf> {
     let mut rotated: Vec<(u32, PathBuf)> = Vec::new();
     if let (Some(dir), Some(name)) = (
@@ -373,6 +493,49 @@ mod tests {
         let d = std::env::temp_dir().join(format!("sbc-cdr-{}-{}", tag, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A store that refuses every write must not hold the shutdown open,
+    /// and the records must still exist somewhere: the JSONL mirror is
+    /// written before the commit for exactly that reason.
+    #[tokio::test]
+    async fn a_broken_store_bounds_close_and_the_mirror_still_has_the_records() {
+        let dir = temp_dir("broken");
+        let jsonl = dir.join("cdr.jsonl");
+        let store = Arc::new(ConfigStore::open_memory().await.unwrap());
+        let metrics = Arc::new(SbcMetrics::new());
+        let cdr = CdrManager::with_store(
+            store.clone(),
+            metrics.clone(),
+            CdrWriterConfig {
+                jsonl_path: Some(jsonl.clone()),
+                import_jsonl: false,
+                ..CdrWriterConfig::default()
+            },
+        );
+        // Every write from here on fails (disk full, I/O error, …).
+        store.pool().close().await;
+        cdr.insert(&record(1, 1_700_000_000)).await.unwrap();
+
+        let started = std::time::Instant::now();
+        cdr.close(Duration::from_millis(300)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "close took {:?} — the retry loop must stop at shutdown",
+            started.elapsed()
+        );
+        let mirrored = tokio::fs::read_to_string(&jsonl).await.unwrap_or_default();
+        assert!(
+            mirrored.contains("\"uuid\":\"u-1\""),
+            "the record must survive in the mirror: {:?}",
+            mirrored
+        );
+        assert!(metrics
+            .cdr_write_errors
+            .lock()
+            .unwrap()
+            .contains_key("sqlite"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -482,6 +645,71 @@ mod tests {
         assert_eq!(store.count_cdrs().await.unwrap(), 4);
         cdr2.close(Duration::from_secs(2)).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The history is read line by line and committed in chunks, so a
+    /// file larger than memory is fine; two legacy lines that shared a
+    /// clock-derived id stay two records; and a re-run stores nothing new.
+    #[tokio::test]
+    async fn the_history_import_is_chunked_and_keeps_colliding_legacy_ids_apart() {
+        let dir = temp_dir("import-chunks");
+        let live = dir.join("cdr.jsonl");
+        let mut lines = String::new();
+        // More lines than one chunk, all sharing one legacy id.
+        for n in 0..(IMPORT_CHUNK + 20) {
+            let mut r = record(n as u32, 1_000 + n as u64);
+            r.id = "same-legacy-id".to_string();
+            lines.push_str(&r.to_json());
+            lines.push('\n');
+        }
+        std::fs::write(&live, &lines).unwrap();
+        let store = Arc::new(ConfigStore::open_memory().await.unwrap());
+        let metrics = Arc::new(SbcMetrics::new());
+        let cfg = CdrWriterConfig {
+            jsonl_path: None,
+            import_path: Some(live.clone()),
+            retention_days: 0,
+            import_jsonl: true,
+        };
+        let cdr = CdrManager::with_store(store.clone(), metrics.clone(), cfg.clone());
+        cdr.flush().await;
+        assert_eq!(
+            store.count_cdrs().await.unwrap() as usize,
+            IMPORT_CHUNK + 20,
+            "every line is its own record despite the shared legacy id"
+        );
+        let marker = store
+            .get_setting(JSONL_IMPORT_MARKER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            marker.contains(&format!("stored={}", IMPORT_CHUNK + 20)),
+            "{}",
+            marker
+        );
+        cdr.close(Duration::from_secs(2)).await;
+
+        // Same file, marker cleared by hand: the ids are content-derived,
+        // so nothing is duplicated.
+        store.delete_setting(JSONL_IMPORT_MARKER).await.unwrap();
+        let cdr2 = CdrManager::with_store(store.clone(), metrics, cfg);
+        cdr2.flush().await;
+        assert_eq!(
+            store.count_cdrs().await.unwrap() as usize,
+            IMPORT_CHUNK + 20
+        );
+        cdr2.close(Duration::from_secs(2)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_id_is_derived_from_the_line() {
+        let a = legacy_row_id("x", "{\"id\":\"x\",\"caller\":\"a\"}");
+        let b = legacy_row_id("x", "{\"id\":\"x\",\"caller\":\"b\"}");
+        assert_ne!(a, b, "different lines must not collapse into one row");
+        assert_eq!(a, legacy_row_id("x", "{\"id\":\"x\",\"caller\":\"a\"}"));
+        assert!(legacy_row_id("", "line").starts_with("jsonl-"));
     }
 
     #[tokio::test]

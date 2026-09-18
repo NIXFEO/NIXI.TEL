@@ -83,9 +83,10 @@ pub async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
 
     let now = std::time::Instant::now();
     for (t, s) in &state.trunks.get_stats() {
-        // Only while the router actually skips the trunk: a cooldown that
-        // expired is not an alert any more.
-        if let Some(left) = s.unavailable_for(now) {
+        // Only while the router actually skips the trunk *because of its
+        // health*: an expired cooldown is not an alert any more, and a
+        // trunk the operator disabled is not an incident.
+        if let Some(left) = s.unavailable_for(now).filter(|_| t.enabled) {
             let parked = s.health_label(now) == "parked";
             alerts.push(json!({
                 "level": if parked { "warning" } else { "critical" },
@@ -95,13 +96,25 @@ pub async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
                 "unavailable_for_secs": left.as_secs(),
             }));
         }
-        if t.enabled && t.register_with_trunk && !s.registered {
+        if t.enabled
+            && t.register_with_trunk
+            && t.transport == sbc_core::routing::TransportType::Udp
+            && !s.registered
+        {
             alerts.push(json!({
                 "level": "warning",
                 "type": "trunk_unregistered",
                 "trunk": t.name,
             }));
         }
+    }
+
+    if state.metrics.store_created_empty.load(Ordering::Relaxed) == 1 {
+        alerts.push(json!({
+            "level": "critical",
+            "type": "store_created_empty",
+            "detail": "the config store file was missing at boot and a new, empty one was created — restore it (docs/INSTALL.md §10)",
+        }));
     }
 
     // Listener certificates: expired, or expiring within 14 days.

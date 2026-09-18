@@ -236,11 +236,27 @@ fn parse_query(q: &CdrQuery, accept: Option<&str>) -> ApiResult<ParsedQuery> {
 
 const CSV_HEADER: &str = "id,call_id,caller,callee,trunk_id,duration_secs,codec,is_webrtc,disconnect_reason,started_at,ended_at,v,uuid,direction,sip_code,answered_at,billable_secs,source_ip,reason,hangup_by";
 
+/// RFC 4180 quoting, plus a guard against spreadsheet formula injection:
+/// a field a caller can influence (`caller`, `callee`, `reason`, …) that
+/// starts with `=`, `@`, or with `+`/`-` followed by something that is not
+/// a digit is prefixed with an apostrophe, so Excel and LibreOffice show
+/// the text instead of evaluating it. `+33…` and `-1` keep their exact
+/// value (they are numbers, not formulas).
 fn csv_field(s: &str) -> String {
+    let dangerous = match s.as_bytes() {
+        [b'=', ..] | [b'@', ..] | [b'\t', ..] | [b'\r', ..] => true,
+        [b'+' | b'-', rest @ ..] => !rest.first().is_some_and(u8::is_ascii_digit),
+        _ => false,
+    };
+    let s = if dangerous {
+        format!("'{}", s)
+    } else {
+        s.to_string()
+    };
     if s.contains([',', '"', '\r', '\n']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_string()
+        s
     }
 }
 

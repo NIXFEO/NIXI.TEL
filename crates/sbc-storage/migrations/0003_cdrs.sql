@@ -1,7 +1,9 @@
--- 0.21: call detail records live in the store; the JSONL file becomes an
+-- Call detail records live in the store; the JSONL file becomes an
 -- optional mirror. Rolling back to a binary that does not know this
--- migration: DELETE FROM _sqlx_migrations WHERE version = 3 (0.20 ignores
--- unknown applied migrations).
+-- migration: DELETE FROM _sqlx_migrations WHERE version IN (2, 3) — a 0.19
+-- binary refuses a store carrying any migration it does not know, and both
+-- 0002 and 0003 came after it (0.20 ignores unknown applied migrations, so
+-- rolling back to it needs no DELETE at all).
 CREATE TABLE IF NOT EXISTS cdrs (
     id                TEXT PRIMARY KEY,
     v                 INTEGER NOT NULL DEFAULT 2,

@@ -419,14 +419,19 @@ impl Sbc {
                 .collect()
         };
         for (sid, uuid) in uuids {
-            warn!(
-                "RTP timeout on media session {} — ending call {}",
-                sid,
-                &uuid[..8.min(uuid.len())]
-            );
-            let outcome = CallOutcome::RtpTimeout;
-            self.hangup_both_legs(&uuid, &outcome).await;
-            self.finish_call(&uuid, outcome).await;
+            let span = self.call_span_for_uuid(&uuid).await;
+            async {
+                warn!(
+                    "RTP timeout on media session {} — ending call {}",
+                    sid,
+                    &uuid[..8.min(uuid.len())]
+                );
+                let outcome = CallOutcome::RtpTimeout;
+                self.hangup_both_legs(&uuid, &outcome).await;
+                self.finish_call(&uuid, outcome).await;
+            }
+            .instrument(span)
+            .await;
         }
     }
 
@@ -458,13 +463,13 @@ impl Sbc {
                 .collect()
         };
         for uuid in stale {
-            warn!(
-                "Setup timeout: call {} unanswered after {}s — CANCEL + 408",
-                &uuid[..8.min(uuid.len())],
-                limit.as_secs()
-            );
             let span = self.call_span_for_uuid(&uuid).await;
             async {
+                warn!(
+                    "Setup timeout: call {} unanswered after {}s — CANCEL + 408",
+                    &uuid[..8.min(uuid.len())],
+                    limit.as_secs()
+                );
                 if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
                     self.note_trunk_failure(&name, None);
                 }

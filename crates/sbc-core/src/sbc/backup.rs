@@ -103,10 +103,10 @@ pub fn spawn_backup_timer(
     lock: Arc<Mutex<()>>,
 ) -> Option<JoinHandle<()>> {
     metrics.set_store_backups(policy.interval);
-    let Some(interval) = policy.interval else {
-        info!("Store backups: timer disabled (backup_interval_hours = 0)");
-        return None;
-    };
+    // Seed the last-success gauge from what is on disk before deciding
+    // whether to run a timer: with `backup_interval_hours = 0` the
+    // dashboard would otherwise read "never" after every restart even
+    // though `POST /api/v1/backup` copies exist.
     let newest = sbc_storage::newest_backup(&policy.dir);
     if let Some((path, mtime)) = &newest {
         let secs = mtime
@@ -116,6 +116,10 @@ pub fn spawn_backup_timer(
         let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         metrics.record_store_backup_at(secs, bytes);
     }
+    let Some(interval) = policy.interval else {
+        info!("Store backups: timer disabled (backup_interval_hours = 0)");
+        return None;
+    };
     let mut delay = next_run_after(newest.map(|(_, t)| t), SystemTime::now(), interval);
     info!(
         "Store backups: every {} h into {} (keep {}), first in {} s",

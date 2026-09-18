@@ -112,6 +112,55 @@ pub struct Registration {
     pub reg_id: Option<u32>,
 }
 
+/// Most bindings one AOR may hold at once (RFC 5626 says a device may
+/// keep several; a phone plus a softphone plus churn is a handful). Past
+/// it the oldest binding is evicted.
+pub const MAX_BINDINGS_PER_AOR: usize = 10;
+/// Most Contacts one REGISTER may carry. A conformant client sends one
+/// (or a few for RFC 5626 flows); thousands is an attempt to fill memory.
+pub const MAX_CONTACTS_PER_REQUEST: usize = 10;
+/// Hard cap on the whole table, so no set of credentials can grow it
+/// without bound. Past it the oldest binding is evicted.
+pub const MAX_BINDINGS_TOTAL: usize = 5000;
+
+/// One spelling for an Address-of-Record, so a REGISTER and a later
+/// inbound call agree: display name and angle brackets removed, scheme and
+/// host lower-cased (the user part is case-sensitive, RFC 3261 §19.1.4),
+/// URI parameters, headers and the port dropped — an AOR is `user@domain`,
+/// and phones spell it with and without `:5060` interchangeably.
+pub fn canonical_aor(raw: &str) -> String {
+    let s = raw.trim();
+    let inner = match (s.find('<'), s.rfind('>')) {
+        (Some(start), Some(end)) if start < end => s[start + 1..end].trim(),
+        _ => s,
+    };
+    // Cut parameters and headers: sip:a@h;transport=tcp?X=1
+    let inner = inner
+        .split([';', '?'])
+        .next()
+        .unwrap_or(inner)
+        .trim()
+        .trim_end_matches('>');
+    let (scheme, rest) = match inner.split_once(':') {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("sip") || scheme.eq_ignore_ascii_case("sips") =>
+        {
+            (format!("{}:", scheme.to_ascii_lowercase()), rest)
+        }
+        _ => (String::new(), inner),
+    };
+    let (user, host) = match rest.rsplit_once('@') {
+        Some((user, host)) => (format!("{}@", user), host),
+        None => (String::new(), rest),
+    };
+    // Drop the port (but keep an IPv6 reference intact).
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if !h.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    };
+    format!("{}{}{}", scheme, user, host.to_ascii_lowercase())
+}
+
 /// What identifies a binding within an AOR: the instance id (plus reg-id
 /// when given), else the Contact URI.
 pub fn binding_key(contact: &str, instance_id: Option<&str>, reg_id: Option<u32>) -> String {
@@ -216,19 +265,26 @@ pub trait Registrar: Send + Sync {
     /// Store or refresh a binding; returns the stored copy.
     async fn register(&self, reg: Registration) -> Result<Registration>;
 
-    /// Remove one binding by key. With a Call-ID, a binding refreshed less
-    /// than 500 ms ago by a *different* REGISTER dialog is kept (a stale
-    /// un-REGISTER racing a fresh REGISTER, RFC 3261 §10.3). Returns the
-    /// removed binding.
+    /// Remove one binding by key. `dialog` is the requesting REGISTER's
+    /// (Call-ID, CSeq): a binding held by the *same* dialog with a CSeq
+    /// that is not lower is kept (an out-of-order or duplicated request,
+    /// RFC 3261 §10.3 step 7), and so is one refreshed less than 500 ms
+    /// ago by a *different* dialog (a stale un-REGISTER racing a fresh
+    /// REGISTER). Returns the removed binding.
     async fn unregister_binding(
         &self,
         aor: &str,
         key: &str,
-        call_id: Option<&str>,
+        dialog: Option<(&str, u32)>,
     ) -> Result<Option<Registration>>;
 
     /// Remove every binding of an AOR (`Contact: *`); returns them.
-    async fn unregister_all(&self, aor: &str) -> Result<Vec<Registration>>;
+    /// `dialog` applies the same §10.3 step 7 rule per binding.
+    async fn unregister_all(
+        &self,
+        aor: &str,
+        dialog: Option<(&str, u32)>,
+    ) -> Result<Vec<Registration>>;
 
     /// The unexpired bindings of an AOR.
     async fn lookup(&self, aor: &str) -> Result<Vec<Registration>>;
@@ -239,8 +295,22 @@ pub trait Registrar: Send + Sync {
     /// Unexpired bindings.
     async fn count(&self) -> u64;
 
-    /// Every unexpired binding (admin API, identity gate, WS close).
+    /// Every unexpired binding (admin API, WS close).
     async fn all_registrations(&self) -> Result<Vec<Registration>>;
+
+    /// The user parts of the unexpired bindings, split into those
+    /// registered from `source_ip` and all of them — the identity gate
+    /// runs this on every INVITE, so it must not clone the table.
+    async fn registered_users(&self, source_ip: &str) -> (Vec<String>, Vec<String>);
+
+    /// True when a REGISTER is out of order *within its own dialog*
+    /// (RFC 3261 §10.3 step 7): same Call-ID, CSeq not higher than the
+    /// binding's — or than the CSeq that removed it moments ago, so a
+    /// retransmission cannot resurrect a binding the client just
+    /// un-registered. Backends without that memory answer false.
+    async fn is_out_of_order(&self, _aor: &str, _key: &str, _call_id: &str, _cseq: u32) -> bool {
+        false
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,21 +320,74 @@ pub trait Registrar: Send + Sync {
 /// Key: (AOR, binding key)
 type RegKey = (String, String);
 
+/// A removed binding: the (Call-ID, CSeq) that removed it and when, in ms.
+type Tombstone = (String, u32, u64);
+
 pub struct InMemoryRegistrar {
     regs: Arc<RwLock<HashMap<RegKey, Registration>>>,
+    /// Bindings removed recently: (Call-ID, CSeq, when) of the request
+    /// that removed them, so a retransmitted REGISTER with a lower CSeq
+    /// cannot bring the binding back (RFC 3261 §10.3 step 7). Swept by
+    /// `cleanup_expired` and hard-capped.
+    tombstones: Arc<RwLock<HashMap<RegKey, Tombstone>>>,
 }
+
+/// How long a removed binding is remembered (well past any UDP
+/// retransmission window: Timer F / 64×T1 is 32 s).
+const TOMBSTONE_TTL_MS: u64 = 64_000;
+/// Hard cap so a flood of un-REGISTERs cannot grow the map without bound.
+const MAX_TOMBSTONES: usize = 4096;
 
 impl InMemoryRegistrar {
     pub fn new() -> Self {
         Self {
             regs: Arc::new(RwLock::new(HashMap::new())),
+            tombstones: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Remember which request removed a binding.
+    async fn entomb(&self, key: &RegKey, dialog: Option<(&str, u32)>) {
+        let Some((call_id, cseq)) = dialog else {
+            return;
+        };
+        let now = unix_now_ms();
+        let mut tombs = self.tombstones.write().await;
+        if tombs.len() >= MAX_TOMBSTONES {
+            tombs.retain(|_, (_, _, at)| now.saturating_sub(*at) < TOMBSTONE_TTL_MS);
+            if tombs.len() >= MAX_TOMBSTONES {
+                return;
+            }
+        }
+        tombs.insert(key.clone(), (call_id.to_string(), cseq, now));
     }
 }
 
 impl Default for InMemoryRegistrar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Drop the oldest binding (by registration time) while `full` holds.
+fn evict_oldest_while(
+    map: &mut HashMap<RegKey, Registration>,
+    full: impl Fn(&HashMap<RegKey, Registration>) -> bool,
+) {
+    while full(map) {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, r)| (r.registered_at_ms, r.expires_at))
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+        if let Some(r) = map.remove(&oldest) {
+            info!(
+                "REGISTER: evicted the oldest binding {} <-> {} (table cap reached)",
+                r.aor, r.contact
+            );
+        }
     }
 }
 
@@ -275,6 +398,16 @@ impl Registrar for InMemoryRegistrar {
         let mut map = self.regs.write().await;
         match map.get_mut(&key) {
             Some(existing) => {
+                // RFC 3261 §10.3 step 7: same dialog, CSeq not higher →
+                // the update is aborted (a retransmission that overtook a
+                // newer request must not resurrect a binding).
+                if existing.call_id == reg.call_id && reg.cseq <= existing.cseq {
+                    debug!(
+                        "REGISTER: ignoring out-of-order refresh of {} <-> {} (CSeq {} <= stored {})",
+                        existing.aor, reg.contact, reg.cseq, existing.cseq
+                    );
+                    return Ok(existing.clone());
+                }
                 debug!(
                     "REGISTER: refreshed {} <-> {} ({}s) from {}:{}",
                     existing.aor, reg.contact, reg.expires, reg.received_ip, reg.received_port
@@ -287,6 +420,14 @@ impl Registrar for InMemoryRegistrar {
                     "REGISTER: new {} <-> {} ({}s) from {}:{}",
                     reg.aor, reg.contact, reg.expires, reg.received_ip, reg.received_port
                 );
+                // Bound the table: the oldest binding of this AOR goes
+                // first, then the oldest of any AOR. Without this one set
+                // of credentials could grow it until the box runs out of
+                // memory (every binding is also scanned per INVITE).
+                evict_oldest_while(&mut map, |m| {
+                    m.iter().filter(|((aor, _), _)| *aor == key.0).count() >= MAX_BINDINGS_PER_AOR
+                });
+                evict_oldest_while(&mut map, |m| m.len() >= MAX_BINDINGS_TOTAL);
                 map.insert(key.clone(), reg);
                 Ok(map[&key].clone())
             }
@@ -297,15 +438,24 @@ impl Registrar for InMemoryRegistrar {
         &self,
         aor: &str,
         key: &str,
-        call_id: Option<&str>,
+        dialog: Option<(&str, u32)>,
     ) -> Result<Option<Registration>> {
         let key = (aor.to_string(), key.to_string());
         let mut map = self.regs.write().await;
         let Some(existing) = map.get(&key) else {
             return Ok(None);
         };
-        if let Some(cid) = call_id {
-            if existing.call_id != cid {
+        if let Some((cid, cseq)) = dialog {
+            if existing.call_id == cid {
+                // RFC 3261 §10.3 step 7.
+                if cseq <= existing.cseq {
+                    debug!(
+                        "REGISTER: ignoring out-of-order un-REGISTER for {} (CSeq {} <= stored {})",
+                        aor, cseq, existing.cseq
+                    );
+                    return Ok(None);
+                }
+            } else {
                 let age_ms = unix_now_ms().saturating_sub(existing.registered_at_ms);
                 if age_ms < 500 {
                     debug!(
@@ -317,16 +467,36 @@ impl Registrar for InMemoryRegistrar {
             }
         }
         let removed = map.remove(&key);
+        drop(map);
         if let Some(r) = &removed {
             info!("REGISTER: removed {} <-> {}", aor, r.contact);
+            self.entomb(&key, dialog).await;
         }
         Ok(removed)
     }
 
-    async fn unregister_all(&self, aor: &str) -> Result<Vec<Registration>> {
+    async fn unregister_all(
+        &self,
+        aor: &str,
+        dialog: Option<(&str, u32)>,
+    ) -> Result<Vec<Registration>> {
         let mut map = self.regs.write().await;
-        let keys: Vec<RegKey> = map.keys().filter(|(a, _)| a == aor).cloned().collect();
+        let keys: Vec<RegKey> = map
+            .iter()
+            .filter(|((a, _), _)| a == aor)
+            .filter(|(_, reg)| match dialog {
+                // RFC 3261 §10.3 step 7: a `Contact: *` that arrives out of
+                // order within its own dialog wipes nothing.
+                Some((cid, cseq)) => !(reg.call_id == cid && cseq <= reg.cseq),
+                None => true,
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         let removed: Vec<Registration> = keys.iter().filter_map(|k| map.remove(k)).collect();
+        drop(map);
+        for k in &keys {
+            self.entomb(k, dialog).await;
+        }
         info!(
             "REGISTER: removed all ({}) contacts for {}",
             removed.len(),
@@ -345,7 +515,46 @@ impl Registrar for InMemoryRegistrar {
             .collect())
     }
 
+    async fn registered_users(&self, source_ip: &str) -> (Vec<String>, Vec<String>) {
+        let now = unix_now();
+        let map = self.regs.read().await;
+        let mut here = Vec::new();
+        let mut anywhere = Vec::new();
+        for reg in map.values().filter(|r| r.expires_at > now) {
+            let Some(user) = crate::sbc::uri_user(&reg.aor) else {
+                continue;
+            };
+            if reg.received_ip == source_ip {
+                here.push(user.clone());
+            }
+            anywhere.push(user);
+        }
+        (here, anywhere)
+    }
+
+    async fn is_out_of_order(&self, aor: &str, key: &str, call_id: &str, cseq: u32) -> bool {
+        let k = (aor.to_string(), key.to_string());
+        if let Some(existing) = self.regs.read().await.get(&k) {
+            return existing.call_id == call_id && cseq <= existing.cseq;
+        }
+        match self.tombstones.read().await.get(&k) {
+            Some((cid, last, at)) => {
+                unix_now_ms().saturating_sub(*at) < TOMBSTONE_TTL_MS
+                    && cid == call_id
+                    && cseq <= *last
+            }
+            None => false,
+        }
+    }
+
     async fn cleanup_expired(&self) -> Result<Vec<Registration>> {
+        {
+            let now = unix_now_ms();
+            self.tombstones
+                .write()
+                .await
+                .retain(|_, (_, _, at)| now.saturating_sub(*at) < TOMBSTONE_TTL_MS);
+        }
         let mut map = self.regs.write().await;
         let now = unix_now();
         let keys: Vec<RegKey> = map
@@ -504,6 +713,7 @@ pub fn parse_contact_header(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A REGISTER as the handler sees it (headers already parsed).
+#[derive(Clone)]
 pub struct RegisterRequest {
     pub aor: String,
     pub contacts: Vec<ContactBinding>,
@@ -568,7 +778,10 @@ impl RegisterHandler {
             }
             return Ok(match req.expires_header {
                 Some(0) => {
-                    let removed = self.registrar.unregister_all(&req.aor).await?;
+                    let removed = self
+                        .registrar
+                        .unregister_all(&req.aor, Some((&req.call_id, req.cseq)))
+                        .await?;
                     RegisterResult::Ok {
                         bindings: Vec::new(),
                         registered: Vec::new(),
@@ -586,6 +799,13 @@ impl RegisterHandler {
                 removed: Vec::new(),
                 granted: None,
             });
+        }
+        if req.contacts.len() > MAX_CONTACTS_PER_REQUEST {
+            return Ok(RegisterResult::BadRequest(format!(
+                "too many Contact bindings in one REGISTER ({}, max {})",
+                req.contacts.len(),
+                MAX_CONTACTS_PER_REQUEST
+            )));
         }
         let mut plan: Vec<(ContactBinding, u32)> = Vec::new();
         for c in &req.contacts {
@@ -605,10 +825,23 @@ impl RegisterHandler {
         let mut granted = None;
         for (c, expires) in plan {
             let key = binding_key(&c.uri, c.instance_id.as_deref(), c.reg_id);
+            if self
+                .registrar
+                .is_out_of_order(&req.aor, &key, &req.call_id, req.cseq)
+                .await
+            {
+                // RFC 3261 §10.3 step 7: a request that is not newer than
+                // what this dialog already did changes nothing.
+                debug!(
+                    "REGISTER: {} CSeq {} is not newer for {} — binding left alone",
+                    req.call_id, req.cseq, c.uri
+                );
+                continue;
+            }
             if expires == 0 {
                 if let Some(r) = self
                     .registrar
-                    .unregister_binding(&req.aor, &key, Some(&req.call_id))
+                    .unregister_binding(&req.aor, &key, Some((&req.call_id, req.cseq)))
                     .await?
                 {
                     removed.push(r);
@@ -640,12 +873,7 @@ impl RegisterHandler {
     }
 
     pub async fn lookup(&self, aor: &str) -> Result<Vec<Registration>> {
-        let s = aor.trim();
-        let normalized = if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-            s[start + 1..end].trim().to_string()
-        } else {
-            s.to_string()
-        };
+        let normalized = canonical_aor(aor);
         let results = self.registrar.lookup(&normalized).await?;
         if !results.is_empty() {
             return Ok(results);
@@ -663,6 +891,10 @@ impl RegisterHandler {
 
     pub async fn all_registrations(&self) -> Result<Vec<Registration>> {
         self.registrar.all_registrations().await
+    }
+
+    pub async fn registered_users(&self, source_ip: &str) -> (Vec<String>, Vec<String>) {
+        self.registrar.registered_users(source_ip).await
     }
 }
 
@@ -693,6 +925,13 @@ mod tests {
         )
     }
 
+    /// A client's CSeq grows within its Call-ID (RFC 3261 §8.1.1.5), so
+    /// the helper does too.
+    fn next_cseq() -> u32 {
+        static CSEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        CSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
     fn request(
         contacts: Vec<ContactBinding>,
         wildcard: bool,
@@ -704,7 +943,7 @@ mod tests {
             wildcard,
             expires_header: expires,
             call_id: "cid-1".into(),
-            cseq: 1,
+            cseq: next_cseq(),
             source: addr(5060),
             transport: "UDP".into(),
             user_agent: Some("Test/1".into()),
@@ -765,6 +1004,157 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aors_have_one_spelling() {
+        for (raw, want) in [
+            ("sip:Alice@SIP.Example.COM", "sip:Alice@sip.example.com"),
+            (
+                "\"Alice\" <sip:alice@sip.example.com:5060>",
+                "sip:alice@sip.example.com",
+            ),
+            (
+                "<sip:alice@sip.example.com;transport=tcp>",
+                "sip:alice@sip.example.com",
+            ),
+            (
+                "sip:alice@sip.example.com?X-Custom=1",
+                "sip:alice@sip.example.com",
+            ),
+            ("sips:alice@Example.com:5061", "sips:alice@example.com"),
+            ("alice@example.com", "alice@example.com"),
+            ("sip:+33123456789@1.2.3.4:5080", "sip:+33123456789@1.2.3.4"),
+        ] {
+            assert_eq!(canonical_aor(raw), want, "{}", raw);
+        }
+    }
+
+    /// RFC 3261 §10.3 step 7: a REGISTER that a client already superseded
+    /// must not resurrect the binding it removed.
+    #[tokio::test]
+    async fn a_retransmitted_register_cannot_resurrect_a_removed_binding() {
+        let h = RegisterHandler::new_inmemory();
+        let policy = RegisterPolicy::default();
+        let mut first = request(
+            vec![contact("sip:alice@10.0.0.9:5060", Some(3600))],
+            false,
+            None,
+        );
+        first.cseq = 9;
+        assert!(matches!(
+            h.process(policy, first.clone()).await.unwrap(),
+            RegisterResult::Ok { .. }
+        ));
+        assert_eq!(h.count().await, 1);
+
+        // The phone un-registers (same dialog, next CSeq).
+        let mut bye = request(
+            vec![contact("sip:alice@10.0.0.9:5060", Some(0))],
+            false,
+            None,
+        );
+        bye.cseq = 10;
+        match h.process(policy, bye).await.unwrap() {
+            RegisterResult::Ok { removed, .. } => assert_eq!(removed.len(), 1),
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(h.count().await, 0);
+
+        // A duplicate of the first request arrives late: nothing changes.
+        match h.process(policy, first).await.unwrap() {
+            RegisterResult::Ok {
+                bindings,
+                registered,
+                removed,
+                ..
+            } => {
+                assert!(bindings.is_empty(), "{:?}", bindings);
+                assert!(registered.is_empty() && removed.is_empty());
+            }
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(h.count().await, 0, "the binding stayed removed");
+
+        // A genuinely newer request registers again.
+        let mut again = request(
+            vec![contact("sip:alice@10.0.0.9:5060", Some(3600))],
+            false,
+            None,
+        );
+        again.cseq = 11;
+        assert!(matches!(
+            h.process(policy, again).await.unwrap(),
+            RegisterResult::Ok { .. }
+        ));
+        assert_eq!(h.count().await, 1);
+    }
+
+    /// One credential holder must not be able to grow the binding table
+    /// without bound (memory, and a per-INVITE scan).
+    #[tokio::test]
+    async fn bindings_are_capped_per_aor_and_the_oldest_goes_first() {
+        let r = InMemoryRegistrar::new();
+        for n in 0..(MAX_BINDINGS_PER_AOR + 4) {
+            r.register(reg(
+                &format!("sip:alice@10.0.0.{}:5060", n),
+                3600,
+                &format!("c{}", n),
+                5060 + n as u16,
+            ))
+            .await
+            .unwrap();
+            // Distinct registration timestamps so "oldest" is well defined.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let bindings = r.lookup(aor()).await.unwrap();
+        assert_eq!(bindings.len(), MAX_BINDINGS_PER_AOR);
+        let contacts: Vec<&str> = bindings.iter().map(|b| b.contact.as_str()).collect();
+        assert!(
+            !contacts.contains(&"sip:alice@10.0.0.0:5060"),
+            "the oldest binding must be evicted: {:?}",
+            contacts
+        );
+        assert!(
+            contacts
+                .contains(&format!("sip:alice@10.0.0.{}:5060", MAX_BINDINGS_PER_AOR + 3).as_str()),
+            "the newest binding must be kept: {:?}",
+            contacts
+        );
+    }
+
+    /// A REGISTER carrying a flood of Contacts is refused outright.
+    #[tokio::test]
+    async fn a_register_with_too_many_contacts_is_refused() {
+        let h = RegisterHandler::new_inmemory();
+        let contacts: Vec<ContactBinding> = (0..MAX_CONTACTS_PER_REQUEST + 1)
+            .map(|n| contact(&format!("sip:alice@10.0.0.{}", n), Some(3600)))
+            .collect();
+        match h
+            .process(RegisterPolicy::default(), request(contacts, false, None))
+            .await
+            .unwrap()
+        {
+            RegisterResult::BadRequest(why) => assert!(why.contains("too many Contact"), "{}", why),
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(h.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn registered_users_splits_by_source_and_skips_expired() {
+        let r = InMemoryRegistrar::new();
+        r.register(reg("sip:alice@10.0.0.9:5060", 3600, "c1", 5060))
+            .await
+            .unwrap();
+        let mut expired = reg("sip:alice@10.0.0.8:5060", 0, "c2", 5061);
+        expired.expires_at = unix_now().saturating_sub(10);
+        r.register(expired).await.unwrap();
+        let (here, anywhere) = r.registered_users("192.168.1.100").await;
+        assert_eq!(here, vec!["alice".to_string()]);
+        assert_eq!(anywhere, vec!["alice".to_string()]);
+        let (elsewhere, _) = r.registered_users("203.0.113.1").await;
+        assert!(elsewhere.is_empty());
+    }
+
     #[tokio::test]
     async fn refresh_updates_source_address_and_call_id() {
         let r = InMemoryRegistrar::new();
@@ -817,13 +1207,13 @@ mod tests {
             .unwrap();
         let key = binding_key("sip:alice@192.168.1.10:5060", None, None);
         assert!(r
-            .unregister_binding(aor(), &key, Some("old"))
+            .unregister_binding(aor(), &key, Some(("old", 1)))
             .await
             .unwrap()
             .is_none());
         assert_eq!(r.count().await, 1);
         assert!(r
-            .unregister_binding(aor(), &key, Some("new"))
+            .unregister_binding(aor(), &key, Some(("new", 2)))
             .await
             .unwrap()
             .is_some());

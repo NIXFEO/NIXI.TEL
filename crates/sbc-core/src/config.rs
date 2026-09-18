@@ -16,6 +16,10 @@ pub struct SbcConfig {
     pub database: DatabaseConfig,
     pub security: SecurityConfig,
     pub management: ManagementConfig,
+    /// `[metrics]`: parsed, never read (the exporter is the management
+    /// server's `/metrics`). Optional so the documented "unused" class is
+    /// true: deleting the section must not break boot or a reload.
+    #[serde(default)]
     pub metrics: MetricsConfig,
     /// SIP trunks for outbound PSTN routing (loaded from [[trunks]] sections)
     #[serde(default)]
@@ -244,8 +248,19 @@ fn default_max_calls() -> u32 {
 pub struct GeneralConfig {
     /// Path to CDR file (JSON-lines format). If set, enables persistent CDR storage.
     pub cdr_file: Option<String>,
+    /// Cosmetic, never read — optional so the documented "unused" class
+    /// holds (see `[metrics]`).
+    #[serde(default = "default_instance_name")]
     pub name: String,
+    #[serde(default = "default_instance_id")]
     pub instance_id: String,
+}
+
+fn default_instance_name() -> String {
+    "SBC-NIXI".to_string()
+}
+fn default_instance_id() -> String {
+    "sbc-001".to_string()
 }
 
 /// Network configuration
@@ -383,8 +398,14 @@ fn default_sqlite_path() -> String {
 /// Security configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
+    /// Parsed, never read (documented "unused"): optional so deleting it
+    /// cannot break a boot or a reload.
+    #[serde(default = "default_rate_limit_global")]
     pub rate_limit_global: u32,
+    #[serde(default = "default_rate_limit_per_ip")]
     pub rate_limit_per_ip: u32,
+    /// Parsed, never read (documented "unused").
+    #[serde(default = "default_auth_challenge_timeout")]
     pub auth_challenge_timeout: u64,
     /// SIP realm for Digest authentication (e.g. "sip.nixi.tel")
     #[serde(default = "default_sip_realm")]
@@ -467,6 +488,15 @@ pub struct SecurityConfig {
     pub features: crate::security::SecurityFeaturesConfig,
 }
 
+fn default_rate_limit_global() -> u32 {
+    1000
+}
+fn default_rate_limit_per_ip() -> u32 {
+    50
+}
+fn default_auth_challenge_timeout() -> u64 {
+    30
+}
 fn default_max_call_duration() -> u64 {
     14400
 }
@@ -588,6 +618,16 @@ pub struct MetricsConfig {
     pub prometheus_port: u16,
 }
 
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            prometheus_enabled: true,
+            prometheus_bind_address: "0.0.0.0".parse().unwrap(),
+            prometheus_port: 9090,
+        }
+    }
+}
+
 impl SbcConfig {
     /// Load configuration from TOML file
     pub fn from_file(path: &str) -> crate::Result<Self> {
@@ -597,9 +637,18 @@ impl SbcConfig {
     }
 
     /// Parse and validate a TOML document (what `from_file` and a reload do).
+    ///
+    /// Parse errors keep the position and the reason but never the source
+    /// excerpt: the offending line can be `api_auth_token` or a trunk
+    /// password, and this message travels to the log and to
+    /// `GET /api/v1/config`.
     pub fn from_toml_str(content: &str) -> crate::Result<Self> {
-        let config: SbcConfig = toml::from_str(content)
-            .map_err(|e| crate::Error::Config(format!("Failed to parse config: {}", e)))?;
+        let config: SbcConfig = toml::from_str(content).map_err(|e| {
+            crate::Error::Config(format!(
+                "Failed to parse config: {}",
+                redact_parse_error(&e.to_string())
+            ))
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -945,6 +994,32 @@ pub enum KeyClass {
     Unused,
 }
 
+/// Strip the quoted source excerpt from a `toml` parse error, keeping the
+/// `TOML parse error at line L, column C` position and the reason. The
+/// excerpt reproduces the offending line, which may hold a secret.
+pub fn redact_parse_error(message: &str) -> String {
+    let kept: Vec<&str> = message
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| {
+            let t = line.trim_start();
+            if t.starts_with('|') {
+                return false; // "  |" and "  | ^" frame lines
+            }
+            // "3 | api_auth_token = \"s3cret\"" — a line number, then the source
+            !t.split_once('|').is_some_and(|(num, _)| {
+                !num.trim().is_empty() && num.trim().bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    if kept.is_empty() {
+        "invalid TOML (details redacted)".to_string()
+    } else {
+        kept.join(": ")
+    }
+}
+
 const RELOAD_KEYS: &[&str] = &[
     "security.max_call_duration",
     "security.call_setup_timeout",
@@ -1165,6 +1240,55 @@ mod key_class_tests {
         assert_eq!(classify_key("metrics.prometheus_port"), KeyClass::Unused);
         assert_eq!(classify_key("logging.format"), KeyClass::Restart);
         assert_eq!(classify_key("database.backup_keep"), KeyClass::Restart);
+    }
+
+    /// The keys documented as "unused" must really be optional: deleting
+    /// them cannot break a boot or a reload.
+    #[test]
+    fn the_unused_sections_can_be_deleted_from_the_file() {
+        let minimal = r#"
+[general]
+[network]
+listeners = [{ transport = "UDP", bind_address = "0.0.0.0", bind_port = 5060 }]
+[media]
+rtp_port_range = [10000, 20000]
+rtcp_enabled = true
+transcoding_threads = 2
+codecs = ["PCMU"]
+[media.webrtc]
+enabled = false
+stun_servers = []
+turn_enabled = false
+[database]
+sqlite_path = "data/sbc.db"
+[security]
+sip_realm = "sip.example.com"
+[management]
+api_enabled = true
+api_bind_address = "127.0.0.1"
+api_port = 8080
+"#;
+        let cfg = SbcConfig::from_toml_str(minimal).expect("no [metrics], no general.name");
+        assert_eq!(cfg.general.name, "SBC-NIXI");
+        assert_eq!(cfg.metrics.prometheus_port, 9090);
+    }
+
+    #[test]
+    fn a_parse_error_never_quotes_the_offending_line() {
+        let err =
+            SbcConfig::from_toml_str("[management]\napi_auth_token = \"s3cret-token\nother = 1\n")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            !err.contains("s3cret-token"),
+            "the secret leaked into the error: {}",
+            err
+        );
+        assert!(err.contains("line 2"), "{}", err);
+        assert_eq!(
+            redact_parse_error("  |\n3 | token = \"x\"\n  | ^"),
+            "invalid TOML (details redacted)"
+        );
     }
 
     #[test]

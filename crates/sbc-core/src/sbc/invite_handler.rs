@@ -1122,16 +1122,16 @@ impl Sbc {
             if !has_remaining {
                 continue;
             }
-            warn!(
-                "Failover: call {} attempt {} unanswered after {:?} — trying next trunk",
-                &uuid[..8.min(uuid.len())],
-                attempt,
-                self.invite_timeout
-            );
             // Only a trunk that never answered at all is struck: a 100
             // Trying means it is working on it (slow post-dial delay).
             let span = self.call_span_for_uuid(&uuid).await;
             async {
+                warn!(
+                    "Failover: call {} attempt {} unanswered after {:?} — trying next trunk",
+                    &uuid[..8.min(uuid.len())],
+                    attempt,
+                    self.invite_timeout
+                );
                 if let Some(name) = self.silent_outbound_trunk_of(&uuid).await {
                     self.note_trunk_failure(&name, None);
                 }
@@ -1164,6 +1164,32 @@ impl Sbc {
             );
             return Box::pin(self.failover_to_next_trunk(uuid)).await;
         };
+        // The candidate list was built when the INVITE arrived. Seconds
+        // later the trunk may have been disabled, filled up, put in
+        // cooldown or parked by a `503 Retry-After` — apply the router's
+        // own filter instead of sending it a call it just refused.
+        let state = self.trunk_manager.get_state(&next_id);
+        let selectable = state
+            .as_ref()
+            .map(|s| s.can_accept_call(&trunk))
+            .unwrap_or(false);
+        if !trunk.enabled || !selectable {
+            warn!(
+                "Failover: trunk '{}' is not selectable now ({}, {}/{} calls) — trying next",
+                trunk.name,
+                if trunk.enabled {
+                    state
+                        .as_ref()
+                        .map(|s| s.health_label(std::time::Instant::now()))
+                        .unwrap_or("unknown")
+                } else {
+                    "disabled"
+                },
+                state.as_ref().map(|s| s.active_calls).unwrap_or(0),
+                trunk.max_concurrent_calls,
+            );
+            return Box::pin(self.failover_to_next_trunk(uuid)).await;
+        }
 
         // Snapshot the previous attempt (stored INVITE + current callee dest)
         let (stored_invite, prev_dest, prev_transport, callee_reply_tx) = {
@@ -1603,21 +1629,9 @@ impl Sbc {
     /// Users registered from `source_ip` and users registered anywhere
     /// (user part of the AORs).
     async fn users_registered_from(&self, source_ip: &str) -> (Vec<String>, Vec<String>) {
-        let regs = self
-            .register_handler
-            .all_registrations()
-            .await
-            .unwrap_or_default();
-        let here = regs
-            .iter()
-            .filter(|r| r.received_ip == source_ip)
-            .filter_map(|r| super::uri_user(&r.aor))
-            .collect();
-        let anywhere = regs
-            .iter()
-            .filter_map(|r| super::uri_user(&r.aor))
-            .collect();
-        (here, anywhere)
+        // Filtered inside the registrar's lock: this runs on the event
+        // loop for every INVITE, so it must not clone the binding table.
+        self.register_handler.registered_users(source_ip).await
     }
 
     /// Whether `user` is a local identity: provisioned for Digest, or
@@ -1672,7 +1686,11 @@ impl Sbc {
                     .map(|h| self.served_domains().contains(&h))
                     .unwrap_or(false);
                 if served_host && self.is_local_user(user, &anywhere).await {
-                    self.flag_identity_mismatch(source, "trunk", &super::normalize_aor(&from_raw));
+                    self.flag_identity_mismatch(
+                        source,
+                        "trunk",
+                        &crate::register::canonical_aor(&from_raw),
+                    );
                     if self.identity_policy.reject_trunk_local_from {
                         return Err(IdentityVerdict::Forbidden {
                             strike: false,

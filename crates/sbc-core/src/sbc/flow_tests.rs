@@ -2450,6 +2450,27 @@ fn write_temp_toml(cfg: &SbcConfig) -> std::path::PathBuf {
     path
 }
 
+/// `security.max_call_duration = 0` is documented as "unlimited": it must
+/// not be clamped to the 60 s floor that protects the other values.
+#[tokio::test]
+async fn max_call_duration_zero_means_unlimited() {
+    use crate::sbc::runtime_config::ReloadSource;
+    let mut sbc = SbcBuilder::new().build();
+    let mut cfg = SbcConfig::default();
+    cfg.security.max_call_duration = 0;
+    let path = write_temp_toml(&cfg);
+    sbc.set_config_path(path.to_string_lossy().into_owned());
+    let report = sbc.reload_config(ReloadSource::Api).await.unwrap();
+    assert!(report.ok, "{:?}", report);
+    assert_eq!(sbc.max_call_duration, Duration::MAX);
+
+    // A 30 s value is still floored at 60 s (a typo must not cut calls).
+    cfg.security.max_call_duration = 30;
+    std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+    assert!(sbc.reload_config(ReloadSource::Api).await.unwrap().ok);
+    assert_eq!(sbc.max_call_duration, Duration::from_secs(60));
+}
+
 #[tokio::test]
 async fn reload_applies_every_reload_class_key_from_the_toml() {
     use crate::sbc::runtime_config::ReloadSource;

@@ -4,6 +4,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use sbc_core::events::{event_ts, SbcEvent};
 use serde_json::json;
 use tracing::info;
 
@@ -20,6 +21,22 @@ pub async fn certificates(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn reload(State(state): State<AppState>) -> impl IntoResponse {
     let outcomes = state.tls.reload_all().await;
     state.tls.publish_expiry(&state.metrics);
+    let ts = event_ts();
+    for o in outcomes.iter().filter(|o| o.error.is_some()) {
+        // Same SSE alert as the SIGHUP / POST /api/v1/reload path: a
+        // certbot hook is the usual caller and nobody reads its output.
+        state.events.publish(SbcEvent::Alert {
+            level: "warning".into(),
+            kind: "tls_reload_failed".into(),
+            detail: format!(
+                "{} {}: {}",
+                o.listener,
+                o.bind,
+                o.error.as_deref().unwrap_or("unknown error")
+            ),
+            ts,
+        });
+    }
     let failed: Vec<&str> = outcomes
         .iter()
         .filter(|o| o.error.is_some())
