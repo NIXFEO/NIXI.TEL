@@ -8,6 +8,36 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 
 ### Fixed
 
+Lot 4 (media), first block — every one of these was found by specifying the
+media plane against the code and having the specs adversarially reviewed:
+
+- **A call the SBC cannot anchor media for is refused or ended, not billed
+  in silence.** The caller's SDP is rewritten to the SBC's own address, so
+  a call with no relay behind it is guaranteed silence — and with no relay
+  there is no inactivity watchdog either, so it ran to
+  `max_call_duration` (4 h by default). Now: an INVITE whose media ports
+  cannot be allocated is answered `503` before anything is dialled (it
+  used to be a warning, a forwarded INVITE and a `c=` line pointing at a
+  port nothing was bound to), and an answered call whose relay fails to
+  start is ended right after the 200 reaches the caller, with BYEs on both
+  legs carrying `cause=47 No media resource available` and a CDR
+  `media-unavailable`. Counted in `sbc_media_relay_failures_total`.
+- **RTP ports rest before reuse.** Allocation walked the range from the
+  bottom, so the pair freed a millisecond ago was the *preferred* next
+  allocation: a new call inherited whatever the previous peer was still
+  sending to that port (stray RTP that can latch an endpoint, refresh an
+  inactivity timer, or be relayed as audio), and it raced the relay task,
+  which still owns the bound sockets when the pair is released. Allocation
+  now walks forward from a cursor and a released pair waits 30 s
+  (`sbc_rtp_ports_quarantined`); an exhausted range takes the oldest
+  quarantined pair rather than failing a call and says so
+  (`sbc_rtp_port_quarantine_forced_total` — the range is too small).
+- Two RTP port pairs leaked on every SDP-rewrite failure in
+  `create_session` (nothing releases a pair that never reached a session,
+  and the sweeper does not touch media), and `sbc_allocated_rtp_ports` was
+  pushed from two call paths only, so it under-reported every ringing
+  call. It is now sampled from the pool when `/metrics` is scraped.
+
 Adversarial review of the whole lot-3 change (16 areas, every finding
 verified independently): the confirmed defects and the low-severity ones
 worth fixing.

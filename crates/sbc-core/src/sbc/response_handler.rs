@@ -260,6 +260,10 @@ impl Sbc {
                         .b2bua
                         .handle_200_ok(&uuid, callee_tag, callee_sdp_str.clone())
                         .await;
+                    // Set when the media relay could not be started: the call
+                    // is answered and billed but the audio path is dead, so it
+                    // is ended right after the 200 reaches the caller.
+                    let mut relay_failed = false;
 
                     // ── Record the negotiated codec (from the SDP answer) for the CDR ──
                     if let Some(ref sdp) = callee_sdp_str {
@@ -580,7 +584,18 @@ impl Sbc {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Failed to start RTP proxy for {}: {}", media_id, e)
+                                    // The SDP the caller and the callee got
+                                    // already points at this SBC, so without
+                                    // a relay the call is silent — and with
+                                    // no relay there is no inactivity
+                                    // watchdog either, so it would run to
+                                    // `max_call_duration`, billed. End it.
+                                    error!(
+                                        "Failed to start RTP proxy for {}: {} — ending the call (media-unavailable)",
+                                        media_id, e
+                                    );
+                                    self.metrics.inc_media_relay_failure();
+                                    relay_failed = true;
                                 }
                             }
                         }
@@ -739,6 +754,15 @@ impl Sbc {
                             reply_tx.as_ref(),
                         )
                         .await;
+                    }
+                    if relay_failed {
+                        // Both dialogs exist now (the caller has its 200), so
+                        // end them the way every other SBC-initiated teardown
+                        // does: BYE both legs, one CDR with the real cause.
+                        let outcome = super::cdr::CallOutcome::MediaUnavailable;
+                        self.hangup_both_legs(&uuid, &outcome).await;
+                        self.finish_call(&uuid, outcome).await;
+                        return Ok(());
                     }
                 }
                 407 => {

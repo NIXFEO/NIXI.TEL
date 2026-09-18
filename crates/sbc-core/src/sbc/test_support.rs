@@ -538,6 +538,7 @@ pub(crate) struct SbcBuilder {
     identity_policy: IdentityPolicy,
     register_policy: crate::register::RegisterPolicy,
     cdr_store: Option<Arc<sbc_storage::ConfigStore>>,
+    no_media_ports: bool,
 }
 
 impl SbcBuilder {
@@ -552,6 +553,7 @@ impl SbcBuilder {
             identity_policy: IdentityPolicy::default(),
             register_policy: crate::register::RegisterPolicy::default(),
             cdr_store: None,
+            no_media_ports: false,
         }
     }
 
@@ -616,9 +618,22 @@ impl SbcBuilder {
         self
     }
 
+    /// An SBC with no RTP port at all (the pool is exhausted), to exercise
+    /// the "cannot anchor media" paths.
+    pub(crate) fn without_media_ports(mut self) -> Self {
+        self.no_media_ports = true;
+        self
+    }
+
     pub(crate) fn build(self) -> Sbc {
         let mut sbc = Sbc::new();
-        let media = Arc::new(MediaManager::with_port_range(next_port_range(), None));
+        let range = if self.no_media_ports {
+            let base = next_port_range().start;
+            base..base // empty: allocate() always fails
+        } else {
+            next_port_range()
+        };
+        let media = Arc::new(MediaManager::with_port_range(range, None));
         sbc.b2bua = Arc::new(B2buaManager::new(media.clone()));
         sbc.media = media;
         sbc.identity = self.identity;

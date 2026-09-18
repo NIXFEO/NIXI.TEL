@@ -432,7 +432,13 @@ impl Sbc {
                 std::net::IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED,
             })
         });
-        let mut media_mgr = MediaManager::with_port_range(port_range, public_ip);
+        // Freed RTP ports rest before reuse: a new call must not inherit
+        // the stray packets of the previous peer on the same port.
+        let mut media_mgr = MediaManager::with_port_range_and_hold(
+            port_range,
+            crate::media::port_allocator::DEFAULT_PORT_HOLD,
+            public_ip,
+        );
         media_mgr.set_global_rtp_counter(metrics.rtp_packets_total.clone());
         media_mgr.set_global_srtp_encrypt_counter(metrics.srtp_encrypted_total.clone());
         media_mgr.set_global_srtp_decrypt_counter(metrics.srtp_decrypted_total.clone());

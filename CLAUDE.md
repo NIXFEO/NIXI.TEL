@@ -112,6 +112,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `security/` | fail2ban banning, anti-IRSF destination rules, per-user limits |
 | `routing/{trunk,router}.rs` | TrunkConfig, LCR, `route_request_candidates()` for failover |
 | `media/rtp.rs` | Bidirectional RTP relay, STUN/DTLS demux, DTMF PT re-mapping, inactivity timeout |
+| `media/port_allocator.rs` | RTP/RTCP pairs: forward allocation from a cursor, 30 s quarantine before reuse (a new call must not inherit the previous peer's stray packets) |
 | `media/{sdp,srtp_crypto,ice,dtls,stun}.rs` | SDP rewriting, SRTP, ICE, DTLS, STUN |
 | `transport/{udp,tcp,tls,ws}.rs` · `transport/tls_connect.rs` | Listeners + real outbound TLS |
 | `transport/tls_identity.rs` | Reloadable listener certificates (load + key/cert check, atomic swap, registry, expiry gauge) behind `/api/v1/tls/*` and reload |
@@ -229,6 +230,13 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   else), so its health comes from real calls. `POST /trunks/{name}/enable`
   forgives the cooldown and the park even when the trunk was already
   enabled — that is the documented remedy.
+
+A call the SBC cannot anchor media for never runs silently: an INVITE
+whose RTP ports cannot be allocated is answered 503 before anything is
+dialled, and an answered call whose relay fails to start is ended right
+after the 200 with a `media-unavailable` CDR (`sbc_media_relay_failures_total`).
+Without a relay there is no inactivity watchdog, so the alternative was a
+mute call billed to `max_call_duration`.
 
 Some callees (e.g. Jambonz-based) drop media without sending BYE — after
 `security.rtp_timeout` (90 s) without RTP the SBC BYEs both legs and writes a

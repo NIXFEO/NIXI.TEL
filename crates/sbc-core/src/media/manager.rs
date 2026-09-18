@@ -134,6 +134,11 @@ pub struct MediaStats {
     pub active_sessions: usize,
     pub allocated_ports: usize,
     pub available_ports: usize,
+    /// Pairs waiting out their quarantine (included in `allocated_ports`).
+    pub quarantined_ports: usize,
+    /// Pairs reused before their quarantine elapsed: the range is too
+    /// small for the call rate.
+    pub forced_reuse: u64,
 }
 
 impl MediaManager {
@@ -142,9 +147,24 @@ impl MediaManager {
         Self::with_allocator(Arc::new(PortAllocator::new()), public_ip)
     }
 
-    /// Create a new media manager with custom port range
+    /// Create a new media manager with custom port range and immediate
+    /// port reuse (tests).
     pub fn with_port_range(port_range: std::ops::Range<u16>, public_ip: Option<IpAddr>) -> Self {
         Self::with_allocator(Arc::new(PortAllocator::with_range(port_range)), public_ip)
+    }
+
+    /// Create a new media manager whose freed RTP ports are quarantined
+    /// for `hold` before reuse (production: a new call must not inherit
+    /// the previous peer's stray packets).
+    pub fn with_port_range_and_hold(
+        port_range: std::ops::Range<u16>,
+        hold: std::time::Duration,
+        public_ip: Option<IpAddr>,
+    ) -> Self {
+        Self::with_allocator(
+            Arc::new(PortAllocator::with_range_and_hold(port_range, hold)),
+            public_ip,
+        )
     }
 
     fn with_allocator(port_allocator: Arc<PortAllocator>, public_ip: Option<IpAddr>) -> Self {
@@ -281,10 +301,21 @@ impl MediaManager {
         }
 
         // Parse and modify SDP if provided (rewrite to leg-A port)
-        let modified_sdp = if let Some(sdp_str) = sdp {
-            Some(self.modify_sdp(sdp_str, ports.rtp)?)
-        } else {
-            None
+        let modified_sdp = match sdp {
+            Some(sdp_str) => match self.modify_sdp(sdp_str, ports.rtp) {
+                Ok(modified) => Some(modified),
+                Err(e) => {
+                    // Both pairs are already ours: give them back, or they
+                    // are leaked until the process restarts (nothing else
+                    // releases a pair that never reached a session).
+                    let _ = self.port_allocator.release(ports);
+                    if let Some(pb) = ports_b {
+                        let _ = self.port_allocator.release(pb);
+                    }
+                    return Err(e);
+                }
+            },
+            None => None,
         };
 
         let media_session = MediaSession {
@@ -807,6 +838,8 @@ impl MediaManager {
             active_sessions: self.sessions.len(),
             allocated_ports: self.port_allocator.allocated_count(),
             available_ports: self.port_allocator.available_count(),
+            quarantined_ports: self.port_allocator.quarantined_count(),
+            forced_reuse: self.port_allocator.forced_reuse_count(),
         }
     }
 

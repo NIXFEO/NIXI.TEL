@@ -296,12 +296,15 @@ impl Sbc {
         {
             Ok(uuid) => uuid,
             Err(e) => {
-                warn!("B2BUA create_call failed: {}", e);
-                self.metrics.inc_sip_response(500);
-                let response_500 = response_for_request(&request, 500, "Server Internal Error");
+                // The only way this fails is a media resource the SBC could
+                // not get: 503 (try elsewhere / retry), not 500.
+                warn!("B2BUA create_call failed: {} — 503 to the caller", e);
+                self.metrics.inc_media_relay_failure();
+                self.metrics.inc_sip_response(503);
+                let response_503 = response_for_request(&request, 503, "Service Unavailable");
                 self.send_sip(
-                    "500 → caller",
-                    response_500.as_bytes(),
+                    "503 (no media resource) → caller",
+                    response_503.as_bytes(),
                     source,
                     transport,
                     reply_tx,

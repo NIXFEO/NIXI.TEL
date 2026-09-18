@@ -1,20 +1,50 @@
 //! Port Allocator for RTP/RTCP
 //!
 //! Manages a pool of UDP ports for RTP media streams.
-//! RTP uses even ports, RTCP uses odd ports (RTP port + 1)
+//! RTP uses even ports, RTCP uses odd ports (RTP port + 1).
+//!
+//! Allocation walks **forward** from a cursor and a released pair is held in
+//! quarantine for `hold` before it can be handed out again. Reusing a pair
+//! immediately (the previous behaviour: lowest free port first) means the
+//! next call inherits whatever the previous peer is still sending to that
+//! port — stray RTP that can latch an endpoint, refresh an inactivity timer
+//! or be relayed as audio — and it races the relay task, which still owns
+//! the bound sockets when `terminate_session` releases the pair.
 
 use crate::{Error, Result};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long a released pair is held before it can be reused again in
+/// production. Long enough to outlive a peer's retransmission burst, short
+/// relative to the default 5000-pair range.
+pub const DEFAULT_PORT_HOLD: Duration = Duration::from_secs(30);
 
 /// Port Allocator for RTP/RTCP pairs
 pub struct PortAllocator {
     /// Range of ports available for allocation
     port_range: Range<u16>,
 
-    /// Currently allocated ports
+    /// Ports that must not be handed out: in use, or in quarantine.
     allocated: Arc<Mutex<HashSet<u16>>>,
+
+    /// Released pairs waiting out `hold`, oldest first.
+    quarantine: Arc<Mutex<VecDeque<(PortPair, Instant)>>>,
+
+    /// How long a released pair waits. `ZERO` disables quarantine (tests
+    /// and small ranges).
+    hold: Duration,
+
+    /// Next RTP port to try, so allocation does not favour the pair that
+    /// was freed a millisecond ago.
+    cursor: Arc<Mutex<u16>>,
+
+    /// Pairs handed out before their hold elapsed because the range was
+    /// exhausted (an operator signal: the range is too small).
+    forced: Arc<AtomicU64>,
 }
 
 /// Allocated RTP/RTCP port pair
@@ -33,11 +63,23 @@ impl PortAllocator {
         Self::with_range(10000..20000)
     }
 
-    /// Create a new port allocator with custom range
+    /// Create a new port allocator with custom range and **no**
+    /// quarantine (immediate reuse).
     pub fn with_range(port_range: Range<u16>) -> Self {
+        Self::with_range_and_hold(port_range, Duration::ZERO)
+    }
+
+    /// Create a new port allocator whose released pairs wait `hold` before
+    /// they can be reused.
+    pub fn with_range_and_hold(port_range: Range<u16>, hold: Duration) -> Self {
+        let start = port_range.start;
         Self {
             port_range,
             allocated: Arc::new(Mutex::new(HashSet::new())),
+            quarantine: Arc::new(Mutex::new(VecDeque::new())),
+            hold,
+            cursor: Arc::new(Mutex::new(start)),
+            forced: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -45,45 +87,127 @@ impl PortAllocator {
     ///
     /// Returns a pair where RTP is even and RTCP is RTP+1
     pub fn allocate(&self) -> Result<PortPair> {
+        let now = Instant::now();
+        self.sweep_quarantine(now)?;
+        {
+            let mut allocated = self
+                .allocated
+                .lock()
+                .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
+            let mut cursor = self
+                .cursor
+                .lock()
+                .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
+
+            // One forward sweep from the cursor, wrapping once: a pair that
+            // was just freed sits at the back of the queue, not the front.
+            let first = Self::even_at_or_after(self.port_range.start);
+            let start = Self::even_at_or_after((*cursor).max(self.port_range.start));
+            let mut rtp_port = start;
+            let mut wrapped = false;
+            loop {
+                if rtp_port.checked_add(1).is_none() || rtp_port + 1 >= self.port_range.end {
+                    if wrapped {
+                        break;
+                    }
+                    wrapped = true;
+                    rtp_port = first;
+                    continue;
+                }
+                let rtcp_port = rtp_port + 1;
+                if !allocated.contains(&rtp_port) && !allocated.contains(&rtcp_port) {
+                    allocated.insert(rtp_port);
+                    allocated.insert(rtcp_port);
+                    *cursor = rtp_port.saturating_add(2);
+                    return Ok(PortPair {
+                        rtp: rtp_port,
+                        rtcp: rtcp_port,
+                    });
+                }
+                if wrapped && rtp_port >= start {
+                    break;
+                }
+                rtp_port += 2;
+            }
+        }
+
+        // Nothing free: take the pair that has been in quarantine longest
+        // rather than fail a call, and count it.
+        let oldest = {
+            let mut q = self
+                .quarantine
+                .lock()
+                .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
+            q.pop_front().map(|(pair, _)| pair)
+        };
+        if let Some(pair) = oldest {
+            self.forced.fetch_add(1, Ordering::Relaxed);
+            return Ok(pair);
+        }
+        Err(Error::Transport("No available ports in range".to_string()))
+    }
+
+    /// Give back the pairs whose hold has elapsed.
+    fn sweep_quarantine(&self, now: Instant) -> Result<()> {
+        let mut q = self
+            .quarantine
+            .lock()
+            .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
+        if q.is_empty() {
+            return Ok(());
+        }
         let mut allocated = self
             .allocated
             .lock()
             .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
-
-        // Find an available even port
-        for port in (self.port_range.start..self.port_range.end).step_by(2) {
-            // Make sure port is even
-            let rtp_port = if port % 2 == 0 { port } else { port + 1 };
-            let rtcp_port = rtp_port + 1;
-
-            // Check if both ports are available
-            if !allocated.contains(&rtp_port)
-                && !allocated.contains(&rtcp_port)
-                && rtcp_port < self.port_range.end
-            {
-                allocated.insert(rtp_port);
-                allocated.insert(rtcp_port);
-
-                return Ok(PortPair {
-                    rtp: rtp_port,
-                    rtcp: rtcp_port,
-                });
+        while let Some((pair, freed_at)) = q.front().copied() {
+            if now.duration_since(freed_at) < self.hold {
+                break;
             }
+            q.pop_front();
+            allocated.remove(&pair.rtp);
+            allocated.remove(&pair.rtcp);
         }
+        Ok(())
+    }
 
-        Err(Error::Transport("No available ports in range".to_string()))
+    fn even_at_or_after(port: u16) -> u16 {
+        if port.is_multiple_of(2) {
+            port
+        } else {
+            port.saturating_add(1)
+        }
+    }
+
+    /// Pairs waiting out their hold.
+    pub fn quarantined_count(&self) -> usize {
+        self.quarantine.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Pairs reused before their hold elapsed (range too small).
+    pub fn forced_reuse_count(&self) -> u64 {
+        self.forced.load(Ordering::Relaxed)
     }
 
     /// Release a port pair
     pub fn release(&self, pair: PortPair) -> Result<()> {
-        let mut allocated = self
-            .allocated
+        if self.hold.is_zero() {
+            let mut allocated = self
+                .allocated
+                .lock()
+                .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
+            allocated.remove(&pair.rtp);
+            allocated.remove(&pair.rtcp);
+            return Ok(());
+        }
+        // Stays "allocated" (nothing else may bind it) until its hold is up.
+        let mut q = self
+            .quarantine
             .lock()
             .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
-
-        allocated.remove(&pair.rtp);
-        allocated.remove(&pair.rtcp);
-
+        if !q.iter().any(|(p, _)| *p == pair) {
+            q.push_back((pair, Instant::now()));
+        }
         Ok(())
     }
 
@@ -108,14 +232,20 @@ impl PortAllocator {
             .unwrap_or(false)
     }
 
-    /// Clear all allocations
+    /// Clear all allocations (and the quarantine, and the cursor — a
+    /// cursor left past the range would brick the allocator).
     pub fn clear(&self) -> Result<()> {
         let mut allocated = self
             .allocated
             .lock()
             .map_err(|e| Error::Transport(format!("Lock error: {}", e)))?;
-
         allocated.clear();
+        if let Ok(mut q) = self.quarantine.lock() {
+            q.clear();
+        }
+        if let Ok(mut cursor) = self.cursor.lock() {
+            *cursor = self.port_range.start;
+        }
         Ok(())
     }
 }
@@ -226,6 +356,71 @@ mod tests {
 
         // The new pair should be the released one
         assert_eq!(pair6, pair3);
+    }
+
+    /// A pair freed a moment ago must not be the next one handed out: the
+    /// previous peer may still be sending to it.
+    #[test]
+    fn a_released_pair_waits_out_its_hold() {
+        let allocator = PortAllocator::with_range_and_hold(10000..10010, Duration::from_secs(30));
+        let first = allocator.allocate().unwrap();
+        let second = allocator.allocate().unwrap();
+        assert_ne!(first, second);
+
+        allocator.release(first).unwrap();
+        assert_eq!(allocator.quarantined_count(), 1);
+        // Still counted as unavailable while it waits.
+        assert!(allocator.is_allocated(first));
+
+        let next = allocator.allocate().unwrap();
+        assert_ne!(next, first, "the freed pair was handed straight back");
+        assert_ne!(next, second);
+        assert_eq!(allocator.forced_reuse_count(), 0);
+    }
+
+    /// An exhausted range takes the oldest quarantined pair rather than
+    /// failing the call, and says so.
+    #[test]
+    fn an_exhausted_range_forces_the_oldest_quarantined_pair() {
+        let allocator = PortAllocator::with_range_and_hold(10000..10004, Duration::from_secs(30));
+        let a = allocator.allocate().unwrap();
+        let b = allocator.allocate().unwrap();
+        assert!(allocator.allocate().is_err(), "range is full");
+
+        allocator.release(a).unwrap();
+        allocator.release(b).unwrap();
+        let forced = allocator.allocate().unwrap();
+        assert_eq!(forced, a, "the oldest quarantined pair comes first");
+        assert_eq!(allocator.forced_reuse_count(), 1);
+        assert_eq!(allocator.quarantined_count(), 1);
+    }
+
+    /// A hold of zero keeps the old behaviour (what the test harnesses and
+    /// their 20-pair ranges rely on).
+    #[test]
+    fn a_zero_hold_reuses_immediately() {
+        let allocator = PortAllocator::with_range(10000..10004);
+        let a = allocator.allocate().unwrap();
+        allocator.release(a).unwrap();
+        assert_eq!(allocator.quarantined_count(), 0);
+        assert!(!allocator.is_allocated(a));
+        let again = allocator.allocate().unwrap();
+        assert!(again == a || again.rtp == a.rtp + 2);
+    }
+
+    /// `clear()` must put the cursor back, or the allocator never finds a
+    /// port again.
+    #[test]
+    fn clear_resets_the_cursor_and_the_quarantine() {
+        let allocator = PortAllocator::with_range_and_hold(10000..10010, Duration::from_secs(30));
+        for _ in 0..5 {
+            allocator.allocate().unwrap();
+        }
+        assert!(allocator.allocate().is_err());
+        allocator.clear().unwrap();
+        assert_eq!(allocator.quarantined_count(), 0);
+        let pair = allocator.allocate().unwrap();
+        assert_eq!(pair.rtp, 10000, "allocation starts over");
     }
 
     #[test]

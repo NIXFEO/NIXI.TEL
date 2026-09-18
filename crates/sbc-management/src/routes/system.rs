@@ -46,6 +46,14 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    // Sample the media port pool here: pushed updates miss every ringing
+    // call, and the quarantine only shows up at scrape time.
+    let pool = state.b2bua.media().stats();
+    state.metrics.set_port_pool(
+        pool.allocated_ports as u64,
+        pool.quarantined_ports as u64,
+        pool.forced_reuse,
+    );
     let mut body = state.metrics.render_prometheus();
     body.push_str(&sbc_core::metrics::render_trunk_availability(
         &state.trunks.get_stats(),

@@ -40,6 +40,10 @@ pub(crate) enum CallOutcome {
     RtpTimeout,
     /// No answer within `security.call_setup_timeout`.
     SetupTimeout,
+    /// The SBC could not anchor the media (no RTP relay, no ports): the
+    /// SDP already points at the SBC, so the call would be silent for its
+    /// whole billed duration.
+    MediaUnavailable,
 }
 
 impl CallOutcome {
@@ -55,6 +59,7 @@ impl CallOutcome {
             Self::DialogLost { .. } => "dialog-lost".into(),
             Self::RtpTimeout => "rtp-timeout".into(),
             Self::SetupTimeout => "setup-timeout".into(),
+            Self::MediaUnavailable => "media-unavailable".into(),
         }
     }
 
@@ -69,7 +74,7 @@ impl CallOutcome {
             Self::Cancelled => Some(487),
             Self::Rejected { code } | Self::Refused { code } => Some(*code),
             Self::SetupTimeout => Some(408),
-            Self::Shutdown => Some(503),
+            Self::Shutdown | Self::MediaUnavailable => Some(503),
             Self::MaxDuration | Self::AdminKick => Some(480),
             Self::WsClosed { callee_died: true } => Some(480),
             Self::NormalClearing { .. }
@@ -88,6 +93,9 @@ impl CallOutcome {
             Self::AdminKick => Some("SIP;cause=200;text=\"Administrative teardown\"".into()),
             Self::RtpTimeout => Some("Q.850;cause=16;text=\"RTP timeout\"".into()),
             Self::SetupTimeout => Some("SIP;cause=408;text=\"No answer\"".into()),
+            Self::MediaUnavailable => {
+                Some("Q.850;cause=47;text=\"No media resource available\"".into())
+            }
             Self::DialogLost { status } => {
                 Some(format!("SIP;cause={};text=\"Dialog lost\"", status))
             }
@@ -114,7 +122,7 @@ impl CallOutcome {
     pub(crate) fn pending_caller_code(&self) -> u16 {
         match self {
             Self::SetupTimeout => 408,
-            Self::Shutdown => 503,
+            Self::Shutdown | Self::MediaUnavailable => 503,
             _ => 480,
         }
     }

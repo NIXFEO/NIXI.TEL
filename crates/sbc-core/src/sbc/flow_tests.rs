@@ -7,6 +7,137 @@
 use super::test_support::*;
 use super::*;
 
+/// A call the SBC cannot anchor media for is refused before it is dialled
+/// out: the SDP would already point at this SBC, so the alternative is a
+/// silent call billed for its whole life.
+#[tokio::test]
+async fn an_invite_with_no_media_port_is_refused_with_503() {
+    let mut sbc = SbcBuilder::new().without_media_ports().build();
+    register_trunk_ip(&sbc).await;
+    let (caller_tx, mut caller_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // The B2BUA refuses outright…
+    let err = sbc
+        .b2bua
+        .create_call(
+            "cid-no-ports".into(),
+            "tag-1".into(),
+            caller_addr(),
+            Some(SDP),
+            Some(caller_tx.clone()),
+            rsip::Transport::Udp,
+        )
+        .await
+        .expect_err("no media resources");
+    assert!(err.to_string().contains("no media resources"), "{}", err);
+    assert!(
+        sbc.b2bua.active_calls().await.is_empty(),
+        "no call was kept"
+    );
+
+    // …and the handler answers 503 rather than dialling the trunk.
+    sbc.handle_invite(
+        invite_from_trunk("+33612345678", 70),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        Some(&caller_tx),
+    )
+    .await
+    .unwrap();
+    let out = drain(&mut caller_rx);
+    let all = out.join("\n");
+    assert!(
+        all.contains("SIP/2.0 503 Service Unavailable"),
+        "the caller must get a 503, got: {}",
+        all
+    );
+    assert!(
+        sbc.media.stats().allocated_ports == 0,
+        "no port was leaked by the refusal"
+    );
+    assert_eq!(
+        sbc.metrics
+            .media_relay_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+/// An answered call whose media relay could not start is ended right away:
+/// the SDP on both sides points at this SBC, so without a relay the call
+/// is silent — and with no relay there is no inactivity watchdog either,
+/// so it would otherwise run to `max_call_duration`, billed.
+#[tokio::test]
+async fn an_answered_call_without_a_relay_is_ended_as_media_unavailable() {
+    let mut sbc = SbcBuilder::new().build();
+    let mut call = add_call(&mut sbc, CallSpec::default()).await;
+    let media_id = sbc.b2bua.get_media_session_id(&call.uuid).await.unwrap();
+    let session = sbc.media.get_session(&media_id).unwrap();
+
+    // Hold the relay's own port so `start_rtp_session` cannot bind it.
+    let _squatter = tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", session.ports.rtp))
+        .await
+        .expect("squat the leg-A RTP port");
+
+    sbc.handle_response(
+        response_for(
+            &call.spec,
+            "200 OK",
+            &call.spec.branch,
+            call.spec.cseq,
+            "INVITE",
+            &format!(
+                "Contact: <{}>\r\nContent-Type: application/sdp\r\n",
+                TRUNK_CONTACT
+            ),
+            TRUNK_SDP,
+        ),
+        trunk_addr(),
+        rsip::Transport::Udp,
+        None,
+    )
+    .await
+    .expect("200 OK handled");
+
+    // The caller got its 200 (both dialogs exist), then the SBC ended them.
+    let to_caller = drain(&mut call.caller_rx);
+    assert!(
+        to_caller[0].starts_with("SIP/2.0 200 OK\r\n"),
+        "{:?}",
+        to_caller
+    );
+    assert!(
+        to_caller.iter().any(|m| m.starts_with("BYE ")),
+        "the caller leg is hung up: {:?}",
+        to_caller
+    );
+    let to_trunk = drain(&mut call.callee_rx);
+    assert!(
+        to_trunk.iter().any(|m| m.starts_with("BYE ")),
+        "the trunk leg is hung up: {:?}",
+        to_trunk
+    );
+    assert!(
+        to_trunk
+            .iter()
+            .any(|m| m.contains("cause=47") && m.contains("No media resource")),
+        "the BYE says why: {:?}",
+        to_trunk
+    );
+
+    let cdr = sbc.cdr.get_recent(1).await.unwrap().pop().expect("one CDR");
+    assert_eq!(cdr.disconnect_reason, "media-unavailable");
+    assert_eq!(cdr.hangup_by, "sbc");
+    assert_eq!(
+        sbc.metrics
+            .media_relay_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(sbc.media.stats().allocated_ports, 0, "media released");
+    assert!(sbc.b2bua.active_calls().await.is_empty());
+}
+
 /// INVITE → 200 OK → ACK → BYE: the everyday outbound call.
 #[tokio::test]
 async fn full_call_relays_200_ack_and_bye_then_releases_media_and_writes_a_cdr() {

@@ -668,6 +668,13 @@ struct RecentDialog {
 const RECENT_DIALOG_TTL: Duration = Duration::from_secs(600);
 
 impl B2buaManager {
+    /// The media manager behind this B2BUA: the metrics endpoint samples
+    /// the port pool from it, rather than relying on pushed updates that
+    /// miss every ringing call.
+    pub fn media(&self) -> Arc<MediaManager> {
+        self.media.clone()
+    }
+
     pub fn new(media: Arc<MediaManager>) -> Self {
         Self {
             calls: Arc::new(Mutex::new(HashMap::new())),
@@ -726,7 +733,14 @@ impl B2buaManager {
                     call.media_session_id = Some(session.session_id.clone());
                 }
                 Err(e) => {
+                    // The caller's SDP would be rewritten to this SBC's
+                    // address with no relay behind it: the call would be
+                    // silent for its whole billed life. Refuse it instead.
                     warn!("B2BUA: could not allocate media ports: {}", e);
+                    return Err(crate::Error::Transport(format!(
+                        "no media resources for call {}: {}",
+                        inbound_call_id, e
+                    )));
                 }
             }
         }

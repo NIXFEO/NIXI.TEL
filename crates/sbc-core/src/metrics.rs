@@ -261,6 +261,13 @@ pub struct SbcMetrics {
     /// users, trunks or DIDs to serve — a lost or unmounted store looks
     /// exactly like this.
     pub store_created_empty: Arc<AtomicU64>,
+    /// Calls the SBC could not anchor media for (no ports, relay start
+    /// failed): refused before dialling, or ended right after the answer.
+    pub media_relay_failures: Arc<AtomicU64>,
+    /// RTP port pairs waiting out their quarantine before reuse.
+    pub quarantined_ports: Arc<AtomicU64>,
+    /// Port pairs reused before their quarantine elapsed (range too small).
+    pub forced_port_reuse: Arc<AtomicU64>,
     /// 1 when the backup timer runs.
     pub store_backups_enabled: Arc<AtomicU64>,
     /// The timer's interval (seconds), for the staleness alert.
@@ -331,6 +338,9 @@ impl SbcMetrics {
             config_last_reload_time: Arc::new(AtomicU64::new(0)),
             store_available: Arc::new(AtomicU64::new(0)),
             store_created_empty: Arc::new(AtomicU64::new(0)),
+            media_relay_failures: Arc::new(AtomicU64::new(0)),
+            quarantined_ports: Arc::new(AtomicU64::new(0)),
+            forced_port_reuse: Arc::new(AtomicU64::new(0)),
             store_backups_enabled: Arc::new(AtomicU64::new(0)),
             store_backup_interval_secs: Arc::new(AtomicU64::new(0)),
             store_backup_last_success_time: Arc::new(AtomicU64::new(0)),
@@ -586,6 +596,19 @@ impl SbcMetrics {
         self.last_cdr_written_time.store(now, Ordering::Relaxed);
     }
 
+    pub fn inc_media_relay_failure(&self) {
+        self.media_relay_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sample the media port pool (called when `/metrics` is scraped, so
+    /// ringing calls are included).
+    pub fn set_port_pool(&self, allocated: u64, quarantined: u64, forced_reuse: u64) {
+        self.allocated_ports.store(allocated, Ordering::Relaxed);
+        self.quarantined_ports.store(quarantined, Ordering::Relaxed);
+        self.forced_port_reuse
+            .store(forced_reuse, Ordering::Relaxed);
+    }
+
     pub fn set_allocated_ports(&self, n: u64) {
         self.allocated_ports.store(n, Ordering::Relaxed);
     }
@@ -721,6 +744,22 @@ impl SbcMetrics {
             "sbc_allocated_rtp_ports",
             "Number of currently allocated RTP port pairs",
             self.allocated_ports.load(Ordering::Relaxed)
+        );
+
+        counter!(
+            "sbc_media_relay_failures",
+            "Calls with no media anchor: refused before dialling, or ended just after the answer",
+            self.media_relay_failures.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "sbc_rtp_ports_quarantined",
+            "RTP port pairs released but not yet reusable (stray-packet quarantine)",
+            self.quarantined_ports.load(Ordering::Relaxed)
+        );
+        counter!(
+            "sbc_rtp_port_quarantine_forced",
+            "RTP port pairs reused before their quarantine elapsed (the range is too small)",
+            self.forced_port_reuse.load(Ordering::Relaxed)
         );
 
         gauge!(
