@@ -158,6 +158,24 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   that lifts bans).
 
 ### Added
+- Trunk tasks follow the trunk table (lot 3). The OPTIONS health check and
+  the outbound REGISTER loop of a trunk were spawned once at boot and never
+  stopped: a trunk created through the API was never probed or registered,
+  a deleted one was probed forever, changed credentials or hosts were
+  ignored until a restart. `trunk_tasks.rs` keeps one set of tasks per
+  enabled trunk and re-syncs on every trunk write, SIGHUP and
+  `POST /api/v1/reload` (start / stop / restart on host, port, transport,
+  credentials, realm, register flag or interval change); a stopped
+  registered trunk gets a best-effort `Expires: 0`. Outbound REGISTER: a
+  `423 Interval Too Brief` is retried with the trunk's `Min-Expires` and
+  the value is remembered; a refused or unanswered REGISTER backs off
+  30 s → 15 min (reset on success, cap `[trunk_health]
+  register_backoff_max`) instead of every 60 s; an OPTIONS down→up
+  transition re-registers immediately. New `[trunk_health]` section
+  (`options_interval`, `options_timeout`, `register_backoff_max`), SSE
+  events `trunk_registered` / `trunk_unregistered`, `registered` on
+  `GET /api/v1/trunks`, `trunk_unregistered` in `GET /api/v1/alerts`, and a
+  changed trunk host is re-resolved on hydrate.
 - Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
   `consecutive_failures` and the cooldown were only ever touched by the
   OPTIONS health check, so `max_concurrent_calls` and the failure ladder

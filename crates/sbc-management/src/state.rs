@@ -42,6 +42,8 @@ pub struct AppState {
     pub security: Arc<SecurityManager>,
     /// `DELETE /api/v1/calls/{uuid}` hands the uuid to the SIP engine here.
     pub kicks: Arc<sbc_core::sbc::AdminKicks>,
+    /// Per-trunk OPTIONS / REGISTER tasks, re-synced after every trunk write.
+    pub trunk_tasks: Arc<sbc_core::trunk_tasks::TrunkTasks>,
     /// Reverse proxies whose X-Real-IP / X-Forwarded-For are believed.
     pub trusted_proxies: Arc<Vec<std::net::IpAddr>>,
     /// Failed bearer-token checks strike the client's IP in fail2ban.

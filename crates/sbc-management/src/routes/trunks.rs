@@ -28,6 +28,7 @@ async fn apply_and_notify(
 ) {
     let _ = apply_trunks_and_routes(&state.trunks, store).await;
     state.refresh_trunk_ips().await;
+    state.trunk_tasks.sync();
     state.events.publish(SbcEvent::ConfigChanged {
         entity: entity.to_string(),
         action: action.to_string(),
@@ -209,7 +210,7 @@ fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
         .get_stats()
         .into_iter()
         .find(|(t, _)| t.name == row.name);
-    let (health, active, total, failed, consecutive) = match &live {
+    let (health, active, total, failed, consecutive, registered) = match &live {
         Some((_, s)) => (
             if s.consecutive_failures == 0 {
                 "up"
@@ -222,9 +223,12 @@ fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
             s.total_calls,
             s.failed_calls,
             s.consecutive_failures,
+            s.registered,
         ),
-        None => ("unknown", 0, 0, 0, 0),
+        None => ("unknown", 0, 0, 0, 0, false),
     };
+    // `registered`: true/false for trunks the SBC registers with, null otherwise.
+    let registered = row.register_with_trunk.then_some(registered);
     json!({
         "name": row.name,
         "enabled": row.enabled,
@@ -254,6 +258,7 @@ fn trunk_json(state: &AppState, row: &TrunkRow) -> serde_json::Value {
             "mtls": row.tls_client_cert.is_some(),
         },
         "health": health,
+        "registered": registered,
         "active_calls": active,
         "total_calls": total,
         "failed_calls": failed,
@@ -284,6 +289,7 @@ pub async fn list_trunks(State(state): State<AppState>) -> ApiResult<Json<serde_
                         "port": t.port,
                         "enabled": t.enabled,
                         "health": if s.consecutive_failures == 0 { "up" } else { "degraded" },
+                        "registered": t.register_with_trunk.then_some(s.registered),
                         "active_calls": s.active_calls,
                         "total_calls": s.total_calls,
                         "failed_calls": s.failed_calls,

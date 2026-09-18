@@ -149,6 +149,18 @@ api_auth_token = "GENERATE-A-LONG-RANDOM-TOKEN"
 trusted_proxies = ["127.0.0.1", "::1"]
 ban_on_auth_failure = true
 
+[trunk_health]
+# OPTIONS probe per enabled trunk (sbc_trunk_up{trunk}, SSE trunk_health);
+# a trunk that stops answering rests through the router's cooldown. The
+# probes and outbound REGISTER loops follow the trunk table live (API,
+# reload) — these timings are read at boot only.
+options_interval = 30
+options_timeout = 5
+# A refused or unanswered outbound REGISTER is retried with exponential
+# backoff from 30 s up to this cap (reset on success); a 423 Interval Too
+# Brief is retried with the trunk's Min-Expires.
+register_backoff_max = 900
+
 [metrics]
 prometheus_enabled = true
 prometheus_bind_address = "127.0.0.1"

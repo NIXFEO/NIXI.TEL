@@ -25,10 +25,21 @@ const TOKEN: &str = "test-token-123";
 
 async fn make_state() -> AppState {
     let media = Arc::new(MediaManager::with_port_range(20000..20100, None));
+    let metrics = Arc::new(SbcMetrics::new());
+    let trunks = Arc::new(TrunkManager::new());
+    let events = EventBus::new();
+    let trunk_tasks = Arc::new(sbc_core::trunk_tasks::TrunkTasks::new(
+        trunks.clone(),
+        Default::default(),
+        None,
+        metrics.clone(),
+        events.clone(),
+        Default::default(),
+    ));
     AppState {
-        metrics: Arc::new(SbcMetrics::new()),
+        metrics,
         b2bua: Arc::new(B2buaManager::new(media)),
-        trunks: Arc::new(TrunkManager::new()),
+        trunks,
         registrar: Arc::new(InMemoryRegistrar::new()),
         cdr: Arc::new(CdrManager::new_memory()),
         acl: Arc::new(AclManager::new_permissive()),
@@ -39,13 +50,14 @@ async fn make_state() -> AppState {
         dids: Arc::new(RwLock::new(Vec::new())),
         trunk_ips: Arc::new(RwLock::new(Vec::new())),
         store: Some(Arc::new(ConfigStore::open_memory().await.unwrap())),
-        events: EventBus::new(),
+        events,
         reload: Arc::new(Notify::new()),
         realm: "sip.example.com".to_string(),
         api_token: Some(TOKEN.to_string()),
         api_rate_limit_per_min: 0, // disabled for deterministic tests
         security: Arc::new(sbc_core::security::SecurityManager::new(Default::default())),
         kicks: Arc::new(sbc_core::sbc::AdminKicks::new()),
+        trunk_tasks,
         trusted_proxies: Arc::new(sbc_management::rate_limit::default_trusted_proxies()),
         ban_on_auth_failure: true,
     }
@@ -1401,4 +1413,106 @@ async fn bearer_token_brute_force_bans_the_client_ip() {
         .security
         .bans
         .is_banned("203.0.113.99".parse().unwrap()));
+}
+
+/// Every trunk write re-syncs the per-trunk OPTIONS / REGISTER tasks:
+/// created → started, credentials changed → restarted, disabled → stopped,
+/// deleted → gone. `registered` is exposed for trunks that register.
+#[tokio::test]
+async fn trunk_mutations_drive_the_task_registry() {
+    let state = make_state().await;
+    let tasks = state.trunk_tasks.clone();
+    assert!(tasks.attach_socket(Arc::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    )));
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/trunks",
+            Some(r#"{"name":"pstn-1","host":"127.0.0.1","port":5999,"transport":"UDP"}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let running = tasks.running();
+    assert_eq!(running.len(), 1, "{:?}", running);
+    assert_eq!(
+        (running[0].name.as_str(), running[0].registers),
+        ("pstn-1", false)
+    );
+    let g1 = running[0].generation;
+
+    // No registration → `registered` is null.
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/trunks/pstn-1", None, true))
+        .await
+        .unwrap();
+    assert!(body_json(resp).await["registered"].is_null());
+
+    // Credentials + register flag: the tasks restart with a register loop.
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/pstn-1",
+            Some(r#"{"username":"u","password":"p","register_with_trunk":true}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let running = tasks.running();
+    assert_eq!(running.len(), 1);
+    assert!(running[0].generation > g1, "restarted: {:?}", running);
+    assert!(running[0].registers);
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/trunks/pstn-1", None, true))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["registered"], false);
+
+    // A field outside the task spec does not restart them.
+    let g2 = running[0].generation;
+    let resp = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/api/v1/trunks/pstn-1",
+            Some(r#"{"priority":7}"#),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(tasks.running()[0].generation, g2);
+
+    // Disabled → stopped; enabled → started again; deleted → gone.
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/trunks/pstn-1/disable", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(tasks.running().is_empty());
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/trunks/pstn-1/enable", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(tasks.running().len(), 1);
+    let resp = app
+        .clone()
+        .oneshot(req("DELETE", "/api/v1/trunks/pstn-1", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(tasks.running().is_empty());
+    tasks.shutdown().await;
 }

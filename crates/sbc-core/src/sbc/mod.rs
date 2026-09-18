@@ -265,7 +265,11 @@ pub struct Sbc {
 
     /// Pending outbound REGISTER responses (Call-ID → oneshot sender)
     /// Used by TrunkRegistrar to receive 401/407/200 responses to its REGISTER requests
-    pub pending_register_responses: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    pub pending_register_responses: crate::trunk_tasks::PendingResponses,
+
+    /// OPTIONS health checks and outbound REGISTER loops, one set per
+    /// enabled trunk, following the trunk table (`trunk_tasks.rs`).
+    trunk_tasks: Arc<crate::trunk_tasks::TrunkTasks>,
 
     /// DID → SIP user mappings for inbound PSTN calls.
     /// Shared with the API layer (hydrated from the SQLite store).
@@ -571,6 +575,16 @@ impl Sbc {
             info!("DID mapping: {} → {}", did.number, did.user);
         }
 
+        let pending_register_responses: crate::trunk_tasks::PendingResponses =
+            Arc::new(DashMap::new());
+        let trunk_tasks = Arc::new(crate::trunk_tasks::TrunkTasks::new(
+            trunk_manager.clone(),
+            pending_register_responses.clone(),
+            identity.clone(),
+            metrics.clone(),
+            events.clone(),
+            crate::trunk_tasks::TrunkTasksConfig::from(&config.trunk_health),
+        ));
         Ok(Self {
             transport: TransportManager::new(),
             media,
@@ -587,7 +601,8 @@ impl Sbc {
             _maintenance: None,
             config_path: None,
             trunk_manager: trunk_manager.clone(),
-            pending_register_responses: Arc::new(DashMap::new()),
+            pending_register_responses,
+            trunk_tasks,
             did_mappings,
             trunk_ips,
             reload_notify,
@@ -730,6 +745,7 @@ impl Sbc {
             hydrate::hydrate_all(&handles, &store).await?;
             self.refresh_trunk_ips().await;
             self.register_trunk_tls_configs();
+            self.trunk_tasks.sync();
             info!("Reload: runtime re-hydrated from config store");
             return Ok(());
         }
@@ -833,8 +849,9 @@ impl Sbc {
             info!("SIGHUP: DID mappings reloaded — {} entries", dids.len());
         }
 
-        // Reload trunk IPs whitelist
+        // Reload trunk IPs whitelist and the per-trunk tasks
         self.refresh_trunk_ips().await;
+        self.trunk_tasks.sync();
 
         info!("SIGHUP: configuration reloaded successfully");
         Ok(())
@@ -892,6 +909,18 @@ impl Sbc {
         let registrar = Arc::new(InMemoryRegistrar::new());
         let register_handler = Arc::new(RegisterHandler::new(registrar));
 
+        let metrics = Arc::new(SbcMetrics::new());
+        let events = crate::events::EventBus::new();
+        let pending_register_responses: crate::trunk_tasks::PendingResponses =
+            Arc::new(DashMap::new());
+        let trunk_tasks = Arc::new(crate::trunk_tasks::TrunkTasks::new(
+            trunk_manager.clone(),
+            pending_register_responses.clone(),
+            None,
+            metrics.clone(),
+            events.clone(),
+            crate::trunk_tasks::TrunkTasksConfig::default(),
+        ));
         Self {
             transport: TransportManager::new(),
             media,
@@ -903,17 +932,18 @@ impl Sbc {
             dos: Arc::new(DosProtector::new(RateLimitConfig::default())),
             identity: None,
             enable_digest_auth: false,
-            metrics: Arc::new(SbcMetrics::new()),
+            metrics,
             cdr: Arc::new(CdrManager::new_memory()),
             _maintenance: None,
             config_path: None,
             trunk_manager,
-            pending_register_responses: Arc::new(DashMap::new()),
+            pending_register_responses,
+            trunk_tasks,
             did_mappings: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             trunk_ips: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
             config_store: None,
-            events: crate::events::EventBus::new(),
+            events,
             invite_timeout: Duration::from_secs(5),
             call_setup_timeout: Duration::from_secs(60),
             admin_kicks: Arc::new(AdminKicks::new()),
@@ -930,454 +960,24 @@ impl Sbc {
         self.router.trunk_manager().add_trunk(trunk)
     }
 
-    /// Start outbound REGISTER loops for trunks that need it.
-    /// Must be called AFTER `sbc.start()` so UDP listeners are available.
-    /// Uses the main UDP socket (port 5060) so that the trunk sees the same
-    /// source address for REGISTER and INVITE. Responses arrive on the main
-    /// event loop and are routed via `pending_register_responses`.
-    pub fn start_trunk_registrations(&self) {
-        let trunks = self.trunk_manager.list_trunks();
-        let identity = self.identity.clone();
-
-        // Get the main UDP socket (port 5060)
-        let udp_socket = match self.transport.udp_socket() {
-            Some(s) => s,
-            None => {
-                warn!("No UDP socket available — trunk registrations will not start");
-                return;
+    /// Start (or re-sync) the per-trunk OPTIONS health checks and outbound
+    /// REGISTER loops (`trunk_tasks.rs`). Must be called after `start()`
+    /// so the UDP socket exists; later trunk changes (API, reload) re-sync
+    /// the tasks by themselves.
+    pub fn start_trunk_tasks(&self) {
+        match self.transport.udp_socket() {
+            Some(sock) => {
+                self.trunk_tasks.attach_socket(sock);
+                self.trunk_tasks.sync();
             }
-        };
-
-        let pending = self.pending_register_responses.clone();
-
-        for trunk in trunks {
-            if !trunk.register_with_trunk || !trunk.enabled {
-                continue;
-            }
-            info!("Starting outbound REGISTER loop for trunk '{}'", trunk.name);
-            let identity = identity.clone();
-            let sock = udp_socket.clone();
-            let pending = pending.clone();
-            tokio::spawn(Self::trunk_register_task(
-                trunk,
-                identity,
-                sock,
-                pending,
-                self.trunk_manager.clone(),
-                self.metrics.clone(),
-            ));
+            None => warn!(
+                "No UDP socket available — trunk health checks and registrations will not start"
+            ),
         }
     }
 
-    /// Single trunk registration task — uses the shared UDP socket (port 5060).
-    /// Responses are routed from handle_response() via pending_register_responses.
-    async fn trunk_register_task(
-        trunk: TrunkConfig,
-        identity: Option<SbcIdentity>,
-        sock: Arc<tokio::net::UdpSocket>,
-        pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
-        trunk_manager: Arc<TrunkManager>,
-        metrics: Arc<SbcMetrics>,
-    ) {
-        let trunk_name = trunk.name.clone();
-        let interval = trunk.registration_interval.as_secs().max(60);
-
-        loop {
-            info!("Trunk '{}': sending REGISTER", trunk_name);
-            let result = Self::send_trunk_register(&trunk, &sock, &identity, &pending).await;
-            let registered = result.is_ok();
-            trunk_manager.update_state(&trunk.id, |s| s.registered = registered);
-            metrics.set_trunk_registered(&trunk_name, Some(registered));
-            match result {
-                Ok(expires) => {
-                    info!(
-                        "Trunk '{}': registered successfully (expires={}s)",
-                        trunk_name, expires
-                    );
-                    let sleep_secs = ((expires as f64) * 0.8) as u64;
-                    let sleep_secs = sleep_secs.max(30).min(interval);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
-                }
-                Err(reason) => {
-                    warn!(
-                        "Trunk '{}': REGISTER failed: {}, retrying in 60s",
-                        trunk_name, reason
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                }
-            }
-        }
-    }
-
-    /// Send a REGISTER to a trunk via the shared UDP socket (port 5060).
-    /// Waits for the response via a oneshot channel populated by handle_response().
-    /// Handles 401/407 auth challenge inline.
-    async fn send_trunk_register(
-        trunk: &TrunkConfig,
-        sock: &tokio::net::UdpSocket,
-        identity: &Option<SbcIdentity>,
-        pending: &Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
-    ) -> std::result::Result<u32, String> {
-        let dest = trunk
-            .destination()
-            .ok_or_else(|| format!("No destination for trunk '{}'", trunk.name))?;
-
-        let call_id = format!(
-            "reg-{}-{}",
-            trunk.name,
-            &uuid::Uuid::new_v4().to_string()[..8]
-        );
-        let branch = format!(
-            "z9hG4bK{}",
-            &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
-        );
-        let tag = uuid::Uuid::new_v4().to_string()[..8].to_string();
-
-        let (sbc_ip, _sbc_domain) = match identity {
-            Some(id) => (id.public_ip.clone(), id.sip_domain.clone()),
-            None => ("127.0.0.1".to_string(), trunk.host.clone()),
-        };
-
-        let username = trunk.username.as_deref().unwrap_or("anonymous");
-        let request_uri = format!("sip:{}", trunk.host);
-        let from = format!("<sip:{}@{}>;tag={}", username, trunk.host, tag);
-        let to = format!("<sip:{}@{}>", username, trunk.host);
-        let contact = format!("<sip:{}@{}:5060;transport=udp>", username, sbc_ip);
-        let via = format!("SIP/2.0/UDP {}:5060;branch={};rport", sbc_ip, branch);
-        let expires = trunk.registration_interval.as_secs();
-
-        let register_msg = format!(
-            "REGISTER {} SIP/2.0\r\n\
-             Via: {}\r\n\
-             Max-Forwards: 70\r\n\
-             From: {}\r\n\
-             To: {}\r\n\
-             Call-ID: {}\r\n\
-             CSeq: 1 REGISTER\r\n\
-             Contact: {}\r\n\
-             Expires: {}\r\n\
-             User-Agent: NIXI-SBC/1.0\r\n\
-             Content-Length: 0\r\n\r\n",
-            request_uri, via, from, to, call_id, contact, expires
-        );
-
-        // Register a oneshot channel so handle_response() can route the reply to us
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-        pending.insert(call_id.clone(), tx);
-
-        // Send via the shared socket (port 5060)
-        sock.send_to(register_msg.as_bytes(), dest)
-            .await
-            .map_err(|e| {
-                pending.remove(&call_id);
-                format!("Send failed: {}", e)
-            })?;
-
-        debug!(
-            "Trunk '{}': sent REGISTER to {} via port 5060 (Call-ID: {})",
-            trunk.name, dest, call_id
-        );
-
-        // Wait for response via the oneshot channel (routed by handle_response)
-        let response_raw =
-            match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await {
-                Ok(Ok(raw)) => raw,
-                Ok(Err(_)) => {
-                    pending.remove(&call_id);
-                    return Err("Response channel closed".to_string());
-                }
-                Err(_) => {
-                    pending.remove(&call_id);
-                    return Err("Timeout (10s)".to_string());
-                }
-            };
-
-        let status = crate::trunk_register::parse_status(&response_raw);
-        debug!("Trunk '{}': got {} for REGISTER", trunk.name, status);
-
-        match status {
-            200 => {
-                let exp = crate::trunk_register::parse_expires(&response_raw).unwrap_or(300);
-                Ok(exp)
-            }
-            401 | 407 => {
-                // Extract challenge and retry with auth
-                let header_name = if status == 401 {
-                    "www-authenticate"
-                } else {
-                    "proxy-authenticate"
-                };
-                let challenge_str =
-                    crate::trunk_register::extract_header(&response_raw, header_name)
-                        .ok_or_else(|| format!("No {} header in {}", header_name, status))?;
-                let challenge = DigestChallenge::from_header(&challenge_str)
-                    .map_err(|e| format!("Bad challenge: {}", e))?;
-
-                let password = trunk.password.as_deref().unwrap_or("");
-                let auth_value = generate_digest_response(
-                    username,
-                    password,
-                    &challenge,
-                    "REGISTER",
-                    &request_uri,
-                );
-
-                info!(
-                    "Trunk '{}': {} challenge, retrying with auth (realm='{}')",
-                    trunk.name, status, challenge.realm
-                );
-
-                let auth_header_name = if status == 401 {
-                    "Authorization"
-                } else {
-                    "Proxy-Authorization"
-                };
-                let branch2 = format!(
-                    "z9hG4bK{}",
-                    &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
-                );
-                let via2 = format!("SIP/2.0/UDP {}:5060;branch={};rport", sbc_ip, branch2);
-
-                let register_auth = format!(
-                    "REGISTER {} SIP/2.0\r\n\
-                     Via: {}\r\n\
-                     Max-Forwards: 70\r\n\
-                     From: {}\r\n\
-                     To: {}\r\n\
-                     Call-ID: {}\r\n\
-                     CSeq: 2 REGISTER\r\n\
-                     Contact: {}\r\n\
-                     {}: {}\r\n\
-                     Expires: {}\r\n\
-                     User-Agent: NIXI-SBC/1.0\r\n\
-                     Content-Length: 0\r\n\r\n",
-                    request_uri,
-                    via2,
-                    from,
-                    to,
-                    call_id,
-                    contact,
-                    auth_header_name,
-                    auth_value,
-                    expires
-                );
-
-                // Register a new oneshot for the auth response
-                let (tx2, rx2) = tokio::sync::oneshot::channel::<String>();
-                pending.insert(call_id.clone(), tx2);
-
-                sock.send_to(register_auth.as_bytes(), dest)
-                    .await
-                    .map_err(|e| {
-                        pending.remove(&call_id);
-                        format!("Auth send failed: {}", e)
-                    })?;
-
-                // Wait for auth response via oneshot channel
-                let response_raw2 =
-                    match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx2).await {
-                        Ok(Ok(raw)) => raw,
-                        Ok(Err(_)) => {
-                            pending.remove(&call_id);
-                            return Err("Auth response channel closed".to_string());
-                        }
-                        Err(_) => {
-                            pending.remove(&call_id);
-                            return Err("Auth response timeout".to_string());
-                        }
-                    };
-
-                let status2 = crate::trunk_register::parse_status(&response_raw2);
-                if status2 == 200 {
-                    let exp = crate::trunk_register::parse_expires(&response_raw2).unwrap_or(300);
-                    Ok(exp)
-                } else {
-                    Err(format!("Auth retry got {}", status2))
-                }
-            }
-            _ => Err(format!("Unexpected status: {}", status)),
-        }
-    }
-
-    /// Start trunk health checks (OPTIONS keepalive every 30s)
-    pub fn start_trunk_health_checks(&self) {
-        let trunks = self.trunk_manager.list_trunks();
-        let identity = self.identity.clone();
-        let trunk_manager = self.trunk_manager.clone();
-        let metrics = self.metrics.clone();
-
-        let udp_socket = match self.transport.udp_socket() {
-            Some(s) => s,
-            None => {
-                warn!("No UDP socket available — trunk health checks will not start");
-                return;
-            }
-        };
-
-        let pending = self.pending_register_responses.clone();
-
-        for trunk in trunks {
-            if !trunk.enabled {
-                continue;
-            }
-            info!(
-                "Starting OPTIONS health check for trunk '{}' ({}:{})",
-                trunk.name, trunk.host, trunk.port
-            );
-            let identity = identity.clone();
-            let sock = udp_socket.clone();
-            let pending = pending.clone();
-            let tm = trunk_manager.clone();
-            let metrics = metrics.clone();
-            let events = self.events.clone();
-            tokio::spawn(Self::trunk_health_check_task(
-                trunk, identity, sock, pending, tm, metrics, events,
-            ));
-        }
-    }
-
-    /// Health check task — sends OPTIONS to trunk every 30s, tracks up/down state
-    async fn trunk_health_check_task(
-        trunk: TrunkConfig,
-        identity: Option<SbcIdentity>,
-        sock: Arc<tokio::net::UdpSocket>,
-        pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<String>>>,
-        trunk_manager: Arc<TrunkManager>,
-        metrics: Arc<SbcMetrics>,
-        events: crate::events::EventBus,
-    ) {
-        let trunk_name = trunk.name.clone();
-        let trunk_id = trunk.id;
-        let mut was_up = true;
-        let mut ever_responded = false; // Track if trunk supports OPTIONS at all
-
-        // Wait 5s before first check (let SBC finish starting)
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        loop {
-            let dest = match trunk.destination() {
-                Some(d) => d,
-                None => {
-                    warn!("Trunk '{}': no destination for health check", trunk_name);
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    continue;
-                }
-            };
-
-            let call_id = format!(
-                "hc-{}-{}",
-                trunk_name,
-                &uuid::Uuid::new_v4().to_string()[..8]
-            );
-            let branch = format!(
-                "z9hG4bK{}",
-                &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
-            );
-
-            let (sbc_ip, _) = match &identity {
-                Some(id) => (id.public_ip.clone(), id.sip_domain.clone()),
-                None => ("127.0.0.1".to_string(), trunk.host.clone()),
-            };
-
-            let options_msg = format!(
-                "OPTIONS sip:{}:{} SIP/2.0\r\n\
-                 Via: SIP/2.0/UDP {}:5060;branch={};rport\r\n\
-                 Max-Forwards: 70\r\n\
-                 From: <sip:healthcheck@{}>;tag={}\r\n\
-                 To: <sip:{}:{}>\r\n\
-                 Call-ID: {}\r\n\
-                 CSeq: 1 OPTIONS\r\n\
-                 User-Agent: NIXI-SBC/1.0\r\n\
-                 Content-Length: 0\r\n\r\n",
-                trunk.host,
-                trunk.port,
-                sbc_ip,
-                branch,
-                sbc_ip,
-                &uuid::Uuid::new_v4().to_string()[..8],
-                trunk.host,
-                trunk.port,
-                call_id,
-            );
-
-            // Register oneshot for response
-            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-            pending.insert(call_id.clone(), tx);
-
-            let is_up = match sock.send_to(options_msg.as_bytes(), dest).await {
-                Ok(_) => match tokio::time::timeout(Duration::from_secs(5), rx).await {
-                    Ok(Ok(raw)) => {
-                        let status = crate::trunk_register::parse_status(&raw);
-                        (200..500).contains(&status)
-                    }
-                    _ => {
-                        pending.remove(&call_id);
-                        false
-                    }
-                },
-                Err(_) => {
-                    pending.remove(&call_id);
-                    false
-                }
-            };
-
-            // sbc_trunk_up: 1/0 once the trunk has answered OPTIONS at
-            // least once; never exported for a trunk that ignores OPTIONS.
-            if is_up {
-                metrics.set_trunk_up(&trunk_name, Some(true));
-            } else if ever_responded {
-                metrics.set_trunk_up(&trunk_name, Some(false));
-            }
-
-            // State transition logging
-            if is_up {
-                ever_responded = true;
-                if !was_up {
-                    info!("Trunk '{}' is UP — responding to OPTIONS", trunk_name);
-                    trunk_manager.update_state(&trunk_id, |s| s.record_success());
-                    events.publish(crate::events::SbcEvent::TrunkHealth {
-                        trunk: trunk_name.clone(),
-                        status: "up".to_string(),
-                        consecutive_failures: 0,
-                        ts: crate::events::event_ts(),
-                    });
-                }
-            } else if ever_responded {
-                // Trunk previously responded to OPTIONS but stopped — real issue
-                if was_up {
-                    warn!(
-                        "Trunk '{}' is DOWN — no response to OPTIONS (timeout 5s)",
-                        trunk_name
-                    );
-                    trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
-                    let failures = trunk_manager
-                        .get_state(&trunk_id)
-                        .map(|s| s.consecutive_failures)
-                        .unwrap_or(1);
-                    events.publish(crate::events::SbcEvent::TrunkHealth {
-                        trunk: trunk_name.clone(),
-                        status: "down".to_string(),
-                        consecutive_failures: failures,
-                        ts: crate::events::event_ts(),
-                    });
-                } else {
-                    trunk_manager.update_state(&trunk_id, |s| s.record_trunk_failure());
-                    debug!("Trunk '{}' still DOWN", trunk_name);
-                }
-            } else {
-                // Trunk never responded to OPTIONS — probably doesn't support it
-                // Log once at info level, then go quiet
-                if was_up {
-                    info!(
-                        "Trunk '{}' does not respond to OPTIONS — health check passive only",
-                        trunk_name
-                    );
-                }
-            }
-
-            was_up = is_up;
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
+    pub fn trunk_tasks(&self) -> Arc<crate::trunk_tasks::TrunkTasks> {
+        self.trunk_tasks.clone()
     }
 
     /// Start the SBC with network configuration
@@ -1497,11 +1097,13 @@ impl Sbc {
                 _ = sigterm.recv() => {
                     info!("SIGTERM received — graceful shutdown");
                     self.graceful_shutdown().await;
+                    self.trunk_tasks.shutdown().await;
                     break;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("SIGINT received — graceful shutdown");
                     self.graceful_shutdown().await;
+                    self.trunk_tasks.shutdown().await;
                     break;
                 }
             }
@@ -1525,6 +1127,7 @@ impl Sbc {
                     _ = tokio::signal::ctrl_c() => {
                         info!("SIGINT received — graceful shutdown");
                         self.graceful_shutdown().await;
+                        self.trunk_tasks.shutdown().await;
                         break;
                     }
                 }

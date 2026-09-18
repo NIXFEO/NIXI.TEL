@@ -42,6 +42,20 @@ pub enum SbcEvent {
         consecutive_failures: u32,
         ts: u64,
     },
+    /// The SBC's outbound REGISTER to a trunk was accepted (once per
+    /// registration, not per refresh).
+    TrunkRegistered {
+        trunk: String,
+        expires: u32,
+        ts: u64,
+    },
+    /// The outbound REGISTER to a trunk failed (`reason`: SIP status,
+    /// `timeout`, `send-failed: …`), once per transition.
+    TrunkUnregistered {
+        trunk: String,
+        reason: String,
+        ts: u64,
+    },
     Alert {
         level: String,
         kind: String,
@@ -62,7 +76,9 @@ impl SbcEvent {
         match self {
             Self::CallStarted { .. } | Self::CallAnswered { .. } | Self::CallEnded { .. } => "call",
             Self::Registered { .. } | Self::Unregistered { .. } => "registration",
-            Self::TrunkHealth { .. } => "trunk",
+            Self::TrunkHealth { .. }
+            | Self::TrunkRegistered { .. }
+            | Self::TrunkUnregistered { .. } => "trunk",
             Self::Alert { .. } => "alert",
             Self::ConfigChanged { .. } => "config",
         }

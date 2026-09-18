@@ -60,6 +60,13 @@ pub async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
                 "failures": s.consecutive_failures,
             }));
         }
+        if t.enabled && t.register_with_trunk && !s.registered {
+            alerts.push(json!({
+                "level": "warning",
+                "type": "trunk_unregistered",
+                "trunk": t.name,
+            }));
+        }
     }
 
     let auth_failures = state.metrics.auth_failures_total.load(Ordering::Relaxed);

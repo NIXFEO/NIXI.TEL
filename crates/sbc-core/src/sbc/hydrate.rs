@@ -173,7 +173,18 @@ pub async fn apply_trunks_and_routes(
             .unwrap_or(&[]);
         let mut cfg = trunk_row_to_config(row, extra);
 
-        if tm.find_by_name(&row.name).is_some() {
+        if let Some(existing) = tm.find_by_name(&row.name) {
+            // A changed host/port (or one never resolved) needs a fresh
+            // destination: the trunk tasks restart on the new address.
+            let changed = existing.host != cfg.host || existing.port != cfg.port;
+            if (changed || existing.resolved_addr.is_none())
+                && cfg.resolve_destination().await.is_none()
+            {
+                warn!(
+                    "Hydrate: trunk '{}': DNS resolution failed for {}:{} — will retry",
+                    cfg.name, cfg.host, cfg.port
+                );
+            }
             tm.update_trunk_by_name(&row.name, cfg);
             updated += 1;
         } else {

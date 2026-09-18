@@ -23,6 +23,46 @@ pub struct SbcConfig {
     /// Inbound DID → SIP user mapping (loaded from [[dids]] sections)
     #[serde(default)]
     pub dids: Vec<DidMapping>,
+    /// Timings of the per-trunk OPTIONS probes and REGISTER retries
+    /// (`[trunk_health]`, boot-only).
+    #[serde(default)]
+    pub trunk_health: TrunkHealthConfig,
+}
+
+/// `[trunk_health]`: OPTIONS health checks and outbound REGISTER retries.
+/// Read at boot only (the tasks themselves follow the trunk table live).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrunkHealthConfig {
+    /// Seconds between two OPTIONS probes of a trunk.
+    #[serde(default = "default_options_interval")]
+    pub options_interval: u64,
+    /// Seconds to wait for the OPTIONS answer before counting a miss.
+    #[serde(default = "default_options_timeout")]
+    pub options_timeout: u64,
+    /// Cap (seconds) of the exponential retry after a refused or unanswered
+    /// outbound REGISTER (starts at 30 s, doubles, resets on success).
+    #[serde(default = "default_register_backoff_max")]
+    pub register_backoff_max: u64,
+}
+
+fn default_options_interval() -> u64 {
+    30
+}
+fn default_options_timeout() -> u64 {
+    5
+}
+fn default_register_backoff_max() -> u64 {
+    900
+}
+
+impl Default for TrunkHealthConfig {
+    fn default() -> Self {
+        Self {
+            options_interval: default_options_interval(),
+            options_timeout: default_options_timeout(),
+            register_backoff_max: default_register_backoff_max(),
+        }
+    }
 }
 
 /// DID (Direct Inward Dialing) mapping: PSTN number → local SIP user
@@ -532,6 +572,7 @@ impl Default for SbcConfig {
             },
             trunks: Vec::new(),
             dids: Vec::new(),
+            trunk_health: TrunkHealthConfig::default(),
         }
     }
 }
@@ -655,5 +696,13 @@ mod example_config_tests {
             "a proxy that is not an IP is a config error at startup"
         );
         assert!(cfg.management.ban_on_auth_failure);
+        assert_eq!(
+            (
+                cfg.trunk_health.options_interval,
+                cfg.trunk_health.options_timeout,
+                cfg.trunk_health.register_backoff_max
+            ),
+            (30, 5, 900)
+        );
     }
 }

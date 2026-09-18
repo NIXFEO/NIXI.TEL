@@ -36,6 +36,7 @@ pub mod topology;
 pub mod transcoding;
 
 pub mod trunk_register;
+pub mod trunk_tasks;
 
 pub use error::{Error, Result};
 /// SIP parser used throughout the public API (`rsip::Transport`, requests, responses).

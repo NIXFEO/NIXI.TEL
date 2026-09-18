@@ -76,13 +76,14 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 
 | File | Role |
 |------|------|
-| `sbc/mod.rs` | Core struct, config, event loop, REGISTER, OPTIONS, pipeline |
+| `sbc/mod.rs` | Core struct, config, event loop, REGISTER, OPTIONS, pipeline, reload |
 | `sbc/invite_handler.rs` | INVITE routing, trunk failover, 407/422 retries, session-timer offer |
 | `sbc/response_handler.rs` | Response relay, non-2xx ACK + per-attempt attribution, SDP, WebRTC/DTLS/SRTP, session-timer completion |
 | `sbc/call_handler.rs` | BYE/CANCEL/ACK/INFO, re-INVITE, timeouts, graceful shutdown |
 | `sbc/cdr.rs` | `CallOutcome`, `finish_call` (single CDR/metrics/release path), `hangup_both_legs`, RTP/setup timeouts, admin kicks |
 | `sbc/invite_tx.rs` | INVITE server-transaction memory: retransmissions replay the last response (RFC 3261 §17.2.1) |
 | `sbc/trunk_state.rs` | Trunk state fed by real calls: per-trunk active-call counting, failure ladder / `503 Retry-After` park, success reset, per-trunk metrics labels |
+| `trunk_tasks.rs` | Per-trunk OPTIONS health check + outbound REGISTER loops (423 Min-Expires, backoff) as a registry that follows the trunk table (API writes, reload) with cancellation |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |

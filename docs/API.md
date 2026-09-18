@@ -88,9 +88,9 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/v1/trunks` | stored config + live health, password redacted |
+| GET | `/api/v1/trunks` | stored config + live health (`health`, `active_calls`, `consecutive_failures`, `registered`: true/false for trunks with `register_with_trunk`, null otherwise), password redacted |
 | POST | `/api/v1/trunks` | full field set: `name`, `host`, `port`, `transport` (UDP/TCP/TLS/WS/WSS), `auth_required`, `username`, `password`, `register_with_trunk`, `prefix_patterns[]`, `priority`, `weight`, `cost_per_minute`, `number_format`, `country_code`, `national_prefix`, `caller_number_override`, `allowed_codecs[]`, `max_concurrent_calls`, `tls_sni`, `tls_ca_cert`, `tls_verify`, `tls_client_cert`, `tls_client_key` |
-| GET/PUT/PATCH/DELETE | `/api/v1/trunks/{name}` | GET masks `password` as `"***"`; PUT replaces every field (an omitted `password` clears it) and refuses `"***"`; PATCH merges any subset (RFC 7396: `null` clears a field, the password and TLS material stay unless given, unknown keys such as the GET-only `tls`/`health` → 400); DELETE refuses while calls are active |
+| GET/PUT/PATCH/DELETE | `/api/v1/trunks/{name}` | GET masks `password` as `"***"`; PUT replaces every field (an omitted `password` clears it) and refuses `"***"`; PATCH merges any subset (RFC 7396: `null` clears a field, the password and TLS material stay unless given, unknown keys such as the GET-only `tls`/`health`/`registered` → 400); DELETE refuses while calls are active. Every write re-syncs the trunk's OPTIONS health check and outbound REGISTER loop (start, stop, or restart when host/port/transport/credentials/interval change) |
 | POST | `/api/v1/trunks/{name}/enable` · `/disable` | |
 
 ### Routes (prefix → trunk)
@@ -135,7 +135,9 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 
 `GET /api/v1/events` streams JSON events with the SSE `event:` field set to
 the category: `call` (`call_started`/`call_answered`/`call_ended`),
-`registration`, `trunk` (health transitions), `alert` (incl. security:
+`registration`, `trunk` (`trunk_health` up/down transitions,
+`trunk_registered` once per accepted outbound REGISTER, `trunk_unregistered`
+with the reason once per failure transition), `alert` (incl. security:
 bans, destination blocks, limit hits), `config` (CRUD changes). Slow
 consumers receive a `lagged` event with the number of skipped messages.
 

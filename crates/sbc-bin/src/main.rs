@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
             api_rate_limit_per_min: config.management.api_rate_limit_per_min,
             security: sbc.security(),
             kicks: sbc.admin_kicks(),
+            trunk_tasks: sbc.trunk_tasks(),
             trusted_proxies: std::sync::Arc::new(config.management.trusted_proxies.clone()),
             ban_on_auth_failure: config.management.ban_on_auth_failure,
         };
@@ -102,11 +103,9 @@ async fn main() -> Result<()> {
     // Start transport listeners
     sbc.start(&config.network, None).await?;
 
-    // Start outbound REGISTER loops for trunks that need it
-    sbc.start_trunk_registrations();
-
-    // Start trunk health checks (OPTIONS keepalive every 30s)
-    sbc.start_trunk_health_checks();
+    // OPTIONS health checks + outbound REGISTER loops per enabled trunk;
+    // they follow the trunk table from here on (API writes, reload).
+    sbc.start_trunk_tasks();
 
     info!("SBC started successfully");
     info!("Instance ID: {}", config.general.instance_id);
