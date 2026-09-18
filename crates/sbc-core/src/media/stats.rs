@@ -450,6 +450,51 @@ mod tests {
         assert!(s.idle_ms() < 1_000);
     }
 
+    /// The accounting runs on every RTP packet of every call (50 pps per
+    /// direction, 200 calls targeted = 20 000 calls/s of accounting on
+    /// 2 vCPU). It must cost atomics, not locks or allocations: this test
+    /// fails if someone adds either.
+    #[test]
+    fn the_per_packet_accounting_stays_cheap() {
+        use crate::media::endpoint::{EndpointPolicy, Observation};
+
+        let stats = CallMediaStats::new();
+        let policy = EndpointPolicy::default();
+        let packet = packet(0x1234_5678, 1);
+        let latched: std::net::SocketAddr = "203.0.113.9:6004".parse().unwrap();
+        const N: usize = 200_000;
+
+        let started = std::time::Instant::now();
+        for i in 0..N {
+            stats.note_rx(Leg::Caller, &packet);
+            let _ = policy.observe(Observation {
+                latched: Some(latched),
+                signalled: Some(latched),
+                source: latched,
+                plausible: true,
+                same_stream: true,
+                latched_quiet_for: stats.quiet_for(Leg::Caller),
+            });
+            stats.note_tx(Leg::Callee, 172);
+            if i % 10_000 == 0 {
+                let _ = stats.idle_ms();
+                let _ = stats.one_way_leg(10_000);
+            }
+        }
+        let elapsed = started.elapsed();
+        // Generous even for a debug build: 200 000 packets through the
+        // whole accounting path in under 2 s is ~10 µs each, and a real
+        // release build is two orders of magnitude faster. A lock or a
+        // per-packet allocation would blow past it.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "{} packets of accounting took {:?}",
+            N,
+            elapsed
+        );
+        assert_eq!(stats.caller.rx_packets.load(Ordering::Relaxed), N as u64);
+    }
+
     #[test]
     fn the_summary_names_every_non_zero_drop() {
         let s = CallMediaStats::new();
