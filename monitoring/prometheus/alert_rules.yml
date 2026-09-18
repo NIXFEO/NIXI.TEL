@@ -89,6 +89,32 @@ groups:
         annotations:
           summary: "Trunk {{ $labels.trunk }} is not selectable (cooldown or 503 Retry-After park)"
 
+      - alert: SBCStoreUnavailable
+        # The SQLite config store is not open/hydrated: the SBC runs from the
+        # TOML seeds only ([database] allow_missing_store = true), every
+        # API write answers 503 and /ready stays 503.
+        expr: sbc_store_available == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "SBC config store unavailable (running from TOML seeds only)"
+
+      - alert: SBCStoreBackupStale
+        # No successful backup for twice the configured interval while the
+        # timer is enabled (the interval gauge follows backup_interval_hours).
+        expr: sbc_store_backups_enabled == 1
+              and (time() - sbc_store_backup_last_success_timestamp_seconds) > 2 * sbc_store_backup_interval_seconds
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "SBC store backup is stale (last success older than twice the interval)"
+
+      - alert: SBCStoreBackupFailed
+        expr: increase(sbc_store_backup_failures_total[1d]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "An SBC store backup failed in the last 24 h (disk full? permissions?)"
+
       - alert: SBCAuthFailureSpike
         expr: rate(sbc_auth_failures_total[5m]) > 5
         for: 10m

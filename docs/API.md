@@ -29,7 +29,7 @@ is replaying it through the CRUD endpoints.
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | 200 healthy / 503 (public) |
-| GET | `/ready` | readiness probe (public) |
+| GET | `/ready` | 200 `{"status":"ready","store":true,"hydrated":true,"listening":true}` once the SQLite store is open, hydrated and the SIP listeners are bound; 503 `{"status":"not_ready",…}` otherwise (a TOML-only box with `allow_missing_store` is never ready). Public. |
 | GET | `/metrics` | Prometheus text exposition (`sbc_*`): calls, SIP traffic, auth, anti-fraud, media, per-trunk series (`sbc_trunk_up/registered/active_calls/calls_total{trunk,direction,outcome}`, `sbc_trunk_enabled/available/unavailable_seconds/consecutive_failures`), `sbc_call_setup_seconds` / `sbc_call_duration_seconds` histograms — see `monitoring/README.md` |
 | GET | `/api/v1/stats` | active calls, totals, uptime |
 | GET | `/api/v1/alerts` | current conditions: `trunk_down` (failure cooldown running) / `trunk_parked` (503 Retry-After) with `unavailable_for_secs`, `trunk_unregistered`, `high_auth_failure_rate`… |
@@ -126,6 +126,7 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 |---|---|---|
 | POST | `/api/v1/reload` (alias `/api/v1/config/reload`) | re-hydrate runtime from the store |
 | GET | `/api/v1/export` | full dynamic-config dump (includes auth material — admin only) |
+| POST | `/api/v1/backup` | `VACUUM INTO` copy of the store into `[database] backup_dir` as `sbc-<timestamp>.db`, pruned to `backup_keep`: 200 `{"path","bytes","took_ms","pruned":[…]}`, 409 `backup already in progress`, 503 without a store. The copy holds trunk passwords and user HA1s. |
 
 ### Legacy aliases
 

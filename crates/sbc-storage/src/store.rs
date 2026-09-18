@@ -10,7 +10,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tracing::info;
 
-use crate::models::{AclRuleRow, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow};
+use crate::models::{
+    AclRuleRow, BackupInfo, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow,
+};
 use crate::{Error, Result};
 
 /// Embedded migrations. `ignore_missing` lets an older binary (rolled back
@@ -601,6 +603,152 @@ const TRUNK_COLS: &str = "name, enabled, host, port, transport, auth_required, u
     caller_number_format, caller_number_override, caller_display_name, allowed_codecs, \
     max_concurrent_calls, tls_sni, tls_ca_cert, tls_verify, tls_client_cert, tls_client_key";
 
+// ── Backups ──────────────────────────────────────────────────────────────────
+
+/// `sbc-YYYYmmdd-HHMMSS[-n].db` → (timestamp, n), None for any other name.
+fn backup_name_key(name: &str) -> Option<(String, u32)> {
+    let rest = name.strip_prefix("sbc-")?.strip_suffix(".db")?;
+    let (stamp, suffix) = match rest.split_at_checked(15) {
+        Some((stamp, suffix)) => (stamp, suffix),
+        None => return None,
+    };
+    let ok = stamp.len() == 15
+        && stamp[..8].bytes().all(|b| b.is_ascii_digit())
+        && &stamp[8..9] == "-"
+        && stamp[9..].bytes().all(|b| b.is_ascii_digit());
+    if !ok {
+        return None;
+    }
+    let n = match suffix {
+        "" => 0,
+        s => s.strip_prefix('-')?.parse::<u32>().ok()?,
+    };
+    Some((stamp.to_string(), n))
+}
+
+impl ConfigStore {
+    /// Write a consistent copy of the store into `dir` as
+    /// `sbc-<YYYYmmdd-HHMMSS>.db` (`VACUUM INTO` on a temporary name,
+    /// fsync, then rename). The directory is created 0700 when missing
+    /// (an existing directory's mode is left alone), the file is 0600: it
+    /// holds trunk passwords and user HA1s.
+    pub async fn backup_to(&self, dir: &Path) -> Result<BackupInfo> {
+        let started = std::time::Instant::now();
+        let io = |what: &str, e: std::io::Error| Error::Database(format!("backup {}: {}", what, e));
+        if tokio::fs::metadata(dir).await.is_err() {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| io("create dir", e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
+            }
+        }
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let mut final_path = dir.join(format!("sbc-{}.db", stamp));
+        let mut n = 0;
+        while tokio::fs::metadata(&final_path).await.is_ok() {
+            n += 1;
+            final_path = dir.join(format!("sbc-{}-{}.db", stamp, n));
+        }
+        let tmp = final_path.with_extension("db.tmp");
+        let _ = tokio::fs::remove_file(&tmp).await; // VACUUM INTO refuses a non-empty target
+        let target = tmp.to_string_lossy().into_owned();
+        sqlx::query("VACUUM INTO ?1")
+            .bind(&target)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Database(format!("backup into {}: {}", target, e)))?;
+        let file = tokio::fs::File::open(&tmp)
+            .await
+            .map_err(|e| io("open copy", e))?;
+        file.sync_all().await.map_err(|e| io("fsync", e))?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|e| io("chmod", e))?;
+        }
+        tokio::fs::rename(&tmp, &final_path)
+            .await
+            .map_err(|e| io("rename", e))?;
+        let bytes = tokio::fs::metadata(&final_path)
+            .await
+            .map_err(|e| io("stat", e))?
+            .len();
+        Ok(BackupInfo {
+            path: final_path,
+            bytes,
+            took_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// Delete the backups beyond the `keep` newest (`keep` 0 = keep all) and
+/// any `.tmp` older than an hour (an interrupted `VACUUM INTO`). Returns
+/// the removed paths. Runs on the blocking pool.
+pub async fn prune_backups(dir: &Path, keep: usize) -> Result<Vec<std::path::PathBuf>> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>> {
+        let mut removed = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+            Err(e) => return Err(Error::Database(format!("prune backups: {}", e))),
+        };
+        let mut backups: Vec<((String, u32), std::path::PathBuf)> = Vec::new();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(key) = backup_name_key(name) {
+                backups.push((key, path));
+            } else if name.starts_with("sbc-") && name.ends_with(".db.tmp") {
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|m| m < hour_ago)
+                    .unwrap_or(false);
+                if stale && std::fs::remove_file(&path).is_ok() {
+                    removed.push(path);
+                }
+            }
+        }
+        if keep > 0 {
+            backups.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+            for (_, path) in backups.into_iter().skip(keep) {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed.push(path);
+                }
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|e| Error::Database(format!("prune backups: {}", e)))?
+}
+
+/// The newest backup in `dir` by name, with its modification time.
+pub fn newest_backup(dir: &Path) -> Option<(std::path::PathBuf, std::time::SystemTime)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let key = backup_name_key(path.file_name()?.to_str()?)?;
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            Some((key, path, mtime))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, path, mtime)| (path, mtime))
+}
+
 fn db_err(e: sqlx::Error) -> Error {
     Error::Database(e.to_string())
 }
@@ -794,5 +942,110 @@ mod tests {
         store.set_setting("k", "v1").await.unwrap();
         store.set_setting("k", "v2").await.unwrap();
         assert_eq!(store.get_setting("k").await.unwrap().unwrap(), "v2");
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sbc-store-{}-{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn backup_names_are_recognised_and_ordered() {
+        assert_eq!(
+            backup_name_key("sbc-20260918-101500.db"),
+            Some(("20260918-101500".into(), 0))
+        );
+        assert_eq!(
+            backup_name_key("sbc-20260918-101500-2.db"),
+            Some(("20260918-101500".into(), 2))
+        );
+        assert_eq!(
+            backup_name_key("sbc-db-20260918-101500.db"),
+            None,
+            "deploy.sh copies"
+        );
+        assert_eq!(backup_name_key("sbc-20260918-101500.db.tmp"), None);
+        assert_eq!(backup_name_key("sbc-2026091-101500.db"), None);
+        assert!(
+            backup_name_key("sbc-20260918-101500-1.db") > backup_name_key("sbc-20260918-101500.db")
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_to_writes_a_consistent_copy_and_prune_keeps_the_newest() {
+        let dir = temp_dir("backup");
+        let store = ConfigStore::open(dir.join("live.db").to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .upsert_user(&UserRow {
+                username: "alice".into(),
+                ha1: "a".repeat(32),
+                realm: "r".into(),
+                display_name: None,
+                enabled: true,
+                max_concurrent_calls: None,
+                max_calls_per_minute: None,
+            })
+            .await
+            .unwrap();
+        let backups = dir.join("backups");
+        let first = store.backup_to(&backups).await.unwrap();
+        assert!(first.bytes > 0);
+        assert!(backup_name_key(first.path.file_name().unwrap().to_str().unwrap()).is_some());
+        assert!(!backups
+            .join(first.path.file_name().unwrap())
+            .with_extension("db.tmp")
+            .exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&first.path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&backups).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let copy = ConfigStore::open(first.path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            copy.get_user("alice").await.unwrap().is_some(),
+            "the copy is a usable store"
+        );
+
+        // Same second: a suffix, no collision.
+        let second = store.backup_to(&backups).await.unwrap();
+        let third = store.backup_to(&backups).await.unwrap();
+        assert_ne!(first.path, second.path);
+        assert_ne!(second.path, third.path);
+        let (path, _) = newest_backup(&backups).unwrap();
+        assert_eq!(path, third.path, "newest by (timestamp, suffix)");
+
+        // A stale tmp from an interrupted VACUUM, and prune to 2.
+        let stale = backups.join("sbc-20200101-000000.db.tmp");
+        std::fs::write(&stale, b"x").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let removed = prune_backups(&backups, 2).await.unwrap();
+        assert!(removed.contains(&first.path), "{:?}", removed);
+        assert!(removed.contains(&stale));
+        assert!(second.path.exists() && third.path.exists());
+        assert!(
+            prune_backups(&backups, 0).await.unwrap().is_empty(),
+            "keep 0 = keep all"
+        );
+        assert!(prune_backups(&dir.join("absent"), 2)
+            .await
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

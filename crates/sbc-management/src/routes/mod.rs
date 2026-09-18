@@ -5,6 +5,7 @@ pub mod calls;
 pub mod config_api;
 pub mod events;
 pub mod security;
+pub mod store;
 pub mod system;
 pub mod trunks;
 

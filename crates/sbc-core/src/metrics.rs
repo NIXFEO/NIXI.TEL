@@ -236,6 +236,16 @@ pub struct SbcMetrics {
 
     /// Per-trunk gauges and counters (see [`TrunkSeries`]).
     pub trunks: Arc<std::sync::Mutex<HashMap<String, TrunkSeries>>>,
+    /// 1 when the SQLite config store is open and hydrated.
+    pub store_available: Arc<AtomicU64>,
+    /// 1 when the backup timer runs.
+    pub store_backups_enabled: Arc<AtomicU64>,
+    /// The timer's interval (seconds), for the staleness alert.
+    pub store_backup_interval_secs: Arc<AtomicU64>,
+    /// Unix time of the last successful backup (0 = none known).
+    pub store_backup_last_success_time: Arc<AtomicU64>,
+    pub store_backup_last_bytes: Arc<AtomicU64>,
+    pub store_backup_failures_total: Arc<AtomicU64>,
     /// INVITE forwarded → final answer, answered calls only.
     pub call_setup_seconds: Histogram,
     /// Answer → end (the billable window).
@@ -285,6 +295,12 @@ impl SbcMetrics {
             auth_nonces: Arc::new(AtomicU64::new(0)),
             last_cdr_written_time: Arc::new(AtomicU64::new(0)),
             trunks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            store_available: Arc::new(AtomicU64::new(0)),
+            store_backups_enabled: Arc::new(AtomicU64::new(0)),
+            store_backup_interval_secs: Arc::new(AtomicU64::new(0)),
+            store_backup_last_success_time: Arc::new(AtomicU64::new(0)),
+            store_backup_last_bytes: Arc::new(AtomicU64::new(0)),
+            store_backup_failures_total: Arc::new(AtomicU64::new(0)),
             call_setup_seconds: Histogram::new(SETUP_BUCKETS),
             call_duration_seconds: Histogram::new(DURATION_BUCKETS),
             start_time: SystemTime::now()
@@ -443,6 +459,40 @@ impl SbcMetrics {
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
+    pub fn set_store_available(&self, on: bool) {
+        self.store_available.store(u64::from(on), Ordering::Relaxed);
+    }
+
+    pub fn set_store_backups(&self, interval: Option<Duration>) {
+        self.store_backups_enabled
+            .store(u64::from(interval.is_some()), Ordering::Relaxed);
+        self.store_backup_interval_secs.store(
+            interval.map(|d| d.as_secs()).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// A backup succeeded now.
+    pub fn record_store_backup(&self, bytes: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        self.record_store_backup_at(now, bytes);
+    }
+
+    /// Seed the last-success gauge from an existing file (survives restarts).
+    pub fn record_store_backup_at(&self, unix_secs: u64, bytes: u64) {
+        self.store_backup_last_success_time
+            .store(unix_secs, Ordering::Relaxed);
+        self.store_backup_last_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn inc_store_backup_failure(&self) {
+        self.store_backup_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_cdr_written(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -600,6 +650,38 @@ impl SbcMetrics {
             "sbc_last_cdr_written_timestamp_seconds",
             "Unix time of the last CDR written (0 = none since start)",
             self.last_cdr_written_time.load(Ordering::Relaxed)
+        );
+
+        // ── Config store ──────────────────────────────────────────────────────
+        gauge!(
+            "sbc_store_available",
+            "SQLite config store open and hydrated (1) or missing (0)",
+            self.store_available.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "sbc_store_backups_enabled",
+            "Automatic store backups scheduled (1) or disabled (0)",
+            self.store_backups_enabled.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "sbc_store_backup_interval_seconds",
+            "Interval of the automatic store backups (0 when disabled)",
+            self.store_backup_interval_secs.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "sbc_store_backup_last_success_timestamp_seconds",
+            "Unix time of the last successful store backup (0 = none known)",
+            self.store_backup_last_success_time.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "sbc_store_backup_last_bytes",
+            "Size of the last successful store backup",
+            self.store_backup_last_bytes.load(Ordering::Relaxed)
+        );
+        counter!(
+            "sbc_store_backup_failures",
+            "Store backups that failed (API or timer)",
+            self.store_backup_failures_total.load(Ordering::Relaxed)
         );
 
         // ── SIP counters ──────────────────────────────────────────────────────
@@ -1248,6 +1330,22 @@ mod tests {
         assert!(output.contains("# TYPE sbc_session_timer_422_retries counter"));
         assert!(output.contains("sbc_session_timer_422_retries_total 1"));
         assert!(output.contains("# TYPE sbc_last_cdr_written_timestamp_seconds gauge"));
+    }
+
+    #[test]
+    fn store_gauges_are_rendered() {
+        let m = SbcMetrics::new();
+        m.set_store_available(true);
+        m.set_store_backups(Some(Duration::from_secs(86400)));
+        m.record_store_backup(1234);
+        m.inc_store_backup_failure();
+        let out = m.render_prometheus();
+        assert!(out.contains("sbc_store_available 1\n"), "{}", out);
+        assert!(out.contains("sbc_store_backups_enabled 1\n"));
+        assert!(out.contains("sbc_store_backup_interval_seconds 86400\n"));
+        assert!(out.contains("sbc_store_backup_last_bytes 1234\n"));
+        assert!(out.contains("sbc_store_backup_failures_total 1\n"));
+        assert!(m.store_backup_last_success_time.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

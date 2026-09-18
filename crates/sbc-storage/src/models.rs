@@ -118,3 +118,11 @@ pub struct DestinationRuleRow {
     pub description: String,
     pub enabled: bool,
 }
+
+/// One store backup written by `ConfigStore::backup_to` (`VACUUM INTO`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackupInfo {
+    pub path: std::path::PathBuf,
+    pub bytes: u64,
+    pub took_ms: u64,
+}

@@ -44,6 +44,11 @@ pub struct AppState {
     pub kicks: Arc<sbc_core::sbc::AdminKicks>,
     /// Per-trunk OPTIONS / REGISTER tasks, re-synced after every trunk write.
     pub trunk_tasks: Arc<sbc_core::trunk_tasks::TrunkTasks>,
+    /// What `/ready` reports (store open, hydrated, listeners bound).
+    pub ready: Arc<sbc_core::sbc::Readiness>,
+    /// Store backup policy and the lock the API shares with the timer.
+    pub backup: Arc<sbc_core::sbc::backup::BackupPolicy>,
+    pub backup_lock: Arc<tokio::sync::Mutex<()>>,
     /// Reverse proxies whose X-Real-IP / X-Forwarded-For are believed.
     pub trusted_proxies: Arc<Vec<std::net::IpAddr>>,
     /// Failed bearer-token checks strike the client's IP in fail2ban.

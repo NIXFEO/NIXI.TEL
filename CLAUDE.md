@@ -58,7 +58,13 @@ applied to the live runtime immediately — no reload needed. `SIGHUP` and
 `POST /api/v1/reload` re-hydrate the runtime from the store.
 
 Key modules: `sbc/import.rs` (first-boot seed), `sbc/hydrate.rs`
-(store → live managers), `config.rs` (TOML schema).
+(store → live managers), `config.rs` (TOML schema), `sbc/backup.rs`
+(`VACUUM INTO` copies: `POST /api/v1/backup` + timer).
+
+The store is **fail-closed**: a store that cannot be opened or hydrated at
+boot aborts startup (`[database] allow_missing_store = true` for the old
+warn-and-run-from-TOML behaviour). `/ready` answers 503 until the store is
+open, hydrated and the SIP listeners are bound (`sbc::Readiness`).
 
 ### Call flow
 
@@ -85,6 +91,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `sbc/trunk_state.rs` | Trunk state fed by real calls: per-trunk active-call counting, failure ladder / `503 Retry-After` park, success reset, per-trunk metrics labels |
 | `trunk_tasks.rs` | Per-trunk OPTIONS health check + outbound REGISTER loops (423 Min-Expires, backoff) as a registry that follows the trunk table (API writes, reload) with cancellation |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
+| `sbc/backup.rs` · `crates/sbc-management/src/routes/store.rs` | Store backups (`VACUUM INTO`, prune, timer) and `POST /api/v1/backup` |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
 | `sbc/test_support.rs` · `sbc/flow_tests.rs` | Handler test harness (real `Sbc`, call legs on channels, raw SIP builders) and the call-flow tests built on it |

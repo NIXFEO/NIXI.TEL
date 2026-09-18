@@ -170,6 +170,10 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   backs off 30 s → 15 min (reset on success) while a timeout or send
   failure retries every 60 s; an OPTIONS down→up transition re-registers
   immediately; a changed trunk host is re-resolved on hydrate.
+- `/ready` answered 200 unconditionally; it now answers 503 with
+  `{store, hydrated, listening}` until the SQLite store is open, the first
+  hydration succeeded and the SIP listeners are bound (public, unchanged
+  path — probes that treated 200 as "process up" now see readiness).
 
 ### Added
 - Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
@@ -200,6 +204,20 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
   `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- Store backups: `POST /api/v1/backup` writes a consistent `VACUUM INTO`
+  copy `sbc-<timestamp>.db` into `[database] backup_dir` (default
+  `<dir of sqlite_path>/backups`, created 0700, files 0600 — they hold
+  trunk passwords and user HA1s), prunes to `backup_keep` (7) copies and
+  answers `{path, bytes, took_ms, pruned}` (409 while another backup runs);
+  a timer does the same every `backup_interval_hours` (24; 0 disables),
+  first run a minute after boot unless a recent copy exists. Metrics
+  `sbc_store_available`, `sbc_store_backups_enabled`,
+  `sbc_store_backup_interval_seconds`,
+  `sbc_store_backup_last_success_timestamp_seconds`,
+  `sbc_store_backup_last_bytes`, `sbc_store_backup_failures_total`; alert
+  rules `SBCStoreUnavailable`, `SBCStoreBackupStale`, `SBCStoreBackupFailed`;
+  SSE `alert` kind `backup_failed`. Restore stays "stop, copy the file
+  over `sqlite_path` (delete `-wal`/`-shm`), start" (INSTALL.md §10).
 - Trunk tasks: `[trunk_health]` section (`options_interval`,
   `options_timeout`, `register_backoff_max`), SSE events
   `trunk_registered` / `trunk_unregistered`, `registered` on
@@ -226,6 +244,11 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Dependabot watches cargo and actions.
 
 ### Changed
+- The SBC refuses to start when the SQLite store cannot be opened or
+  hydrated (it used to warn and run with no users, trunks or DIDs while
+  reporting ready). `[database] allow_missing_store = true` restores the
+  old behaviour. With the documented systemd unit (`Restart=on-failure`)
+  the unit ends failed within seconds — check `journalctl -u sbc`.
 - Workspace version 0.20.0; release binaries are stripped.
 - `sqlx` 0.8 (no TLS features), `clap` 4 replaces `structopt`;
   `trust-dns-resolver` and `config` (unused) dropped; `anyhow`,

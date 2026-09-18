@@ -2178,8 +2178,12 @@ async fn trunk_state_and_metrics_follow_real_calls() {
     //    (The park from step 2 survives a 200 OK: only a re-enable lifts it.)
     sbc.trunk_manager.update_state(&tid, |s| s.record_success());
     assert!(!state(&sbc).can_accept_call(&trunk_cfg), "still parked");
-    sbc.trunk_manager.update_state(&tid, |s| s.clear_cooldowns());
-    assert!(state(&sbc).can_accept_call(&trunk_cfg), "re-enable forgives");
+    sbc.trunk_manager
+        .update_state(&tid, |s| s.clear_cooldowns());
+    assert!(
+        state(&sbc).can_accept_call(&trunk_cfg),
+        "re-enable forgives"
+    );
     let mut call3 = add_call(&mut sbc, CallSpec::numbered(3)).await;
     sbc.handle_response(
         response_for(

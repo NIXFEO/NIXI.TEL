@@ -77,6 +77,9 @@ async fn main() -> Result<()> {
             security: sbc.security(),
             kicks: sbc.admin_kicks(),
             trunk_tasks: sbc.trunk_tasks(),
+            ready: sbc.readiness(),
+            backup: sbc.backup_policy(),
+            backup_lock: sbc.backup_lock(),
             trusted_proxies: std::sync::Arc::new(config.management.trusted_proxies.clone()),
             ban_on_auth_failure: config.management.ban_on_auth_failure,
         };

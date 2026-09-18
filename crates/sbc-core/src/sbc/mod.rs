@@ -8,6 +8,7 @@ mod invite_handler;
 pub(crate) use invite_handler::extract_contact_uri as invite_handler_contact_uri;
 mod response_handler;
 pub(crate) use response_handler::parse_session_expires as response_handler_session_expires;
+pub mod backup;
 mod call_handler;
 mod cdr;
 mod invite_tx;
@@ -174,6 +175,46 @@ pub(crate) fn authorize_aor(
     Ok(())
 }
 
+/// What `/ready` reports: the store is open, the first hydration
+/// succeeded, the SIP listeners are bound. A reload that fails later keeps
+/// the last good runtime and does not clear the flags.
+#[derive(Default, Debug)]
+pub struct Readiness {
+    store_open: std::sync::atomic::AtomicBool,
+    hydrated: std::sync::atomic::AtomicBool,
+    listening: std::sync::atomic::AtomicBool,
+}
+
+impl Readiness {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn set_store_open(&self) {
+        self.store_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn set_hydrated(&self) {
+        self.hydrated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn set_listening(&self) {
+        self.listening
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn store_open(&self) -> bool {
+        self.store_open.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn hydrated(&self) -> bool {
+        self.hydrated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn listening(&self) -> bool {
+        self.listening.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn is_ready(&self) -> bool {
+        self.store_open() && self.hydrated() && self.listening()
+    }
+}
+
 /// Administrative teardown requests (`DELETE /api/v1/calls/{uuid}`). The
 /// API has no SIP transport: it queues the uuid here and the event loop
 /// ends the call properly (BYE/CANCEL on both legs, CDR "admin-kick").
@@ -270,6 +311,13 @@ pub struct Sbc {
     /// OPTIONS health checks and outbound REGISTER loops, one set per
     /// enabled trunk, following the trunk table (`trunk_tasks.rs`).
     trunk_tasks: Arc<crate::trunk_tasks::TrunkTasks>,
+
+    /// What `/ready` reports.
+    readiness: Arc<Readiness>,
+    /// Store backups (`POST /api/v1/backup`, timer).
+    backup_policy: Arc<backup::BackupPolicy>,
+    backup_lock: Arc<tokio::sync::Mutex<()>>,
+    _backup_timer: Option<tokio::task::JoinHandle<()>>,
 
     /// DID → SIP user mappings for inbound PSTN calls.
     /// Shared with the API layer (hydrated from the SQLite store).
@@ -503,6 +551,7 @@ impl Sbc {
         let did_mappings = Arc::new(tokio::sync::RwLock::new(config.dids.clone()));
 
         // --- SQLite config store (dynamic config source of truth) ---
+        let readiness = Arc::new(Readiness::new());
         let config_store = match sbc_storage::ConfigStore::open(&config.database.sqlite_path).await
         {
             Ok(store) => {
@@ -519,12 +568,21 @@ impl Sbc {
                     acl: acl.clone(),
                     security: security.clone(),
                 };
-                if let Err(e) = hydrate::hydrate_all(&handles, &store).await {
-                    warn!(
-                        "Hydration from config store failed: {} — TOML values remain active",
+                readiness.set_store_open();
+                match hydrate::hydrate_all(&handles, &store).await {
+                    Ok(()) => readiness.set_hydrated(),
+                    Err(e) if config.database.allow_missing_store => warn!(
+                        "Hydration from config store failed: {} — TOML values remain active (allow_missing_store)",
                         e
-                    );
+                    ),
+                    Err(e) => {
+                        return Err(crate::Error::Config(format!(
+                            "config store {}: hydration failed: {} — refusing to start with a runtime that does not match the store (set [database].allow_missing_store = true to run from the TOML seeds only)",
+                            config.database.sqlite_path, e
+                        )));
+                    }
                 }
+                metrics.set_store_available(readiness.hydrated());
 
                 // Restore persisted bans (restart must not amnesty offenders)
                 let now = crate::sbc::import::now_rfc3339();
@@ -544,12 +602,18 @@ impl Sbc {
                 }
                 Some(store)
             }
-            Err(e) => {
+            Err(e) if config.database.allow_missing_store => {
                 warn!(
-                    "Config store unavailable ({}): {} — running from TOML only",
+                    "Config store unavailable ({}): {} — running from TOML only (allow_missing_store)",
                     config.database.sqlite_path, e
                 );
                 None
+            }
+            Err(e) => {
+                return Err(crate::Error::Config(format!(
+                    "config store {} cannot be opened: {} — refusing to start with no users, trunks or DIDs (set [database].allow_missing_store = true to run from the TOML seeds only)",
+                    config.database.sqlite_path, e
+                )));
             }
         };
 
@@ -584,7 +648,12 @@ impl Sbc {
             events.clone(),
             crate::trunk_tasks::TrunkTasksConfig::from(&config.trunk_health),
         ));
+        let backup_policy = Arc::new(config.database.backup_policy());
         Ok(Self {
+            readiness,
+            backup_policy,
+            backup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            _backup_timer: None,
             transport: TransportManager::new(),
             media,
             b2bua,
@@ -920,6 +989,14 @@ impl Sbc {
             crate::trunk_tasks::TrunkTasksConfig::default(),
         ));
         Self {
+            readiness: Arc::new(Readiness::new()),
+            backup_policy: Arc::new(backup::BackupPolicy {
+                dir: std::path::PathBuf::from("data/backups"),
+                interval: None,
+                keep: 7,
+            }),
+            backup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            _backup_timer: None,
             transport: TransportManager::new(),
             media,
             b2bua,
@@ -978,6 +1055,18 @@ impl Sbc {
         self.trunk_tasks.clone()
     }
 
+    pub fn readiness(&self) -> Arc<Readiness> {
+        self.readiness.clone()
+    }
+
+    pub fn backup_policy(&self) -> Arc<backup::BackupPolicy> {
+        self.backup_policy.clone()
+    }
+
+    pub fn backup_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.backup_lock.clone()
+    }
+
     /// Start the SBC with network configuration
     pub async fn start(
         &mut self,
@@ -989,6 +1078,18 @@ impl Sbc {
         // Start transport listeners
         self.transport.start_listeners(network_config).await?;
         info!("Transport listeners started");
+        self.readiness.set_listening();
+
+        // Periodic store backups (only with a store; the policy decides).
+        if let Some(store) = self.config_store.clone() {
+            self._backup_timer = backup::spawn_backup_timer(
+                store,
+                self.backup_policy.clone(),
+                self.metrics.clone(),
+                self.events.clone(),
+                self.backup_lock.clone(),
+            );
+        }
 
         // Outbound TLS for TLS trunks (no plaintext fallback)
         self.register_trunk_tls_configs();
@@ -2453,16 +2554,60 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    /// A config whose store lives in a private temp dir (the default
+    /// `data/sbc.db` would be shared by every test in the binary).
+    fn config_with_temp_store() -> (SbcConfig, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sbc-boot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = SbcConfig::default();
+        config.database.sqlite_path = dir.join("sbc.db").to_string_lossy().into_owned();
+        config.database.backup_interval_hours = 0;
+        (config, dir)
+    }
+
     #[tokio::test]
     async fn test_sbc_from_config() {
-        let config = SbcConfig::default();
-        let sbc = Sbc::new_from_config(&config).await;
-        assert!(sbc.is_ok());
+        let (config, dir) = config_with_temp_store();
+        let sbc = Sbc::new_from_config(&config).await.unwrap();
+        let ready = sbc.readiness();
+        assert!(ready.store_open() && ready.hydrated());
+        assert!(!ready.listening(), "not before start()");
+        assert!(!ready.is_ready());
+        assert_eq!(
+            sbc.metrics
+                .store_available
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn store_open_failure_is_fatal_by_default_and_tolerated_when_allowed() {
+        // The store path's parent is a regular file: it cannot be created.
+        let dir = std::env::temp_dir().join(format!("sbc-boot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut config = SbcConfig::default();
+        config.database.sqlite_path = blocker.join("sbc.db").to_string_lossy().into_owned();
+        config.database.backup_interval_hours = 0;
+        let err = Sbc::new_from_config(&config).await.err().expect("fatal");
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to start"), "{}", msg);
+        assert!(msg.contains("allow_missing_store"), "{}", msg);
+
+        config.database.allow_missing_store = true;
+        let sbc = Sbc::new_from_config(&config).await.unwrap();
+        assert!(sbc.config_store().is_none());
+        assert!(!sbc.readiness().store_open());
+        assert!(!sbc.readiness().is_ready());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn test_sbc_with_digest_auth() {
-        let mut config = SbcConfig::default();
+        let (mut config, _dir) = config_with_temp_store();
         config.security.enable_digest_auth = true;
         config.security.sip_realm = "test.sbc.local".to_string();
         config

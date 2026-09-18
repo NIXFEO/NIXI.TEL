@@ -10,7 +10,9 @@
 # binary, start, check /health, run the API smoke test, remove the swap.
 # The SQLite store (database.sqlite_path of the remote config) is copied
 # with the backups: the binary migrates it forward at startup and an older
-# binary may refuse the migrated store.
+# binary may refuse the migrated store. (At runtime the SBC keeps its own
+# copies in [database] backup_dir and on POST /api/v1/backup; a restore
+# must also delete <sqlite_path>-wal/-shm, see INSTALL.md §10.)
 # --rollback restores the most recent binary and config backups and
 # restarts; it never touches the store, it prints the applied migrations
 # and the remediation from INSTALL.md §10 instead.

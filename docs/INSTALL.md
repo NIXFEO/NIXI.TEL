@@ -111,7 +111,7 @@ Type=simple
 # Secrets (API token) live here, not in the TOML — see §7
 EnvironmentFile=/etc/sbc/sbc.env
 ExecStart=/usr/local/bin/sbc --config /etc/sbc/sbc.toml
-Restart=on-failure
+Restart=on-failure    # a store that cannot be opened is fatal: the unit ends failed within seconds, see journalctl
 # Graceful stop: the SBC sends BYE to active peers on SIGTERM
 KillSignal=SIGTERM
 TimeoutStopSec=15
@@ -343,6 +343,7 @@ sudo cp /usr/local/bin/sbc /usr/local/bin/sbc.bak      # keep previous
 sudo systemctl stop sbc                                 # graceful BYE
 sudo cp target/release/sbc /usr/local/bin/sbc
 sudo systemctl start sbc
+curl -i http://127.0.0.1:8080/ready                     # 200 once store + listeners are up
 bash scripts/api_smoke.sh                               # verify
 
 # Rollback if needed
@@ -352,9 +353,32 @@ sudo systemctl stop sbc && sudo cp /usr/local/bin/sbc.bak /usr/local/bin/sbc && 
 The TOML file is untouched by binary upgrades. The SQLite store is
 **migrated forward at startup**: schema migrations are embedded in the
 binary, applied once and recorded in `_sqlx_migrations`. `scripts/deploy.sh`
-copies the store next to the other backups (`sbc-db-<timestamp>.db`); do the
-same by hand (`sqlite3 <sqlite_path> ".backup <copy>"`) and grab a config
-snapshot via `GET /api/v1/export` before major upgrades.
+copies the store next to the other backups (`sbc-db-<timestamp>.db`, never
+pruned by the SBC). The SBC itself writes `sbc-<timestamp>.db` copies into
+`[database] backup_dir` (`/var/lib/sbc/backups` in the example config;
+created 0700, files 0600 — they hold trunk passwords and user HA1s) every
+`backup_interval_hours` and on `POST /api/v1/backup`, keeping the
+`backup_keep` newest. Take one before an upgrade:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/backup
+```
+
+Restore = stop, copy, start (the copy is a plain SQLite file; drop any
+stale WAL of the live store):
+
+```bash
+sudo systemctl stop sbc
+sudo cp -p /var/lib/sbc/backups/sbc-<timestamp>.db /var/lib/sbc/sbc.db
+sudo rm -f /var/lib/sbc/sbc.db-wal /var/lib/sbc/sbc.db-shm
+sudo systemctl start sbc
+```
+
+A store that cannot be opened or read at boot is fatal (the SBC would run
+with no users, trunks or DIDs): the unit ends failed, `journalctl -u sbc`
+names the path. `[database] allow_missing_store = true` is the escape
+hatch (TOML seeds only, `/ready` stays 503). Grab a config snapshot via
+`GET /api/v1/export` as well before major upgrades.
 
 **Rolling back across a migration.** A binary older than 0.20 refuses to
 open a store that carries a migration it does not know (0.20 added

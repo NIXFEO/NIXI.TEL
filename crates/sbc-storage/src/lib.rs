@@ -10,5 +10,7 @@ pub mod models;
 pub mod store;
 
 pub use error::{Error, Result};
-pub use models::{AclRuleRow, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow};
-pub use store::{ConfigStore, Table};
+pub use models::{
+    AclRuleRow, BackupInfo, BanRow, DestinationRuleRow, DidRow, RouteRow, TrunkRow, UserRow,
+};
+pub use store::{newest_backup, prune_backups, ConfigStore, Table};

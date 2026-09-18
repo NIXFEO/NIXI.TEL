@@ -57,8 +57,19 @@ turn_enabled = false
 
 [database]
 # Embedded SQLite: source of truth for API-managed config. No external
-# database is required to run the SBC.
+# database is required to run the SBC. A store that cannot be opened or
+# read at boot is fatal (the SBC would run with no users, trunks or DIDs);
+# allow_missing_store = true restores the old warn-and-run-from-TOML
+# behaviour (/ready then stays 503).
 sqlite_path = "/var/lib/sbc/sbc.db"
+allow_missing_store = false
+# Backups: POST /api/v1/backup and a timer write sbc-<timestamp>.db copies
+# (VACUUM INTO, dir 0700, files 0600 — they hold trunk passwords and user
+# HA1s) and keep the backup_keep newest. backup_interval_hours = 0 disables
+# the timer; default backup_dir is <dir of sqlite_path>/backups.
+backup_dir = "/var/lib/sbc/backups"
+backup_interval_hours = 24
+backup_keep = 7
 
 [security]
 rate_limit_global = 1000

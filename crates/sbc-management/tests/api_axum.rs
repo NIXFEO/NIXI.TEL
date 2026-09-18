@@ -57,6 +57,13 @@ async fn make_state() -> AppState {
         security: Arc::new(sbc_core::security::SecurityManager::new(Default::default())),
         kicks: Arc::new(sbc_core::sbc::AdminKicks::new()),
         trunk_tasks,
+        ready: Arc::new(sbc_core::sbc::Readiness::new()),
+        backup: Arc::new(sbc_core::sbc::backup::BackupPolicy {
+            dir: std::env::temp_dir().join(format!("sbc-api-backups-{}", uuid::Uuid::new_v4())),
+            interval: None,
+            keep: 2,
+        }),
+        backup_lock: Arc::new(tokio::sync::Mutex::new(())),
         trusted_proxies: Arc::new(sbc_management::rate_limit::default_trusted_proxies()),
         ban_on_auth_failure: true,
     }
@@ -1607,4 +1614,115 @@ async fn trunk_health_alerts_and_metrics_reflect_availability() {
         .unwrap();
     assert!(!body_json(resp).await.to_string().contains("trunk_parked"));
     state.trunk_tasks.shutdown().await;
+}
+
+/// `/ready` is public and answers 503 with the three flags until the store
+/// is open, hydrated and the listeners are bound.
+#[tokio::test]
+async fn ready_is_503_until_store_hydrate_and_listeners() {
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/ready", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "not_ready");
+    assert_eq!(json["store"], false);
+    state.ready.set_store_open();
+    state.ready.set_hydrated();
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/ready", None, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "listeners not bound yet"
+    );
+    state.ready.set_listening();
+    let resp = app
+        .oneshot(req("GET", "/ready", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "ready");
+    assert!(json["store"] == true && json["hydrated"] == true && json["listening"] == true);
+}
+
+/// `POST /api/v1/backup` writes a copy, prunes to `keep`, needs the token,
+/// refuses a concurrent run and 503s without a store.
+#[tokio::test]
+async fn backup_endpoint_writes_prunes_and_needs_a_token() {
+    let mut state = make_state().await;
+    // A file-backed store: VACUUM INTO needs a real database.
+    let dir = state
+        .backup
+        .dir
+        .parent()
+        .unwrap()
+        .join(format!("sbc-api-live-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    state.store = Some(Arc::new(
+        ConfigStore::open(dir.join("live.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    ));
+    let app = build_router(state.clone(), &[]);
+
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/backup", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let mut paths = Vec::new();
+    for _ in 0..3 {
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/api/v1/backup", None, true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json["bytes"].as_u64().unwrap() > 0);
+        assert!(json["took_ms"].is_u64());
+        paths.push(json["path"].as_str().unwrap().to_string());
+    }
+    let files: Vec<_> = std::fs::read_dir(&state.backup.dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files.len(), 2, "keep 2: {:?}", files);
+    assert!(
+        !std::path::Path::new(&paths[0]).exists(),
+        "the oldest was pruned"
+    );
+
+    // A held lock (the timer is running) → 409.
+    let guard = state.backup_lock.lock().await;
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/backup", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    drop(guard);
+
+    // No store → 503.
+    let mut no_store = state.clone();
+    no_store.store = None;
+    let resp = build_router(no_store, &[])
+        .oneshot(req("POST", "/api/v1/backup", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state.backup.dir);
 }

@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main SBC configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -243,12 +243,59 @@ pub struct DatabaseConfig {
     /// Source of truth for everything managed via the REST API.
     #[serde(default = "default_sqlite_path")]
     pub sqlite_path: String,
+    /// A store that cannot be opened or read at boot is fatal (the SBC
+    /// would run with no users, trunks or DIDs). `true` restores the old
+    /// behaviour: warn and run from the TOML seeds, `/ready` stays 503.
+    #[serde(default)]
+    pub allow_missing_store: bool,
+    /// Where `POST /api/v1/backup` and the backup timer write
+    /// `sbc-<timestamp>.db` copies; default `<dir of sqlite_path>/backups`.
+    #[serde(default)]
+    pub backup_dir: Option<String>,
+    /// Hours between two automatic backups; 0 disables the timer.
+    #[serde(default = "default_backup_interval_hours")]
+    pub backup_interval_hours: u32,
+    /// Newest backups kept after each backup; 0 = never prune.
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: u32,
+}
+
+fn default_backup_interval_hours() -> u32 {
+    24
+}
+fn default_backup_keep() -> u32 {
+    7
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             sqlite_path: default_sqlite_path(),
+            allow_missing_store: false,
+            backup_dir: None,
+            backup_interval_hours: default_backup_interval_hours(),
+            backup_keep: default_backup_keep(),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// The backup policy derived from this section.
+    pub fn backup_policy(&self) -> crate::sbc::backup::BackupPolicy {
+        let dir = match self.backup_dir.as_deref().map(str::trim) {
+            Some(d) if !d.is_empty() => PathBuf::from(d),
+            _ => Path::new(&self.sqlite_path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join("backups"),
+        };
+        let interval = (self.backup_interval_hours > 0)
+            .then(|| std::time::Duration::from_secs(u64::from(self.backup_interval_hours) * 3600));
+        crate::sbc::backup::BackupPolicy {
+            dir,
+            interval,
+            keep: self.backup_keep as usize,
         }
     }
 }
@@ -704,5 +751,38 @@ mod example_config_tests {
             ),
             (30, 5, 900)
         );
+        assert!(!cfg.database.allow_missing_store);
+        assert_eq!(
+            cfg.database.backup_dir.as_deref(),
+            Some("/var/lib/sbc/backups")
+        );
+        assert_eq!(
+            (cfg.database.backup_interval_hours, cfg.database.backup_keep),
+            (24, 7)
+        );
+    }
+
+    #[test]
+    fn backup_policy_defaults_next_to_the_store() {
+        let mut db = DatabaseConfig::default();
+        let policy = db.backup_policy();
+        assert_eq!(policy.dir, PathBuf::from("data/backups"));
+        assert_eq!(
+            policy.interval,
+            Some(std::time::Duration::from_secs(24 * 3600))
+        );
+        assert_eq!(policy.keep, 7);
+        db.backup_interval_hours = 0;
+        db.backup_dir = Some("  ".into());
+        db.sqlite_path = "/var/lib/sbc/sbc.db".into();
+        let policy = db.backup_policy();
+        assert!(policy.interval.is_none(), "0 disables the timer");
+        assert_eq!(
+            policy.dir,
+            PathBuf::from("/var/lib/sbc/backups"),
+            "blank dir falls back"
+        );
+        db.sqlite_path = "sbc.db".into();
+        assert_eq!(db.backup_policy().dir, PathBuf::from("./backups"));
     }
 }

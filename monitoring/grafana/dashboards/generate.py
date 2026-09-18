@@ -121,6 +121,11 @@ P += [stat("Last CDR age","time() - sbc_last_cdr_written_timestamp_seconds",0,y,
       stat("SIP parse errors (total)","sbc_sip_parse_errors_total",12,y,w=6),
       stat("Failed calls (total)","sbc_calls_failed_total",18,y,w=6)]
 y+=4
+P += [stat("Config store available","sbc_store_available",0,y,w=6),
+      stat("Last store backup age","time() - sbc_store_backup_last_success_timestamp_seconds",6,y,w=6,unit="s"),
+      stat("Store backup failures (24h)","increase(sbc_store_backup_failures_total[1d])",12,y,w=6),
+      stat("Last backup size","sbc_store_backup_last_bytes",18,y,w=6,unit="bytes")]
+y+=4
 # A steady rate here means a trunk's Min-SE floor is above [security]
 # session_expires: the SBC pays a 422 round trip on every call until it is raised.
 P += [stat("Session-timer 422 retries (total)","sbc_session_timer_422_retries_total",0,y,w=6)]

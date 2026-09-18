@@ -24,8 +24,25 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-pub async fn ready() -> impl IntoResponse {
-    Json(json!({ "status": "ready" }))
+/// 200 once the store is open, the first hydration succeeded and the SIP
+/// listeners are bound; 503 with the three flags otherwise. Public.
+pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    let r = &state.ready;
+    let ready = r.is_ready();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "store": r.store_open(),
+            "hydrated": r.hydrated(),
+            "listening": r.listening(),
+        })),
+    )
 }
 
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
