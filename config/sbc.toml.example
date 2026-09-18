@@ -71,6 +71,11 @@ backup_dir = "/var/lib/sbc/backups"
 backup_interval_hours = 24
 backup_keep = 7
 
+# Key classes (docs/API.md "Reload vs restart"): most [security] values
+# apply on SIGHUP / POST /api/v1/reload; listeners, ports, database,
+# realm, [management], [trunk_health] and [logging] need a restart;
+# users/trunks/dids/rules are first-boot seeds. GET /api/v1/config shows
+# what the file on disk would change.
 [security]
 rate_limit_global = 1000
 rate_limit_per_ip = 50

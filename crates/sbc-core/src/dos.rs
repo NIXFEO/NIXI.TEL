@@ -159,7 +159,8 @@ pub struct DosStats {
 
 /// Gestionnaire de protection DoS
 pub struct DosProtector {
-    config: RateLimitConfig,
+    /// Live: `set_config` on reload; read at the top of every check.
+    config: std::sync::RwLock<RateLimitConfig>,
     /// État par IP
     ip_states: Arc<Mutex<HashMap<IpAddr, IpState>>>,
     /// Whitelist statique (jamais bloquées)
@@ -173,7 +174,7 @@ pub struct DosProtector {
 impl DosProtector {
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
-            config,
+            config: std::sync::RwLock::new(config),
             ip_states: Arc::new(Mutex::new(HashMap::new())),
             whitelist: Arc::new(Vec::new()),
             allowed_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -184,7 +185,7 @@ impl DosProtector {
 
     pub fn new_with_whitelist(config: RateLimitConfig, whitelist: Vec<IpAddr>) -> Self {
         Self {
-            config,
+            config: std::sync::RwLock::new(config),
             ip_states: Arc::new(Mutex::new(HashMap::new())),
             whitelist: Arc::new(whitelist),
             allowed_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -194,6 +195,20 @@ impl DosProtector {
     }
 
     /// Vérifier si une adresse IP est autorisée à envoyer une requête
+    /// The current limits (cloned; the lock is never held across an await).
+    pub fn config(&self) -> RateLimitConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace the limits (reload): existing buckets refill at the new
+    /// rate on their next request.
+    pub fn set_config(&self, config: RateLimitConfig) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
     pub async fn check(&self, addr: IpAddr) -> RateLimitResult {
         // Whitelist check
         if self.whitelist.contains(&addr) {
@@ -202,10 +217,11 @@ impl DosProtector {
             return RateLimitResult::Whitelisted;
         }
 
-        let rate = self.config.requests_per_second as f64;
-        let burst = self.config.burst_size as f64;
-        let blacklist_dur = self.config.blacklist_duration_secs;
-        let max_violations = self.config.violations_before_blacklist;
+        let cfg = self.config();
+        let rate = cfg.requests_per_second as f64;
+        let burst = cfg.burst_size as f64;
+        let blacklist_dur = cfg.blacklist_duration_secs;
+        let max_violations = cfg.violations_before_blacklist;
 
         let mut states = self.ip_states.lock().await;
         if !states.contains_key(&addr) {
@@ -213,7 +229,7 @@ impl DosProtector {
         }
         let state = states
             .entry(addr)
-            .or_insert_with(|| IpState::new(self.config.burst_size));
+            .or_insert_with(|| IpState::new(cfg.burst_size));
 
         // Recharger les tokens
         state.refill(rate, burst);
@@ -272,7 +288,7 @@ impl DosProtector {
         let mut states = self.ip_states.lock().await;
         let state = states
             .entry(addr)
-            .or_insert_with(|| IpState::new(self.config.burst_size));
+            .or_insert_with(|| IpState::new(self.config().burst_size));
         state.blacklisted_until = Some(Instant::now() + Duration::from_secs(duration_secs));
         warn!(
             "IP {} manually blacklisted for {} seconds",
@@ -295,7 +311,7 @@ impl DosProtector {
     /// maintenance sweeper; without it the map grows with every source IP
     /// ever seen.
     pub async fn cleanup_expired(&self) -> usize {
-        let max_age = Duration::from_secs(self.config.cleanup_after_secs);
+        let max_age = Duration::from_secs(self.config().cleanup_after_secs);
         let mut states = self.ip_states.lock().await;
         let removed = Self::evict_idle(&mut states, max_age);
         if removed > 0 {
@@ -325,7 +341,7 @@ impl DosProtector {
         if states.len() < MAX_TRACKED_IPS {
             return;
         }
-        let max_age = Duration::from_secs(self.config.cleanup_after_secs);
+        let max_age = Duration::from_secs(self.config().cleanup_after_secs);
         let mut removed = Self::evict_idle(states, max_age / 4);
         if states.len() >= MAX_TRACKED_IPS {
             removed += Self::evict_idle(states, Duration::from_secs(10));

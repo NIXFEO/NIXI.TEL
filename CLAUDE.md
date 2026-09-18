@@ -55,7 +55,13 @@ in the SQLite store and is the source of truth. On first boot, TOML seed
 entries (`[security.sip_users]`, `[[trunks]]`, `[[dids]]`) are imported once
 into the store, then ignored. Every API write goes to the store and is
 applied to the live runtime immediately — no reload needed. `SIGHUP` and
-`POST /api/v1/reload` re-hydrate the runtime from the store.
+`POST /api/v1/reload` re-hydrate the runtime from the store and apply the
+reload-class `[security]` keys (`config::classify_key`; table in
+docs/API.md "Reload vs restart"); listeners, media ports, TLS material,
+realm, `[management]`, `[trunk_health]` and `[logging]` need a restart.
+`GET /api/v1/config` shows the effective values (`sbc/runtime_config.rs`),
+what a reload loaded but could not apply, and what the file on disk would
+change; `POST /reload` returns the engine's report.
 
 Key modules: `sbc/import.rs` (first-boot seed), `sbc/hydrate.rs`
 (store → live managers), `config.rs` (TOML schema), `sbc/backup.rs`
@@ -92,6 +98,7 @@ BYE/CANCEL/ACK/INFO/re-INVITE through `sbc/call_handler.rs`. The B2BUA
 | `trunk_tasks.rs` | Per-trunk OPTIONS health check + outbound REGISTER loops (423 Min-Expires, backoff) as a registry that follows the trunk table (API writes, reload) with cancellation |
 | `sbc/hydrate.rs` · `sbc/import.rs` | Store → runtime hydration / first-boot TOML seed |
 | `sbc/backup.rs` · `crates/sbc-management/src/routes/store.rs` | Store backups (`VACUUM INTO`, prune, timer) and `POST /api/v1/backup` |
+| `sbc/runtime_config.rs` | Effective config + reload reports (`GET /api/v1/config`, `POST /reload`); key classes and diff live in `config.rs` |
 | `sip_builder.rs` | Synthetic in-dialog requests (BYE/CANCEL/ACK/re-INVITE) from real dialog identity |
 | `b2bua.rs` | B2BUA half-mode, dialog state, INVITE attempts, failover state, session timers |
 | `sbc/test_support.rs` · `sbc/flow_tests.rs` | Handler test harness (real `Sbc`, call legs on channels, raw SIP builders) and the call-flow tests built on it |

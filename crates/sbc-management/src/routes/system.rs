@@ -118,7 +118,88 @@ pub async fn alerts(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /api/v1/reload — re-hydrate the runtime (store-backed when available).
+/// How long `POST /api/v1/reload` waits for the engine's report.
+const RELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask the engine to reload and wait for its report: 200 with what was
+/// applied and what needs a restart, 422 when the file is unusable
+/// (nothing changed), 202 when the engine did not answer in time (busy
+/// loop: check `GET /api/v1/config.last_reload`). Concurrent triggers
+/// (SIGHUP, API) coalesce and may answer with the other's report.
 pub async fn reload(State(state): State<AppState>) -> impl IntoResponse {
+    let mut rx = state.runtime_config.subscribe();
+    let before = *rx.borrow_and_update();
     state.reload.notify_one();
-    Json(json!({ "status": "reload_triggered" }))
+    let answered = tokio::time::timeout(RELOAD_WAIT, rx.wait_for(|g| *g > before)).await;
+    match answered {
+        Ok(Ok(_)) => match state.runtime_config.last_reload() {
+            Some(r) if r.ok => (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "reloaded",
+                    "source": r.source,
+                    "applied": r.applied,
+                    "restart_required": r.restart_required,
+                    "hydrated": r.hydrated,
+                    "ts": r.ts,
+                })),
+            )
+                .into_response(),
+            Some(r) => super::ApiError::unprocessable(
+                "reload_failed",
+                r.error.unwrap_or_else(|| "reload failed".into()),
+            )
+            .into_response(),
+            None => (
+                StatusCode::ACCEPTED,
+                Json(json!({ "status": "reload_triggered" })),
+            )
+                .into_response(),
+        },
+        _ => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "reload_triggered",
+                "note": "engine did not answer within 5 s; check GET /api/v1/config",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// The effective configuration (secrets masked), what a reload already
+/// loaded but could not apply, and what the on-disk file would change.
+pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
+    use sbc_core::config::{config_diff, key_classes, masked_json, SbcConfig};
+    let snap = state.runtime_config.snapshot();
+    let restart_required = config_diff(&snap.effective, &snap.last_loaded).restart_required;
+    let file = match snap.path.as_deref() {
+        None => serde_json::Value::Null,
+        Some(path) => match tokio::fs::read_to_string(path).await {
+            Err(e) => json!({ "readable": false, "error": e.to_string() }),
+            Ok(raw) => match SbcConfig::from_toml_str(&raw) {
+                Err(e) => json!({ "readable": true, "parse_error": e.to_string() }),
+                Ok(on_disk) => {
+                    let d = config_diff(&snap.effective, &on_disk);
+                    json!({
+                        "readable": true,
+                        "parse_error": null,
+                        "restart_required": d.restart_required,
+                        "reload_pending": d.reload_pending,
+                    })
+                }
+            },
+        },
+    };
+    Json(json!({
+        "path": snap.path,
+        "loaded_at": snap.loaded_at,
+        "loaded_by": snap.source,
+        "store": state.store.is_some(),
+        "running": masked_json(&snap.effective),
+        "restart_required": restart_required,
+        "file": file,
+        "last_reload": snap.last_reload,
+        "key_classes": key_classes(),
+    }))
 }

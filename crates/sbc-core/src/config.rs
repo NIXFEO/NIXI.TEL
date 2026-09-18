@@ -536,13 +536,21 @@ impl SbcConfig {
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| crate::Error::Config(format!("Failed to read config file: {}", e)))?;
+        Self::from_toml_str(&content)
+    }
 
-        let config: SbcConfig = toml::from_str(&content)
+    /// Parse and validate a TOML document (what `from_file` and a reload do).
+    pub fn from_toml_str(content: &str) -> crate::Result<Self> {
+        let config: SbcConfig = toml::from_str(content)
             .map_err(|e| crate::Error::Config(format!("Failed to parse config: {}", e)))?;
-
         config.validate()?;
-
         Ok(config)
+    }
+
+    /// True when the management API binds a non-loopback address (allowed
+    /// by `allow_public_bind`): the binary warns once at boot.
+    pub fn management_bind_is_public(&self) -> bool {
+        self.management.api_enabled && !self.management.api_bind_address.is_loopback()
     }
 
     /// Validate configuration
@@ -567,23 +575,15 @@ impl SbcConfig {
         // Fail closed: never expose the management API on a non-loopback
         // address without a deliberate opt-in. A publicly reachable, world-
         // writable config surface is exactly the incident this guards against.
-        if self.management.api_enabled && !self.management.api_bind_address.is_loopback() {
-            if !self.management.allow_public_bind {
-                return Err(crate::Error::Config(format!(
-                    "management API bound to non-loopback address {} without \
-                     allow_public_bind=true — refusing to start. The management \
-                     API must never be publicly exposed; bind to 127.0.0.1 and \
-                     reverse-proxy it, or set [management].allow_public_bind=true \
-                     only if it is firewalled and TLS-fronted.",
-                    self.management.api_bind_address
-                )));
-            }
-            tracing::warn!(
-                addr = %self.management.api_bind_address,
-                "management API bound to non-loopback address {} — ensure it is \
-                 firewalled and never publicly exposed",
+        if self.management_bind_is_public() && !self.management.allow_public_bind {
+            return Err(crate::Error::Config(format!(
+                "management API bound to non-loopback address {} without \
+                 allow_public_bind=true — refusing to start. The management \
+                 API must never be publicly exposed; bind to 127.0.0.1 and \
+                 reverse-proxy it, or set [management].allow_public_bind=true \
+                 only if it is firewalled and TLS-fronted.",
                 self.management.api_bind_address
-            );
+            )));
         }
 
         Ok(())
@@ -847,5 +847,296 @@ mod example_config_tests {
         );
         db.sqlite_path = "sbc.db".into();
         assert_eq!(db.backup_policy().dir, PathBuf::from("./backups"));
+    }
+}
+
+// ── Key classes, diff, masking (GET /api/v1/config, reload reports) ──────────
+
+/// What a change of a TOML key needs to take effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyClass {
+    /// Applied by SIGHUP / `POST /api/v1/reload`.
+    Reload,
+    /// Read once at boot.
+    Restart,
+    /// Imported once into the SQLite store at first boot, then ignored.
+    Seed,
+    /// Parsed for compatibility, read by nothing.
+    Unused,
+}
+
+const RELOAD_KEYS: &[&str] = &[
+    "security.max_call_duration",
+    "security.call_setup_timeout",
+    "security.rtp_timeout",
+    "security.invite_timeout",
+    "security.session_timer_enabled",
+    "security.session_expires",
+    "security.min_se",
+    "security.register_aor_check",
+    "security.served_domains",
+    "security.trunk_local_from",
+    "security.rate_limit_per_ip",
+    "security.ban.",
+    "security.destinations.enabled",
+    "security.destinations.default_action",
+    "security.destinations.default_country_code",
+    "security.user_limits.enabled",
+    "security.user_limits.default_max_concurrent_calls",
+    "security.user_limits.default_max_calls_per_minute",
+];
+const RESTART_KEYS: &[&str] = &[
+    "general.cdr_file",
+    "network.listeners",
+    "network.public_ipv4",
+    "media.rtp_port_range",
+    "database.",
+    "security.sip_realm",
+    "security.enable_digest_auth",
+    "management.",
+    "trunk_health.",
+    "logging.",
+];
+const SEED_KEYS: &[&str] = &[
+    "security.sip_users",
+    "trunks",
+    "dids",
+    "security.destinations.rules",
+    "security.destinations.seed_irsf_rules",
+    "security.user_limits.overrides",
+];
+
+/// The class of a dotted key path (`security.ban.max_failures`); the
+/// longest matching prefix wins, unknown keys are `Unused`.
+pub fn classify_key(path: &str) -> KeyClass {
+    let matches = |prefixes: &[&str]| -> usize {
+        prefixes
+            .iter()
+            .filter(|p| {
+                path == p.trim_end_matches('.')
+                    || path.starts_with(*p)
+                    || (!p.ends_with('.') && path.starts_with(&format!("{}.", p)))
+            })
+            .map(|p| p.len())
+            .max()
+            .unwrap_or(0)
+    };
+    let (reload, restart, seed) = (
+        matches(RELOAD_KEYS),
+        matches(RESTART_KEYS),
+        matches(SEED_KEYS),
+    );
+    let best = reload.max(restart).max(seed);
+    if best == 0 {
+        KeyClass::Unused
+    } else if best == reload {
+        KeyClass::Reload
+    } else if best == restart {
+        KeyClass::Restart
+    } else {
+        KeyClass::Seed
+    }
+}
+
+/// The prefix tables, for `GET /api/v1/config`.
+pub fn key_classes() -> serde_json::Value {
+    serde_json::json!({
+        "reload": RELOAD_KEYS,
+        "restart": RESTART_KEYS,
+        "seed": SEED_KEYS,
+        "unused": ["general.name", "general.instance_id", "network.public_ipv6",
+                   "security.rate_limit_global", "security.auth_challenge_timeout",
+                   "media.* (except rtp_port_range)", "metrics.*"],
+    })
+}
+
+/// Keys that differ between two configs, by what applying them needs.
+/// Paths only, never values (a token cannot leak through here).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigDiff {
+    pub restart_required: Vec<String>,
+    pub reload_pending: Vec<String>,
+}
+
+fn leaves(value: &serde_json::Value, prefix: &str, out: &mut Vec<(String, serde_json::Value)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let path = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", prefix, k)
+                };
+                leaves(v, &path, out);
+            }
+        }
+        other => out.push((prefix.to_string(), other.clone())),
+    }
+}
+
+fn config_leaves(cfg: &SbcConfig) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut out = Vec::new();
+    leaves(&serde_json::to_value(cfg).unwrap_or_default(), "", &mut out);
+    out.into_iter().collect()
+}
+
+pub fn config_diff(running: &SbcConfig, candidate: &SbcConfig) -> ConfigDiff {
+    let a = config_leaves(running);
+    let b = config_leaves(candidate);
+    let mut diff = ConfigDiff::default();
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    for key in keys {
+        if a.get(key) == b.get(key) {
+            continue;
+        }
+        match classify_key(key) {
+            KeyClass::Reload => diff.reload_pending.push(key.clone()),
+            KeyClass::Restart => diff.restart_required.push(key.clone()),
+            KeyClass::Seed | KeyClass::Unused => {}
+        }
+    }
+    diff
+}
+
+/// `effective` with every reload-class leaf taken from `loaded`: what
+/// actually runs after a reload (restart-class keys keep their boot value).
+pub fn overlay_reload_keys(effective: &SbcConfig, loaded: &SbcConfig) -> SbcConfig {
+    let mut base = serde_json::to_value(effective).unwrap_or_default();
+    let mut new_leaves = Vec::new();
+    leaves(
+        &serde_json::to_value(loaded).unwrap_or_default(),
+        "",
+        &mut new_leaves,
+    );
+    for (path, value) in new_leaves {
+        if classify_key(&path) != KeyClass::Reload {
+            continue;
+        }
+        let mut cursor = &mut base;
+        let parts: Vec<&str> = path.split('.').collect();
+        for part in &parts[..parts.len() - 1] {
+            cursor = cursor
+                .as_object_mut()
+                .map(|m| m.entry(part.to_string()).or_insert(serde_json::json!({})))
+                .expect("object path");
+        }
+        if let Some(m) = cursor.as_object_mut() {
+            m.insert(parts[parts.len() - 1].to_string(), value);
+        }
+    }
+    serde_json::from_value(base).unwrap_or_else(|_| effective.clone())
+}
+
+/// The config as JSON with every secret replaced by `"***"`.
+pub fn masked_json(cfg: &SbcConfig) -> serde_json::Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_default();
+    if let Some(t) = v.pointer_mut("/management/api_auth_token") {
+        if !t.is_null() {
+            *t = serde_json::json!("***");
+        }
+    }
+    if let Some(serde_json::Value::Object(users)) = v.pointer_mut("/security/sip_users") {
+        for value in users.values_mut() {
+            *value = serde_json::json!("***");
+        }
+    }
+    if let Some(serde_json::Value::Array(trunks)) = v.pointer_mut("/trunks") {
+        for t in trunks.iter_mut() {
+            if let Some(p) = t.get_mut("password") {
+                if !p.is_null() {
+                    *p = serde_json::json!("***");
+                }
+            }
+        }
+    }
+    v
+}
+
+#[cfg(test)]
+mod key_class_tests {
+    use super::*;
+
+    #[test]
+    fn keys_are_classified_by_longest_prefix() {
+        assert_eq!(classify_key("security.ban.max_failures"), KeyClass::Reload);
+        assert_eq!(classify_key("security.destinations.rules"), KeyClass::Seed);
+        assert_eq!(
+            classify_key("security.destinations.enabled"),
+            KeyClass::Reload
+        );
+        assert_eq!(
+            classify_key("security.user_limits.overrides"),
+            KeyClass::Seed
+        );
+        assert_eq!(
+            classify_key("security.user_limits.enabled"),
+            KeyClass::Reload
+        );
+        assert_eq!(classify_key("security.sip_users.alice"), KeyClass::Seed);
+        assert_eq!(classify_key("security.sip_realm"), KeyClass::Restart);
+        assert_eq!(classify_key("network.listeners"), KeyClass::Restart);
+        assert_eq!(classify_key("network.public_ipv6"), KeyClass::Unused);
+        assert_eq!(classify_key("management.api_port"), KeyClass::Restart);
+        assert_eq!(classify_key("trunks"), KeyClass::Seed);
+        assert_eq!(classify_key("metrics.prometheus_port"), KeyClass::Unused);
+        assert_eq!(classify_key("logging.format"), KeyClass::Restart);
+        assert_eq!(classify_key("database.backup_keep"), KeyClass::Restart);
+    }
+
+    #[test]
+    fn diff_classifies_paths_and_carries_no_values() {
+        let a = SbcConfig::default();
+        let mut b = a.clone();
+        b.security.max_call_duration += 1;
+        b.security.features.ban.max_failures += 1;
+        b.management.api_port += 1;
+        b.management.api_auth_token = Some("tok-secret-1".into());
+        b.metrics.prometheus_port += 1;
+        b.security.sip_users.insert("alice".into(), "pw".into());
+        let d = config_diff(&a, &b);
+        assert_eq!(
+            d.reload_pending,
+            vec!["security.ban.max_failures", "security.max_call_duration"]
+        );
+        assert_eq!(
+            d.restart_required,
+            vec!["management.api_auth_token", "management.api_port"]
+        );
+        assert!(!serde_json::to_string(&d).unwrap().contains("tok-secret"));
+        assert_eq!(config_diff(&a, &a), ConfigDiff::default());
+    }
+
+    #[test]
+    fn overlay_takes_reload_keys_only() {
+        let boot = SbcConfig::default();
+        let mut loaded = boot.clone();
+        loaded.security.rtp_timeout = 45;
+        loaded.security.features.ban.max_failures = 2;
+        loaded.management.api_port = 9999;
+        loaded.security.sip_realm = "other".into();
+        let eff = overlay_reload_keys(&boot, &loaded);
+        assert_eq!(eff.security.rtp_timeout, 45);
+        assert_eq!(eff.security.features.ban.max_failures, 2);
+        assert_eq!(eff.management.api_port, boot.management.api_port);
+        assert_eq!(eff.security.sip_realm, boot.security.sip_realm);
+    }
+
+    #[test]
+    fn masked_json_hides_every_secret() {
+        let mut cfg = SbcConfig::default();
+        cfg.management.api_auth_token = Some("tok-1".into());
+        cfg.security.sip_users.insert("alice".into(), "pw-1".into());
+        cfg.trunks.push(TrunkConfigToml {
+            password: Some("pw-2".into()),
+            ..toml::from_str("name = \"t\"\nhost = \"h\"\n").unwrap()
+        });
+        let v = masked_json(&cfg);
+        assert_eq!(v["management"]["api_auth_token"], "***");
+        assert_eq!(v["security"]["sip_users"]["alice"], "***");
+        assert_eq!(v["trunks"][0]["password"], "***");
+        let text = v.to_string();
+        assert!(!text.contains("tok-1") && !text.contains("pw-1") && !text.contains("pw-2"));
+        assert!(masked_json(&SbcConfig::default())["management"]["api_auth_token"].is_null());
     }
 }

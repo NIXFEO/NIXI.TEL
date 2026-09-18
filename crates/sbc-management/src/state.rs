@@ -46,6 +46,8 @@ pub struct AppState {
     pub trunk_tasks: Arc<sbc_core::trunk_tasks::TrunkTasks>,
     /// What `/ready` reports (store open, hydrated, listeners bound).
     pub ready: Arc<sbc_core::sbc::Readiness>,
+    /// The running configuration and reload outcomes (`GET /api/v1/config`).
+    pub runtime_config: Arc<sbc_core::sbc::runtime_config::RuntimeConfig>,
     /// Store backup policy and the lock the API shares with the timer.
     pub backup: Arc<sbc_core::sbc::backup::BackupPolicy>,
     pub backup_lock: Arc<tokio::sync::Mutex<()>>,

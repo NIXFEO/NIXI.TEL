@@ -44,6 +44,12 @@ async fn main() -> Result<()> {
         "Configuration loaded from {}: {}",
         config_path, config.general.name
     );
+    if config.management_bind_is_public() {
+        warn!(
+            "management API bound to non-loopback address {} — ensure it is firewalled and never publicly exposed",
+            config.management.api_bind_address
+        );
+    }
 
     // Build integrated SBC from config (wires all modules). The management
     // API (axum) is assembled from the SBC's handles and spawned below.
@@ -93,6 +99,7 @@ async fn main() -> Result<()> {
             kicks: sbc.admin_kicks(),
             trunk_tasks: sbc.trunk_tasks(),
             ready: sbc.readiness(),
+            runtime_config: sbc.runtime_config(),
             backup: sbc.backup_policy(),
             backup_lock: sbc.backup_lock(),
             trusted_proxies: std::sync::Arc::new(config.management.trusted_proxies.clone()),

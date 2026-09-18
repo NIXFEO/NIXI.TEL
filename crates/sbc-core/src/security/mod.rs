@@ -94,6 +94,26 @@ pub struct SecurityManager {
 }
 
 impl SecurityManager {
+    /// Apply the reload-class `[security.*]` flags and thresholds. Rules
+    /// and per-user overrides are store-owned and untouched; the global
+    /// user-limit defaults follow the TOML only when `apply_limit_defaults`
+    /// (i.e. the store carries none set through the API).
+    pub fn apply_config(&self, f: &SecurityFeaturesConfig, apply_limit_defaults: bool) {
+        self.bans.set_config(f.ban.clone());
+        self.destinations.set_enabled(f.destinations.enabled);
+        self.destinations
+            .set_default_action(f.destinations.default_action.eq_ignore_ascii_case("deny"));
+        self.destinations
+            .set_default_country_code(&f.destinations.default_country_code);
+        self.user_limits.set_enabled(f.user_limits.enabled);
+        if apply_limit_defaults {
+            self.user_limits.set_defaults(
+                f.user_limits.default_max_concurrent_calls,
+                f.user_limits.default_max_calls_per_minute,
+            );
+        }
+    }
+
     pub fn new(config: SecurityFeaturesConfig) -> Self {
         Self {
             bans: BanManager::new(config.ban),

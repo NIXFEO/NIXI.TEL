@@ -13,8 +13,9 @@ failures), per-trunk series (`sbc_trunk_up`, `sbc_trunk_registered`,
 `sbc_trunk_consecutive_failures`), the config store (`sbc_store_available`,
 `sbc_store_backups_enabled`, `sbc_store_backup_interval_seconds`,
 `sbc_store_backup_last_success_timestamp_seconds`,
-`sbc_store_backup_last_bytes`, `sbc_store_backup_failures_total`), the log
-writer (`sbc_log_dropped_lines_total`) and the histograms
+`sbc_store_backup_last_bytes`, `sbc_store_backup_failures_total`), reloads
+(`sbc_config_reloads_total{result}`, `sbc_config_last_reload_timestamp_seconds`),
+the log writer (`sbc_log_dropped_lines_total`) and the histograms
 `sbc_call_setup_seconds` / `sbc_call_duration_seconds`.
 
 ## Prometheus
@@ -35,8 +36,8 @@ Optional alerting rules are in `prometheus/alert_rules.yml`: `SBCDown`,
 `SBCCdrsStale`, `SBCRtpTimeouts`, `SBCSessionTimer422Retries`,
 `SBCSipSendFailures`, `SBCTrunkDown`, `SBCTrunkRegistrationFailing`,
 `SBCTrunkAsrLow`, `SBCTrunkUnavailable`, `SBCStoreUnavailable`,
-`SBCStoreBackupStale`, `SBCStoreBackupFailed`, `SBCLogLinesDropped`,
-`SBCAuthFailureSpike`.
+`SBCStoreBackupStale`, `SBCStoreBackupFailed`, `SBCConfigReloadFailed`,
+`SBCLogLinesDropped`, `SBCAuthFailureSpike`.
 Validate with `promtool check rules prometheus/alert_rules.yml`.
 
 ## Grafana

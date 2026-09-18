@@ -112,6 +112,7 @@ Type=simple
 EnvironmentFile=/etc/sbc/sbc.env
 ExecStart=/usr/local/bin/sbc --config /etc/sbc/sbc.toml
 Restart=on-failure    # a store that cannot be opened is fatal: the unit ends failed within seconds, see journalctl
+ExecReload=/bin/kill -HUP $MAINPID   # `systemctl reload sbc` = re-read the reload-class keys (docs/API.md)
 # Graceful stop: the SBC sends BYE to active peers on SIGTERM
 KillSignal=SIGTERM
 TimeoutStopSec=15
@@ -183,12 +184,17 @@ sudo certbot certonly --standalone -d sip.example.com -d webrtc.example.com
 
 Point the listener `cert_file`/`key_file` at
 `/etc/letsencrypt/live/<host>/fullchain.pem` and `privkey.pem`. A renewal
-hook can reload the SBC after renewal:
+hook must **restart** the SBC after renewal: listener certificates are
+loaded at start and a reload does not re-read them. Restart gracefully
+when no call is up (the SBC BYEs active calls on stop):
 
 ```bash
-# /etc/letsencrypt/renewal-hooks/deploy/reload-sbc.sh
-curl -s -X POST -H "Authorization: Bearer $SBC_API_TOKEN" \
-  http://127.0.0.1:8080/api/v1/reload
+# /etc/letsencrypt/renewal-hooks/deploy/restart-sbc.sh
+if curl -s -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/calls | grep -q '"total": *0'; then
+  systemctl restart sbc
+else
+  echo "sbc: calls in progress, restart later" | systemd-cat -t certbot
+fi
 ```
 
 For remote access to the management API, read [§7](#7-securing-the-management-api)
@@ -368,6 +374,7 @@ sudo systemctl stop sbc                                 # graceful BYE
 sudo cp target/release/sbc /usr/local/bin/sbc
 sudo systemctl start sbc
 curl -i http://127.0.0.1:8080/ready                     # 200 once store + listeners are up
+curl -s -H "Authorization: Bearer $SBC_API_TOKEN" http://127.0.0.1:8080/api/v1/config | jq '.file'   # what a reload would change
 bash scripts/api_smoke.sh                               # verify
 
 # Rollback if needed

@@ -177,6 +177,16 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 - SDP offers/answers and relayed BYE/ACK bodies (WebRTC `a=ice-pwd:`
   included) were printed at info; they are debug now, and the UDP parse
   warning's snippet is one line.
+- SIGHUP / `POST /api/v1/reload` re-hydrated the store and re-read only
+  the session-timer, `max_call_duration`, identity and `call_setup_timeout`
+  keys; `[security.ban]`, `rate_limit_per_ip`, `rtp_timeout`,
+  `invite_timeout` and the destination / user-limit flags were
+  constructor-only. Every reload-class key now applies (see the table in
+  docs/API.md); a hydration failure applies nothing from the new file;
+  `POST /api/v1/reload` returns the real outcome (200 with `applied` /
+  `restart_required`, 422 `reload_failed` when the file is unusable, 202
+  when the engine did not answer within 5 s). docs/INSTALL.md and
+  docs/WEBRTC.md no longer claim a reload picks up renewed certificates.
 
 ### Added
 - Trunk state fed by real calls (lot 3). `TrunkState.active_calls`,
@@ -207,6 +217,14 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   transitions publish `trunk_health` SSE events too. Alert rules
   `SBCTrunkDown`, `SBCTrunkRegistrationFailing`, `SBCTrunkAsrLow`,
   `SBCTrunkUnavailable` and a "Trunks" Grafana row ship in `monitoring/`.
+- `GET /api/v1/config`: the effective configuration (secrets `"***"`),
+  what a reload already loaded but could not apply (`restart_required`),
+  what the on-disk file would change (`file.reload_pending`,
+  `file.restart_required`, or its `parse_error`), the last reload report
+  and the key classes (reload / restart / seed / unused). Metrics
+  `sbc_config_reloads_total{result}`,
+  `sbc_config_last_reload_timestamp_seconds`; alert `SBCConfigReloadFailed`;
+  SSE `config` events `runtime/reloaded` and `runtime/reload_failed`.
 - Structured logging (lot 3). Every log line of a call — SIP handlers,
   media relay, timer and admin teardowns — carries a `call` span with
   `uuid`, `call_id`, `trunk` and `direction` (recorded as they become
@@ -257,6 +275,12 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
   Dependabot watches cargo and actions.
 
 ### Changed
+- A reload applies whatever `[security]` reload-class values are on disk,
+  including `[security.ban] whitelist` (an emptied list un-whitelists;
+  loopback stays whitelisted) and `rate_limit_per_ip`: check
+  `GET /api/v1/config` → `file.reload_pending` before the first SIGHUP
+  after this upgrade. TOML `[security.user_limits] default_*` apply only
+  until `PUT /api/v1/security/user-limits` has set store values.
 - `[logging] level` is honoured (it was parsed into nothing): precedence
   `sbc --verbose` > `RUST_LOG` > TOML. The per-message and per-RTP-packet
   lines (`Handling … request`, `Response Call-ID`, `Transport reply`,

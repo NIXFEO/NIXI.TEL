@@ -115,6 +115,14 @@ groups:
         annotations:
           summary: "An SBC store backup failed in the last 24 h (disk full? permissions?)"
 
+      - alert: SBCConfigReloadFailed
+        # SIGHUP / POST /api/v1/reload could not read, parse or hydrate: the
+        # runtime kept its previous values (GET /api/v1/config.last_reload).
+        expr: increase(sbc_config_reloads_total{result="error"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "An SBC configuration reload failed (see /api/v1/config.last_reload)"
+
       - alert: SBCLogLinesDropped
         # The non-blocking log writer discarded lines (journald/stdout
         # back-pressure): call forensics for that window are incomplete.

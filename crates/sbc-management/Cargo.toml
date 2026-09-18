@@ -33,5 +33,7 @@ async-trait = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }
 http-body-util = "0.1"
 tower = { workspace = true, features = ["util"] }

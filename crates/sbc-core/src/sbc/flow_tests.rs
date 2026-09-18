@@ -2439,3 +2439,159 @@ async fn a_normal_call_stays_within_the_info_budget() {
         assert!(!msg.contains('\n'), "no bodies at info: {}", msg);
     }
 }
+
+// ── Reload ───────────────────────────────────────────────────────────────────
+
+fn write_temp_toml(cfg: &SbcConfig) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("sbc-reload-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sbc.toml");
+    std::fs::write(&path, toml::to_string(cfg).unwrap()).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn reload_applies_every_reload_class_key_from_the_toml() {
+    use crate::sbc::runtime_config::ReloadSource;
+    let mut sbc = SbcBuilder::new().build();
+    let mut cfg = SbcConfig::default();
+    cfg.security.rate_limit_per_ip = 7;
+    cfg.security.rtp_timeout = 45;
+    cfg.security.invite_timeout = 9;
+    cfg.security.max_call_duration = 600;
+    cfg.security.call_setup_timeout = 30;
+    cfg.security.session_timer_enabled = true;
+    cfg.security.session_expires = 14400;
+    cfg.security.min_se = 90;
+    cfg.security.trunk_local_from = "reject".into();
+    cfg.security.features.ban.max_failures = 2;
+    cfg.security.features.destinations.default_action = "deny".into();
+    cfg.security.features.user_limits.enabled = false;
+    cfg.security
+        .features
+        .user_limits
+        .default_max_concurrent_calls = 2;
+    cfg.security
+        .features
+        .user_limits
+        .default_max_calls_per_minute = 3;
+    let path = write_temp_toml(&cfg);
+    sbc.set_config_path(path.to_string_lossy().into_owned());
+    let mut events = sbc.events().subscribe();
+
+    let report = sbc.reload_config(ReloadSource::Api).await.unwrap();
+    assert!(report.ok && !report.hydrated);
+    assert!(report.restart_required.is_empty(), "{:?}", report);
+    for key in [
+        "security.rate_limit_per_ip",
+        "security.rtp_timeout",
+        "security.invite_timeout",
+        "security.max_call_duration",
+        "security.call_setup_timeout",
+        "security.session_timer",
+        "security.identity",
+        "security.ban",
+        "security.destinations",
+        "security.user_limits",
+    ] {
+        assert!(
+            report.applied.iter().any(|k| k == key),
+            "{} in {:?}",
+            key,
+            report.applied
+        );
+    }
+    assert_eq!(sbc.dos.config().requests_per_second, 7);
+    assert_eq!(sbc.media.rtp_timeout(), 45);
+    assert_eq!(sbc.invite_timeout, Duration::from_secs(9));
+    assert_eq!(sbc.max_call_duration, Duration::from_secs(600));
+    assert_eq!(sbc.call_setup_timeout, Duration::from_secs(30));
+    assert_eq!(sbc.session_timer, Some((14400, 90)));
+    assert!(sbc.identity_policy.reject_trunk_local_from);
+    assert_eq!(sbc.security.bans.config().max_failures, 2);
+    assert!(sbc.security.destinations.default_action_deny());
+    assert!(!sbc.security.user_limits.is_enabled());
+    assert_eq!(sbc.security.user_limits.defaults(), (2, 3));
+    assert_eq!(sbc.runtime_config().effective().security.rtp_timeout, 45);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::events::SbcEvent::ConfigChanged { ref entity, ref action, .. }) if entity == "runtime" && action == "reloaded"
+    ));
+
+    // A second reload of the same file applies nothing new.
+    let again = sbc.reload_config(ReloadSource::Sighup).await.unwrap();
+    assert!(again.applied.is_empty(), "{:?}", again.applied);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn reload_reports_restart_required_and_a_broken_file_changes_nothing() {
+    use crate::sbc::runtime_config::ReloadSource;
+    let mut sbc = SbcBuilder::new().build();
+    let mut cfg = SbcConfig::default();
+    cfg.security.sip_realm = "other.example".into();
+    cfg.management.api_port += 1;
+    let path = write_temp_toml(&cfg);
+    sbc.set_config_path(path.to_string_lossy().into_owned());
+    let report = sbc.reload_config(ReloadSource::Api).await.unwrap();
+    assert_eq!(
+        report.restart_required,
+        vec!["management.api_port", "security.sip_realm"]
+    );
+    assert_eq!(
+        sbc.runtime_config().effective().security.sip_realm,
+        SbcConfig::default().security.sip_realm,
+        "restart keys keep the boot value"
+    );
+
+    let before = sbc.max_call_duration;
+    std::fs::write(&path, "[security]\nmax_call_duration = \"x\"\n").unwrap();
+    let mut events = sbc.events().subscribe();
+    let err = sbc.reload_config(ReloadSource::Sighup).await.unwrap_err();
+    assert!(err.to_string().contains("parse"), "{}", err);
+    assert_eq!(sbc.max_call_duration, before);
+    let last = sbc.runtime_config().last_reload().unwrap();
+    assert!(!last.ok && last.error.is_some());
+    assert_eq!(sbc.metrics.config_reloads.lock().unwrap()["error"], 1);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::events::SbcEvent::ConfigChanged { ref action, .. }) if action == "reload_failed"
+    ));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn reload_keeps_api_set_user_limit_defaults_over_the_toml() {
+    use crate::sbc::runtime_config::ReloadSource;
+    let mut sbc = SbcBuilder::new().build();
+    let store = sbc_storage::ConfigStore::open_memory().await.unwrap();
+    store
+        .set_setting(super::hydrate::SETTING_DEFAULT_CONCURRENT, "9")
+        .await
+        .unwrap();
+    store
+        .set_setting(super::hydrate::SETTING_DEFAULT_CPM, "99")
+        .await
+        .unwrap();
+    sbc.config_store = Some(Arc::new(store));
+    let mut cfg = SbcConfig::default();
+    cfg.security
+        .features
+        .user_limits
+        .default_max_concurrent_calls = 4;
+    cfg.security
+        .features
+        .user_limits
+        .default_max_calls_per_minute = 10;
+    let path = write_temp_toml(&cfg);
+    sbc.set_config_path(path.to_string_lossy().into_owned());
+    let report = sbc.reload_config(ReloadSource::Api).await.unwrap();
+    assert!(report.hydrated);
+    assert_eq!(
+        sbc.security.user_limits.defaults(),
+        (9, 99),
+        "the store wins"
+    );
+    assert!(!report.applied.iter().any(|k| k == "security.user_limits"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

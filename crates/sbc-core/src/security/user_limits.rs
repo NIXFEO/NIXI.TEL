@@ -130,6 +130,14 @@ impl UserLimitsManager {
         self.overrides.remove(user).is_some()
     }
 
+    pub fn set_enabled(&self, on: bool) {
+        *self.enabled.write().unwrap() = on;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.read().unwrap()
+    }
+
     pub fn set_defaults(&self, max_concurrent: u32, max_cpm: u32) {
         *self.defaults.write().unwrap() = (max_concurrent, max_cpm);
     }

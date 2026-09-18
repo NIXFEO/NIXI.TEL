@@ -12,6 +12,7 @@ pub mod backup;
 mod call_handler;
 mod cdr;
 mod invite_tx;
+pub mod runtime_config;
 mod trunk_state;
 pub(crate) use cdr::CallOutcome;
 #[cfg(test)]
@@ -54,7 +55,7 @@ use tracing::{debug, error, info, warn};
 
 /// Integrated SBC combining all layers
 /// How claimed identities are policed (`[security]`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityPolicy {
     /// 403 (true) or log-only on a REGISTER for someone else's AOR.
     pub enforce_register_aor: bool,
@@ -321,8 +322,8 @@ pub struct Sbc {
     /// Background maintenance tasks handle
     _maintenance: Option<MaintenanceHandle>,
 
-    /// Path to configuration file (for SIGHUP hot-reload)
-    config_path: Option<String>,
+    /// The running configuration and reload outcomes (`GET /api/v1/config`).
+    runtime_config: Arc<runtime_config::RuntimeConfig>,
 
     /// Trunk manager reference (for outbound REGISTER, hot-reload)
     pub trunk_manager: Arc<TrunkManager>,
@@ -523,12 +524,7 @@ impl Sbc {
         ));
 
         // --- DoS ---
-        let dos_config = RateLimitConfig {
-            requests_per_second: config.security.rate_limit_per_ip,
-            burst_size: config.security.rate_limit_per_ip * 2,
-            ..Default::default()
-        };
-        let dos = Arc::new(DosProtector::new(dos_config));
+        let dos = Arc::new(DosProtector::new(Self::dos_config(&config.security)));
 
         // --- Topology identity ---
         let identity = config.network.public_ipv4.map(|public_ip| {
@@ -690,7 +686,7 @@ impl Sbc {
             metrics,
             cdr,
             _maintenance: None,
-            config_path: None,
+            runtime_config: Arc::new(runtime_config::RuntimeConfig::new(config.clone(), None)),
             trunk_manager: trunk_manager.clone(),
             pending_register_responses,
             trunk_tasks,
@@ -765,7 +761,7 @@ impl Sbc {
 
     /// Set the config file path (for SIGHUP hot-reload)
     pub fn set_config_path(&mut self, path: impl Into<String>) {
-        self.config_path = Some(path.into());
+        self.runtime_config.set_path(path);
     }
 
     /// Get the reload notifier (for API-triggered reload)
@@ -773,26 +769,35 @@ impl Sbc {
         self.reload_notify.clone()
     }
 
-    /// Hot-reload configuration from the TOML file.
-    /// Currently reloads: SIP users (Digest auth), trunks.
-    /// Preserves: transport listeners, active calls, registrations, nonces.
-    pub async fn reload_config(&mut self) -> Result<()> {
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or_else(|| Error::Config("No config path set for reload".to_string()))?;
+    pub fn runtime_config(&self) -> Arc<runtime_config::RuntimeConfig> {
+        self.runtime_config.clone()
+    }
 
-        info!("SIGHUP: reloading configuration from {}", path);
+    /// The DoS limiter's config from `[security]` (per-IP rate, burst ×2).
+    fn dos_config(sec: &crate::config::SecurityConfig) -> RateLimitConfig {
+        RateLimitConfig {
+            requests_per_second: sec.rate_limit_per_ip,
+            burst_size: sec.rate_limit_per_ip.saturating_mul(2),
+            ..Default::default()
+        }
+    }
 
-        let config = SbcConfig::from_file(path)?;
+    /// Apply every reload-class key of `config` to the live runtime and
+    /// return the dotted keys whose effective value changed. Values are
+    /// captured per call/relay/attempt, so timers and limits apply to new
+    /// calls; `max_call_duration` / `call_setup_timeout` to the next tick.
+    fn apply_runtime_settings(
+        &mut self,
+        config: &SbcConfig,
+        apply_limit_defaults: bool,
+    ) -> Vec<String> {
+        let mut applied = Vec::new();
+        let sec = &config.security;
 
-        // ── RFC 4028 session-timer offer: applied without a restart, so an
-        // operator can raise session_expires to a trunk's floor (e.g. 14400
-        // for Genesys) on the fly. Affects new calls only.
-        let session_timer = config.security.session_timer_enabled.then(|| {
+        let session_timer = sec.session_timer_enabled.then(|| {
             (
-                config.security.session_expires.max(config.security.min_se) as u32,
-                config.security.min_se as u32,
+                sec.session_expires.max(sec.min_se) as u32,
+                sec.min_se as u32,
             )
         });
         if session_timer != self.session_timer {
@@ -801,8 +806,9 @@ impl Sbc {
                 self.session_timer, session_timer
             );
             self.session_timer = session_timer;
+            applied.push("security.session_timer".to_string());
         }
-        let max_call_duration = Duration::from_secs(config.security.max_call_duration.max(60));
+        let max_call_duration = Duration::from_secs(sec.max_call_duration.max(60));
         if max_call_duration != self.max_call_duration {
             info!(
                 "Reload: max_call_duration {}s → {}s",
@@ -810,9 +816,9 @@ impl Sbc {
                 max_call_duration.as_secs()
             );
             self.max_call_duration = max_call_duration;
+            applied.push("security.max_call_duration".to_string());
         }
-        self.identity_policy = IdentityPolicy::from_config(&config.security);
-        let setup_timeout = Duration::from_secs(config.security.call_setup_timeout.max(10));
+        let setup_timeout = Duration::from_secs(sec.call_setup_timeout.max(10));
         if setup_timeout != self.call_setup_timeout {
             info!(
                 "Reload: call_setup_timeout {}s → {}s",
@@ -820,11 +826,133 @@ impl Sbc {
                 setup_timeout.as_secs()
             );
             self.call_setup_timeout = setup_timeout;
+            applied.push("security.call_setup_timeout".to_string());
         }
+        let invite_timeout = Duration::from_secs(sec.invite_timeout.max(1));
+        if invite_timeout != self.invite_timeout {
+            info!(
+                "Reload: invite_timeout {}s → {}s",
+                self.invite_timeout.as_secs(),
+                invite_timeout.as_secs()
+            );
+            self.invite_timeout = invite_timeout;
+            applied.push("security.invite_timeout".to_string());
+        }
+        let identity_policy = IdentityPolicy::from_config(sec);
+        if identity_policy != self.identity_policy {
+            info!("Reload: identity policy updated");
+            self.identity_policy = identity_policy;
+            applied.push("security.identity".to_string());
+        }
+        let rtp_timeout = sec.rtp_timeout.max(10);
+        if rtp_timeout != self.media.rtp_timeout() {
+            info!(
+                "Reload: rtp_timeout {}s → {}s (new calls)",
+                self.media.rtp_timeout(),
+                rtp_timeout
+            );
+            self.media.set_rtp_timeout(rtp_timeout);
+            applied.push("security.rtp_timeout".to_string());
+        }
+        let dos = Self::dos_config(sec);
+        if dos.requests_per_second != self.dos.config().requests_per_second {
+            info!(
+                "Reload: rate_limit_per_ip {} → {}",
+                self.dos.config().requests_per_second,
+                dos.requests_per_second
+            );
+            self.dos.set_config(dos);
+            applied.push("security.rate_limit_per_ip".to_string());
+        }
+        let f = &sec.features;
+        let ban_changed = self.security.bans.config() != f.ban;
+        let dest_changed = self.security.destinations.is_enabled() != f.destinations.enabled
+            || self.security.destinations.default_action_deny()
+                != f.destinations.default_action.eq_ignore_ascii_case("deny")
+            || self.security.destinations.default_country_code()
+                != f.destinations.default_country_code;
+        let limits_changed = self.security.user_limits.is_enabled() != f.user_limits.enabled
+            || (apply_limit_defaults
+                && self.security.user_limits.defaults()
+                    != (
+                        f.user_limits.default_max_concurrent_calls,
+                        f.user_limits.default_max_calls_per_minute,
+                    ));
+        self.security.apply_config(f, apply_limit_defaults);
+        if ban_changed {
+            applied.push("security.ban".to_string());
+        }
+        if dest_changed {
+            applied.push("security.destinations".to_string());
+        }
+        if limits_changed {
+            applied.push("security.user_limits".to_string());
+        }
+        applied
+    }
+
+    /// Hot-reload: re-read the TOML, re-hydrate from the store, then apply
+    /// the reload-class keys (see `config::classify_key`). Listeners,
+    /// media ports, TLS material, realm and `[management]` need a restart
+    /// and are reported as such. The outcome is recorded for
+    /// `GET /api/v1/config` and returned to `POST /api/v1/reload`.
+    pub async fn reload_config(
+        &mut self,
+        source: runtime_config::ReloadSource,
+    ) -> Result<runtime_config::ReloadReport> {
+        let ts = crate::events::event_ts();
+        let fail = |this: &Self, error: String| -> runtime_config::ReloadReport {
+            let report = runtime_config::ReloadReport {
+                ts,
+                source,
+                ok: false,
+                error: Some(error.clone()),
+                applied: Vec::new(),
+                restart_required: this
+                    .runtime_config
+                    .last_reload()
+                    .map(|r| r.restart_required)
+                    .unwrap_or_default(),
+                hydrated: false,
+            };
+            this.runtime_config.record_reload(report.clone(), None);
+            this.metrics.inc_config_reload(false);
+            this.events.publish(crate::events::SbcEvent::ConfigChanged {
+                entity: "runtime".into(),
+                action: "reload_failed".into(),
+                id: format!("{:?}", source).to_lowercase(),
+                ts,
+            });
+            warn!("Reload failed ({:?}): {}", source, error);
+            report
+        };
+        let Some(path) = self.runtime_config.config_path() else {
+            let r = fail(self, "no config path set for reload".into());
+            return Err(Error::Config(r.error.unwrap_or_default()));
+        };
+        info!("Reload ({:?}): reading {}", source, path);
+        // tokio::fs so the read does not pin a runtime worker; the SIP loop
+        // itself still waits for the reload (hydration, DNS) as before.
+        let raw = match tokio::fs::read_to_string(&path).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                let r = fail(self, format!("Failed to read config file: {}", e));
+                return Err(Error::Config(r.error.unwrap_or_default()));
+            }
+        };
+        let config = match SbcConfig::from_toml_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                let r = fail(self, e.to_string());
+                return Err(Error::Config(r.error.unwrap_or_default()));
+            }
+        };
 
         // ── SQLite store present: it is the source of truth for dynamic
-        // config — re-hydrate users/DIDs/trunks/ACL from it and skip the
-        // legacy TOML merge below.
+        // config — re-hydrate users/DIDs/trunks/ACL from it first, so a
+        // hydration failure applies nothing from the new file.
+        let mut hydrated = false;
+        let mut apply_limit_defaults = true;
         if let Some(store) = self.config_store.clone() {
             let handles = hydrate::RuntimeHandles {
                 auth: self.auth.clone(),
@@ -833,14 +961,61 @@ impl Sbc {
                 acl: self.acl.clone(),
                 security: self.security.clone(),
             };
-            hydrate::hydrate_all(&handles, &store).await?;
+            if let Err(e) = hydrate::hydrate_all(&handles, &store).await {
+                let r = fail(self, format!("hydration from the store failed: {}", e));
+                return Err(Error::Config(r.error.unwrap_or_default()));
+            }
             self.refresh_trunk_ips().await;
             self.register_trunk_tls_configs();
             self.trunk_tasks.sync();
+            hydrated = true;
+            // API-set global user limits (settings) win over the TOML defaults.
+            let concurrent = store
+                .get_setting(hydrate::SETTING_DEFAULT_CONCURRENT)
+                .await
+                .ok()
+                .flatten();
+            let cpm = store
+                .get_setting(hydrate::SETTING_DEFAULT_CPM)
+                .await
+                .ok()
+                .flatten();
+            apply_limit_defaults = !(concurrent.is_some() && cpm.is_some());
             info!("Reload: runtime re-hydrated from config store");
-            return Ok(());
+        } else {
+            self.reload_legacy_toml(&config).await;
         }
 
+        let applied = self.apply_runtime_settings(&config, apply_limit_defaults);
+        let restart_required =
+            crate::config::config_diff(&self.runtime_config.effective(), &config).restart_required;
+        let report = runtime_config::ReloadReport {
+            ts,
+            source,
+            ok: true,
+            error: None,
+            applied,
+            restart_required,
+            hydrated,
+        };
+        self.runtime_config
+            .record_reload(report.clone(), Some(config));
+        self.metrics.inc_config_reload(true);
+        self.events.publish(crate::events::SbcEvent::ConfigChanged {
+            entity: "runtime".into(),
+            action: "reloaded".into(),
+            id: format!("{:?}", source).to_lowercase(),
+            ts,
+        });
+        info!(
+            "Reload ({:?}) done: applied {:?}, restart required for {:?}",
+            source, report.applied, report.restart_required
+        );
+        Ok(report)
+    }
+
+    /// TOML-only box (no store): users, trunks and DIDs come from the file.
+    async fn reload_legacy_toml(&mut self, config: &SbcConfig) {
         // ── Legacy TOML-only reload path ──
         // Reload SIP users in DigestAuthenticator
         if let Some(ref auth) = self.auth {
@@ -943,9 +1118,6 @@ impl Sbc {
         // Reload trunk IPs whitelist and the per-trunk tasks
         self.refresh_trunk_ips().await;
         self.trunk_tasks.sync();
-
-        info!("SIGHUP: configuration reloaded successfully");
-        Ok(())
     }
 
     /// Register outbound-TLS parameters for every TLS trunk with the
@@ -1033,7 +1205,10 @@ impl Sbc {
             metrics,
             cdr: Arc::new(CdrManager::new_memory()),
             _maintenance: None,
-            config_path: None,
+            runtime_config: Arc::new(runtime_config::RuntimeConfig::new(
+                SbcConfig::default(),
+                None,
+            )),
             trunk_manager,
             pending_register_responses,
             trunk_tasks,
@@ -1206,13 +1381,13 @@ impl Sbc {
                 }
                 _ = sighup.recv() => {
                     info!("SIGHUP received — reloading configuration");
-                    if let Err(e) = self.reload_config().await {
+                    if let Err(e) = self.reload_config(runtime_config::ReloadSource::Sighup).await {
                         error!("SIGHUP reload failed: {}", e);
                     }
                 }
                 _ = self.reload_notify.notified() => {
                     info!("API reload requested — reloading configuration");
-                    if let Err(e) = self.reload_config().await {
+                    if let Err(e) = self.reload_config(runtime_config::ReloadSource::Api).await {
                         error!("API reload failed: {}", e);
                     }
                 }

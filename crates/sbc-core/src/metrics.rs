@@ -239,6 +239,12 @@ pub struct SbcMetrics {
     /// Lines the non-blocking log writer dropped because stdout/journald
     /// did not keep up (sampled from the writer's counter).
     pub log_dropped_lines: Arc<AtomicU64>,
+    /// Config reloads by result ("ok" / "error"). Pre-seeded to 0 so both
+    /// series exist before the first reload (an `increase()` alert needs
+    /// them), unlike the lazily populated `sip_send_failures`.
+    pub config_reloads: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Unix time of the last successful reload (0 = none since start).
+    pub config_last_reload_time: Arc<AtomicU64>,
     /// 1 when the SQLite config store is open and hydrated.
     pub store_available: Arc<AtomicU64>,
     /// 1 when the backup timer runs.
@@ -299,6 +305,11 @@ impl SbcMetrics {
             last_cdr_written_time: Arc::new(AtomicU64::new(0)),
             trunks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             log_dropped_lines: Arc::new(AtomicU64::new(0)),
+            config_reloads: Arc::new(std::sync::Mutex::new(HashMap::from([
+                ("ok", 0u64),
+                ("error", 0u64),
+            ]))),
+            config_last_reload_time: Arc::new(AtomicU64::new(0)),
             store_available: Arc::new(AtomicU64::new(0)),
             store_backups_enabled: Arc::new(AtomicU64::new(0)),
             store_backup_interval_secs: Arc::new(AtomicU64::new(0)),
@@ -463,6 +474,19 @@ impl SbcMetrics {
     }
 
     /// Stamp the time a CDR was just written (Unix seconds, current time).
+    pub fn inc_config_reload(&self, ok: bool) {
+        if let Ok(mut map) = self.config_reloads.lock() {
+            *map.entry(if ok { "ok" } else { "error" }).or_insert(0) += 1;
+        }
+        if ok {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs();
+            self.config_last_reload_time.store(now, Ordering::Relaxed);
+        }
+    }
+
     pub fn set_log_dropped_lines(&self, n: u64) {
         self.log_dropped_lines.store(n, Ordering::Relaxed);
     }
@@ -658,6 +682,23 @@ impl SbcMetrics {
             "sbc_last_cdr_written_timestamp_seconds",
             "Unix time of the last CDR written (0 = none since start)",
             self.last_cdr_written_time.load(Ordering::Relaxed)
+        );
+
+        out.push_str("# HELP sbc_config_reloads_total Configuration reloads (SIGHUP / POST /api/v1/reload) by result\n# TYPE sbc_config_reloads_total counter\n");
+        if let Ok(map) = self.config_reloads.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort();
+            for (result, n) in entries {
+                out.push_str(&format!(
+                    "sbc_config_reloads_total{{result=\"{}\"}} {}\n",
+                    result, n
+                ));
+            }
+        }
+        gauge!(
+            "sbc_config_last_reload_timestamp_seconds",
+            "Unix time of the last successful configuration reload (0 = none since start)",
+            self.config_last_reload_time.load(Ordering::Relaxed)
         );
 
         counter!(
@@ -1361,6 +1402,18 @@ mod tests {
         assert!(out.contains("sbc_store_backup_failures_total 1\n"));
         assert!(m.store_backup_last_success_time.load(Ordering::Relaxed) > 0);
         assert!(out.contains("sbc_log_dropped_lines_total 0\n"));
+        assert!(
+            out.contains("sbc_config_reloads_total{result=\"error\"} 0\n"),
+            "{}",
+            out
+        );
+        assert!(out.contains("sbc_config_reloads_total{result=\"ok\"} 0\n"));
+        m.inc_config_reload(false);
+        m.inc_config_reload(true);
+        let out = m.render_prometheus();
+        assert!(out.contains("sbc_config_reloads_total{result=\"error\"} 1\n"));
+        assert!(out.contains("sbc_config_reloads_total{result=\"ok\"} 1\n"));
+        assert!(m.config_last_reload_time.load(Ordering::Relaxed) > 0);
         m.set_log_dropped_lines(7);
         assert!(m
             .render_prometheus()

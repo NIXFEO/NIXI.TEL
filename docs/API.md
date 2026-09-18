@@ -124,13 +124,26 @@ Security events (`GET /api/v1/security/status` → `recent_events`, SSE `alert`)
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/v1/reload` (alias `/api/v1/config/reload`) | re-hydrate runtime from the store |
+| POST | `/api/v1/reload` (alias `/api/v1/config/reload`) | re-reads the TOML (reload-class keys, table below) and re-hydrates from the store; 200 `{"status":"reloaded","applied":[…],"restart_required":[…],"hydrated":bool}`, 422 `reload_failed` (unusable file, nothing changed), 202 `reload_triggered` when the engine did not answer within 5 s (check `GET /api/v1/config`). Concurrent SIGHUP/API triggers coalesce. |
+| GET | `/api/v1/config` | effective configuration with secrets masked (`running`), `restart_required` (loaded by a reload but needs a restart), `file` = the on-disk TOML's `reload_pending` / `restart_required` or `parse_error` / `readable:false`, `last_reload`, `key_classes`, `store`. Exposes usernames, trunk hosts and file paths like `/users`, `/trunks` and `/export`: admin only. |
 | GET | `/api/v1/export` | full dynamic-config dump (includes auth material — admin only) |
 | POST | `/api/v1/backup` | `VACUUM INTO` copy of the store into `[database] backup_dir` as `sbc-<timestamp>.db`, pruned to `backup_keep`: 200 `{"path","bytes","took_ms","pruned":[…]}`, 409 `backup already in progress`, 503 without a store. The copy holds trunk passwords and user HA1s. |
 
 ### Legacy aliases
 
 `GET /api/calls`, `/api/registrations`, `/api/status`, `/api/trunks`.
+
+## Reload vs restart
+
+Key classes assume the SQLite store is open (always in production; on a
+TOML-only box the seed keys are re-applied by a reload).
+
+| Class | Keys | Applied by |
+|---|---|---|
+| reload | `security.max_call_duration`, `call_setup_timeout`, `rtp_timeout`, `invite_timeout`, `session_timer_enabled`, `session_expires`, `min_se`, `register_aor_check`, `served_domains`, `trunk_local_from`, `rate_limit_per_ip`, `[security.ban]`, `[security.destinations]` `enabled` / `default_action` / `default_country_code`, `[security.user_limits]` `enabled` / `default_*` | SIGHUP or `POST /api/v1/reload` (timers and limits apply to new calls) |
+| restart | `general.cdr_file`, `[network]` listeners and `public_ipv4`, `media.rtp_port_range`, `[database]`, `security.sip_realm`, `enable_digest_auth`, `[management]`, `[trunk_health]`, `[logging]` | `systemctl restart sbc` (graceful) |
+| seed | `[security.sip_users]`, `[[trunks]]`, `[[dids]]`, `[security.destinations] rules` / `seed_irsf_rules`, `[[security.user_limits.overrides]]` | imported once at first boot into the store, then the API |
+| unused | `general.name` / `instance_id`, `network.public_ipv6`, `security.rate_limit_global` / `auth_challenge_timeout`, `[media]` except the port range, `[metrics]` | nothing |
 
 ## SSE events
 
@@ -139,7 +152,8 @@ the category: `call` (`call_started`/`call_answered`/`call_ended`),
 `registration`, `trunk` (`trunk_health` up/down transitions,
 `trunk_registered` once per accepted outbound REGISTER, `trunk_unregistered`
 with the reason once per failure transition), `alert` (incl. security:
-bans, destination blocks, limit hits), `config` (CRUD changes). Slow
+bans, destination blocks, limit hits), `config` (CRUD changes, plus
+`runtime` / `reloaded` and `runtime` / `reload_failed` for reloads). Slow
 consumers receive a `lagged` event with the number of skipped messages.
 
 ```bash

@@ -58,6 +58,10 @@ async fn make_state() -> AppState {
         kicks: Arc::new(sbc_core::sbc::AdminKicks::new()),
         trunk_tasks,
         ready: Arc::new(sbc_core::sbc::Readiness::new()),
+        runtime_config: Arc::new(sbc_core::sbc::runtime_config::RuntimeConfig::new(
+            sbc_core::config::SbcConfig::default(),
+            None,
+        )),
         backup: Arc::new(sbc_core::sbc::backup::BackupPolicy {
             dir: std::env::temp_dir().join(format!("sbc-api-backups-{}", uuid::Uuid::new_v4())),
             interval: None,
@@ -1725,4 +1729,165 @@ async fn backup_endpoint_writes_prunes_and_needs_a_token() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&state.backup.dir);
+}
+
+// ── GET /api/v1/config, POST /api/v1/reload ──────────────────────────────────
+
+#[tokio::test]
+async fn config_endpoint_masks_secrets_and_needs_a_token() {
+    let mut state = make_state().await;
+    let mut cfg = sbc_core::config::SbcConfig::default();
+    cfg.management.api_auth_token = Some("tok-secret-1".into());
+    cfg.security
+        .sip_users
+        .insert("alice".into(), "pw-secret-1".into());
+    cfg.trunks
+        .push(toml::from_str("name = \"t\"\nhost = \"h\"\npassword = \"pw-secret-2\"\n").unwrap());
+    state.runtime_config = Arc::new(sbc_core::sbc::runtime_config::RuntimeConfig::new(cfg, None));
+    let app = build_router(state, &[]);
+    let resp = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/config", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app
+        .oneshot(req("GET", "/api/v1/config", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["running"]["management"]["api_auth_token"], "***");
+    assert_eq!(json["running"]["security"]["sip_users"]["alice"], "***");
+    assert_eq!(json["running"]["trunks"][0]["password"], "***");
+    assert!(!json.to_string().contains("secret"));
+    assert!(json["file"].is_null(), "no path set");
+    assert_eq!(json["loaded_by"], "boot");
+    assert!(json["key_classes"]["reload"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k == "security.ban."));
+}
+
+#[tokio::test]
+async fn config_endpoint_diffs_the_file_against_the_running_values() {
+    let state = make_state().await;
+    let dir = std::env::temp_dir().join(format!("sbc-cfg-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sbc.toml");
+    let mut on_disk = sbc_core::config::SbcConfig::default();
+    on_disk.security.max_call_duration += 100;
+    on_disk.management.api_port += 1;
+    std::fs::write(&path, toml::to_string(&on_disk).unwrap()).unwrap();
+    state
+        .runtime_config
+        .set_path(path.to_string_lossy().into_owned());
+    let app = build_router(state, &[]);
+
+    let json = body_json(
+        app.clone()
+            .oneshot(req("GET", "/api/v1/config", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json["file"]["readable"], true);
+    assert_eq!(
+        json["file"]["reload_pending"],
+        serde_json::json!(["security.max_call_duration"])
+    );
+    assert_eq!(
+        json["file"]["restart_required"],
+        serde_json::json!(["management.api_port"])
+    );
+
+    std::fs::write(&path, "this = is not [ toml").unwrap();
+    let json = body_json(
+        app.clone()
+            .oneshot(req("GET", "/api/v1/config", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(json["file"]["parse_error"].is_string());
+
+    std::fs::remove_file(&path).unwrap();
+    let json = body_json(
+        app.oneshot(req("GET", "/api/v1/config", None, true))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(json["file"]["readable"], false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn reload_returns_the_engine_report() {
+    use sbc_core::sbc::runtime_config::{ReloadReport, ReloadSource};
+    let state = make_state().await;
+    let app = build_router(state.clone(), &[]);
+
+    // A fake engine: on notify, record an ok report.
+    let engine = state.clone();
+    tokio::spawn(async move {
+        engine.reload.notified().await;
+        engine.runtime_config.record_reload(
+            ReloadReport {
+                ts: 1,
+                source: ReloadSource::Api,
+                ok: true,
+                error: None,
+                applied: vec!["security.rtp_timeout".into()],
+                restart_required: vec![],
+                hydrated: true,
+            },
+            Some(sbc_core::config::SbcConfig::default()),
+        );
+        engine.reload.notified().await;
+        engine.runtime_config.record_reload(
+            ReloadReport {
+                ts: 2,
+                source: ReloadSource::Api,
+                ok: false,
+                error: Some("Failed to parse config: boom".into()),
+                applied: vec![],
+                restart_required: vec![],
+                hydrated: false,
+            },
+            None,
+        );
+    });
+    let resp = app
+        .clone()
+        .oneshot(req("POST", "/api/v1/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "reloaded");
+    assert_eq!(json["applied"], serde_json::json!(["security.rtp_timeout"]));
+    let resp = app
+        .oneshot(req("POST", "/api/v1/config/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "reload_failed");
+    assert!(json["error"].as_str().unwrap().contains("boom"));
+}
+
+#[tokio::test]
+async fn reload_without_an_engine_answers_202() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+    // Paused time: the 5 s wait for the engine elapses instantly.
+    tokio::time::pause();
+    let resp = app
+        .oneshot(req("POST", "/api/v1/reload", None, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(resp).await["status"], "reload_triggered");
 }

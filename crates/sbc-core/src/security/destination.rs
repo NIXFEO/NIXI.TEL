@@ -233,6 +233,22 @@ impl DestinationPolicy {
         *self.default_deny.write().unwrap() = deny;
     }
 
+    pub fn set_enabled(&self, on: bool) {
+        *self.enabled.write().unwrap() = on;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.read().unwrap()
+    }
+
+    pub fn set_default_country_code(&self, cc: &str) {
+        *self.default_cc.write().unwrap() = cc.to_string();
+    }
+
+    pub fn default_country_code(&self) -> String {
+        self.default_cc.read().unwrap().clone()
+    }
+
     pub fn default_action_deny(&self) -> bool {
         *self.default_deny.read().unwrap()
     }

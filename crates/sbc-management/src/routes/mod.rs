@@ -36,6 +36,15 @@ impl ApiError {
             message: message.into(),
         }
     }
+    /// 422 with a caller-chosen code (`reload_failed`…).
+    pub fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
