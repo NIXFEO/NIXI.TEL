@@ -36,7 +36,7 @@ tokio-tungstenite = "0.21"
 # WebRTC
 webrtc-ice = "0.9"
 webrtc-dtls = "0.8"
-webrtc-util = { version = "0.8", features = ["conn"] }
+webrtc-util = { version = "0.17", features = ["conn"] }
 webrtc-srtp = "0.12"
 
 # Media
