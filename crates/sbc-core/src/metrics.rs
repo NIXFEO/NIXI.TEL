@@ -261,6 +261,11 @@ pub struct SbcMetrics {
     /// users, trunks or DIDs to serve — a lost or unmounted store looks
     /// exactly like this.
     pub store_created_empty: Arc<AtomicU64>,
+    /// Media packets and bytes delivered, by the leg they went to.
+    pub media_tx_packets: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    pub media_tx_bytes: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
+    /// Calls reported as one-way, by the leg that went silent.
+    pub media_one_way: Arc<std::sync::Mutex<HashMap<&'static str, u64>>>,
     /// Calls the SBC could not anchor media for (no ports, relay start
     /// failed): refused before dialling, or ended right after the answer.
     pub media_relay_failures: Arc<AtomicU64>,
@@ -338,6 +343,9 @@ impl SbcMetrics {
             config_last_reload_time: Arc::new(AtomicU64::new(0)),
             store_available: Arc::new(AtomicU64::new(0)),
             store_created_empty: Arc::new(AtomicU64::new(0)),
+            media_tx_packets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            media_tx_bytes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            media_one_way: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_relay_failures: Arc::new(AtomicU64::new(0)),
             quarantined_ports: Arc::new(AtomicU64::new(0)),
             forced_port_reuse: Arc::new(AtomicU64::new(0)),
@@ -596,6 +604,23 @@ impl SbcMetrics {
         self.last_cdr_written_time.store(now, Ordering::Relaxed);
     }
 
+    /// One relayed packet toward `leg` ("caller" / "callee").
+    pub fn note_media_relayed(&self, leg: &'static str, bytes: u64) {
+        if let Ok(mut m) = self.media_tx_packets.lock() {
+            *m.entry(leg).or_insert(0) += 1;
+        }
+        if let Ok(mut m) = self.media_tx_bytes.lock() {
+            *m.entry(leg).or_insert(0) += bytes;
+        }
+    }
+
+    /// A call was reported one-way: `leg` is the side that went silent.
+    pub fn inc_media_one_way(&self, leg: &'static str) {
+        if let Ok(mut m) = self.media_one_way.lock() {
+            *m.entry(leg).or_insert(0) += 1;
+        }
+    }
+
     pub fn inc_media_relay_failure(&self) {
         self.media_relay_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -745,6 +770,36 @@ impl SbcMetrics {
             "Number of currently allocated RTP port pairs",
             self.allocated_ports.load(Ordering::Relaxed)
         );
+
+        for (name, help, map) in [
+            (
+                "sbc_media_packets_relayed",
+                "RTP packets delivered, by the leg they were sent to",
+                &self.media_tx_packets,
+            ),
+            (
+                "sbc_media_bytes_relayed",
+                "RTP bytes delivered, by the leg they were sent to",
+                &self.media_tx_bytes,
+            ),
+            (
+                "sbc_media_one_way_calls",
+                "Calls where one direction stayed silent while the other was delivering",
+                &self.media_one_way,
+            ),
+        ] {
+            out.push_str(&format!(
+                "# HELP {} {}\n# TYPE {} counter\n",
+                name, help, name
+            ));
+            if let Ok(map) = map.lock() {
+                let mut rows: Vec<(&&str, &u64)> = map.iter().collect();
+                rows.sort();
+                for (leg, value) in rows {
+                    out.push_str(&format!("{}_total{{leg=\"{}\"}} {}\n", name, leg, value));
+                }
+            }
+        }
 
         counter!(
             "sbc_media_relay_failures",

@@ -32,6 +32,36 @@ media plane against the code and having the specs adversarially reviewed:
   (`sbc_rtp_ports_quarantined`); an exhausted range takes the oldest
   quarantined pair rather than failing a call and says so
   (`sbc_rtp_port_quarantine_forced_total` — the range is too small).
+- **Per-leg media counters** (`media/stats.rs`, one struct per call,
+  written only by the relay task): packets and bytes received from and
+  delivered to each leg, sequence loss, SSRC changes, endpoint learns and
+  moves, and a drop tally per reason (`not-rtp`, `no-endpoint`,
+  `payload-type`, `transcode`, `srtp`, `send-failed`) — so "packets in,
+  packets out, and the difference explained" holds for every call. One
+  `Media session … ended:` line per call carries the lot, and
+  `sbc_media_packets_relayed_total{leg}` / `sbc_media_bytes_relayed_total{leg}`
+  aggregate it. The five per-packet warnings are now `debug!`.
+- **One-way audio is detected and reported**: when the SBC keeps
+  delivering to a peer that has said nothing for 10 s while the other peer
+  is talking, the relay logs it once per leg inside the call span and
+  counts `sbc_media_one_way_calls_total{leg}`. It never tears the call
+  down — a re-INVITE hold looks identical.
+- **A datagram that is not media is no longer relayed.** The shape check
+  added earlier only guarded endpoint learning: the send path had none, so
+  a source spraying the port had its junk forwarded to the peer *and*
+  refreshed the inactivity watchdog, keeping a silent call billed alive to
+  `max_call_duration`. A datagram is now relayed only if it is RTP/RTCP
+  (12 bytes, version 2), a STUN message with its magic cookie, or a DTLS
+  record — so two SIP peers running their own ICE/DTLS-SRTP through the
+  SBC keep working — and anything else is dropped and counted.
+- The RTP inactivity watchdog runs on a **monotonic** per-call clock and on
+  the last packet actually *delivered*. It compared wall-clock timestamps,
+  so an NTP step forward tore down every live call as `rtp-timeout`, and a
+  packet that arrived but died at the transcoder or the SRTP layer counted
+  as activity.
+- RFC 5761: RTCP is demultiplexed on the full 192..=223 range, so RTPFB,
+  PSFB and XR packets are no longer treated as audio, and the RTCP
+  destination port no longer panics in a debug build at port 65535.
 - Two RTP port pairs leaked on every SDP-rewrite failure in
   `create_session` (nothing releases a pair that never reached a session,
   and the sweeper does not touch media), and `sbc_allocated_rtp_ports` was

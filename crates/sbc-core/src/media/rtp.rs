@@ -14,6 +14,7 @@
 //!   - The INVITE SDP sent to callee contains `ports_b.rtp` → callee sends to leg-B.
 
 use crate::media::srtp::SrtpContext;
+use crate::media::stats::{DropReason, Leg};
 use crate::media::stun::{
     build_binding_response_with_integrity, classify_packet, MultiplexedPacketType,
 };
@@ -98,6 +99,12 @@ pub struct RtpSession {
 
     /// Statistics
     stats: Arc<RtpStats>,
+
+    /// Per-leg counters and drop reasons (what explains a silent call).
+    media_stats: Arc<crate::media::stats::CallMediaStats>,
+
+    /// Metrics sink for the aggregate counters (set by the manager).
+    metrics: Option<Arc<crate::metrics::SbcMetrics>>,
 
     /// Global RTP packet counter (from SbcMetrics — shared across all sessions)
     global_rtp_counter: Option<Arc<AtomicU64>>,
@@ -281,6 +288,10 @@ impl RtpPacket {
 /// Returns 0 if the packet is too short or malformed.
 /// This properly handles WebRTC packets which typically have one-byte or
 /// two-byte header extensions (RFC 5285).
+/// How long one direction may stay silent while the other is delivering
+/// before the relay reports a one-way call (checked on the 15 s tick).
+const ONE_WAY_QUIET_MS: u64 = 10_000;
+
 /// Cheap plausibility check before an endpoint is learned or moved: a
 /// full RTP/RTCP header and version 2 (RFC 3550 §5.1). It does not
 /// authenticate anything — it only stops a stray or hand-crafted byte
@@ -288,6 +299,34 @@ impl RtpPacket {
 /// is in clear), STUN and DTLS are demuxed before this.
 fn looks_like_rtp(data: &[u8]) -> bool {
     data.len() >= 12 && (data[0] >> 6) == 2
+}
+
+/// What the relay does with a datagram that landed on a media port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaInput {
+    /// RTP or RTCP: relayed, and counted as this leg's media.
+    Rtp,
+    /// Plausible ICE or DTLS: relayed untouched (two SIP peers can run
+    /// their own DTLS-SRTP through this SBC), not counted as audio.
+    Passthrough,
+    /// None of the above: not relayed at all. Relaying it would feed the
+    /// peer garbage and — worse — refresh the inactivity watchdog, so a
+    /// source spraying the port could keep a silent call billed alive.
+    Junk,
+}
+
+/// Classify a datagram by the minimum each protocol's header needs: an RTP
+/// header (12 bytes, version 2), a STUN header with its magic cookie
+/// (RFC 5389 §6), or a DTLS record header (RFC 6347 §4.1).
+fn classify_media_input(data: &[u8]) -> MediaInput {
+    match data.first() {
+        Some(128..=191) if looks_like_rtp(data) => MediaInput::Rtp,
+        Some(0..=3) if data.len() >= 20 && data[4..8] == [0x21, 0x12, 0xA4, 0x42] => {
+            MediaInput::Passthrough
+        }
+        Some(20..=63) if data.len() >= 13 => MediaInput::Passthrough,
+        _ => MediaInput::Junk,
+    }
 }
 
 fn rtp_header_length(data: &[u8]) -> usize {
@@ -368,6 +407,8 @@ impl RtpSession {
             rtcp_socket_a: Arc::new(rtcp_socket_a),
             rtcp_socket_b: Arc::new(rtcp_socket_b),
             stats: Arc::new(RtpStats::new()),
+            media_stats: Arc::new(crate::media::stats::CallMediaStats::new()),
+            metrics: None,
             global_rtp_counter: None,
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
@@ -614,6 +655,8 @@ impl RtpSession {
         let rtcp_socket_a = self.rtcp_socket_a.clone();
         let rtcp_socket_b = self.rtcp_socket_b.clone();
         let stats = self.stats.clone();
+        let media_stats = self.media_stats.clone();
+        let metrics = self.metrics.clone();
         let session_id = self.session_id.clone();
         let global_rtp_counter = self.global_rtp_counter.clone();
         let global_srtp_encrypt_counter = self.global_srtp_encrypt_counter.clone();
@@ -724,22 +767,37 @@ impl RtpSession {
                     // it is not a fault and must not be a warning.
                     shutdown_result = shutdown_rx.recv() => {
                         debug!(
-                            "RTP session {} stopped ({}, relayed {} packets)",
+                            "RTP session {} stopped ({})",
                             session_id,
-                            if shutdown_result.is_some() { "signal" } else { "released" },
-                            pkt_count
+                            if shutdown_result.is_some() { "signal" } else { "released" }
                         );
                         break;
                     }
 
                     // ── RTP inactivity check ────────────────────────────────────────
                     _ = rtp_timeout_interval.tick() => {
-                        let last = stats.last_activity_secs.load(Ordering::Relaxed);
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let idle_secs = now.saturating_sub(last);
+                        // One-way audio: we deliver to a peer that says
+                        // nothing back while the other one is talking.
+                        // Reported once per leg, never a teardown — a
+                        // re-INVITE hold looks exactly the same.
+                        if let Some(silent) = media_stats.one_way_leg(ONE_WAY_QUIET_MS) {
+                            if media_stats.claim_one_way_report(silent) {
+                                warn!(
+                                    "Media one-way on session {}: nothing from the {} for {} s ({})",
+                                    session_id,
+                                    silent.label(),
+                                    ONE_WAY_QUIET_MS / 1000,
+                                    media_stats.summary()
+                                );
+                                if let Some(ref m) = metrics {
+                                    m.inc_media_one_way(silent.label());
+                                }
+                            }
+                        }
+                        // Idle time comes from the last packet actually
+                        // *delivered*, on a monotonic clock: a wall-clock
+                        // base tears every live call down when NTP steps.
+                        let idle_secs = media_stats.idle_ms() / 1000;
                         // `last_activity` starts at the relay's start, so
                         // this also covers a call where no packet ever
                         // arrived (media blocked both ways) — the
@@ -851,15 +909,30 @@ impl RtpSession {
                             // the endpoint: a single stray byte to the port
                             // must not redirect the audio. (A source filter
                             // and a first-packet latch are lot 4.)
+                            match classify_media_input(&data) {
+                                MediaInput::Rtp => media_stats.note_rx(Leg::Caller, &data),
+                                MediaInput::Passthrough => {}
+                                MediaInput::Junk => {
+                                    debug!(
+                                        "RTP A: dropping a {}-byte datagram from {} that is not media",
+                                        data.len(),
+                                        source
+                                    );
+                                    media_stats.note_drop(DropReason::NotRtp);
+                                    continue;
+                                }
+                            }
                             if looks_like_rtp(&data) {
                                 let mut ep = endpoint_a.lock().await;
                                 if ep.is_none() {
                                     info!("RTP: learned caller (A) = {} on leg-A:{}", source, ports_a_rtp);
                                     *ep = Some(source);
+                                    media_stats.note_endpoint_learned(Leg::Caller);
                                 } else if *ep != Some(source) {
                                     // NAT port change, or a hijack attempt.
                                     info!("RTP: caller (A) address moved {} → {}", ep.unwrap(), source);
                                     *ep = Some(source);
+                                    media_stats.note_endpoint_moved(Leg::Caller);
                                 }
                             }
 
@@ -876,7 +949,8 @@ impl RtpSession {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SRTP A decrypt error: {} (dropping packet)", e);
+                                            debug!("SRTP A decrypt error: {} (dropping packet)", e);
+                                            media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
                                     }
@@ -1041,7 +1115,8 @@ impl RtpSession {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("SRTP B encrypt error: {} (dropping packet)", e);
+                                            debug!("SRTP B encrypt error: {} (dropping packet)", e);
+                                            media_stats.note_drop(DropReason::Srtp);
                                             continue;
                                         }
                                     }
@@ -1057,17 +1132,22 @@ impl RtpSession {
                                     debug!("RTP A→B #{}: {} → {} ({} bytes)", ab_count+1, source, dst, out_len);
                                 }
                                 if let Err(e) = rtp_socket_b.send_to(&data, dst).await {
-                                    warn!("RTP A→B send error: {}", e);
+                                    debug!("RTP A→B send error: {}", e);
+                                    media_stats.note_drop(DropReason::SendFailed);
                                 } else {
                                     stats.packets_a_to_b.fetch_add(1, Ordering::Relaxed);
-                                        stats.last_activity_secs.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(), Ordering::Relaxed);
                                     stats.bytes_a_to_b.fetch_add(out_len as u64, Ordering::Relaxed);
+                                    media_stats.note_tx(Leg::Callee, out_len);
                                     if let Some(ref c) = global_rtp_counter {
                                         c.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if let Some(ref m) = metrics {
+                                        m.note_media_relayed(Leg::Callee.label(), out_len as u64);
                                     }
                                 }
                             } else {
                                 debug!("RTP A: callee endpoint not yet known, packet from {} dropped", source);
+                                media_stats.note_drop(DropReason::NoEndpoint);
                             }
                         } else if let Err(e) = result {
                             error!("RTP leg-A recv error: {}", e);
@@ -1153,14 +1233,29 @@ impl RtpSession {
 
                             // Same rule as leg A: an RTP-shaped datagram
                             // may move the endpoint, a stray byte may not.
+                            match classify_media_input(&data) {
+                                MediaInput::Rtp => media_stats.note_rx(Leg::Callee, &data),
+                                MediaInput::Passthrough => {}
+                                MediaInput::Junk => {
+                                    debug!(
+                                        "RTP B: dropping a {}-byte datagram from {} that is not media",
+                                        data.len(),
+                                        source
+                                    );
+                                    media_stats.note_drop(DropReason::NotRtp);
+                                    continue;
+                                }
+                            }
                             if looks_like_rtp(&data) {
                                 let mut ep = endpoint_b.lock().await;
                                 if ep.is_none() {
                                     info!("RTP: learned callee (B) = {} on leg-B:{}", source, ports_b_rtp);
                                     *ep = Some(source);
+                                    media_stats.note_endpoint_learned(Leg::Callee);
                                 } else if *ep != Some(source) {
                                     info!("RTP: callee (B) address moved {} → {}", ep.unwrap(), source);
                                     *ep = Some(source);
+                                    media_stats.note_endpoint_moved(Leg::Callee);
                                 }
                             }
 
@@ -1346,17 +1441,22 @@ impl RtpSession {
                                     debug!("RTP B→A #{}: {} → {} ({} bytes)", ba_count+1, source, dst, out_len);
                                 }
                                 if let Err(e) = rtp_socket_a.send_to(&data, dst).await {
-                                    warn!("RTP B→A send error: {}", e);
+                                    debug!("RTP B→A send error: {}", e);
+                                    media_stats.note_drop(DropReason::SendFailed);
                                 } else {
                                     stats.packets_b_to_a.fetch_add(1, Ordering::Relaxed);
-                                        stats.last_activity_secs.store(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(), Ordering::Relaxed);
                                     stats.bytes_b_to_a.fetch_add(out_len as u64, Ordering::Relaxed);
+                                    media_stats.note_tx(Leg::Caller, out_len);
                                     if let Some(ref c) = global_rtp_counter {
                                         c.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if let Some(ref m) = metrics {
+                                        m.note_media_relayed(Leg::Caller.label(), out_len as u64);
                                     }
                                 }
                             } else {
                                 debug!("RTP B: caller endpoint not yet known, packet from {} dropped", source);
+                                media_stats.note_drop(DropReason::NoEndpoint);
                             }
                         } else if let Err(e) = result {
                             error!("RTP leg-B recv error: {}", e);
@@ -1369,9 +1469,13 @@ impl RtpSession {
                             let data = buf_rtcp_a[..len].to_vec();
                             let dest = *endpoint_b.lock().await;
                             if let Some(dst) = dest {
-                                // Send RTCP to callee's RTCP port (RTP port + 1 by convention)
-                                let rtcp_dst = SocketAddr::new(dst.ip(), dst.port() + 1);
-                                let _ = rtcp_socket_b.send_to(&data, rtcp_dst).await;
+                                // Send RTCP to callee's RTCP port (RTP port + 1 by
+                                // convention). `+ 1` on a u16 panics in a debug
+                                // build at 65535.
+                                if let Some(rtcp_port) = dst.port().checked_add(1) {
+                                    let rtcp_dst = SocketAddr::new(dst.ip(), rtcp_port);
+                                    let _ = rtcp_socket_b.send_to(&data, rtcp_dst).await;
+                                }
                             }
                         }
                     }
@@ -1382,13 +1486,19 @@ impl RtpSession {
                             let data = buf_rtcp_b[..len].to_vec();
                             let dest = *endpoint_a.lock().await;
                             if let Some(dst) = dest {
-                                let rtcp_dst = SocketAddr::new(dst.ip(), dst.port() + 1);
-                                let _ = rtcp_socket_a.send_to(&data, rtcp_dst).await;
+                                // `+ 1` on a u16 panics in a debug build at 65535.
+                                if let Some(rtcp_port) = dst.port().checked_add(1) {
+                                    let rtcp_dst = SocketAddr::new(dst.ip(), rtcp_port);
+                                    let _ = rtcp_socket_a.send_to(&data, rtcp_dst).await;
+                                }
                             }
                         }
                     }
                 }
             }
+            // One line per call on the way out: what each leg sent and
+            // received, and every drop that explains the difference.
+            info!("Media session {} ended: {}", session_id, media_stats.summary());
         }.instrument(tracing::Span::current()));
 
         Ok(())
@@ -1407,6 +1517,16 @@ impl RtpSession {
     }
 
     /// Get session statistics
+    /// The per-leg counters, so the manager can keep reading them after
+    /// `start_rtp_session` returns (the `RtpSession` itself is dropped).
+    pub fn media_stats(&self) -> Arc<crate::media::stats::CallMediaStats> {
+        self.media_stats.clone()
+    }
+
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::SbcMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
     pub fn stats(&self) -> RtpSessionStats {
         RtpSessionStats {
             packets_a_to_b: self.stats.packets_a_to_b.load(Ordering::Relaxed),
@@ -1583,6 +1703,98 @@ mod tests {
         assert_eq!(stats.packets_b_to_a, 0);
         assert_eq!(stats.bytes_a_to_b, 0);
         assert_eq!(stats.bytes_b_to_a, 0);
+    }
+
+    #[test]
+    fn media_input_classification_keeps_ice_and_dtls_but_drops_junk() {
+        // RTP: version 2, 12-byte header.
+        let mut rtp = vec![0x80, 0x00, 0x00, 0x01];
+        rtp.extend_from_slice(&[0u8; 8]);
+        assert_eq!(classify_media_input(&rtp), MediaInput::Rtp);
+        // …but not a truncated one.
+        assert_eq!(classify_media_input(&rtp[..8]), MediaInput::Junk);
+
+        // STUN with its magic cookie (RFC 5389) passes through untouched.
+        let mut stun = vec![0x00, 0x01, 0x00, 0x00];
+        stun.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        stun.extend_from_slice(&[0u8; 12]);
+        assert_eq!(classify_media_input(&stun), MediaInput::Passthrough);
+        // A byte that only looks like STUN does not.
+        assert_eq!(classify_media_input(&[0x01]), MediaInput::Junk);
+        let mut fake = stun.clone();
+        fake[4] = 0x00;
+        assert_eq!(classify_media_input(&fake), MediaInput::Junk);
+
+        // A DTLS record header.
+        let dtls = vec![0x16, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(classify_media_input(&dtls), MediaInput::Passthrough);
+        assert_eq!(classify_media_input(&dtls[..5]), MediaInput::Junk);
+
+        assert_eq!(classify_media_input(&[]), MediaInput::Junk);
+    }
+
+    /// Two peers, one relay: the per-leg counters must show what each side
+    /// sent and received, and a datagram that is not RTP-shaped must be
+    /// counted as a drop instead of being relayed as audio.
+    #[tokio::test]
+    async fn the_relay_counts_each_leg_and_every_drop() {
+        let ports_a = PortPair::new(10040).unwrap();
+        let ports_b = PortPair::new(10042).unwrap();
+        let mut session = RtpSession::new_two_leg("counted".to_string(), ports_a, ports_b)
+            .await
+            .unwrap();
+        let stats = session.media_stats();
+
+        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        session.set_endpoint_a(caller.local_addr().unwrap());
+        session.set_endpoint_b(callee.local_addr().unwrap());
+        session.start().await.unwrap();
+
+        // An RTP packet with a 160-byte G.711 payload, each way.
+        let mut packet = vec![0x80, 0x00, 0x00, 0x01];
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&0x1234_5678u32.to_be_bytes());
+        packet.extend_from_slice(&[0xd5u8; 160]);
+
+        caller
+            .send_to(&packet, format!("127.0.0.1:{}", ports_a.rtp))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            callee.recv_from(&mut buf),
+        )
+        .await
+        .expect("the callee receives the relayed packet")
+        .unwrap();
+        assert_eq!(n, packet.len());
+
+        // A stray byte: counted, never relayed.
+        caller
+            .send_to(&[0x01], format!("127.0.0.1:{}", ports_a.rtp))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                callee.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "a 1-byte datagram must not reach the other leg"
+        );
+
+        assert_eq!(stats.caller.rx_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.caller.rx_bytes.load(Ordering::Relaxed), 172);
+        assert_eq!(stats.callee.tx_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.callee.tx_bytes.load(Ordering::Relaxed), 172);
+        assert_eq!(stats.caller.tx_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.drops(DropReason::NotRtp), 1);
+        assert!(stats.since_last_relay_ms().is_some());
+        let summary = stats.summary();
+        assert!(summary.contains("not-rtp 1"), "{}", summary);
     }
 
     #[tokio::test]

@@ -65,6 +65,13 @@ pub struct MediaManager {
 
     global_rtp_timeout_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 
+    /// Metrics sink for the per-leg media counters (set at boot).
+    metrics: Option<Arc<crate::metrics::SbcMetrics>>,
+
+    /// Per-call media counters, kept after `start_rtp_session` returns
+    /// (the `RtpSession` itself is moved into its task).
+    media_stats: dashmap::DashMap<String, Arc<crate::media::stats::CallMediaStats>>,
+
     /// Global transcoded packet counter (from SbcMetrics)
     global_transcode_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 
@@ -177,6 +184,8 @@ impl MediaManager {
             global_srtp_encrypt_counter: None,
             global_srtp_decrypt_counter: None,
             global_rtp_timeout_counter: None,
+            metrics: None,
+            media_stats: dashmap::DashMap::new(),
             global_transcode_counter: None,
             rtp_timeout_secs: std::sync::atomic::AtomicU64::new(90),
             timed_out_tx,
@@ -226,6 +235,19 @@ impl MediaManager {
     /// Attach global SRTP decrypted counter from SbcMetrics
     pub fn set_global_srtp_decrypt_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
         self.global_srtp_decrypt_counter = Some(counter);
+    }
+
+    /// Where the per-leg media counters are aggregated.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::SbcMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// The per-leg counters of a live media session.
+    pub fn call_media_stats(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<crate::media::stats::CallMediaStats>> {
+        self.media_stats.get(session_id).map(|e| e.clone())
     }
 
     pub fn set_global_rtp_timeout_counter(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
@@ -526,6 +548,12 @@ impl MediaManager {
         }
         rtp_session.set_rtp_timeout(self.rtp_timeout());
         rtp_session.set_timed_out_notifier(self.timed_out_tx.clone());
+        if let Some(ref metrics) = self.metrics {
+            rtp_session.set_metrics(metrics.clone());
+        }
+        // Keep the counters reachable once the session moves into its task.
+        self.media_stats
+            .insert(session_id.to_string(), rtp_session.media_stats());
 
         // Attach global transcoded packet counter for Prometheus metrics
         if let Some(ref counter) = self.global_transcode_counter {
@@ -813,6 +841,7 @@ impl MediaManager {
         if let Some((_, session)) = self.sessions.remove(session_id) {
             // Stop RTP relay task (dropping shutdown_tx signals the relay task to exit)
             drop(session.rtp_shutdown_tx);
+            self.media_stats.remove(session_id);
 
             // Release leg-A ports
             self.port_allocator.release(session.ports)?;

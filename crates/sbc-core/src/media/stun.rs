@@ -603,9 +603,11 @@ pub fn classify_packet(data: &[u8]) -> MultiplexedPacketType {
         Some(0..=3) => MultiplexedPacketType::Stun,
         Some(20..=63) => MultiplexedPacketType::Dtls,
         Some(128..=191) => {
-            // RFC 5761: Distinguish RTP from RTCP on rtcp-mux port
-            // RTCP packet types in byte[1]: 200(SR), 201(RR), 202(SDES), 203(BYE), 204(APP)
-            if data.len() >= 2 && data[1] >= 200 && data[1] <= 204 {
+            // RFC 5761 §4: on a muxed port, RTCP packet types are 192..=223
+            // in byte[1] — 200(SR), 201(RR), 202(SDES), 203(BYE), 204(APP),
+            // but also 205(RTPFB), 206(PSFB), 207(XR) and the legacy 192/193.
+            // (RTP avoids the matching payload types for exactly this reason.)
+            if data.len() >= 2 && (192..=223).contains(&data[1]) {
                 MultiplexedPacketType::Rtcp
             } else {
                 MultiplexedPacketType::Rtp

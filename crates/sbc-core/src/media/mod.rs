@@ -11,6 +11,7 @@ pub mod rtp;
 pub mod sdp;
 pub mod srtp;
 pub mod srtp_crypto;
+pub mod stats;
 pub mod stun;
 // TURN relay is intentionally NOT implemented in the SBC: it runs on a
 // public IP and never needs TURN itself; browsers behind hostile NAT should
