@@ -774,6 +774,7 @@ pub fn sdp_audio_pts(sdp: &str) -> Vec<u8> {
                 return parts[3..]
                     .iter()
                     .filter_map(|s| s.parse::<u8>().ok())
+                    .filter(|pt| *pt <= MAX_PAYLOAD_TYPE)
                     .collect();
             }
         }
@@ -791,6 +792,12 @@ pub fn sdp_has_pcmu(sdp: &str) -> bool {
     let pts = sdp_audio_pts(sdp);
     pts.contains(&PT_PCMU)
 }
+
+/// RTP's payload type field is 7 bits (RFC 3550 §5.1), so a number above
+/// 127 cannot appear on the wire. An SDP that lists one is malformed, and
+/// echoing it back into an `m=` line would name a payload type no packet
+/// can carry.
+pub const MAX_PAYLOAD_TYPE: u8 = 127;
 
 /// One audio format of an `m=audio` line: its payload type and its
 /// identity. A dynamic payload type (96-127) means nothing on its own —
@@ -881,6 +888,7 @@ pub fn sdp_audio_formats(sdp: &str) -> Vec<AudioFormat> {
         .split_whitespace()
         .skip(3)
         .filter_map(|s| s.parse::<u8>().ok())
+        .filter(|pt| *pt <= MAX_PAYLOAD_TYPE)
         .collect();
     if pts.is_empty() {
         return Vec::new();
@@ -895,7 +903,11 @@ pub fn sdp_audio_formats(sdp: &str) -> Vec<AudioFormat> {
             continue;
         };
         let mut parts = rest.split_whitespace();
-        let Some(pt) = parts.next().and_then(|p| p.parse::<u8>().ok()) else {
+        let Some(pt) = parts
+            .next()
+            .and_then(|p| p.parse::<u8>().ok())
+            .filter(|pt| *pt <= MAX_PAYLOAD_TYPE)
+        else {
             continue;
         };
         let Some(spec) = parts.next() else { continue };
@@ -1626,5 +1638,45 @@ mod tests {
             return 0.0;
         }
         sum_ab / (sum_aa.sqrt() * sum_bb.sqrt())
+    }
+}
+
+#[cfg(test)]
+mod payload_type_bound_tests {
+    use super::*;
+
+    /// RTP carries the payload type in 7 bits (RFC 3550 §5.1), so 128 and
+    /// above cannot be on the wire. `parse::<u8>()` accepts up to 255, and
+    /// the SDP answer echoes the offer's numbering, so a malformed offer
+    /// could have put a payload type in an `m=` line that no packet can
+    /// carry.
+    #[test]
+    fn a_payload_type_above_127_is_not_a_format() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             m=audio 50000 RTP/AVP 8 200 255 0\r\n\
+             a=rtpmap:200 opus/48000/2\r\n\
+             a=rtpmap:255 telephone-event/8000\r\n";
+        let formats = sdp_audio_formats(sdp);
+        let pts: Vec<u8> = formats.iter().map(|f| f.pt).collect();
+        assert_eq!(pts, vec![8, 0], "only the payload types RTP can carry");
+        assert!(
+            formats.iter().all(|f| f.pt <= MAX_PAYLOAD_TYPE),
+            "{:?}",
+            formats
+        );
+        // And the primary format is still the first usable one.
+        assert_eq!(sdp_primary_format(sdp).map(|f| f.pt), Some(8));
+    }
+
+    /// The boundary itself is legal and must survive.
+    #[test]
+    fn a_payload_type_of_exactly_127_is_kept() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\
+             m=audio 50000 RTP/AVP 127\r\n\
+             a=rtpmap:127 opus/48000/2\r\n";
+        let formats = sdp_audio_formats(sdp);
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].pt, 127);
+        assert_eq!(formats[0].name, "opus");
     }
 }

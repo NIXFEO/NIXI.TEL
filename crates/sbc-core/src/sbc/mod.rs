@@ -1675,8 +1675,11 @@ impl Sbc {
                     let branch = client_tx::branch_param(via.value());
                     let method = cseq.value().split_whitespace().nth(1);
                     if let (Some(branch), Some(method)) = (branch, method) {
-                        self.client_tx
-                            .answered_parts(&branch, &method.to_ascii_uppercase());
+                        self.client_tx.answered_parts(
+                            &branch,
+                            &method.to_ascii_uppercase(),
+                            u16::from(response.status_code.clone()),
+                        );
                     }
                 }
             }

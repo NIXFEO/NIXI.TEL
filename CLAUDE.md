@@ -230,11 +230,16 @@ Hard-won behaviors the SBC handles (Genesys-style clustered trunks):
   `sbc_sip_transaction_timeouts_total`). Sending a CANCEL stops its
   INVITE. ACKs and responses are never tracked (an ACK has no response of
   its own; a response is replayed by `invite_tx.rs` instead), and TCP/TLS
-  retransmit in the transport. **Every request the SBC originates must go
-  out through `send_sip` or `send_request_tracked`** — the INVITE paths
-  need the latter because they branch on the send error, and a direct
-  `transport.reply` is invisible to both the timers and
-  `sbc_sip_send_failures_total`.
+  retransmit in the transport. **Every request a handler originates must
+  go out through `send_sip` or `send_request_tracked`** — the INVITE
+  paths need the latter because they branch on the send error, and a
+  direct `transport.reply` is invisible to both the timers and
+  `sbc_sip_send_failures_total`. The two retransmission loops in
+  `sbc/cdr.rs` are the deliberate exception (they must not re-record what
+  they are replaying), and `trunk_tasks.rs` is outside this rule
+  altogether: its OPTIONS and REGISTER go out on its own socket with its
+  own timeout and backoff ladder, so tracking them would retransmit them
+  twice.
 
 - **Trunk capacity and cooldown are real** — a call counts on its trunk
   from the forwarded INVITE (or from the inbound INVITE's source trunk) to

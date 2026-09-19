@@ -136,16 +136,17 @@ impl ClientTxCache {
         let branch = via_branch(text)?;
         let now = Instant::now();
         let mut txs = self.txs.lock().unwrap_or_else(|e| e.into_inner());
+        // Sending a CANCEL means this attempt is abandoned: stop resending
+        // its INVITE. Before the capacity check, or a full table would
+        // keep resending an INVITE we have just given up on.
+        if method == "CANCEL" {
+            txs.remove(&key(&branch, "INVITE"));
+        }
         if txs.len() >= MAX_ENTRIES {
             txs.retain(|_, tx| tx.give_up_at > now);
             if txs.len() >= MAX_ENTRIES {
                 return None;
             }
-        }
-        // Sending a CANCEL means this attempt is abandoned: stop resending
-        // its INVITE.
-        if method == "CANCEL" {
-            txs.remove(&key(&branch, "INVITE"));
         }
         let k = key(&branch, &method);
         txs.insert(
@@ -166,13 +167,26 @@ impl ClientTxCache {
         Some(k)
     }
 
-    /// A response arrived: the transaction it answers stops retransmitting
-    /// (§17.1.1.2 — even a provisional stops Timer A). Read from the
-    /// parsed headers, so the dispatch path never re-serializes a message
-    /// just to stop a timer. Returns true when something was tracking it.
-    pub(crate) fn answered_parts(&self, branch: &str, cseq_method: &str) -> bool {
+    /// A response arrived for the transaction with this branch and CSeq
+    /// method. Read from the parsed headers, so the dispatch path never
+    /// re-serializes a message just to stop a timer.
+    ///
+    /// What stops the retransmissions differs by method. For an INVITE a
+    /// provisional is enough (§17.1.1.2: Timer A stops on the first
+    /// response of any kind). For everything else §17.1.2.2 keeps Timer E
+    /// running at T2 through the Proceeding state, so only a final
+    /// (≥ 200) ends it — a peer that answers a BYE with `100 Trying` and
+    /// then goes quiet must still see the BYE again.
+    ///
+    /// Returns true when the transaction was ended here.
+    pub(crate) fn answered_parts(&self, branch: &str, cseq_method: &str, status: u16) -> bool {
+        let final_response = status >= 200;
         let mut txs = self.txs.lock().unwrap_or_else(|e| e.into_inner());
-        txs.remove(&key(branch, cseq_method)).is_some()
+        let k = key(branch, cseq_method);
+        match txs.get(&k) {
+            Some(tx) if tx.is_invite || final_response => txs.remove(&k).is_some(),
+            _ => false,
+        }
     }
 
     /// Whether anything is in flight (cheap guard on the response path).
@@ -228,11 +242,11 @@ impl ClientTxCache {
 mod tests {
     use super::*;
 
-    fn addr() -> SocketAddr {
+    pub(super) fn addr() -> SocketAddr {
         "203.0.113.9:5060".parse().unwrap()
     }
 
-    fn invite(branch: &str) -> String {
+    pub(super) fn invite(branch: &str) -> String {
         format!(
             "INVITE sip:bob@203.0.113.9 SIP/2.0\r\n\
              Via: SIP/2.0/UDP 198.51.100.1:5060;branch={};rport\r\n\
@@ -242,7 +256,7 @@ mod tests {
         )
     }
 
-    fn bye(branch: &str) -> String {
+    pub(super) fn bye(branch: &str) -> String {
         format!(
             "BYE sip:bob@203.0.113.9 SIP/2.0\r\n\
              Via: SIP/2.0/UDP 198.51.100.1:5060;branch={}\r\n\
@@ -331,7 +345,8 @@ mod tests {
     }
 
     /// What `Sbc::dispatch` does with a response, from its raw text: read
-    /// the top Via's branch and the CSeq method, then stop that timer.
+    /// the top Via's branch, the CSeq method and the status, then stop
+    /// that timer if the method's rule says so.
     fn answer_with(cache: &ClientTxCache, raw: &str) -> bool {
         let msg = rsip::SipMessage::try_from(raw).expect("parses");
         let rsip::SipMessage::Response(r) = msg else {
@@ -342,7 +357,11 @@ mod tests {
         let cseq = r.cseq_header().expect("CSeq");
         let branch = branch_param(via.value()).expect("branch");
         let method = cseq.value().split_whitespace().nth(1).expect("method");
-        cache.answered_parts(&branch, &method.to_ascii_uppercase())
+        cache.answered_parts(
+            &branch,
+            &method.to_ascii_uppercase(),
+            u16::from(r.status_code.clone()),
+        )
     }
 
     #[test]
@@ -514,6 +533,108 @@ mod tests {
         assert!(cache
             .record_sent("x", b"", addr(), rsip::Transport::Udp, None)
             .is_none());
-        assert!(!cache.answered_parts("", "INVITE"), "no branch, no match");
+        assert!(
+            !cache.answered_parts("", "INVITE", 200),
+            "no branch, no match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod non_invite_timer_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// RFC 3261 §17.1.2.2: for a non-INVITE the client transaction moves
+    /// to Proceeding on a provisional and **Timer E keeps running** at
+    /// T2. Only a final ends it. Stopping on the provisional meant a peer
+    /// that answered a BYE with `100 Trying` and then went quiet kept its
+    /// session: the very ghost the layer exists to prevent.
+    #[test]
+    fn a_provisional_does_not_end_a_non_invite_transaction() {
+        let cache = ClientTxCache::default();
+        cache
+            .record_sent(
+                "BYE → trunk",
+                bye("z9hG4bKnib").as_bytes(),
+                addr(),
+                rsip::Transport::Udp,
+                None,
+            )
+            .expect("tracked");
+
+        // A provisional leaves it armed.
+        assert!(!cache.answered_parts("z9hG4bKnib", "BYE", 100));
+        assert_eq!(cache.len(), 1, "still in flight");
+        let (due, _) = cache.due(Instant::now() + Duration::from_millis(600));
+        assert_eq!(due.len(), 1, "Timer E still fires");
+
+        // The final ends it.
+        assert!(cache.answered_parts("z9hG4bKnib", "BYE", 200));
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// An INVITE is the other way round: the first response of any kind
+    /// stops Timer A (§17.1.1.2), because the far end has clearly got it.
+    #[test]
+    fn a_provisional_does_end_an_invite_transaction() {
+        let cache = ClientTxCache::default();
+        cache
+            .record_sent(
+                "INVITE → trunk",
+                invite("z9hG4bKinv").as_bytes(),
+                addr(),
+                rsip::Transport::Udp,
+                None,
+            )
+            .expect("tracked");
+        assert!(cache.answered_parts("z9hG4bKinv", "INVITE", 100));
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// And a CANCEL stops its INVITE even with the table at its cap: the
+    /// capacity check used to return before the cancellation, so a full
+    /// table kept resending an attempt already abandoned.
+    #[test]
+    fn a_cancel_stops_its_invite_even_when_the_table_is_full() {
+        let cache = ClientTxCache::default();
+        let branch = "z9hG4bKfull";
+        cache
+            .record_sent(
+                "INVITE → trunk",
+                invite(branch).as_bytes(),
+                addr(),
+                rsip::Transport::Udp,
+                None,
+            )
+            .expect("tracked");
+        // Fill the rest of the table with live transactions.
+        for i in 0..MAX_ENTRIES {
+            cache.record_sent(
+                "INVITE → trunk",
+                invite(&format!("z9hG4bKpad{}", i)).as_bytes(),
+                addr(),
+                rsip::Transport::Udp,
+                None,
+            );
+        }
+        assert_eq!(cache.len(), MAX_ENTRIES, "at the cap");
+
+        let cancel = invite(branch)
+            .replace("INVITE sip", "CANCEL sip")
+            .replace("CSeq: 2 INVITE", "CSeq: 2 CANCEL");
+        cache.record_sent(
+            "CANCEL → trunk",
+            cancel.as_bytes(),
+            addr(),
+            rsip::Transport::Udp,
+            None,
+        );
+        let (due, _) = cache.due(Instant::now() + Duration::from_millis(600));
+        assert!(
+            !due.iter().any(|r| r.raw.starts_with(b"INVITE ")
+                && String::from_utf8_lossy(&r.raw).contains(branch)),
+            "the cancelled INVITE is not resent"
+        );
     }
 }

@@ -246,6 +246,16 @@ Two were critical, both in the work that had just been written.
   transferor, so the transferee answered the transferor and the SBC never
   saw the 202 (RFC 3261 §18.2.2) — which since the transaction layer
   meant 32 s of retransmissions for a response that could not arrive.
+- Four more, from findings the skeptics refuted on consequence but whose
+  mechanism was real: a CANCEL now stops its INVITE even with the
+  transaction table at its cap (the capacity check returned before the
+  cancellation); a provisional response no longer ends a **non**-INVITE
+  transaction, since RFC 3261 §17.1.2.2 keeps Timer E running at T2
+  through Proceeding, so a peer that answers a BYE with `100 Trying` and
+  goes quiet still sees the BYE again; a payload type above 127 is no
+  longer read out of an `m=` line, RTP carrying it in 7 bits (RFC 3550
+  §5.1); and the invariant in CLAUDE.md now says which senders it covers,
+  `trunk_tasks` being outside it with its own socket and its own backoff.
 - A failed INVITE forward counted `sbc_sip_send_failures_total` twice:
   the manual increment stayed behind when the accounting moved into
   `send_request_tracked`.

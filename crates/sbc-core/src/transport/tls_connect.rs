@@ -265,9 +265,6 @@ pub fn build_client_config(params: &TlsClientParams) -> Result<ClientConfig> {
     Ok(config)
 }
 
-/// Find one complete SIP message in `buffer` using Content-Length framing.
-/// Returns (message_end, remaining_start) — identical here, kept as a pair
-/// for clarity at the call site.
 pub(crate) mod danger {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
