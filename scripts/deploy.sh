@@ -75,7 +75,10 @@ fi
 say "Backups (suffix $TS) + temporary swap"
 ssh "$HOST" "set -e
   mkdir -p $BACKUPS
-  tar czf $BACKUPS/sbc-src-$TS.tgz -C \$(dirname $SRC) \$(basename $SRC) --exclude=\$(basename $SRC)/target
+  # --exclude must precede the positional argument: GNU tar warns 'has no
+  # effect' otherwise and exits non-zero, which under set -e aborted the
+  # whole deploy before a single backup was taken.
+  tar czf $BACKUPS/sbc-src-$TS.tgz --exclude=target -C \$(dirname $SRC) \$(basename $SRC)
   cp -p $BIN $BIN.bak.$TS; cp -p $CONFIG $CONFIG.bak.$TS
   DB=\$($REMOTE_DB_CMD)
   if [ -n \"\$DB\" ] && [ -f \"\$DB\" ]; then
