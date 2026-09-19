@@ -6,6 +6,15 @@ the workspace version in `Cargo.toml` and git tags `vX.Y.Z`.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.20.0] - 2026-09-19
+
+Five lots of work (solidity, SIP correctness and billing, operations,
+media, scale) plus the media-security lot 4b, each specified against the
+code, adversarially refuted, implemented and then reviewed again as a
+diff before merging. 682 tests.
+
 ### Added
 - `sbc_media_packets_dropped_total{reason}`: why the media path refused a
   packet, in aggregate. The per-reason tally existed per call (a log line
