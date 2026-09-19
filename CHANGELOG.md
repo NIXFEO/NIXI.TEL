@@ -15,6 +15,23 @@ media, scale) plus the media-security lot 4b, each specified against the
 code, adversarially refuted, implemented and then reviewed again as a
 diff before merging. 682 tests.
 
+**Deployed to production on 2026-09-19 at 07:36 UTC** (commit
+`300b3026746c`), replacing 0.1.0. The SQLite store from the previous
+release migrated forward at boot — verified first against a copy on
+separate ports, so the migration was a known quantity before the switch
+rather than after. All four listeners bound, the API smoke test passes
+21/21, the trunk answers OPTIONS and the CPaaS client re-registered
+within seconds of the restart.
+
+Two defects in `scripts/deploy.sh` came out of running it for real, both
+fixed here: `tar --exclude` sat after the positional argument, so GNU tar
+ignored it and exited non-zero, aborting the deploy before its first
+backup; and every `curl` probe ran unguarded under `set -e`, so the
+connection refused in the first moments after `systemctl start` killed
+the remote block — the deploy restarted the service and then skipped its
+own readiness gate, smoke test and swap removal. The probes now tolerate
+a refusal and the build swap is removed by a trap, on every path.
+
 ### Added
 - `sbc_media_packets_dropped_total{reason}`: why the media path refused a
   packet, in aggregate. The per-reason tally existed per call (a log line

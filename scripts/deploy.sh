@@ -103,8 +103,16 @@ ssh "$HOST" "set -e; cd $SRC
 
 say "Waiting for 0 active calls (max ${MAX_WAIT}s), then graceful restart"
 ssh "$HOST" "set -e
+  # The build swap goes away whatever happens next, including the aborts
+  # below: a failed deploy used to leave 2 GB of swapfile behind.
+  trap 'swapoff /swapfile.build 2>/dev/null; rm -f /swapfile.build' EXIT
+  A=
   for i in \$(seq 1 $((MAX_WAIT / 10))); do
-    A=\$(curl -s -m 3 http://127.0.0.1:8080/health | sed -n 's/.*\"active_calls\": *\([0-9]*\).*/\1/p')
+    # '|| true' on every probe: curl exits non-zero when nothing is
+    # listening, and under set -e that killed the whole block — which is
+    # how one deploy restarted the service and then skipped its own
+    # verification, smoke test and swap removal.
+    A=\$(curl -s -m 3 http://127.0.0.1:8080/health 2>/dev/null | sed -n 's/.*\"active_calls\": *\([0-9]*\).*/\1/p' || true)
     echo \"active_calls=\${A:-?}\"; [ \"\$A\" = 0 ] && break; sleep 10
   done
   [ \"\$A\" = 0 ] || { echo 'ABORT: calls still active — not restarting'; exit 3; }
@@ -113,16 +121,19 @@ ssh "$HOST" "set -e
   # /ready (not /health) is the real gate: it stays 503 until the
   # SQLite store is open and hydrated and the SIP listeners are bound, and a
   # store that cannot be opened aborts the boot.
-  for i in \$(seq 1 20); do
-    R=\$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ready)
+  R=000
+  for i in \$(seq 1 30); do
+    R=\$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ready 2>/dev/null || echo 000)
     [ \"\$R\" = 200 ] && break; sleep 1
   done
   systemctl is-active sbc
-  echo \"ready=\$R\"; curl -s -m 3 http://127.0.0.1:8080/ready; echo
-  [ \"\$R\" = 200 ] || { echo 'ABORT: /ready never turned 200 — check journalctl -u sbc (store? listeners?)'; exit 4; }
-  curl -s -m 3 http://127.0.0.1:8080/health; echo
+  echo \"ready=\$R\"; curl -s -m 3 http://127.0.0.1:8080/ready 2>/dev/null || true; echo
+  [ \"\$R\" = 200 ] || { echo 'ABORT: /ready never turned 200 — check the log (store? listeners?)'; exit 4; }
+  curl -s -m 3 http://127.0.0.1:8080/health 2>/dev/null || true; echo
   . /etc/sbc/sbc.env; SBC_API_TOKEN=\$SBC_API_TOKEN bash $SRC/scripts/api_smoke.sh | grep -c '^OK' | xargs echo 'smoke OK:'
-  swapoff /swapfile.build && rm -f /swapfile.build
-  journalctl -u sbc --since '-1min' --no-pager | grep -i -E 'version|error|panic' | tail -5"
+  echo 'trunks up:'; curl -s -m 3 -H \"Authorization: Bearer \$SBC_API_TOKEN\" http://127.0.0.1:8080/metrics | grep -E '^sbc_trunk_up' || echo '  (no trunk has answered OPTIONS yet)'
+  # The SBC logs to [logging] file, not journald, so read both.
+  journalctl -u sbc --since '-2min' --no-pager 2>/dev/null | grep -i -E 'error|panic' | tail -3 || true
+  tail -300 /var/log/sbc/sbc.log 2>/dev/null | grep -iE 'Version:|listener bound|ERROR|panic' | tail -8 || true"
 
 say "Done. Rollback: scripts/deploy.sh --rollback $HOST"
